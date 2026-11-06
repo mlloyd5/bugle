@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bugle-core",
+    "crates/bugle-platform",
+    "crates/bugle-annotate",
+    "crates/bugle-ai",
+    "crates/bugle-engine",
+    "crates/bugle-api",
+    "crates/bugle-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/mlloyd/bugle"
+authors = ["Max Lloyd"]
+
+[workspace.dependencies]
+bugle-core = { path = "crates/bugle-core" }
+bugle-platform = { path = "crates/bugle-platform" }
+bugle-annotate = { path = "crates/bugle-annotate" }
+bugle-ai = { path = "crates/bugle-ai" }
+bugle-engine = { path = "crates/bugle-engine" }
+bugle-api = { path = "crates/bugle-api" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "tiff"] }
+imageproc = "0.25"
+ab_glyph = "0.2"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+dirs = "6"
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
+axum = { version = "0.8", features = ["multipart", "json"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+cc = "1"
+libc = "0.2"
+futures = "0.3"
+bytes = "1"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

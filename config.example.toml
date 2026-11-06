@@ -1,0 +1,99 @@
+# Bugle configuration — copy to ~/.config/bugle/config.toml (or `bugle config init`).
+# Every key is optional; these are the defaults with comments.
+
+[general]
+save_dir = "~/Desktop/Bugle"
+# Tokens: {date} {time} {datetime} {year} {month} {day} {hour} {minute} {second}
+#         {kind} {label} {id} {app} {title}
+filename_template = "Bugle {date} at {time}"
+sound = false
+copy_to_clipboard = false
+# history_path = "~/Library/Application Support/bugle/history.jsonl"
+
+[screenshots]
+format = "png"            # png | jpeg | webp | tiff
+jpeg_quality = 90
+window_shadow = true      # keep the window drop shadow in window captures
+hide_desktop_icons = false
+self_timer_seconds = 5.0
+downscale_retina = false  # save at 1x points instead of 2x pixels
+
+[recording]
+gif_fps = 12
+gif_max_size = 1200       # long edge, pixels
+video_fps = 30
+microphone = false
+system_audio = false      # not supported by the screencapture backend yet
+highlight_clicks = false
+retina = true
+
+[ocr]
+languages = []            # e.g. ["en-US", "de-DE"]; empty = automatic
+accurate = true           # VNRequestTextRecognitionLevelAccurate
+language_correction = true
+engine = "vision"         # "vision" or an AI provider name
+
+[annotate]
+stroke_color = "#FF3B30"
+stroke_width = 4.0
+# font_path = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
+font_size = 28.0
+background = "none"       # default for canvas.background = "auto"
+padding = 48
+corner_radius = 12
+shadow = true
+
+[api]
+bind = "127.0.0.1:4848"
+# token = "change-me"     # bearer token required on every request when set
+cors = true
+
+# ---------------------------------------------------------------------------
+# AI providers. Kinds:
+#   openai      any OpenAI-compatible server (llama.cpp `llama-server`,
+#               LM Studio, vLLM, Ollama's /v1, OpenAI, OpenRouter, Groq…)
+#               roles: vision, text, transcriber (/audio/transcriptions)
+#   ollama      Ollama native API                          roles: vision, text
+#   anthropic   Anthropic Messages API                     roles: vision, text
+#   whisper_cpp whisper.cpp `server` (/inference)          roles: transcriber
+#   command     run a local program                        roles: all
+# ---------------------------------------------------------------------------
+[ai]
+default_vision = "llama"
+default_text = "llama"
+default_transcriber = "whisper"
+
+[ai.providers.llama]
+kind = "openai"
+base_url = "http://127.0.0.1:8080/v1"      # llama-server -m llava.gguf --mmproj ...
+model = "default"
+system_prompt = "You describe screenshots precisely. Name the application, the key UI elements, and any visible text. Be concise."
+timeout_seconds = 180
+max_tokens = 1024
+
+[ai.providers.ollama]
+kind = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "llava"
+
+[ai.providers.whisper]
+kind = "whisper_cpp"
+base_url = "http://127.0.0.1:8178"         # whisper-server -m ggml-base.en.bin --port 8178
+
+[ai.providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+
+[ai.providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+model = "claude-sonnet-5-5"
+api_key_env = "ANTHROPIC_API_KEY"
+
+# A local whisper-cli: {input} {output} {language} {prompt} {model} are substituted.
+# The program must write SRT to {output} (or `<input>.srt`, or stdout).
+# [ai.providers.whisper-cli]
+# kind = "command"
+# command = ["whisper-cli", "-m", "/models/ggml-base.en.bin", "-l", "{language}", "-osrt", "-of", "{output}", "-f", "{input}"]

@@ -1,0 +1,20 @@
+[package]
+name = "bugle-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Agent-facing HTTP and MCP servers for Bugle"
+
+[dependencies]
+bugle-core.workspace = true
+bugle-engine.workspace = true
+bugle-annotate.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+base64.workspace = true
+image.workspace = true
+tracing.workspace = true
