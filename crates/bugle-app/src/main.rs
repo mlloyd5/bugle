@@ -61,6 +61,7 @@ enum Action {
     StopRecording,
     OcrLatest,
     PinLatest,
+    SyncLatest,
 }
 
 impl Action {
@@ -76,6 +77,7 @@ impl Action {
             "stop_recording" => Self::StopRecording,
             "ocr_latest" => Self::OcrLatest,
             "pin_latest" => Self::PinLatest,
+            "sync_latest" => Self::SyncLatest,
             _ => return None,
         })
     }
@@ -181,7 +183,7 @@ fn run_action(engine: &Engine, action: Action) -> Result<Option<Notice>> {
             }
             Ok(Some(Notice {
                 title: format!("Scrolling capture saved ({} frames)", stats.frames),
-                subtitle: file_name(&out.item.path),
+                subtitle: saved_subtitle(engine, &out.item),
                 thumb: bugle_engine::encode_png_bounded(&out.image, 112).ok(),
                 open: Some(out.item.path.clone()),
             }))
@@ -223,7 +225,7 @@ fn run_action(engine: &Engine, action: Action) -> Result<Option<Notice>> {
             };
             Ok(Some(Notice {
                 title: format!("Recording saved ({:.0}s)", media.duration_seconds.unwrap_or(0.0)),
-                subtitle: file_name(&media.path),
+                subtitle: saved_subtitle(engine, &media),
                 thumb,
                 open: Some(media.path.clone()),
             }))
@@ -252,6 +254,24 @@ fn run_action(engine: &Engine, action: Action) -> Result<Option<Notice>> {
             engine.pin("latest", None, 1.0, false)?;
             Ok(None)
         }
+        Action::SyncLatest => {
+            let (media, report) = engine.sync_media("latest")?;
+            let thumb = if media.is_image() {
+                image::open(&media.path).ok().and_then(|i| bugle_engine::encode_png_bounded(&i.to_rgba8(), 112).ok())
+            } else {
+                None
+            };
+            let mut action = report.action.clone();
+            if let Some(c) = action.get_mut(..1) {
+                c.make_ascii_uppercase();
+            }
+            Ok(Some(Notice {
+                title: format!("{action}: {}", file_name(&media.path)),
+                subtitle: report.destination,
+                thumb,
+                open: Some(media.path.clone()),
+            }))
+        }
     }
 }
 
@@ -268,10 +288,25 @@ fn capture(engine: &Engine, target: CaptureTarget) -> Result<Option<Notice>> {
     };
     Ok(Some(Notice {
         title: what,
-        subtitle: file_name(&out.item.path),
+        subtitle: saved_subtitle(engine, &out.item),
         thumb: bugle_engine::encode_png_bounded(&out.image, 112).ok(),
         open: Some(out.item.path.clone()),
     }))
+}
+
+/// Toast subtitle for a saved item: the object URL after an upload, the
+/// file name plus the sync folder after a copy/move, else the file name.
+fn saved_subtitle(engine: &Engine, item: &bugle_core::MediaItem) -> String {
+    if let Some(url) = &item.url {
+        return url.clone();
+    }
+    let name = file_name(&item.path);
+    if engine.config.sync.applies_to(item.kind) {
+        if let Some(label) = engine.sync_destination_label() {
+            return format!("{name} → {label}");
+        }
+    }
+    name
 }
 
 fn file_name(p: &std::path::Path) -> String {
@@ -346,6 +381,8 @@ fn build_menu(config: &Config) -> Result<MenuItems> {
     let stop = MenuItem::with_id("stop_recording", "Stop Recording", false, None);
     let ocr = item("ocr_latest", "OCR Latest", Some("ocr_latest"));
     let pin = item("pin_latest", "Pin Latest", Some("pin_latest"));
+    let sync_enabled = matches!(config.sync.destination(), Ok(Some(_)));
+    let sync = MenuItem::with_id("sync_latest", "Sync Latest", sync_enabled, None);
     let recent = Submenu::with_id("recent", "Recent Captures", true);
     let open_folder = MenuItem::with_id("open_folder", "Open History Folder", true, None);
     let api = MenuItem::with_id("api_toggle", format!("Start Agent API ({})", config.api.bind), true, None);
@@ -363,6 +400,7 @@ fn build_menu(config: &Config) -> Result<MenuItems> {
         &PredefinedMenuItem::separator(),
         &ocr,
         &pin,
+        &sync,
         &recent,
         &open_folder,
         &PredefinedMenuItem::separator(),
@@ -394,7 +432,7 @@ struct App {
 }
 
 impl App {
-    fn recording(&self) -> bool {
+    fn is_recording(&self) -> bool {
         self.engine.record_status().state == RecordingState::Active
     }
 
@@ -408,7 +446,7 @@ impl App {
     }
 
     fn dispatch(&mut self, mut action: Action) {
-        let recording = self.recording();
+        let recording = self.is_recording();
         if matches!(action, Action::RecordVideo | Action::RecordGif) && recording {
             action = Action::StopRecording;
         }
@@ -558,7 +596,7 @@ impl App {
     }
 
     fn quit(&mut self, control_flow: &mut ControlFlow) {
-        if self.recording() {
+        if self.is_recording() {
             match self.engine.record_stop() {
                 Ok(m) => tracing::info!("recording saved to {}", m.path.display()),
                 Err(e) => tracing::warn!("stopping recording on quit: {e:#}"),

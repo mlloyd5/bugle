@@ -24,8 +24,11 @@ an obvious home.
 
 ### `bugle-core`
 Pure data: `Rect`/`Point`, `CaptureTarget`, `CaptureOptions`, `OcrResult`,
-`Transcript` (with SRT/VTT rendering), `MediaItem`/`MediaKind`, the TOML `Config`,
-filename templates (`naming`) and the JSON-lines `History`.
+`Transcript` (with SRT/VTT rendering), `MediaItem`/`MediaKind`, the TOML `Config`
+(including `SyncConfig`: folder *or* S3 destination, copy/move, kinds), filename
+templates (`naming`) and the JSON-lines `History`. A history line whose id is
+already present replaces the earlier record, which is how a moved file or a new
+sync URL is stored without rewriting the file.
 
 
 ### `bugle-platform`
@@ -103,6 +106,19 @@ recorder state machine, and exposes one method per user-facing action:
   re-appended at the stop time so the video track covers the whole recording.
 * `ocr`, `ocr_with_ai`, `describe` (images or sampled video frames), `transcribe`
   (extracts the audio track first), `subtitles`, `annotate`, `pin`, `select_area`.
+* `sync` (`sync.rs`) — runs after every successful save (`save_image`, so
+  screenshots, scrolling captures and annotation output; `record_stop`) for the
+  kinds listed in `[sync]`, before the item is written to history. A folder
+  destination copies or moves the file (unique name on collision; a move updates
+  the item's path). An S3 destination reads the credentials from the named
+  environment variables, hand-rolls an AWS SigV4 `Authorization` header with
+  `ring` (HMAC-SHA256, verified against the AWS test vectors) and `PUT`s the
+  file path-style through `reqwest` on a throw-away single-thread runtime, so it
+  works from the CLI's runtime, the servers' blocking pool and the app's worker
+  thread alike. The object URL lands in `MediaItem.url` and on the clipboard when
+  `general.copy_to_clipboard` is off. A failed sync is logged and never fails the
+  capture; `sync_media` (CLI `bugle sync`, action `sync`, menu *Sync Latest*)
+  syncs on demand regardless of `enabled`/`kinds` and updates history.
 
 ### `bugle-api`
 `actions::catalog()` is the single list of tools with JSON schemas;
@@ -128,12 +144,18 @@ plus the shutter sound; the status item title shows `● m:ss` while recording.
 
 ## Feature ideas
 
-* **Post-capture video editor** (timeline, auto-zoom, cursor smoothing).
-* **Audio mixing** — microphone and system audio are written as two AAC
-  tracks rather than mixed into one. Click highlighting on the
-  ScreenCaptureKit backend.
-* **Quick-access overlay** after a capture (Bugle shows a toast with a thumbnail
-  instead), window-picking mode for *Capture Window* (Bugle takes the front-most
-  window), configurable hotkeys for every menu item, onboarding, auto-update,
-  Touch ID gating.
-* **Cloud upload** — out of scope by design.
+Bugle is a standalone app; this is the backlog, roughly in the order it would
+earn its keep.
+
+* **Post-capture video editor** — trim, auto-zoom on clicks, cursor smoothing,
+  export presets.
+* **Audio mixing** — fold the microphone and system-audio tracks into one when
+  asked; click highlighting on the ScreenCaptureKit recorder.
+* **Quick-access panel** after a capture (the toast with a thumbnail is the
+  minimal version): annotate, copy, pin or send from one place.
+* **Window-picking mode** for *Capture Window* (hover to highlight) instead of
+  taking the front-most window; a hotkey for every menu item.
+* **Packaging** — a signed `.app` bundle so notifications, Login Items and the
+  permission prompts carry Bugle's own name.
+* **Sync extras** — a destination per media kind, streaming multipart uploads
+  for long recordings, and syncing sidecar subtitles next to their video.

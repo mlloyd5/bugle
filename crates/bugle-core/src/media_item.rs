@@ -38,6 +38,10 @@ pub struct MediaItem {
     pub parent: Option<String>,
     #[serde(default)]
     pub bytes: Option<u64>,
+    /// Link to the synced copy when the sync destination is an S3-compatible
+    /// bucket (see `[sync]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 impl MediaItem {
@@ -56,6 +60,7 @@ impl MediaItem {
             source: None,
             parent: None,
             bytes,
+            url: None,
         }
     }
 

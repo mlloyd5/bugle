@@ -66,6 +66,33 @@ ocr_latest = "cmd+shift+2"
 pin_latest = "cmd+shift+p"
 
 # ---------------------------------------------------------------------------
+# Sync every new capture to storage you own. There is no hosted service: pick
+# a folder that Dropbox / iCloud Drive / Syncthing already mirrors, or an
+# S3-compatible bucket (AWS S3, MinIO, Garage, Cloudflare R2, Backblaze B2…).
+# Set `folder` OR `[sync.s3]`, never both. `bugle sync <source|latest>` syncs
+# on demand even when `enabled = false`.
+# ---------------------------------------------------------------------------
+[sync]
+enabled = false
+mode = "copy"             # copy | move  (move: the history entry follows the file;
+                          # uploads always keep the local file)
+kinds = ["screenshot", "scroll_capture", "annotated", "video", "gif"]
+# folder = "~/Library/Mobile Documents/com~apple~CloudDocs/Bugle"   # iCloud Drive
+# folder = "~/Dropbox/Bugle"
+
+# [sync.s3]
+# endpoint = "https://s3.eu-west-1.amazonaws.com"   # or http://127.0.0.1:9000 (MinIO),
+#                                                   # https://<account>.r2.cloudflarestorage.com
+# bucket = "my-captures"
+# region = "eu-west-1"                              # "auto" for R2
+# prefix = "bugle"                                  # key prefix, trailing "/" implied
+# access_key_env = "AWS_ACCESS_KEY_ID"              # credentials stay in your environment
+# secret_key_env = "AWS_SECRET_ACCESS_KEY"
+# public_url = "https://captures.example.com"       # link base; default {endpoint}/{bucket}
+# The object URL is written to history (`url`) and, unless general.copy_to_clipboard
+# puts the image there, copied to the clipboard.
+
+# ---------------------------------------------------------------------------
 # AI providers. Kinds:
 #   openai      any OpenAI-compatible server (llama.cpp `llama-server`,
 #               LM Studio, vLLM, Ollama's /v1, OpenAI, OpenRouter, Groq…)

@@ -1,5 +1,7 @@
 //! Append-only JSON-lines history store: a flat file is enough and is
-//! trivially inspectable by agents.
+//! trivially inspectable by agents. A record appended again with an id that
+//! is already present replaces the earlier one (used when a file is moved
+//! or gains a sync URL); `DELETE <id>` lines are tombstones.
 
 use crate::media_item::MediaItem;
 use anyhow::{Context, Result};
@@ -34,6 +36,12 @@ impl History {
         Ok(())
     }
 
+    /// Re-record an item whose path or metadata changed. The newest line
+    /// for an id wins while the item keeps its original position.
+    pub fn update(&self, media: &MediaItem) -> Result<()> {
+        self.push(media)
+    }
+
     /// All items, newest last. Tombstones (deleted items) are filtered out.
     pub fn all(&self) -> Result<Vec<MediaItem>> {
         let _g = self.lock.lock().unwrap();
@@ -58,7 +66,10 @@ impl History {
                 continue;
             }
             match serde_json::from_str::<MediaItem>(&line) {
-                Ok(m) => items.push(m),
+                Ok(m) => match items.iter().position(|x| x.id == m.id) {
+                    Some(i) => items[i] = m,
+                    None => items.push(m),
+                },
                 Err(e) => tracing::warn!("skipping bad history line: {e}"),
             }
         }
@@ -112,8 +123,17 @@ mod tests {
         h.push(&m).unwrap();
         assert_eq!(h.all().unwrap().len(), 1);
         assert!(h.get(&m.id[..6]).unwrap().is_some());
+        let mut moved = m.clone();
+        moved.path = "/tmp/moved.png".into();
+        moved.url = Some("https://example.invalid/moved.png".into());
+        h.push(&MediaItem::new(MediaKind::Gif, "/tmp/later.gif")).unwrap();
+        h.update(&moved).unwrap();
+        let all = h.all().unwrap();
+        assert_eq!(all.len(), 2, "update replaces instead of appending");
+        assert_eq!(all[0].path, moved.path, "updated item keeps its position");
+        assert_eq!(all[0].url.as_deref(), Some("https://example.invalid/moved.png"));
         assert!(h.delete(&m.id, false).unwrap());
-        assert!(h.all().unwrap().is_empty());
+        assert_eq!(h.all().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

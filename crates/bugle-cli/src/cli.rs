@@ -83,6 +83,11 @@ pub enum Cmd {
         #[arg(default_value = "latest")]
         source: String,
     },
+    /// Copy, move or upload a capture to the `[sync]` destination (folder or S3 bucket).
+    Sync {
+        #[arg(default_value = "latest")]
+        source: String,
+    },
     /// Plain text completion with the configured text provider.
     Ask {
         prompt: String,
@@ -477,6 +482,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 println!("{}", json!({"media": out.item, "rect": out.rect, "window": out.window, "extra": extra}));
             } else {
                 println!("{}  [{}]  {}x{}", out.item.path.display(), out.item.id, out.image.width(), out.image.height());
+                if let Some(url) = &out.item.url {
+                    println!("{url}");
+                }
             }
             if a.open {
                 bugle_platform::open_path(&out.item.path);
@@ -769,6 +777,15 @@ pub async fn run(cli: Cli) -> Result<()> {
         Cmd::Open { source } => {
             let m = engine.resolve_media(&source)?;
             bugle_platform::open_path(&m.path);
+        }
+        Cmd::Sync { source } => {
+            let e = engine.clone();
+            let (media, report) = tokio::task::spawn_blocking(move || e.sync_media(&source)).await??;
+            if json {
+                println!("{}", json!({"media": media, "sync": report}));
+            } else {
+                println!("{} {}  →  {}", report.action, media.path.display(), report.destination);
+            }
         }
         Cmd::Ask { prompt, provider, system } => {
             println!("{}", engine.complete_text(&prompt, provider.as_deref(), system.as_deref()).await?);

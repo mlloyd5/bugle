@@ -14,7 +14,9 @@ screenshot apps lack:
   and MCP (`bugle mcp`, alias `parker`) so coding agents can take and read
   screenshots, annotate them and drive recordings.
 
-Cloud upload / link sharing is intentionally out of scope.
+There is no hosted sharing service and none is planned. Captures can instead be
+[synced](#sync) to storage you own: a folder Dropbox or iCloud Drive mirrors, or
+an S3-compatible bucket.
 
 ## Status
 
@@ -38,7 +40,8 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | HTTP API + OpenAPI | axum, bearer token | ✅ |
 | MCP server (stdio) | JSON-RPC 2.0, image content | ✅ |
 | Menu-bar app, global hotkeys | `bugle-app`: `NSStatusItem` via `tray-icon`, Carbon hotkeys via `global-hotkey`, in-app overlays | ✅ |
-| Studio-mode video editor | — | ❌ future |
+| Sync to your own storage | folder copy/move, or SigV4 `PUT` to any S3-compatible bucket | ✅ |
+| Post-capture video editor | — | see [feature ideas](docs/ARCHITECTURE.md#feature-ideas) |
 
 ## Build
 
@@ -91,6 +94,7 @@ bugle annotate --schema                            # example of every shape
 
 bugle pin latest --at 1900,120,600,300 --opacity 0.95
 bugle windows | bugle displays | bugle history -n 10 | bugle delete <id> --file
+bugle sync latest                  # copy/move/upload to the [sync] destination
 bugle providers | bugle ask "summarise this OCR output: ..."
 bugle config init | bugle config show
 bugle serve --token secret         # HTTP API on 127.0.0.1:4848   (alias: jameson)
@@ -184,6 +188,45 @@ to write the defaults, which point at the usual local servers:
 Any OpenAI-compatible server works for `kind = "openai"` (LM Studio, vLLM,
 OpenRouter, Groq…). `kind = "command"` wraps a local executable, e.g. `whisper-cli`.
 
+The other sections: `[general]` (save folder, filename template, clipboard),
+`[screenshots]`, `[recordings]` (backend, audio), `[ocr]`, `[markup]` defaults,
+`[api]` (bind address, token), `[hotkeys]` for the menu-bar app and `[sync]`
+below.
+
+### Sync
+
+`[sync]` sends every new capture to storage you own — no accounts, no hosted
+service. Pick one destination:
+
+```toml
+[sync]
+enabled = true
+mode = "copy"                 # or "move": the file (and its history entry) relocates
+kinds = ["screenshot", "scroll_capture", "annotated", "video", "gif"]
+folder = "~/Library/Mobile Documents/com~apple~CloudDocs/Bugle"   # iCloud Drive, or ~/Dropbox/…
+```
+
+or an S3-compatible bucket (AWS S3, MinIO, Garage, Cloudflare R2, Backblaze B2…):
+
+```toml
+[sync]
+enabled = true
+[sync.s3]
+endpoint = "https://s3.eu-west-1.amazonaws.com"
+bucket = "my-captures"
+region = "eu-west-1"
+prefix = "bugle"
+access_key_env = "AWS_ACCESS_KEY_ID"      # credentials are read from the environment
+secret_key_env = "AWS_SECRET_ACCESS_KEY"
+# public_url = "https://captures.example.com"
+```
+
+Uploads are SigV4-signed `PUT`s (path-style, no SDK). The object URL is stored
+in the history item (`url`) and copied to the clipboard unless
+`general.copy_to_clipboard` already puts the image there. `bugle sync latest`,
+the `sync` agent action and *Sync Latest* in the menu bar do the same on demand,
+even with `enabled = false`.
+
 ## Agents
 
 See [docs/AGENTS.md](docs/AGENTS.md). In short:
@@ -198,9 +241,9 @@ curl -H 'Authorization: Bearer secret' -H 'content-type: application/json' \
      -d '{"target":{"kind":"window","owner":"Safari"}}' http://127.0.0.1:4848/v1/capture
 ```
 
-Both transports expose the same 22 tools (`capture`, `list_windows`, `ocr`,
+Both transports expose the same 23 tools (`capture`, `list_windows`, `ocr`,
 `describe`, `annotate`, `scroll_capture`, `record_start/stop/status`, `transcribe`,
-`subtitles`, `history`, `pin`, …). `capture` returns the PNG inline so an agent can
+`subtitles`, `history`, `pin`, `sync`, …). `capture` returns the PNG inline so an agent can
 look at what it took.
 
 ## Architecture

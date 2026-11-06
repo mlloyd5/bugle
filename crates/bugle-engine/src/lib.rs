@@ -8,6 +8,7 @@ pub mod capture;
 pub mod record;
 pub mod scroll;
 pub mod stitch;
+pub mod sync;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bugle_ai::{ImageInput, Registry, Role, TextModel, Transcriber, VisionModel};
@@ -24,6 +25,7 @@ use std::sync::{Arc, Mutex};
 
 pub use capture::CaptureOutcome;
 pub use record::RecorderState;
+pub use sync::SyncReport;
 
 /// Hook for front ends that own the process main thread and an AppKit run
 /// loop (the menu-bar app). When installed, interactive selection and pin
@@ -55,6 +57,9 @@ impl Engine {
         let history = History::open(config.history_path())?;
         let ai = Registry::from_config(&config.ai);
         std::fs::create_dir_all(config.save_dir()).ok();
+        if let Err(e) = config.sync.destination() {
+            tracing::warn!("{e:#}; sync is off until the config is fixed");
+        }
         Ok(Self { config, history, ai, recorder_state: RecorderState::default(), main_thread_ui, ui_host: None, renderer: Mutex::new(None) })
     }
 
@@ -117,7 +122,7 @@ impl Engine {
         naming::unique_path(&dir, &stem, ext)
     }
 
-    /// Encode and save an image, record it in history.
+    /// Encode and save an image, sync it (see `[sync]`), record it in history.
     pub fn save_image(
         &self,
         img: &RgbaImage,
@@ -136,6 +141,7 @@ impl Engine {
         m.label = label;
         m.source = source;
         m.parent = parent;
+        self.sync_after_save(&mut m);
         self.history.push(&m)?;
         Ok(m)
     }

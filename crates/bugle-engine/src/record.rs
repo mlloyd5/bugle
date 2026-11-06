@@ -305,6 +305,7 @@ impl Engine {
                 m.height = Some(d.1);
             }
         }
+        self.sync_after_save(&mut m);
         self.history.push(&m)?;
         Ok(m)
     }

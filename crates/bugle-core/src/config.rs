@@ -1,13 +1,14 @@
 //! Configuration (`~/.config/bugle/config.toml`).
 //!
 //! Capture, recording, OCR and annotation settings, plus the AI provider
-//! registry and the agent API settings.
+//! registry, the agent API settings and the sync destination.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::media_item::MediaKind;
 use crate::spec::ImageFormat;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +22,7 @@ pub struct Config {
     pub api: ApiConfig,
     pub ai: AiConfig,
     pub hotkeys: HotkeyConfig,
+    pub sync: SyncConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +185,7 @@ impl Default for Config {
             api: ApiConfig::default(),
             ai: AiConfig::default_registry(),
             hotkeys: HotkeyConfig::default(),
+            sync: SyncConfig::default(),
         }
     }
 }
@@ -312,6 +315,116 @@ impl HotkeyConfig {
         all.into_iter()
             .filter_map(|(name, v)| v.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|s| (name, s.to_string())))
             .collect()
+    }
+}
+
+/// Sync every new capture to storage you own: a folder that Dropbox or
+/// iCloud Drive mirrors, or an S3-compatible bucket. No hosted service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncConfig {
+    /// Run the sync step after every save. `bugle sync <source>` works
+    /// whenever a destination is configured, enabled or not.
+    pub enabled: bool,
+    /// `copy` leaves the original in `save_dir`; `move` relocates it (folder
+    /// destinations only — an upload always keeps the local file).
+    pub mode: SyncMode,
+    /// Which kinds of media are synced automatically.
+    pub kinds: Vec<MediaKind>,
+    /// Destination folder (`~` is expanded). Mutually exclusive with `s3`.
+    pub folder: Option<String>,
+    /// S3-compatible destination. Mutually exclusive with `folder`.
+    pub s3: Option<S3Config>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncMode {
+    #[default]
+    Copy,
+    Move,
+}
+
+/// An S3-compatible bucket reached with path-style requests
+/// (`{endpoint}/{bucket}/{key}`) and SigV4 signing: AWS S3, MinIO, Garage,
+/// Cloudflare R2, Backblaze B2, … Credentials come from the environment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct S3Config {
+    /// Base URL of the service, e.g. `https://s3.eu-west-1.amazonaws.com`,
+    /// `http://127.0.0.1:9000` (MinIO) or `https://<account>.r2.cloudflarestorage.com`.
+    pub endpoint: String,
+    pub bucket: String,
+    /// Signing region. `auto` for R2, `us-east-1` for most self-hosted servers.
+    pub region: String,
+    /// Key prefix ("folder") inside the bucket; a trailing `/` is implied.
+    pub prefix: String,
+    /// Environment variables holding the credentials.
+    pub access_key_env: String,
+    pub secret_key_env: String,
+    /// Base URL used for the link that is recorded and copied, when objects
+    /// are served from somewhere else than the API endpoint (a CDN, a custom
+    /// domain). Defaults to `{endpoint}/{bucket}`.
+    pub public_url: Option<String>,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: SyncMode::Copy,
+            kinds: vec![MediaKind::Screenshot, MediaKind::ScrollCapture, MediaKind::Annotated, MediaKind::Video, MediaKind::Gif],
+            folder: None,
+            s3: None,
+        }
+    }
+}
+
+impl Default for S3Config {
+    fn default() -> Self {
+        Self {
+            endpoint: "https://s3.amazonaws.com".into(),
+            bucket: String::new(),
+            region: "us-east-1".into(),
+            prefix: String::new(),
+            access_key_env: "AWS_ACCESS_KEY_ID".into(),
+            secret_key_env: "AWS_SECRET_ACCESS_KEY".into(),
+            public_url: None,
+        }
+    }
+}
+
+/// Where synced files go, resolved from [`SyncConfig`].
+#[derive(Debug, Clone)]
+pub enum SyncDestination {
+    Folder(PathBuf),
+    S3(S3Config),
+}
+
+impl SyncConfig {
+    /// The configured destination; `None` when neither `folder` nor `s3` is
+    /// set, an error when both are.
+    pub fn destination(&self) -> Result<Option<SyncDestination>> {
+        let folder = self.folder.as_deref().map(str::trim).filter(|f| !f.is_empty());
+        match (folder, &self.s3) {
+            (Some(_), Some(_)) => anyhow::bail!("[sync] sets both `folder` and `s3`; pick one"),
+            (Some(f), None) => Ok(Some(SyncDestination::Folder(expand_tilde(f)))),
+            (None, Some(s3)) => {
+                if s3.bucket.trim().is_empty() {
+                    anyhow::bail!("[sync.s3] needs a `bucket`");
+                }
+                if s3.endpoint.trim().is_empty() {
+                    anyhow::bail!("[sync.s3] needs an `endpoint`");
+                }
+                Ok(Some(SyncDestination::S3(s3.clone())))
+            }
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// Whether the automatic step applies to `kind`.
+    pub fn applies_to(&self, kind: MediaKind) -> bool {
+        self.enabled && self.kinds.contains(&kind)
     }
 }
 
@@ -448,5 +561,35 @@ impl ProviderConfig {
             }
         }
         self.api_key.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_defaults_and_folder() {
+        let cfg: Config = toml::from_str("[sync]\nenabled = true\nfolder = \"~/Sync/Bugle\"\n").unwrap();
+        assert!(cfg.sync.enabled);
+        assert_eq!(cfg.sync.mode, SyncMode::Copy);
+        assert!(cfg.sync.applies_to(MediaKind::Screenshot));
+        assert!(!cfg.sync.applies_to(MediaKind::Subtitle));
+        match cfg.sync.destination().unwrap() {
+            Some(SyncDestination::Folder(p)) => assert!(p.ends_with("Sync/Bugle") && !p.starts_with("~")),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(Config::default().sync.destination().unwrap().is_none());
+    }
+
+    #[test]
+    fn sync_rejects_two_destinations() {
+        let cfg: Config = toml::from_str(
+            "[sync]\nfolder = \"~/x\"\nmode = \"move\"\nkinds = [\"screenshot\"]\n[sync.s3]\nbucket = \"b\"\nendpoint = \"http://127.0.0.1:9000\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.sync.mode, SyncMode::Move);
+        assert_eq!(cfg.sync.kinds, vec![MediaKind::Screenshot]);
+        assert!(cfg.sync.destination().is_err());
     }
 }

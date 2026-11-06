@@ -48,6 +48,7 @@ pub fn router(engine: Arc<Engine>, token: Option<String>, cors: bool) -> Router 
         .route("/v1/record/status", get(|s| action_get(s, "record_status")))
         .route("/v1/pin", post(|s, j| action_post(s, Path("pin".into()), j)))
         .route("/v1/copy", post(|s, j| action_post(s, Path("copy".into()), j)))
+        .route("/v1/sync", post(|s, j| action_post(s, Path("sync".into()), j)))
         .route("/v1/select", post(|s| action_post(s, Path("select_area".into()), Json(json!({})))))
         .route("/v1/displays", get(|s| action_get(s, "list_displays")))
         .route("/v1/windows", get(windows))

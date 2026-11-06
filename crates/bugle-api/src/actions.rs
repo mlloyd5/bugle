@@ -225,6 +225,11 @@ pub fn catalog() -> Vec<ToolSpec> {
             input_schema: json!({"type":"object","properties":{"source":{"type":"string","default":"latest"}}}),
         },
         ToolSpec {
+            name: "sync",
+            description: "Copy, move or upload a media item to the user's own sync destination ([sync] in the config: a folder Dropbox/iCloud Drive mirrors, or an S3-compatible bucket). Returns the new path and, for buckets, the object URL.",
+            input_schema: json!({"type":"object","properties":{"source":{"type":"string","default":"latest"}}}),
+        },
+        ToolSpec {
             name: "select_area",
             description: "Ask the user to drag a rectangle on screen; returns it in screen points. Use it before area captures or recordings when the region is unknown.",
             input_schema: json!({"type":"object","properties":{}}),
@@ -389,6 +394,11 @@ pub async fn run(engine: &Arc<Engine>, name: &str, args: Value) -> Result<Action
             })
             .await??;
             Ok(ActionOutput::json(json!({"copied": media.id})))
+        }
+        "sync" => {
+            let source = source_of(&args);
+            let (media, report) = tokio::task::spawn_blocking(move || e.sync_media(&source)).await??;
+            Ok(ActionOutput::json(json!({"media": media, "sync": report})))
         }
         "select_area" => {
             let r = tokio::task::spawn_blocking(move || e.select_area()).await??;
