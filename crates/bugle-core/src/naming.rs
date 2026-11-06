@@ -22,7 +22,7 @@ pub fn render(template: &str, vars: &HashMap<&str, String>) -> String {
         ("hour", now.format("%H").to_string()),
         ("minute", now.format("%M").to_string()),
         ("second", now.format("%S").to_string()),
-        ("id", crate::media::short_id()),
+        ("id", crate::media_item::short_id()),
     ];
     for (k, v) in builtins {
         out = out.replace(&format!("{{{k}}}"), &v);
@@ -67,7 +67,7 @@ pub fn unique_path(dir: &std::path::Path, stem: &str, ext: &str) -> std::path::P
             return p;
         }
     }
-    dir.join(format!("{stem} {}.{ext}", crate::media::short_id()))
+    dir.join(format!("{stem} {}.{ext}", crate::media_item::short_id()))
 }
 
 #[cfg(test)]

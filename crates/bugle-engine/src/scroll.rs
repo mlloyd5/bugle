@@ -33,7 +33,7 @@ impl Engine {
         let horizontal = req.horizontal;
         let settle = Duration::from_millis(req.settle_ms.max(50));
 
-        let first = bugle_platform::capture_rect(rect, false)?;
+        let first = bugle_platform::capture_area(rect, false)?;
         let mut canvas = first.clone();
         let mut prev = first;
         let mut frames = 1u32;
@@ -48,7 +48,7 @@ impl Engine {
                 bugle_platform::post_scroll(at, 0, req.step_lines)?;
             }
             std::thread::sleep(settle);
-            let next = bugle_platform::capture_rect(rect, false)?;
+            let next = bugle_platform::capture_area(rect, false)?;
             frames += 1;
             if frame_difference(&prev, &next) < 0.5 {
                 stalls += 1;
@@ -81,7 +81,7 @@ impl Engine {
         let format = req.options.format.unwrap_or(self.config.screenshots.format);
         let media = self.save_image(
             &canvas,
-            MediaKind::ScrollingCapture,
+            MediaKind::ScrollCapture,
             format,
             req.options.quality.unwrap_or(self.config.screenshots.jpeg_quality),
             req.options.output.as_deref(),
@@ -94,7 +94,7 @@ impl Engine {
             self.copy_to_clipboard(&media.path, Some(&canvas))?;
         }
         Ok((
-            CaptureOutcome { media, image: canvas, rect: Some(rect), window: None },
+            CaptureOutcome { item: media, image: canvas, rect: Some(rect), window: None },
             ScrollStats { frames, stitched_pixels: total_shift, stopped_reason: reason },
         ))
     }

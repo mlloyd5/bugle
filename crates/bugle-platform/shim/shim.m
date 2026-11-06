@@ -259,7 +259,7 @@ bugle_image_t bugle_capture_display(uint32_t display_id, int32_t show_cursor) {
     }
 }
 
-bugle_image_t bugle_capture_rect(double x, double y, double w, double h, int32_t show_cursor) {
+bugle_image_t bugle_capture_area(double x, double y, double w, double h, int32_t show_cursor) {
     @autoreleasepool {
         g_last_error = nil;
         CGRect rect = CGRectMake(x, y, w, h);
@@ -460,9 +460,11 @@ int32_t bugle_clipboard_write_file(const char *path) {
 // ---------------------------------------------------------------------------
 // Interactive area selection overlay (crosshair over a dimmed screen)
 // ---------------------------------------------------------------------------
-
-static CGRect g_selection = {{0, 0}, {0, 0}};
-static BOOL g_selection_ok = NO;
+//
+// Two entry points share one implementation. `bugle_select_rect_blocking`
+// spins `[NSApp run]` until the drag ends, for the CLI which has no run loop
+// of its own. `bugle_select_rect_begin` returns at once and reports through a
+// C callback, for the menu-bar app whose run loop is already going.
 
 static void stop_app(void) {
     [NSApp stop:nil];
@@ -479,11 +481,25 @@ static void stop_app(void) {
     [NSApp postEvent:e atStart:YES];
 }
 
+typedef void (^BugleSelectCompletion)(BOOL ok, CGRect rect);
+
+@class BugleSelectSession;
+
 @interface BugleSelectView : NSView
 @property(nonatomic) NSPoint start;
 @property(nonatomic) NSRect sel;
 @property(nonatomic) BOOL dragging;
+@property(nonatomic, weak) BugleSelectSession *session;
 @end
+
+@interface BugleSelectSession : NSObject
+@property(nonatomic, strong) NSMutableArray<NSWindow *> *windows;
+@property(nonatomic, copy) BugleSelectCompletion completion;
+@property(nonatomic) BOOL finished;
+- (void)finishWithRect:(CGRect)rect ok:(BOOL)ok;
+@end
+
+static BugleSelectSession *g_select_session = nil;
 
 @implementation BugleSelectView
 - (BOOL)acceptsFirstResponder { return YES; }
@@ -532,17 +548,15 @@ static void stop_app(void) {
         NSRect screenRect = [self.window convertRectToScreen:inWin];
         // Cocoa bottom-left → CoreGraphics top-left global coordinates.
         CGFloat primaryH = [NSScreen screens].firstObject.frame.size.height;
-        g_selection = CGRectMake(screenRect.origin.x, primaryH - screenRect.origin.y - screenRect.size.height,
-                                 screenRect.size.width, screenRect.size.height);
-        g_selection_ok = YES;
-        stop_app();
+        CGRect r = CGRectMake(screenRect.origin.x, primaryH - screenRect.origin.y - screenRect.size.height,
+                              screenRect.size.width, screenRect.size.height);
+        [self.session finishWithRect:r ok:YES];
     }
     [self setNeedsDisplay:YES];
 }
 - (void)keyDown:(NSEvent *)e {
     if (e.keyCode == 53) { // Esc
-        g_selection_ok = NO;
-        stop_app();
+        [self.session finishWithRect:CGRectZero ok:NO];
     }
 }
 @end
@@ -554,62 +568,127 @@ static void stop_app(void) {
 - (BOOL)canBecomeMainWindow { return YES; }
 @end
 
+@implementation BugleSelectSession
+- (void)finishWithRect:(CGRect)rect ok:(BOOL)ok {
+    if (self.finished) return;
+    self.finished = YES;
+    [NSCursor pop];
+    for (NSWindow *win in self.windows) [win orderOut:nil];
+    [self.windows removeAllObjects];
+    BugleSelectCompletion done = self.completion;
+    self.completion = nil;
+    if (g_select_session == self) g_select_session = nil;
+    // Give keyboard focus back to whatever the user was working in.
+    [NSApp deactivate];
+    if (done) done(ok, rect);
+}
+@end
+
+/// Show the overlay on every screen. Returns NO when a selection is already
+/// in progress (the completion is then never called).
+static BOOL select_begin(BugleSelectCompletion completion) {
+    if (g_select_session) return NO;
+    NSApplication *app = [NSApplication sharedApplication];
+    [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    BugleSelectSession *session = [[BugleSelectSession alloc] init];
+    session.windows = [NSMutableArray array];
+    session.completion = completion;
+    for (NSScreen *screen in [NSScreen screens]) {
+        BugleOverlayWindow *win = [[BugleOverlayWindow alloc] initWithContentRect:screen.frame
+                                                                        styleMask:NSWindowStyleMaskBorderless
+                                                                          backing:NSBackingStoreBuffered
+                                                                            defer:NO
+                                                                           screen:screen];
+        win.releasedWhenClosed = NO;
+        win.level = NSScreenSaverWindowLevel;
+        win.backgroundColor = [NSColor clearColor];
+        win.opaque = NO;
+        win.hasShadow = NO;
+        win.ignoresMouseEvents = NO;
+        win.acceptsMouseMovedEvents = YES;
+        win.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
+        BugleSelectView *v = [[BugleSelectView alloc] initWithFrame:win.contentView.bounds];
+        v.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        v.session = session;
+        win.contentView = v;
+        [win makeFirstResponder:v];
+        [win makeKeyAndOrderFront:nil];
+        [session.windows addObject:win];
+    }
+    g_select_session = session;
+    [app activateIgnoringOtherApps:YES];
+    [[NSCursor crosshairCursor] push];
+    return YES;
+}
+
 int32_t bugle_select_rect_blocking(double *x, double *y, double *w, double *h) {
     @autoreleasepool {
-        g_selection_ok = NO;
-        NSApplication *app = [NSApplication sharedApplication];
-        [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
-        NSMutableArray *windows = [NSMutableArray array];
-        for (NSScreen *screen in [NSScreen screens]) {
-            BugleOverlayWindow *win = [[BugleOverlayWindow alloc] initWithContentRect:screen.frame
-                                                                            styleMask:NSWindowStyleMaskBorderless
-                                                                              backing:NSBackingStoreBuffered
-                                                                                defer:NO
-                                                                               screen:screen];
-            win.level = NSScreenSaverWindowLevel;
-            win.backgroundColor = [NSColor clearColor];
-            win.opaque = NO;
-            win.hasShadow = NO;
-            win.ignoresMouseEvents = NO;
-            win.acceptsMouseMovedEvents = YES;
-            win.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
-            BugleSelectView *v = [[BugleSelectView alloc] initWithFrame:win.contentView.bounds];
-            v.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-            win.contentView = v;
-            [win makeFirstResponder:v];
-            [win makeKeyAndOrderFront:nil];
-            [windows addObject:win];
+        __block BOOL ok = NO;
+        __block CGRect r = CGRectZero;
+        if (!select_begin(^(BOOL k, CGRect rect) {
+                ok = k;
+                r = rect;
+                stop_app();
+            })) {
+            return 0;
         }
-        [app activateIgnoringOtherApps:YES];
-        [[NSCursor crosshairCursor] push];
-        [app run];
-        [NSCursor pop];
-        for (NSWindow *win in windows) [win orderOut:nil];
-        if (!g_selection_ok) return 0;
-        *x = g_selection.origin.x;
-        *y = g_selection.origin.y;
-        *w = g_selection.size.width;
-        *h = g_selection.size.height;
+        [NSApp run];
+        if (!ok) return 0;
+        *x = r.origin.x;
+        *y = r.origin.y;
+        *w = r.size.width;
+        *h = r.size.height;
         return 1;
     }
 }
 
+int32_t bugle_select_rect_begin(bugle_select_callback_t cb, void *ctx) {
+    @autoreleasepool {
+        BOOL started = select_begin(^(BOOL ok, CGRect r) {
+            cb(ctx, ok ? 1 : 0, r.origin.x, r.origin.y, r.size.width, r.size.height);
+        });
+        return started ? 1 : 0;
+    }
+}
+
+int32_t bugle_select_rect_active(void) { return g_select_session ? 1 : 0; }
+
+/// Dismiss an in-progress selection as cancelled (the callback fires with ok=0).
+void bugle_select_rect_cancel(void) {
+    @autoreleasepool {
+        [g_select_session finishWithRect:CGRectZero ok:NO];
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Pin to screen: a floating panel. Blocks until closed.
-// Esc or double-click closes; drag anywhere to move; scroll to resize.
+// Pin to screen. Esc or double-click closes; drag anywhere to move; scroll
+// to resize. `bugle_pin_image_show` returns at once (the window lives until
+// closed); `bugle_pin_image_blocking` waits for it, for the CLI.
 // ---------------------------------------------------------------------------
 
+static NSMutableArray<NSWindow *> *g_pins = nil;
+
 @interface BuglePinView : NSImageView
+@property(nonatomic, copy) void (^onClose)(void);
+- (void)closePin;
 @end
 @implementation BuglePinView
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
 - (BOOL)acceptsFirstResponder { return YES; }
+- (void)closePin {
+    NSWindow *win = self.window;
+    void (^done)(void) = self.onClose;
+    self.onClose = nil;
+    [win orderOut:nil];
+    [g_pins removeObject:win];
+    if (done) done();
+}
 - (void)mouseDown:(NSEvent *)e {
-    if (e.clickCount == 2) { stop_app(); return; }
+    if (e.clickCount == 2) { [self closePin]; return; }
     [self.window performWindowDragWithEvent:e];
 }
 - (void)keyDown:(NSEvent *)e {
-    if (e.keyCode == 53 || (e.keyCode == 13 && (e.modifierFlags & NSEventModifierFlagCommand))) stop_app();
+    if (e.keyCode == 53 || (e.keyCode == 13 && (e.modifierFlags & NSEventModifierFlagCommand))) [self closePin];
 }
 - (void)scrollWheel:(NSEvent *)e {
     NSRect f = self.window.frame;
@@ -622,48 +701,169 @@ int32_t bugle_select_rect_blocking(double *x, double *y, double *w, double *h) {
 }
 @end
 
+static BuglePinView *pin_show(const uint8_t *png, size_t len, double x, double y, double w, double h, double opacity) {
+    NSApplication *app = [NSApplication sharedApplication];
+    [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    NSImage *img = [[NSImage alloc] initWithData:[NSData dataWithBytes:png length:len]];
+    if (!img) return nil;
+    if (!g_pins) g_pins = [NSMutableArray array];
+    CGFloat primaryH = [NSScreen screens].firstObject.frame.size.height;
+    if (w <= 0 || h <= 0) {
+        NSSize s = img.size;
+        w = s.width;
+        h = s.height;
+    }
+    if (x < 0 || y < 0) {
+        NSRect vf = [NSScreen mainScreen].visibleFrame;
+        x = NSMaxX(vf) - w - 24;
+        y = primaryH - NSMaxY(vf) + 24;
+    }
+    NSRect frame = NSMakeRect(x, primaryH - y - h, w, h);
+    BugleOverlayWindow *win = [[BugleOverlayWindow alloc] initWithContentRect:frame
+                                                                    styleMask:NSWindowStyleMaskBorderless
+                                                                      backing:NSBackingStoreBuffered
+                                                                        defer:NO];
+    win.releasedWhenClosed = NO;
+    win.level = NSFloatingWindowLevel;
+    win.hasShadow = YES;
+    win.opaque = NO;
+    win.backgroundColor = [NSColor clearColor];
+    win.alphaValue = opacity > 0 ? opacity : 1.0;
+    win.movableByWindowBackground = YES;
+    win.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
+    BuglePinView *iv = [[BuglePinView alloc] initWithFrame:win.contentView.bounds];
+    iv.image = img;
+    iv.imageScaling = NSImageScaleProportionallyUpOrDown;
+    iv.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    iv.wantsLayer = YES;
+    iv.layer.cornerRadius = 8;
+    iv.layer.masksToBounds = YES;
+    win.contentView = iv;
+    [win makeFirstResponder:iv];
+    [g_pins addObject:win];
+    [win makeKeyAndOrderFront:nil];
+    [app activateIgnoringOtherApps:YES];
+    return iv;
+}
+
 void bugle_pin_image_blocking(const uint8_t *png, size_t len, double x, double y, double w, double h, double opacity) {
     @autoreleasepool {
-        NSApplication *app = [NSApplication sharedApplication];
-        [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
-        NSImage *img = [[NSImage alloc] initWithData:[NSData dataWithBytes:png length:len]];
-        if (!img) return;
-        CGFloat primaryH = [NSScreen screens].firstObject.frame.size.height;
-        if (w <= 0 || h <= 0) {
-            NSSize s = img.size;
-            w = s.width;
-            h = s.height;
+        BuglePinView *iv = pin_show(png, len, x, y, w, h, opacity);
+        if (!iv) return;
+        iv.onClose = ^{ stop_app(); };
+        [NSApp run];
+    }
+}
+
+int32_t bugle_pin_image_show(const uint8_t *png, size_t len, double x, double y, double w, double h, double opacity) {
+    @autoreleasepool {
+        return pin_show(png, len, x, y, w, h, opacity) ? 1 : 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Toast: a small non-activating panel in the corner of the main screen that
+// shows a thumbnail and two lines of text, then fades out. Clicking it opens
+// the file. Used by the menu-bar app as its "capture done" notification;
+// unbundled binaries cannot post user notifications.
+// ---------------------------------------------------------------------------
+
+static NSPanel *g_toast = nil;
+static NSTimer *g_toast_timer = nil;
+
+@interface BugleToastView : NSVisualEffectView
+@property(nonatomic, copy) NSString *openPath;
+@end
+@implementation BugleToastView
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
+- (void)mouseDown:(NSEvent *)e {
+    if (self.openPath.length) {
+        [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:self.openPath]];
+    }
+    [g_toast_timer invalidate];
+    g_toast_timer = nil;
+    [g_toast orderOut:nil];
+    g_toast = nil;
+}
+@end
+
+static void toast_dismiss(void) {
+    NSPanel *p = g_toast;
+    g_toast = nil;
+    g_toast_timer = nil;
+    if (!p) return;
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
+        ctx.duration = 0.25;
+        [p.animator setAlphaValue:0.0];
+    } completionHandler:^{
+        [p orderOut:nil];
+    }];
+}
+
+void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const char *subtitle, const char *open_path,
+                      double seconds) {
+    @autoreleasepool {
+        if (g_toast) {
+            [g_toast_timer invalidate];
+            [g_toast orderOut:nil];
+            g_toast = nil;
+            g_toast_timer = nil;
         }
-        if (x < 0 || y < 0) {
-            NSRect vf = [NSScreen mainScreen].visibleFrame;
-            x = NSMaxX(vf) - w - 24;
-            y = primaryH - NSMaxY(vf) + 24;
+        NSImage *img = (png && len) ? [[NSImage alloc] initWithData:[NSData dataWithBytes:png length:len]] : nil;
+        CGFloat pad = 10, thumb = img ? 56 : 0, width = 320, height = 76;
+        NSRect vf = [NSScreen mainScreen].visibleFrame;
+        NSRect frame = NSMakeRect(NSMaxX(vf) - width - 16, NSMaxY(vf) - height - 16, width, height);
+        NSPanel *panel = [[NSPanel alloc] initWithContentRect:frame
+                                                    styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+                                                      backing:NSBackingStoreBuffered
+                                                        defer:NO];
+        panel.releasedWhenClosed = NO;
+        panel.level = NSStatusWindowLevel;
+        panel.opaque = NO;
+        panel.hasShadow = YES;
+        panel.backgroundColor = [NSColor clearColor];
+        panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
+        panel.hidesOnDeactivate = NO;
+
+        BugleToastView *root = [[BugleToastView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
+        root.material = NSVisualEffectMaterialHUDWindow;
+        root.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+        root.state = NSVisualEffectStateActive;
+        root.wantsLayer = YES;
+        root.layer.cornerRadius = 12;
+        root.layer.masksToBounds = YES;
+        root.openPath = open_path ? [NSString stringWithUTF8String:open_path] : nil;
+
+        CGFloat tx = pad;
+        if (img) {
+            NSImageView *iv = [[NSImageView alloc] initWithFrame:NSMakeRect(pad, (height - thumb) / 2, thumb, thumb)];
+            iv.image = img;
+            iv.imageScaling = NSImageScaleProportionallyUpOrDown;
+            iv.wantsLayer = YES;
+            iv.layer.cornerRadius = 6;
+            iv.layer.masksToBounds = YES;
+            [root addSubview:iv];
+            tx = pad + thumb + pad;
         }
-        NSRect frame = NSMakeRect(x, primaryH - y - h, w, h);
-        BugleOverlayWindow *win = [[BugleOverlayWindow alloc] initWithContentRect:frame
-                                                                        styleMask:NSWindowStyleMaskBorderless
-                                                                          backing:NSBackingStoreBuffered
-                                                                            defer:NO];
-        win.level = NSFloatingWindowLevel;
-        win.hasShadow = YES;
-        win.opaque = NO;
-        win.backgroundColor = [NSColor clearColor];
-        win.alphaValue = opacity > 0 ? opacity : 1.0;
-        win.movableByWindowBackground = YES;
-        win.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
-        BuglePinView *iv = [[BuglePinView alloc] initWithFrame:win.contentView.bounds];
-        iv.image = img;
-        iv.imageScaling = NSImageScaleProportionallyUpOrDown;
-        iv.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-        iv.wantsLayer = YES;
-        iv.layer.cornerRadius = 8;
-        iv.layer.masksToBounds = YES;
-        win.contentView = iv;
-        [win makeFirstResponder:iv];
-        [win makeKeyAndOrderFront:nil];
-        [app activateIgnoringOtherApps:YES];
-        [app run];
-        [win orderOut:nil];
+        NSTextField *t = [NSTextField labelWithString:title ? [NSString stringWithUTF8String:title] : @""];
+        t.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+        t.textColor = [NSColor whiteColor];
+        t.lineBreakMode = NSLineBreakByTruncatingTail;
+        t.frame = NSMakeRect(tx, height / 2 + 2, width - tx - pad, 18);
+        [root addSubview:t];
+        NSTextField *s = [NSTextField labelWithString:subtitle ? [NSString stringWithUTF8String:subtitle] : @""];
+        s.font = [NSFont systemFontOfSize:11];
+        s.textColor = [NSColor colorWithWhite:1 alpha:0.75];
+        s.lineBreakMode = NSLineBreakByTruncatingMiddle;
+        s.frame = NSMakeRect(tx, height / 2 - 18, width - tx - pad, 16);
+        [root addSubview:s];
+        panel.contentView = root;
+        panel.alphaValue = 1.0;
+        [panel orderFrontRegardless];
+        g_toast = panel;
+        g_toast_timer = [NSTimer scheduledTimerWithTimeInterval:(seconds > 0 ? seconds : 2.5)
+                                                        repeats:NO
+                                                          block:^(NSTimer *timer) { toast_dismiss(); }];
     }
 }
 
@@ -697,7 +897,7 @@ int32_t bugle_export_audio_m4a(const char *in_path, const char *out_path) {
     }
 }
 
-int32_t bugle_export_mp4(const char *in_path, const char *out_path) {
+static int32_t remux(const char *in_path, const char *out_path, AVFileType type) {
     @autoreleasepool {
         g_last_error = nil;
         NSURL *in = [NSURL fileURLWithPath:[NSString stringWithUTF8String:in_path]];
@@ -707,17 +907,25 @@ int32_t bugle_export_mp4(const char *in_path, const char *out_path) {
         AVAssetExportSession *s = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetPassthrough];
         if (!s) { set_error(@"could not create export session"); return -1; }
         s.outputURL = out;
-        s.outputFileType = AVFileTypeMPEG4;
+        s.outputFileType = type;
         s.shouldOptimizeForNetworkUse = YES;
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         [s exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
         dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
         if (s.status != AVAssetExportSessionStatusCompleted) {
-            set_error(@"mp4 export failed: %@", s.error.localizedDescription);
+            set_error(@"%@ export failed: %@", type, s.error.localizedDescription);
             return -1;
         }
         return 0;
     }
+}
+
+int32_t bugle_export_mp4(const char *in_path, const char *out_path) {
+    return remux(in_path, out_path, AVFileTypeMPEG4);
+}
+
+int32_t bugle_export_mov(const char *in_path, const char *out_path) {
+    return remux(in_path, out_path, AVFileTypeQuickTimeMovie);
 }
 
 double bugle_media_duration(const char *path) {
@@ -756,5 +964,473 @@ void bugle_play_sound(const char *name) {
 void bugle_open_path(const char *path) {
     @autoreleasepool {
         [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:path]]];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Video recording — SCStream (screen + system audio) and an optional
+// AVCaptureSession microphone, written by AVAssetWriter straight to .mp4
+// (H.264 + AAC). This is the only path that can capture system audio.
+//
+// Timing: ScreenCaptureKit stamps samples with the host clock; microphone
+// buffers are converted from the capture session's clock to the host clock
+// so the three tracks line up. The writer session starts when the stream
+// starts. A static screen's first frame carries the time it was last
+// rendered, which can be well before the stream started, so earlier frames
+// are clamped to the session start. On stop the last frame is re-appended at
+// the stop time so the video track covers the whole recording.
+// ---------------------------------------------------------------------------
+
+@interface BugleSckRecorder : NSObject <SCStreamOutput, SCStreamDelegate, AVCaptureAudioDataOutputSampleBufferDelegate>
+@property (nonatomic, strong) SCStream *stream;
+@property (nonatomic, strong) AVAssetWriter *writer;
+@property (nonatomic, strong) AVAssetWriterInput *videoInput;
+@property (nonatomic, strong) AVAssetWriterInputPixelBufferAdaptor *videoAdaptor;
+@property (nonatomic, strong) AVAssetWriterInput *audioInput;   // system audio
+@property (nonatomic, strong) AVAssetWriterInput *micInput;     // microphone
+@property (nonatomic, strong) AVCaptureSession *micSession;
+@property (nonatomic, strong) dispatch_queue_t videoQueue;
+@property (nonatomic, strong) dispatch_queue_t audioQueue;
+@property (nonatomic, strong) dispatch_queue_t micQueue;
+@property (nonatomic, strong) NSLock *lock;        // guards the fields below
+@property (nonatomic) BOOL sessionStarted;
+@property (nonatomic) CMTime sessionStart;
+@property (nonatomic) BOOL stopping;
+@property (nonatomic) BOOL finished;
+@property (nonatomic) int32_t result;
+@property (nonatomic) int64_t frames;
+@property (nonatomic) int32_t fps;
+@property (nonatomic) CVPixelBufferRef lastFrame;  // retained
+@property (nonatomic) CMTime lastPts;
+@property (nonatomic, strong) NSString *failure;
+@property (nonatomic, strong) NSMutableArray<NSString *> *warnings;
+@end
+
+@implementation BugleSckRecorder
+
+- (instancetype)init {
+    if ((self = [super init])) {
+        _videoQueue = dispatch_queue_create("bugle.sck.video", DISPATCH_QUEUE_SERIAL);
+        _audioQueue = dispatch_queue_create("bugle.sck.audio", DISPATCH_QUEUE_SERIAL);
+        _micQueue = dispatch_queue_create("bugle.sck.mic", DISPATCH_QUEUE_SERIAL);
+        _lock = [[NSLock alloc] init];
+        _warnings = [NSMutableArray array];
+        _sessionStart = kCMTimeInvalid;
+        _lastPts = kCMTimeInvalid;
+    }
+    return self;
+}
+
+- (void)dealloc {
+    if (_lastFrame) CVPixelBufferRelease(_lastFrame);
+}
+
+- (void)warn:(NSString *)fmt, ... {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    [self.lock lock];
+    [self.warnings addObject:s];
+    [self.lock unlock];
+}
+
+- (void)noteWriterFailure {
+    if (self.writer.status == AVAssetWriterStatusFailed && !self.failure) {
+        self.failure = self.writer.error.localizedDescription ?: @"asset writer failed";
+    }
+}
+
+// --- SCStreamOutput ---------------------------------------------------------
+
+- (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sb ofType:(SCStreamOutputType)type {
+    if (!sb || !CMSampleBufferDataIsReady(sb)) return;
+    if (type == SCStreamOutputTypeScreen) {
+        [self handleScreen:sb];
+    } else if (type == SCStreamOutputTypeAudio) {
+        [self handleAudio:sb input:self.audioInput];
+    }
+}
+
+- (void)handleScreen:(CMSampleBufferRef)sb {
+    CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, false);
+    if (atts && CFArrayGetCount(atts) > 0) {
+        NSDictionary *d = (__bridge NSDictionary *)CFArrayGetValueAtIndex(atts, 0);
+        // Idle/blank/suspended frames carry no image; a static screen sends
+        // one complete frame and then only idle ones.
+        NSNumber *status = d[SCStreamFrameInfoStatus];
+        if (status && status.intValue != SCFrameStatusComplete && status.intValue != SCFrameStatusStarted) return;
+    }
+    CVPixelBufferRef px = CMSampleBufferGetImageBuffer(sb);
+    if (!px) return;
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
+    [self.lock lock];
+    if (self.stopping || !self.sessionStarted) { [self.lock unlock]; return; }
+    if (CMTimeCompare(pts, self.sessionStart) < 0) pts = self.sessionStart;
+    if (CMTIME_IS_VALID(self.lastPts) && CMTimeCompare(pts, self.lastPts) <= 0) { [self.lock unlock]; return; }
+    if (self.videoInput.readyForMoreMediaData) {
+        if ([self.videoAdaptor appendPixelBuffer:px withPresentationTime:pts]) {
+            self.frames++;
+            if (self.lastFrame) CVPixelBufferRelease(self.lastFrame);
+            self.lastFrame = CVPixelBufferRetain(px);
+            self.lastPts = pts;
+        } else {
+            [self noteWriterFailure];
+        }
+    }
+    [self.lock unlock];
+}
+
+- (void)handleAudio:(CMSampleBufferRef)sb input:(AVAssetWriterInput *)input {
+    if (!input) return;
+    [self.lock lock];
+    if (self.stopping || !self.sessionStarted) { [self.lock unlock]; return; }
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
+    if (CMTimeCompare(pts, self.sessionStart) < 0) { [self.lock unlock]; return; }
+    if (input.readyForMoreMediaData) {
+        if (![input appendSampleBuffer:sb]) [self noteWriterFailure];
+    }
+    [self.lock unlock];
+}
+
+// --- SCStreamDelegate -------------------------------------------------------
+
+- (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
+    [self.lock lock];
+    BOOL expected = self.stopping;
+    [self.lock unlock];
+    if (!expected) [self warn:@"capture stream stopped early: %@", error.localizedDescription];
+}
+
+// --- AVCaptureAudioDataOutputSampleBufferDelegate (microphone) --------------
+
+- (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sb
+       fromConnection:(AVCaptureConnection *)connection {
+    if (!sb || !CMSampleBufferDataIsReady(sb)) return;
+    CMClockRef sessionClock = self.micSession.synchronizationClock;
+    CMClockRef host = CMClockGetHostTimeClock();
+    if (sessionClock && !CFEqual(sessionClock, host)) {
+        CMSampleTimingInfo t;
+        t.duration = CMSampleBufferGetDuration(sb);
+        t.presentationTimeStamp = CMSyncConvertTime(CMSampleBufferGetPresentationTimeStamp(sb), sessionClock, host);
+        t.decodeTimeStamp = kCMTimeInvalid;
+        CMSampleBufferRef adjusted = NULL;
+        if (CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, sb, 1, &t, &adjusted) == noErr && adjusted) {
+            [self handleAudio:adjusted input:self.micInput];
+            CFRelease(adjusted);
+            return;
+        }
+    }
+    [self handleAudio:sb input:self.micInput];
+}
+
+// --- Setup ------------------------------------------------------------------
+
+- (BOOL)setupMicrophone:(NSDictionary *)audioSettings {
+    AVAuthorizationStatus st = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
+    if (st == AVAuthorizationStatusNotDetermined) {
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block BOOL granted = NO;
+        [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL g) {
+            granted = g;
+            dispatch_semaphore_signal(sem);
+        }];
+        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC)) != 0) granted = NO;
+        st = granted ? AVAuthorizationStatusAuthorized : AVAuthorizationStatusDenied;
+    }
+    if (st != AVAuthorizationStatusAuthorized) {
+        [self warn:@"microphone access not granted; recording without microphone"];
+        return NO;
+    }
+    AVCaptureDevice *dev = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+    if (!dev) { [self warn:@"no microphone found; recording without microphone"]; return NO; }
+    NSError *err = nil;
+    AVCaptureDeviceInput *in = [AVCaptureDeviceInput deviceInputWithDevice:dev error:&err];
+    if (!in) { [self warn:@"microphone unavailable (%@); recording without microphone", err.localizedDescription]; return NO; }
+    AVCaptureSession *session = [[AVCaptureSession alloc] init];
+    AVCaptureAudioDataOutput *out = [[AVCaptureAudioDataOutput alloc] init];
+    [out setSampleBufferDelegate:self queue:self.micQueue];
+    if (![session canAddInput:in] || ![session canAddOutput:out]) {
+        [self warn:@"microphone capture session could not be configured; recording without microphone"];
+        return NO;
+    }
+    [session addInput:in];
+    [session addOutput:out];
+    AVAssetWriterInput *mic = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:audioSettings];
+    mic.expectsMediaDataInRealTime = YES;
+    if (![self.writer canAddInput:mic]) {
+        [self warn:@"writer refused the microphone track; recording without microphone"];
+        return NO;
+    }
+    [self.writer addInput:mic];
+    self.micInput = mic;
+    self.micSession = session;
+    return YES;
+}
+
+- (BOOL)startWithFilter:(SCContentFilter *)filter
+                 config:(SCStreamConfiguration *)cfg
+                    url:(NSURL *)url
+                    fps:(int32_t)fps
+            systemAudio:(BOOL)systemAudio
+             microphone:(BOOL)microphone {
+    NSError *err = nil;
+    [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+    [[NSFileManager defaultManager] createDirectoryAtURL:url.URLByDeletingLastPathComponent
+                             withIntermediateDirectories:YES attributes:nil error:nil];
+    self.writer = [[AVAssetWriter alloc] initWithURL:url fileType:AVFileTypeMPEG4 error:&err];
+    if (!self.writer) { set_error(@"AVAssetWriter: %@", err.localizedDescription); return NO; }
+    self.writer.shouldOptimizeForNetworkUse = YES;
+    self.fps = fps;
+
+    int32_t w = (int32_t)cfg.width, h = (int32_t)cfg.height;
+    // ~0.1 bit per pixel per frame: screen content is mostly static.
+    double bitrate = fmax(1.0e6, fmin(40.0e6, (double)w * (double)h * (double)fps * 0.1));
+    NSDictionary *video = @{
+        AVVideoCodecKey: AVVideoCodecTypeH264,
+        AVVideoWidthKey: @(w),
+        AVVideoHeightKey: @(h),
+        AVVideoCompressionPropertiesKey: @{
+            AVVideoAverageBitRateKey: @((int64_t)bitrate),
+            AVVideoExpectedSourceFrameRateKey: @(fps),
+            AVVideoMaxKeyFrameIntervalKey: @(fps * 2),
+            AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+            AVVideoAllowFrameReorderingKey: @NO,
+        },
+    };
+    self.videoInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:video];
+    self.videoInput.expectsMediaDataInRealTime = YES;
+    self.videoAdaptor = [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:self.videoInput
+                                                                                       sourcePixelBufferAttributes:nil];
+    if (![self.writer canAddInput:self.videoInput]) { set_error(@"writer refused the H.264 video track"); return NO; }
+    [self.writer addInput:self.videoInput];
+
+    NSDictionary *audio = @{
+        AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+        AVSampleRateKey: @48000,
+        AVNumberOfChannelsKey: @2,
+        AVEncoderBitRateKey: @160000,
+    };
+    if (systemAudio) {
+        self.audioInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:audio];
+        self.audioInput.expectsMediaDataInRealTime = YES;
+        if (![self.writer canAddInput:self.audioInput]) { set_error(@"writer refused the AAC audio track"); return NO; }
+        [self.writer addInput:self.audioInput];
+    }
+    if (microphone) [self setupMicrophone:audio];
+
+    if (![self.writer startWriting]) {
+        set_error(@"could not start writing %@: %@", url.path, self.writer.error.localizedDescription);
+        return NO;
+    }
+    // Open the session before the stream starts: the first (and on a static
+    // screen, only) complete frame can arrive before startCapture's
+    // completion handler runs.
+    [self.lock lock];
+    self.sessionStart = CMClockGetTime(CMClockGetHostTimeClock());
+    [self.writer startSessionAtSourceTime:self.sessionStart];
+    self.sessionStarted = YES;
+    [self.lock unlock];
+
+    self.stream = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:self];
+    if (![self.stream addStreamOutput:self type:SCStreamOutputTypeScreen sampleHandlerQueue:self.videoQueue error:&err]) {
+        set_error(@"ScreenCaptureKit: %@", err.localizedDescription);
+        return NO;
+    }
+    if (systemAudio &&
+        ![self.stream addStreamOutput:self type:SCStreamOutputTypeAudio sampleHandlerQueue:self.audioQueue error:&err]) {
+        set_error(@"ScreenCaptureKit audio: %@", err.localizedDescription);
+        return NO;
+    }
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block NSError *startErr = nil;
+    [self.stream startCaptureWithCompletionHandler:^(NSError *e) {
+        startErr = e;
+        dispatch_semaphore_signal(sem);
+    }];
+    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC)) != 0) {
+        set_error(@"ScreenCaptureKit: timed out starting the stream");
+        return NO;
+    }
+    if (startErr) { set_error(@"ScreenCaptureKit: %@", startErr.localizedDescription); return NO; }
+    if (self.micSession) [self.micSession startRunning];
+    return YES;
+}
+
+// Stop capturing. Idempotent and serialised: a second caller (the auto-stop
+// timer vs. an explicit stop) waits for the first to finish.
+- (void)stopCapture {
+    @synchronized (self) {
+        [self.lock lock];
+        BOOL already = self.stopping;
+        self.stopping = YES;
+        CMTime stopTime = CMClockGetTime(CMClockGetHostTimeClock());
+        [self.lock unlock];
+        if (already) return;
+        if (self.micSession) [self.micSession stopRunning];
+        if (self.stream) {
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            [self.stream stopCaptureWithCompletionHandler:^(NSError *e) { dispatch_semaphore_signal(sem); }];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+        }
+        // Extend the last frame to the stop time so the video track covers
+        // the whole recording even when the screen was static at the end.
+        // The writer gives the final sample the previous sample's duration,
+        // so append one frame an interval before the stop and one at it.
+        if (self.sessionStarted && self.lastFrame && self.writer.status == AVAssetWriterStatusWriting) {
+            CMTime interval = CMTimeMake(1, self.fps > 0 ? self.fps : 30);
+            CMTime times[2] = { CMTimeSubtract(stopTime, interval), stopTime };
+            for (int k = 0; k < 2; k++) {
+                if (CMTimeCompare(times[k], self.lastPts) <= 0) continue;
+                for (int i = 0; i < 50 && !self.videoInput.readyForMoreMediaData; i++) usleep(10 * 1000);
+                if (!self.videoInput.readyForMoreMediaData) break;
+                if ([self.videoAdaptor appendPixelBuffer:self.lastFrame withPresentationTime:times[k]]) self.lastPts = times[k];
+            }
+        }
+    }
+}
+
+- (int32_t)finish {
+    [self stopCapture];
+    @synchronized (self) {
+        if (self.finished) return self.result;
+        self.finished = YES;
+        self.result = -1;
+        if (!self.sessionStarted) {
+            [self.writer cancelWriting];
+            set_error(@"no frames were captured%@", self.failure ? [NSString stringWithFormat:@" (%@)", self.failure] : @"");
+            return -1;
+        }
+        if (self.writer.status != AVAssetWriterStatusWriting) {
+            set_error(@"recording failed: %@", self.failure ?: self.writer.error.localizedDescription ?: @"unknown writer state");
+            return -1;
+        }
+        [self.videoInput markAsFinished];
+        [self.audioInput markAsFinished];
+        [self.micInput markAsFinished];
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        [self.writer finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
+        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC)) != 0) {
+            set_error(@"timed out finalising the recording");
+            return -1;
+        }
+        if (self.writer.status != AVAssetWriterStatusCompleted) {
+            set_error(@"finalising the recording failed: %@", self.writer.error.localizedDescription);
+            return -1;
+        }
+        self.result = 0;
+        return 0;
+    }
+}
+
+@end
+
+int32_t bugle_sck_record_available(void) {
+    return (sck_available() && NSClassFromString(@"SCStream") != nil &&
+            [SCStreamConfiguration instancesRespondToSelector:@selector(setCapturesAudio:)]) ? 1 : 0;
+}
+
+static size_t even_px(double v) {
+    long long n = llround(v);
+    if (n < 2) n = 2;
+    return (size_t)(n & ~1LL);
+}
+
+void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t window_id, int32_t fps, int32_t retina,
+                             int32_t system_audio, int32_t microphone, int32_t show_cursor, double max_seconds,
+                             const char *out_path) {
+    @autoreleasepool {
+        g_last_error = nil;
+        if (!bugle_sck_record_available()) { set_error(@"ScreenCaptureKit recording needs macOS 14 or later"); return NULL; }
+        if (fps < 1) fps = 1;
+        if (fps > 120) fps = 120;
+        SCShareableContent *content = sck_content();
+        if (!content) return NULL;
+        SCContentFilter *filter = nil;
+        SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
+        if (window_id != 0) {
+            for (SCWindow *win in content.windows) {
+                if (win.windowID == window_id) {
+                    filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:win];
+                    break;
+                }
+            }
+            if (!filter) { set_error(@"window %u is not capturable", window_id); return NULL; }
+            double s = retina ? filter.pointPixelScale : 1.0;
+            CGRect cr = filter.contentRect;
+            cfg.width = even_px(cr.size.width * s);
+            cfg.height = even_px(cr.size.height * s);
+            cfg.scalesToFit = YES;
+        } else {
+            CGRect rect = CGRectMake(x, y, w, h);
+            if (w < 2 || h < 2) { set_error(@"recording rect is empty"); return NULL; }
+            CGDirectDisplayID did = display_for_rect(rect);
+            CGRect db = CGDisplayBounds(did);
+            for (SCDisplay *d in content.displays) {
+                if (d.displayID == did) {
+                    filter = [[SCContentFilter alloc] initWithDisplay:d excludingWindows:@[]];
+                    break;
+                }
+            }
+            if (!filter) { set_error(@"display %u is not capturable", did); return NULL; }
+            double s = retina ? filter.pointPixelScale : 1.0;
+            cfg.sourceRect = CGRectMake(x - db.origin.x, y - db.origin.y, w, h);
+            cfg.width = even_px(w * s);
+            cfg.height = even_px(h * s);
+        }
+        cfg.minimumFrameInterval = CMTimeMake(1, fps);
+        cfg.queueDepth = 8;
+        cfg.showsCursor = show_cursor != 0;
+        cfg.pixelFormat = kCVPixelFormatType_32BGRA;
+        cfg.colorSpaceName = kCGColorSpaceSRGB;
+        cfg.captureResolution = SCCaptureResolutionBest;
+        cfg.shouldBeOpaque = YES;
+        if (system_audio) {
+            cfg.capturesAudio = YES;
+            cfg.sampleRate = 48000;
+            cfg.channelCount = 2;
+            cfg.excludesCurrentProcessAudio = YES;
+        }
+        NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
+        BugleSckRecorder *rec = [[BugleSckRecorder alloc] init];
+        if (![rec startWithFilter:filter config:cfg url:url fps:fps systemAudio:system_audio != 0 microphone:microphone != 0]) {
+            [rec.writer cancelWriting];
+            [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+            return NULL;
+        }
+        if (max_seconds > 0) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(max_seconds * NSEC_PER_SEC)),
+                           dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ [rec stopCapture]; });
+        }
+        return (__bridge_retained void *)rec;
+    }
+}
+
+int64_t bugle_sck_record_frames(void *handle) {
+    if (!handle) return 0;
+    BugleSckRecorder *rec = (__bridge BugleSckRecorder *)handle;
+    [rec.lock lock];
+    int64_t n = rec.frames;
+    [rec.lock unlock];
+    return n;
+}
+
+char *bugle_sck_record_warnings(void *handle) {
+    if (!handle) return NULL;
+    @autoreleasepool {
+        BugleSckRecorder *rec = (__bridge BugleSckRecorder *)handle;
+        [rec.lock lock];
+        NSString *s = rec.warnings.count ? [rec.warnings componentsJoinedByString:@"; "] : nil;
+        [rec.lock unlock];
+        return s ? strdup(s.UTF8String) : NULL;
+    }
+}
+
+int32_t bugle_sck_record_stop(void *handle) {
+    if (!handle) return -1;
+    @autoreleasepool {
+        g_last_error = nil;
+        BugleSckRecorder *rec = (__bridge_transfer BugleSckRecorder *)handle;
+        return [rec finish];
     }
 }

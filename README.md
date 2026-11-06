@@ -31,13 +31,14 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | Pin to screen | Floating AppKit panel (drag, scroll-to-resize, Esc/double-click closes) | ✅ |
 | GIF recording | In-process frame grab loop + `image` GIF encoder | ✅ |
 | Video recording | `screencapture -v` (H.264 .mov → remuxed .mp4), microphone, click highlight | ✅ |
-| System audio in recordings | needs an `SCStream` audio tap | ❌ not yet |
+| System audio in recordings | ScreenCaptureKit `SCStream` audio tap + `AVAssetWriter` (H.264 + AAC .mp4), microphone as a second track | ✅ (macOS 14+) |
 | Describe image / video frames with a vision model | OpenAI-compatible, Ollama, Anthropic, command | ✅ |
 | Transcribe / subtitles (SRT, VTT) | whisper.cpp server, OpenAI-compatible, command | ✅ |
 | History | JSON-lines file, ids, delete | ✅ |
 | HTTP API + OpenAPI | axum, bearer token | ✅ |
 | MCP server (stdio) | JSON-RPC 2.0, image content | ✅ |
-| Menu-bar app, global hotkeys, Studio-mode video editor | — | ❌ future |
+| Menu-bar app, global hotkeys | `bugle-app`: `NSStatusItem` via `tray-icon`, Carbon hotkeys via `global-hotkey`, in-app overlays | ✅ |
+| Studio-mode video editor | — | ❌ future |
 
 ## Build
 
@@ -45,7 +46,8 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 cargo build --release
 ```
 
-The binary is `target/release/bugle`. The platform crate compiles a small
+The binaries are `target/release/bugle` (CLI + servers) and `target/release/bugle-app`
+(menu-bar app). The platform crate compiles a small
 Objective-C shim (`crates/bugle-platform/shim/shim.m`) with the Xcode command
 line tools; no Xcode project is needed.
 
@@ -72,6 +74,7 @@ bugle scroll --rect 0,120,1200,800 --max-frames 60 --step -10
 
 bugle record start area --rect 0,30,1280,720 -f gif --fps 10 -s 8
 bugle record start window --app Xcode -f mp4 --mic --subtitles   # Ctrl-C to stop
+bugle record start screen -f mp4 --system-audio -s 30              # ScreenCaptureKit backend
 
 bugle ocr latest                   # Apple Vision, reading order, --json for boxes
 bugle ocr latest --engine llama    # OCR through a vision model instead
@@ -123,6 +126,47 @@ Shapes: `rectangle`, `ellipse`, `line`, `arrow` (standard/double/slim/fancy),
 `spotlight`, `image`. Background presets: sunset, ocean, forest, candy, mono, midnight,
 peach, mint, any `#hex`, or `gradient:#a,#b[,angle]`.
 
+## Menu-bar app
+
+```bash
+cargo run -p bugle-app            # or target/release/bugle-app [--serve] [--config FILE]
+```
+
+`bugle-app` is an accessory process (no Dock icon) that puts a camera glyph in the
+menu bar and listens for global hotkeys. Everything it does goes through the same
+`Engine` as the CLI, so captures land in the configured `save_dir`, appear in
+history, and play the shutter sound when `general.shutter_sound` is on.
+
+Menu: Capture Area · Capture Window (front-most window) · Capture Screen ·
+Scrolling Capture · Record Video · Record GIF · Stop Recording · OCR Latest
+(copies the text) · Pin Latest · Recent Captures (last five, click to open) ·
+Open History Folder · Start/Stop Agent API · Preferences… (opens the config
+file) · Quit. While recording, the status item shows `● m:ss`. After each
+action a small toast in the top-right corner shows a thumbnail and the file
+name; clicking it opens the file.
+
+Hotkeys live in the `[hotkeys]` section of the config file and are parsed as
+`modifier+modifier+key` (`cmd`, `shift`, `alt`/`option`, `ctrl`; letters,
+digits, `F1`…`F24`, `space`, …). Defaults:
+
+| Action | Key | Default |
+|---|---|---|
+| `capture_area` | ⌘⇧4 | drag an area with the crosshair overlay |
+| `capture_screen` | ⌘⇧3 | main display |
+| `record` | ⌘⇧5 | start an MP4 recording of a dragged area, or stop the active one |
+| `ocr_latest` | ⌘⇧2 | OCR the latest capture to the clipboard |
+| `pin_latest` | ⌘⇧P | pin the latest capture |
+| `capture_window`, `scroll_capture`, `record_gif` | — | unbound until set |
+
+An empty string unbinds an action. ⌘⇧3/4/5 are also the system screenshot
+shortcuts; disable those in System Settings → Keyboard → Keyboard Shortcuts →
+Screenshots (or pick other keys) so they do not fire twice. The agent API started
+from the menu uses `[api]` from the config and serves the in-app overlay for
+`select_area`, `pin` and interactive captures — no helper processes.
+
+Screen Recording permission is requested on first launch (granted to the
+terminal or app that launched `bugle-app` when run from a shell).
+
 ## Configuration
 
 `~/.config/bugle/config.toml` (or `$BUGLE_CONFIG`). See
@@ -161,17 +205,18 @@ look at what it took.
 
 ## Architecture
 
-Seven crates; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the details.
+Eight crates; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the details.
 
 ```
 bugle-core      types, config, naming, history (no OS calls)
 bugle-platform  Objective-C shim: SCKit/CG capture, Vision OCR + registration,
                 scroll events, clipboard, selection overlay, pin panel, AVFoundation
-bugle-annotate  annotation document model + SDF-based raster renderer
+bugle-markup    annotation document model + SDF-based raster renderer
 bugle-ai        provider registry: openai | ollama | anthropic | whisper_cpp | command
 bugle-engine    Engine: capture, scroll stitch, record, annotate, OCR, AI actions
 bugle-api       action catalog → HTTP (axum) and MCP (stdio)
 bugle-cli       the `bugle` binary
+bugle-app       the `bugle-app` menu-bar binary: status item, hotkeys, toasts
 ```
 
 ## Why "Bugle"?

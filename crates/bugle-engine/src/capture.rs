@@ -2,13 +2,13 @@
 
 use crate::Engine;
 use anyhow::{anyhow, Result};
-use bugle_core::{BugleError, CaptureRequest, CaptureTarget, DisplayInfo, Media, MediaKind, Rect, WindowInfo};
+use bugle_core::{BugleError, CaptureRequest, CaptureTarget, DisplayInfo, MediaItem, MediaKind, Rect, WindowInfo};
 use image::RgbaImage;
 use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct CaptureOutcome {
-    pub media: Media,
+    pub item: MediaItem,
     pub image: RgbaImage,
     /// Screen rect that was captured, when known (points).
     pub rect: Option<Rect>,
@@ -75,7 +75,7 @@ impl Engine {
                 Ok((self.maybe_downscale(img, d.scale), Some(d.frame), None))
             }
             CaptureTarget::Area { rect } => {
-                let img = bugle_platform::capture_rect(*rect, show_cursor)?;
+                let img = bugle_platform::capture_area(*rect, show_cursor)?;
                 let scale = img.width() as f64 / rect.w.max(1.0);
                 Ok((self.maybe_downscale(img, scale), Some(*rect), None))
             }
@@ -87,7 +87,7 @@ impl Engine {
             }
             CaptureTarget::Interactive => {
                 let rect = self.select_area()?.ok_or_else(|| anyhow!("selection cancelled"))?;
-                let img = bugle_platform::capture_rect(rect, show_cursor)?;
+                let img = bugle_platform::capture_area(rect, show_cursor)?;
                 let scale = img.width() as f64 / rect.w.max(1.0);
                 Ok((self.maybe_downscale(img, scale), Some(rect), None))
             }
@@ -153,7 +153,7 @@ impl Engine {
         let shadow = o.shadow.unwrap_or(self.config.screenshots.window_shadow);
         let show_cursor = !o.hide_cursor.unwrap_or(true);
         let (image, rect, window) = self.grab(&req.target, shadow, show_cursor)?;
-        if self.config.general.sound {
+        if self.config.general.shutter_sound {
             bugle_platform::play_sound("Tink");
         }
         let format = o.format.unwrap_or(self.config.screenshots.format);
@@ -191,6 +191,6 @@ impl Engine {
         if o.copy.unwrap_or(self.config.general.copy_to_clipboard) {
             self.copy_to_clipboard(&media.path, Some(&image))?;
         }
-        Ok(CaptureOutcome { media, image, rect, window })
+        Ok(CaptureOutcome { item: media, image, rect, window })
     }
 }

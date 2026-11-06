@@ -11,28 +11,42 @@ pub mod stitch;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bugle_ai::{ImageInput, Registry, Role, TextModel, Transcriber, VisionModel};
-use bugle_annotate::{Annotation, Renderer, Style};
+use bugle_markup::{Annotation, Renderer, Style};
 use bugle_core::naming;
 use bugle_core::{
-    BugleError, Config, DescribeRequest, DescribeResult, History, ImageFormat, Media, MediaKind, OcrOptions, OcrResult,
+    BugleError, Config, DescribeRequest, DescribeResult, History, ImageFormat, MediaItem, MediaKind, OcrOptions, OcrResult,
     Rect, SubtitleFormat, Transcript,
 };
 use image::{DynamicImage, RgbaImage};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub use capture::CaptureOutcome;
-pub use record::Recorder;
+pub use record::RecorderState;
+
+/// Hook for front ends that own the process main thread and an AppKit run
+/// loop (the menu-bar app). When installed, interactive selection and pin
+/// windows go through it instead of spawning helper processes. Implementations
+/// marshal to the main thread; the engine calls them from worker threads.
+pub trait UiHost: Send + Sync {
+    /// Show the crosshair overlay; `None` when the user cancels.
+    fn select_area(&self) -> Result<Option<Rect>>;
+    /// Float a PNG above all windows and return without waiting.
+    fn pin(&self, png: Vec<u8>, frame: Option<Rect>, opacity: f64) -> Result<()>;
+}
 
 pub struct Engine {
     pub config: Config,
     pub history: History,
     pub ai: Registry,
-    pub recorder: Recorder,
+    pub recorder_state: RecorderState,
     /// Whether the caller runs on the process main thread, so AppKit overlays
     /// (area selection, pin) can be shown in-process instead of via a helper.
     pub main_thread_ui: bool,
+    /// In-process overlay host, see [`UiHost`]. Takes precedence over the
+    /// helper-process fallback when `main_thread_ui` is false.
+    pub ui_host: Option<Arc<dyn UiHost>>,
     renderer: Mutex<Option<Renderer>>,
 }
 
@@ -41,7 +55,7 @@ impl Engine {
         let history = History::open(config.history_path())?;
         let ai = Registry::from_config(&config.ai);
         std::fs::create_dir_all(config.save_dir()).ok();
-        Ok(Self { config, history, ai, recorder: Recorder::default(), main_thread_ui, renderer: Mutex::new(None) })
+        Ok(Self { config, history, ai, recorder_state: RecorderState::default(), main_thread_ui, ui_host: None, renderer: Mutex::new(None) })
     }
 
     pub fn from_default_config(main_thread_ui: bool) -> Result<Self> {
@@ -49,19 +63,19 @@ impl Engine {
     }
 
     // -----------------------------------------------------------------------
-    // Media resolution
+    // MediaItem resolution
     // -----------------------------------------------------------------------
 
     /// Resolve `source` to a history item or a file on disk. Accepts a media
     /// id (or prefix), `latest`/`last`, or a path.
-    pub fn resolve_media(&self, source: &str) -> Result<Media> {
+    pub fn resolve_media(&self, source: &str) -> Result<MediaItem> {
         if source.is_empty() || source == "latest" || source == "last" {
             return self.history.latest()?.ok_or_else(|| BugleError::MediaNotFound("history is empty".into()).into());
         }
         let p = bugle_core::config::expand_tilde(source);
         if p.exists() {
             let kind = kind_from_path(&p);
-            let mut m = Media::new(kind, &p);
+            let mut m = MediaItem::new(kind, &p);
             if m.is_image() {
                 if let Ok(dim) = image::image_dimensions(&p) {
                     m.width = Some(dim.0);
@@ -73,7 +87,7 @@ impl Engine {
         self.history.get(source)?.ok_or_else(|| BugleError::MediaNotFound(source.to_string()).into())
     }
 
-    pub fn load_image(&self, source: &str) -> Result<(Media, RgbaImage)> {
+    pub fn load_image(&self, source: &str) -> Result<(MediaItem, RgbaImage)> {
         let m = self.resolve_media(source)?;
         if m.is_video() {
             // First frame of a video is a fine stand-in for image operations.
@@ -115,10 +129,10 @@ impl Engine {
         label: Option<String>,
         source: Option<String>,
         parent: Option<String>,
-    ) -> Result<Media> {
+    ) -> Result<MediaItem> {
         let path = self.output_path(output, format.extension(), vars);
         encode_to_path(img, format, quality, &path)?;
-        let mut m = Media::new(kind, &path).with_size(img.width(), img.height());
+        let mut m = MediaItem::new(kind, &path).with_size(img.width(), img.height());
         m.label = label;
         m.source = source;
         m.parent = parent;
@@ -174,7 +188,7 @@ impl Engine {
         Ok(OcrResult { text, lines, engine: "vision".into() })
     }
 
-    pub fn ocr(&self, source: &str, opts: &OcrOptions) -> Result<(Media, OcrResult)> {
+    pub fn ocr(&self, source: &str, opts: &OcrOptions) -> Result<(MediaItem, OcrResult)> {
         let (m, img) = self.load_image(source)?;
         Ok((m, self.ocr_image(&img, opts)?))
     }
@@ -201,7 +215,7 @@ impl Engine {
     fn with_renderer<T>(&self, f: impl FnOnce(&Renderer) -> Result<T>) -> Result<T> {
         let mut guard = self.renderer.lock().unwrap();
         if guard.is_none() {
-            let a = &self.config.annotate;
+            let a = &self.config.markup;
             let defaults = Style {
                 color: Some(a.stroke_color.parse().map_err(|e: String| anyhow!(e))?),
                 stroke_width: Some(a.stroke_width),
@@ -215,11 +229,11 @@ impl Engine {
         f(guard.as_ref().unwrap())
     }
 
-    pub fn annotate(&self, source: &str, mut doc: Annotation, output: Option<&str>, copy: bool) -> Result<(Media, RgbaImage)> {
+    pub fn apply_annotations(&self, source: &str, mut doc: Annotation, output: Option<&str>, copy: bool) -> Result<(MediaItem, RgbaImage)> {
         let (parent, img) = self.load_image(source)?;
         if let Some(c) = doc.canvas.as_mut() {
-            if matches!(&c.background, bugle_annotate::Background::Named(n) if n == "auto") {
-                c.background = bugle_annotate::Background::Named(self.config.annotate.background.clone());
+            if matches!(&c.background, bugle_markup::Background::Named(n) if n == "auto") {
+                c.background = bugle_markup::Background::Named(self.config.markup.background.clone());
             }
         }
         let out = self.with_renderer(|r| r.render(&img, &doc))?;
@@ -278,7 +292,7 @@ impl Engine {
 
     /// Transcribe a recording (or audio file). Video sources get their audio
     /// track extracted to a temporary AAC file first.
-    pub async fn transcribe(&self, source: &str, provider: Option<&str>, language: Option<&str>) -> Result<(Media, Transcript)> {
+    pub async fn transcribe(&self, source: &str, provider: Option<&str>, language: Option<&str>) -> Result<(MediaItem, Transcript)> {
         let media = self.resolve_media(source)?;
         let p = self.ai.resolve(provider, Role::Transcribe)?;
         let ext = media.path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
@@ -308,7 +322,7 @@ impl Engine {
         provider: Option<&str>,
         language: Option<&str>,
         output: Option<&str>,
-    ) -> Result<(Media, Transcript, PathBuf)> {
+    ) -> Result<(MediaItem, Transcript, PathBuf)> {
         let (media, transcript) = self.transcribe(source, provider, language).await?;
         let ext = match format {
             SubtitleFormat::Srt => "srt",
@@ -319,7 +333,7 @@ impl Engine {
             None => media.path.with_extension(ext),
         };
         std::fs::write(&path, transcript.render(format))?;
-        let mut m = Media::new(MediaKind::Subtitle, &path);
+        let mut m = MediaItem::new(MediaKind::Subtitle, &path);
         m.parent = Some(media.id.clone());
         m.source = Some(format!("subtitles via {}", transcript.provider));
         self.history.push(&m)?;
@@ -332,12 +346,18 @@ impl Engine {
 
     /// Float an image above everything. Runs in-process on the main thread,
     /// otherwise spawns a detached helper process.
-    pub fn pin(&self, source: &str, frame: Option<Rect>, opacity: f64, blocking: bool) -> Result<Media> {
+    pub fn pin(&self, source: &str, frame: Option<Rect>, opacity: f64, blocking: bool) -> Result<MediaItem> {
         let (media, img) = self.load_image(source)?;
         if self.main_thread_ui && blocking {
             let mut buf = std::io::Cursor::new(Vec::new());
             DynamicImage::ImageRgba8(img).write_to(&mut buf, image::ImageFormat::Png)?;
             bugle_platform::pin_image_blocking(buf.get_ref(), frame, opacity);
+            return Ok(media);
+        }
+        if let Some(host) = &self.ui_host {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            DynamicImage::ImageRgba8(img).write_to(&mut buf, image::ImageFormat::Png)?;
+            host.pin(buf.into_inner(), frame, opacity)?;
             return Ok(media);
         }
         let exe = std::env::current_exe()?;
@@ -358,6 +378,9 @@ impl Engine {
     pub fn select_area(&self) -> Result<Option<Rect>> {
         if self.main_thread_ui {
             return Ok(bugle_platform::select_rect_blocking());
+        }
+        if let Some(host) = &self.ui_host {
+            return host.select_area();
         }
         let exe = std::env::current_exe()?;
         let out = std::process::Command::new(exe).arg("select").arg("--json").output().context("spawning select helper")?;

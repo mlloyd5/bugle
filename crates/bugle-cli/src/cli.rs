@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use bugle_annotate::{Annotation, Shape, Style};
+use bugle_markup::{Annotation, Shape, Style};
 use bugle_core::{
     CaptureOptions, CaptureRequest, CaptureTarget, Config, DescribeRequest, ImageFormat, OcrOptions, Point, RecordRequest,
     RecordingFormat, Rect, ScrollCaptureRequest, SubtitleFormat,
@@ -47,7 +47,8 @@ pub enum Cmd {
     /// Transcribe a recording and write SRT/VTT subtitles next to it.
     Subtitles(SubtitlesArgs),
     /// Draw annotations onto an image.
-    Annotate(AnnotateArgs),
+    #[command(name = "annotate")]
+    Markup(MarkupArgs),
     /// Float an image above all windows until Esc / double-click.
     Pin(PinArgs),
     /// Let the user drag a rectangle; prints it.
@@ -260,6 +261,9 @@ pub struct RecordArgs {
     /// Record the microphone.
     #[arg(long, short = 'm')]
     pub mic: bool,
+    /// Record system audio (uses the ScreenCaptureKit recorder).
+    #[arg(long)]
+    pub system_audio: bool,
     /// Stop automatically after N seconds.
     #[arg(long, short = 's')]
     pub seconds: Option<f64>,
@@ -340,7 +344,7 @@ pub struct SubtitlesArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct AnnotateArgs {
+pub struct MarkupArgs {
     #[arg(default_value = "latest")]
     pub source: String,
     /// Annotation JSON document (file path, or `-` for stdin).
@@ -463,22 +467,22 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
             if a.describe {
-                let r = engine.describe(&DescribeRequest { source: out.media.id.clone(), ..Default::default() }).await?;
+                let r = engine.describe(&DescribeRequest { source: out.item.id.clone(), ..Default::default() }).await?;
                 extra["description"] = json!(r);
                 if !json {
                     println!("{}", r.description);
                 }
             }
             if json {
-                println!("{}", json!({"media": out.media, "rect": out.rect, "window": out.window, "extra": extra}));
+                println!("{}", json!({"media": out.item, "rect": out.rect, "window": out.window, "extra": extra}));
             } else {
-                println!("{}  [{}]  {}x{}", out.media.path.display(), out.media.id, out.image.width(), out.image.height());
+                println!("{}  [{}]  {}x{}", out.item.path.display(), out.item.id, out.image.width(), out.image.height());
             }
             if a.open {
-                bugle_platform::open_path(&out.media.path);
+                bugle_platform::open_path(&out.item.path);
             }
             if a.pin {
-                engine.pin(&out.media.id, None, 1.0, true)?;
+                engine.pin(&out.item.id, None, 1.0, true)?;
             }
         }
         Cmd::Scroll(a) => {
@@ -500,12 +504,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             };
             let (out, stats) = engine.scroll_capture(&req)?;
             if json {
-                println!("{}", json!({"media": out.media, "stats": stats}));
+                println!("{}", json!({"media": out.item, "stats": stats}));
             } else {
                 println!(
                     "{}  [{}]  {}x{}  ({} frames, {})",
-                    out.media.path.display(),
-                    out.media.id,
+                    out.item.path.display(),
+                    out.item.id,
                     out.image.width(),
                     out.image.height(),
                     stats.frames,
@@ -525,7 +529,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     },
                     fps: a.fps,
                     microphone: a.mic,
-                    system_audio: false,
+                    system_audio: a.system_audio,
                     max_seconds: a.seconds,
                     highlight_clicks: a.clicks,
                     output: a.output,
@@ -622,9 +626,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 println!("{}  ({} segments via {})", path.display(), t.segments.len(), t.provider);
             }
         }
-        Cmd::Annotate(a) => {
+        Cmd::Markup(a) => {
             if a.schema {
-                println!("{}", serde_json::to_string_pretty(&bugle_annotate::schema_description())?);
+                println!("{}", serde_json::to_string_pretty(&bugle_markup::schema_description())?);
                 return Ok(());
             }
             let mut doc = match a.spec.as_deref() {
@@ -677,7 +681,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             if a.canvas.is_some() || a.padding.is_some() {
                 let mut canvas = doc.canvas.take().unwrap_or_default();
                 if let Some(c) = &a.canvas {
-                    canvas.background = bugle_annotate::Background::Named(c.clone());
+                    canvas.background = bugle_markup::Background::Named(c.clone());
                 }
                 if let Some(p) = a.padding {
                     canvas.padding = p;
@@ -687,7 +691,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             if doc.shapes.is_empty() && doc.crop.is_none() && doc.canvas.is_none() {
                 bail!("nothing to do: pass --spec, or quick flags like --arrow/--box/--text/--redact/--canvas");
             }
-            let (media, img) = engine.annotate(&a.source, doc, a.output.as_deref(), a.copy)?;
+            let (media, img) = engine.apply_annotations(&a.source, doc, a.output.as_deref(), a.copy)?;
             if json {
                 println!("{}", json!({"media": media}));
             } else {

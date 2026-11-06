@@ -3,11 +3,12 @@ resolver = "2"
 members = [
     "crates/bugle-core",
     "crates/bugle-platform",
-    "crates/bugle-annotate",
+    "crates/bugle-markup",
     "crates/bugle-ai",
     "crates/bugle-engine",
     "crates/bugle-api",
     "crates/bugle-cli",
+    "crates/bugle-app",
 ]
 
 [workspace.package]
@@ -20,7 +21,7 @@ authors = ["Max Lloyd"]
 [workspace.dependencies]
 bugle-core = { path = "crates/bugle-core" }
 bugle-platform = { path = "crates/bugle-platform" }
-bugle-annotate = { path = "crates/bugle-annotate" }
+bugle-markup = { path = "crates/bugle-markup" }
 bugle-ai = { path = "crates/bugle-ai" }
 bugle-engine = { path = "crates/bugle-engine" }
 bugle-api = { path = "crates/bugle-api" }

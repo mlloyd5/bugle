@@ -147,11 +147,11 @@ pub fn capture_display(display_id: Option<u32>, show_cursor: bool) -> Result<Rgb
     take_image(unsafe { ffi::bugle_capture_display(display_id.unwrap_or(0), show_cursor as i32) })
 }
 
-pub fn capture_rect(rect: Rect, show_cursor: bool) -> Result<RgbaImage> {
+pub fn capture_area(rect: Rect, show_cursor: bool) -> Result<RgbaImage> {
     if rect.is_empty() {
         return Err(BugleError::Invalid("empty capture rect".into()).into());
     }
-    take_image(unsafe { ffi::bugle_capture_rect(rect.x, rect.y, rect.w, rect.h, show_cursor as i32) })
+    take_image(unsafe { ffi::bugle_capture_area(rect.x, rect.y, rect.w, rect.h, show_cursor as i32) })
 }
 
 pub fn capture_window(window_id: u32, shadow: bool, show_cursor: bool) -> Result<RgbaImage> {
@@ -294,8 +294,66 @@ pub fn pin_image_blocking(png: &[u8], frame: Option<Rect>, opacity: f64) {
     unsafe { ffi::bugle_pin_image_blocking(png.as_ptr(), png.len(), f.x, f.y, f.w, f.h, opacity) }
 }
 
+/// Non-blocking area selection for hosts whose AppKit run loop is already
+/// running (the menu-bar app). `done` is called once on the main thread with
+/// the rect, or `None` when cancelled. Returns `false` (and never calls
+/// `done`) when a selection is already in progress. Main thread only.
+pub fn select_rect_begin(done: impl FnOnce(Option<Rect>) + 'static) -> bool {
+    type Cb = Box<dyn FnOnce(Option<Rect>)>;
+    unsafe extern "C" fn trampoline(ctx: *mut libc::c_void, ok: i32, x: f64, y: f64, w: f64, h: f64) {
+        let cb: Box<Cb> = unsafe { Box::from_raw(ctx as *mut Cb) };
+        cb((ok == 1).then(|| Rect::new(x, y, w, h)));
+    }
+    let boxed: Box<Cb> = Box::new(Box::new(done));
+    let ctx = Box::into_raw(boxed);
+    let started = unsafe { ffi::bugle_select_rect_begin(trampoline, ctx as *mut libc::c_void) } == 1;
+    if !started {
+        drop(unsafe { Box::from_raw(ctx) });
+    }
+    started
+}
+
+/// Whether a selection overlay is currently on screen.
+pub fn select_rect_active() -> bool {
+    unsafe { ffi::bugle_select_rect_active() == 1 }
+}
+
+/// Dismiss the selection overlay as if Esc was pressed. Main thread only.
+pub fn select_rect_cancel() {
+    unsafe { ffi::bugle_select_rect_cancel() }
+}
+
+/// Show a pin window and return immediately; it stays until the user closes
+/// it. Main thread only, needs a running AppKit loop. See `pin_image_blocking`
+/// for the frame conventions.
+pub fn pin_image_show(png: &[u8], frame: Option<Rect>, opacity: f64) -> Result<()> {
+    let f = frame.unwrap_or(Rect::new(-1.0, -1.0, 0.0, 0.0));
+    if unsafe { ffi::bugle_pin_image_show(png.as_ptr(), png.len(), f.x, f.y, f.w, f.h, opacity) } != 1 {
+        bail!("could not decode image for pin window");
+    }
+    Ok(())
+}
+
+/// Show a transient corner notification with an optional PNG thumbnail.
+/// Clicking it opens `open_path`. Main thread only, needs a running AppKit loop.
+pub fn toast_show(png: Option<&[u8]>, title: &str, subtitle: &str, open_path: Option<&Path>, seconds: f64) {
+    let (Ok(t), Ok(st)) = (cstr(title), cstr(subtitle)) else { return };
+    let op = open_path.and_then(|p| path_cstr(p).ok());
+    let (ptr, len) = png.map(|p| (p.as_ptr(), p.len())).unwrap_or((std::ptr::null(), 0));
+    unsafe {
+        ffi::bugle_toast_show(
+            ptr,
+            len,
+            t.as_ptr(),
+            st.as_ptr(),
+            op.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
+            seconds,
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Media
+// MediaItem
 // ---------------------------------------------------------------------------
 
 /// Extract the audio track of a movie to an AAC `.m4a` (what speech-to-text
@@ -320,6 +378,16 @@ pub fn export_mp4(input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Remux an MP4 into a QuickTime `.mov` container without re-encoding.
+pub fn export_mov(input: &Path, output: &Path) -> Result<()> {
+    let i = path_cstr(input)?;
+    let o = path_cstr(output)?;
+    if unsafe { ffi::bugle_export_mov(i.as_ptr(), o.as_ptr()) } != 0 {
+        bail!("{}", last_error());
+    }
+    Ok(())
+}
+
 pub fn media_duration(path: &Path) -> Result<f64> {
     let p = path_cstr(path)?;
     let d = unsafe { ffi::bugle_media_duration(p.as_ptr()) };
@@ -332,6 +400,115 @@ pub fn media_duration(path: &Path) -> Result<f64> {
 pub fn video_frame(path: &Path, seconds: f64) -> Result<RgbaImage> {
     let p = path_cstr(path)?;
     take_image(unsafe { ffi::bugle_video_frame(p.as_ptr(), seconds) })
+}
+
+// ---------------------------------------------------------------------------
+// ScreenCaptureKit recording
+// ---------------------------------------------------------------------------
+
+/// Whether the in-process ScreenCaptureKit recorder (system audio) is
+/// available on this macOS (14+).
+pub fn sck_record_available() -> bool {
+    unsafe { ffi::bugle_sck_record_available() != 0 }
+}
+
+#[derive(Debug, Clone)]
+pub struct SckRecordOptions {
+    /// Area to record in global points; ignored when `window_id` is set.
+    pub rect: Rect,
+    pub window_id: Option<u32>,
+    pub fps: u32,
+    /// Keep Retina pixels (otherwise record at 1x points).
+    pub retina: bool,
+    pub system_audio: bool,
+    pub microphone: bool,
+    pub show_cursor: bool,
+    /// Stop capturing by itself after this long; `stop` then only finalises.
+    pub max_seconds: Option<f64>,
+}
+
+/// An in-progress `SCStream` → `AVAssetWriter` recording (H.264 video, AAC
+/// system audio, AAC microphone as a second audio track). Dropping an
+/// unstopped recorder stops and finalises it.
+pub struct SckRecorder {
+    handle: *mut libc::c_void,
+}
+
+// The handle is an Objective-C object whose state is guarded by its own lock.
+unsafe impl Send for SckRecorder {}
+unsafe impl Sync for SckRecorder {}
+
+impl SckRecorder {
+    pub fn start(opts: &SckRecordOptions, output: &Path) -> Result<Self> {
+        if opts.window_id.is_none() && opts.rect.is_empty() {
+            return Err(BugleError::Invalid("empty recording rect".into()).into());
+        }
+        let out = path_cstr(output)?;
+        let handle = unsafe {
+            ffi::bugle_sck_record_start(
+                opts.rect.x,
+                opts.rect.y,
+                opts.rect.w,
+                opts.rect.h,
+                opts.window_id.unwrap_or(0),
+                opts.fps.clamp(1, 120) as i32,
+                opts.retina as i32,
+                opts.system_audio as i32,
+                opts.microphone as i32,
+                opts.show_cursor as i32,
+                opts.max_seconds.unwrap_or(0.0),
+                out.as_ptr(),
+            )
+        };
+        if handle.is_null() {
+            let e = last_error();
+            if !screen_access_preflight() {
+                return Err(BugleError::PermissionDenied.into());
+            }
+            bail!("{e}");
+        }
+        Ok(Self { handle })
+    }
+
+    /// Video frames written so far.
+    pub fn frames(&self) -> u64 {
+        unsafe { ffi::bugle_sck_record_frames(self.handle) }.max(0) as u64
+    }
+
+    /// Non-fatal problems (microphone unavailable, stream stopped early).
+    pub fn warnings(&self) -> Option<String> {
+        unsafe {
+            let p = ffi::bugle_sck_record_warnings(self.handle);
+            if p.is_null() {
+                return None;
+            }
+            let s = CStr::from_ptr(p).to_string_lossy().into_owned();
+            ffi::bugle_free(p as *mut _);
+            Some(s)
+        }
+    }
+
+    /// Stop capturing and finalise the file.
+    pub fn stop(mut self) -> Result<()> {
+        self.stop_inner()
+    }
+
+    fn stop_inner(&mut self) -> Result<()> {
+        if self.handle.is_null() {
+            return Ok(());
+        }
+        let h = std::mem::replace(&mut self.handle, std::ptr::null_mut());
+        if unsafe { ffi::bugle_sck_record_stop(h) } != 0 {
+            bail!("{}", last_error());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SckRecorder {
+    fn drop(&mut self) {
+        let _ = self.stop_inner();
+    }
 }
 
 pub fn play_sound(name: &str) {

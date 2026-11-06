@@ -21,7 +21,7 @@ const FONT_CANDIDATES: &[(&str, u32)] = &[
     ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 0),
 ];
 
-/// Rendering defaults (filled from `AnnotateConfig`).
+/// Rendering defaults (filled from `MarkupConfig`).
 pub struct Renderer {
     pub font: FontVec,
     pub defaults: Style,

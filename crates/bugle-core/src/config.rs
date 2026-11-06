@@ -15,11 +15,12 @@ use crate::spec::ImageFormat;
 pub struct Config {
     pub general: GeneralConfig,
     pub screenshots: ScreenshotConfig,
-    pub recording: RecordingConfig,
+    pub recordings: RecordingConfig,
     pub ocr: OcrConfig,
-    pub annotate: AnnotateConfig,
+    pub markup: MarkupConfig,
     pub api: ApiConfig,
     pub ai: AiConfig,
+    pub hotkeys: HotkeyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,7 +31,7 @@ pub struct GeneralConfig {
     /// Filename template, see `naming`.
     pub filename_template: String,
     /// Play the shutter sound.
-    pub sound: bool,
+    pub shutter_sound: bool,
     /// Copy every capture to the clipboard as well as saving it.
     pub copy_to_clipboard: bool,
     /// Where the history file lives.
@@ -45,24 +46,42 @@ pub struct ScreenshotConfig {
     /// Keep the window drop shadow in window captures.
     pub window_shadow: bool,
     /// Hide desktop icons during capture.
-    pub hide_desktop_icons: bool,
+    pub desktop_icons_hidden: bool,
     /// Self-timer default when `--delay` is given without a value.
     pub self_timer_seconds: f64,
     /// Scale captures down to 1x (points) instead of keeping Retina pixels.
     pub downscale_retina: bool,
 }
 
+/// Which recorder produces video (mp4/mov) recordings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingBackend {
+    /// ScreenCaptureKit when system audio is requested (and available),
+    /// otherwise `screencapture -v`.
+    #[default]
+    Auto,
+    /// Always the in-process ScreenCaptureKit + AVAssetWriter recorder.
+    #[serde(rename = "stream")]
+    StreamCapture,
+    /// Always the system `screencapture -v` child process (no system audio).
+    #[serde(rename = "system")]
+    SystemRecorder,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RecordingConfig {
-    pub gif_fps: u32,
+    pub gif_frame_rate: u32,
     /// Max long edge for GIF frames.
     pub gif_max_size: u32,
     pub video_fps: u32,
     pub microphone: bool,
+    /// Record system audio; needs the ScreenCaptureKit backend.
     pub system_audio: bool,
     pub highlight_clicks: bool,
     pub retina: bool,
+    pub backend: RecordingBackend,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,7 +97,7 @@ pub struct OcrConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct AnnotateConfig {
+pub struct MarkupConfig {
     pub stroke_color: String,
     pub stroke_width: f32,
     pub font_path: Option<String>,
@@ -158,11 +177,12 @@ impl Default for Config {
         Self {
             general: GeneralConfig::default(),
             screenshots: ScreenshotConfig::default(),
-            recording: RecordingConfig::default(),
+            recordings: RecordingConfig::default(),
             ocr: OcrConfig::default(),
-            annotate: AnnotateConfig::default(),
+            markup: MarkupConfig::default(),
             api: ApiConfig::default(),
             ai: AiConfig::default_registry(),
+            hotkeys: HotkeyConfig::default(),
         }
     }
 }
@@ -172,7 +192,7 @@ impl Default for GeneralConfig {
         Self {
             save_dir: "~/Desktop/Bugle".into(),
             filename_template: crate::naming::DEFAULT_TEMPLATE.into(),
-            sound: false,
+            shutter_sound: false,
             copy_to_clipboard: false,
             history_path: None,
         }
@@ -185,7 +205,7 @@ impl Default for ScreenshotConfig {
             format: ImageFormat::Png,
             jpeg_quality: 90,
             window_shadow: true,
-            hide_desktop_icons: false,
+            desktop_icons_hidden: false,
             self_timer_seconds: 5.0,
             downscale_retina: false,
         }
@@ -195,13 +215,14 @@ impl Default for ScreenshotConfig {
 impl Default for RecordingConfig {
     fn default() -> Self {
         Self {
-            gif_fps: 12,
+            gif_frame_rate: 12,
             gif_max_size: 1200,
             video_fps: 30,
             microphone: false,
             system_audio: false,
             highlight_clicks: false,
             retina: true,
+            backend: RecordingBackend::Auto,
         }
     }
 }
@@ -212,7 +233,7 @@ impl Default for OcrConfig {
     }
 }
 
-impl Default for AnnotateConfig {
+impl Default for MarkupConfig {
     fn default() -> Self {
         Self {
             stroke_color: "#FF3B30".into(),
@@ -230,6 +251,67 @@ impl Default for AnnotateConfig {
 impl Default for ApiConfig {
     fn default() -> Self {
         Self { bind: "127.0.0.1:4848".into(), token: None, cors: true }
+    }
+}
+
+/// Global hotkeys for the menu-bar app (`bugle-app`). Each value is a
+/// `modifier+modifier+key` string: modifiers `cmd`, `shift`, `alt`/`option`,
+/// `ctrl`; keys are letters, digits, `F1`..`F24`, `space`, `enter`, … (the
+/// W3C `KeyboardEvent.code` names also work). An empty string or a missing
+/// key leaves that action without a hotkey.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HotkeyConfig {
+    /// Drag an area with the crosshair overlay.
+    pub capture_area: Option<String>,
+    /// Capture the main display.
+    pub capture_screen: Option<String>,
+    /// Capture the front-most window.
+    pub capture_window: Option<String>,
+    /// Drag an area, then scroll-and-stitch it (needs Accessibility).
+    pub scroll_capture: Option<String>,
+    /// Start an MP4 recording of a dragged area, or stop the active recording.
+    pub record: Option<String>,
+    /// Start a GIF recording of a dragged area, or stop the active recording.
+    pub record_gif: Option<String>,
+    /// OCR the latest capture and copy the text.
+    pub ocr_latest: Option<String>,
+    /// Pin the latest capture to the screen.
+    pub pin_latest: Option<String>,
+}
+
+impl Default for HotkeyConfig {
+    fn default() -> Self {
+        Self {
+            capture_area: Some("cmd+shift+4".into()),
+            capture_screen: Some("cmd+shift+3".into()),
+            capture_window: None,
+            scroll_capture: None,
+            record: Some("cmd+shift+5".into()),
+            record_gif: None,
+            ocr_latest: Some("cmd+shift+2".into()),
+            pin_latest: Some("cmd+shift+p".into()),
+        }
+    }
+}
+
+impl HotkeyConfig {
+    /// `(action, binding)` pairs for every configured, non-empty hotkey.
+    /// Action names match the `[hotkeys]` keys.
+    pub fn bindings(&self) -> Vec<(&'static str, String)> {
+        let all = [
+            ("capture_area", &self.capture_area),
+            ("capture_screen", &self.capture_screen),
+            ("capture_window", &self.capture_window),
+            ("scroll_capture", &self.scroll_capture),
+            ("record", &self.record),
+            ("record_gif", &self.record_gif),
+            ("ocr_latest", &self.ocr_latest),
+            ("pin_latest", &self.pin_latest),
+        ];
+        all.into_iter()
+            .filter_map(|(name, v)| v.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|s| (name, s.to_string())))
+            .collect()
     }
 }
 

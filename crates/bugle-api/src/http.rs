@@ -39,7 +39,7 @@ pub fn router(engine: Arc<Engine>, token: Option<String>, cors: bool) -> Router 
         .route("/v1/ocr", post(|s, j| action_post(s, Path("ocr".into()), j)))
         .route("/v1/describe", post(|s, j| action_post(s, Path("describe".into()), j)))
         .route("/v1/annotate", post(|s, j| action_post(s, Path("annotate".into()), j)))
-        .route("/v1/annotate/schema", get(|| async { Json(bugle_annotate::schema_description()) }))
+        .route("/v1/annotate/schema", get(|| async { Json(bugle_markup::schema_description()) }))
         .route("/v1/transcribe", post(|s, j| action_post(s, Path("transcribe".into()), j)))
         .route("/v1/subtitles", post(|s, j| action_post(s, Path("subtitles".into()), j)))
         .route("/v1/complete", post(|s, j| action_post(s, Path("complete".into()), j)))
@@ -65,9 +65,24 @@ pub fn router(engine: Arc<Engine>, token: Option<String>, cors: bool) -> Router 
 }
 
 pub async fn serve(engine: Arc<Engine>, bind: &str, token: Option<String>, cors: bool) -> anyhow::Result<()> {
+    serve_with_shutdown(engine, bind, token, cors, std::future::pending()).await
+}
+
+/// Like [`serve`], but stops accepting connections once `shutdown` resolves
+/// (the menu-bar app toggles the API from its status menu).
+pub async fn serve_with_shutdown<F>(
+    engine: Arc<Engine>,
+    bind: &str,
+    token: Option<String>,
+    cors: bool,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("Bugle API listening on http://{bind}/v1  (token: {})", if token.is_some() { "required" } else { "none" });
-    axum::serve(listener, router(engine, token, cors)).await?;
+    axum::serve(listener, router(engine, token, cors)).with_graceful_shutdown(shutdown).await?;
     Ok(())
 }
 

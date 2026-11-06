@@ -47,6 +47,8 @@ pub struct bugle_ocr_line_t {
     pub confidence: f64,
 }
 
+pub type bugle_select_callback_t = unsafe extern "C" fn(ctx: *mut c_void, ok: i32, x: f64, y: f64, w: f64, h: f64);
+
 extern "C" {
     pub fn bugle_free(p: *mut c_void);
     pub fn bugle_image_free(img: *mut bugle_image_t);
@@ -60,7 +62,7 @@ extern "C" {
     pub fn bugle_list_windows(out: *mut bugle_window_t, max: i32, on_screen_only: i32) -> i32;
 
     pub fn bugle_capture_display(display_id: u32, show_cursor: i32) -> bugle_image_t;
-    pub fn bugle_capture_rect(x: f64, y: f64, w: f64, h: f64, show_cursor: i32) -> bugle_image_t;
+    pub fn bugle_capture_area(x: f64, y: f64, w: f64, h: f64, show_cursor: i32) -> bugle_image_t;
     pub fn bugle_capture_window(window_id: u32, shadow: i32, show_cursor: i32) -> bugle_image_t;
 
     pub fn bugle_ocr(
@@ -95,11 +97,43 @@ extern "C" {
 
     pub fn bugle_select_rect_blocking(x: *mut f64, y: *mut f64, w: *mut f64, h: *mut f64) -> i32;
     pub fn bugle_pin_image_blocking(png: *const u8, len: size_t, x: f64, y: f64, w: f64, h: f64, opacity: f64);
+    pub fn bugle_select_rect_begin(cb: bugle_select_callback_t, ctx: *mut c_void) -> i32;
+    pub fn bugle_select_rect_active() -> i32;
+    pub fn bugle_select_rect_cancel();
+    pub fn bugle_pin_image_show(png: *const u8, len: size_t, x: f64, y: f64, w: f64, h: f64, opacity: f64) -> i32;
+    pub fn bugle_toast_show(
+        png: *const u8,
+        len: size_t,
+        title: *const c_char,
+        subtitle: *const c_char,
+        open_path: *const c_char,
+        seconds: f64,
+    );
 
     pub fn bugle_export_audio_m4a(in_path: *const c_char, out_path: *const c_char) -> i32;
     pub fn bugle_export_mp4(in_path: *const c_char, out_path: *const c_char) -> i32;
+    pub fn bugle_export_mov(in_path: *const c_char, out_path: *const c_char) -> i32;
     pub fn bugle_media_duration(path: *const c_char) -> f64;
     pub fn bugle_video_frame(path: *const c_char, seconds: f64) -> bugle_image_t;
     pub fn bugle_play_sound(name: *const c_char);
     pub fn bugle_open_path(path: *const c_char);
+
+    pub fn bugle_sck_record_available() -> i32;
+    pub fn bugle_sck_record_start(
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        window_id: u32,
+        fps: i32,
+        retina: i32,
+        system_audio: i32,
+        microphone: i32,
+        show_cursor: i32,
+        max_seconds: f64,
+        out_path: *const c_char,
+    ) -> *mut c_void;
+    pub fn bugle_sck_record_frames(handle: *mut c_void) -> i64;
+    pub fn bugle_sck_record_warnings(handle: *mut c_void) -> *mut c_char;
+    pub fn bugle_sck_record_stop(handle: *mut c_void) -> i32;
 }

@@ -142,7 +142,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "record_start",
-            description: "Start a screen recording (mp4/mov via the system recorder, or gif via a frame grab loop). Only one recording at a time.",
+            description: "Start a screen recording (mp4/mov via screencapture or, with system_audio, the ScreenCaptureKit recorder; gif via a frame grab loop). Only one recording at a time.",
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -150,6 +150,7 @@ pub fn catalog() -> Vec<ToolSpec> {
                     "format":{"type":"string","enum":["mp4","mov","gif"],"default":"mp4"},
                     "fps":{"type":"integer","description":"gif only"},
                     "microphone":{"type":"boolean"},
+                    "system_audio":{"type":"boolean","description":"capture system audio (ScreenCaptureKit backend)"},
                     "max_seconds":{"type":"number","description":"auto-stop"},
                     "highlight_clicks":{"type":"boolean"},
                     "output":{"type":"string"},
@@ -270,7 +271,7 @@ pub async fn run(engine: &Arc<Engine>, name: &str, args: Value) -> Result<Action
             let me = max_edge(&args);
             let out = tokio::task::spawn_blocking(move || e.capture(&req)).await??;
             let image = if want { Some(image_bytes(&out.image, me)?) } else { None };
-            Ok(ActionOutput { json: json!({"media": out.media, "rect": out.rect, "window": out.window}), image })
+            Ok(ActionOutput { json: json!({"media": out.item, "rect": out.rect, "window": out.window}), image })
         }
         "list_displays" => Ok(ActionOutput::json(json!(tokio::task::spawn_blocking(move || e.displays()).await??))),
         "list_windows" => {
@@ -297,24 +298,24 @@ pub async fn run(engine: &Arc<Engine>, name: &str, args: Value) -> Result<Action
         }
         "annotate" => {
             let source = source_of(&args);
-            let doc: bugle_annotate::Annotation =
+            let doc: bugle_markup::Annotation =
                 serde_json::from_value(args.get("annotation").cloned().ok_or_else(|| anyhow!("annotation is required"))?)?;
             let output = args.get("output").and_then(|v| v.as_str()).map(|s| s.to_string());
             let copy = args.get("copy").and_then(|v| v.as_bool()).unwrap_or(false);
             let want = inline_image(&args, true);
             let me = max_edge(&args);
-            let (media, img) = tokio::task::spawn_blocking(move || e.annotate(&source, doc, output.as_deref(), copy)).await??;
+            let (media, img) = tokio::task::spawn_blocking(move || e.apply_annotations(&source, doc, output.as_deref(), copy)).await??;
             let image = if want { Some(image_bytes(&img, me)?) } else { None };
             Ok(ActionOutput { json: json!({"media": media}), image })
         }
-        "annotate_schema" => Ok(ActionOutput::json(bugle_annotate::schema_description())),
+        "annotate_schema" => Ok(ActionOutput::json(bugle_markup::schema_description())),
         "scroll_capture" => {
             let req: ScrollCaptureRequest = serde_json::from_value(args.clone())?;
             let want = inline_image(&args, false);
             let me = max_edge(&args);
             let (out, stats) = tokio::task::spawn_blocking(move || e.scroll_capture(&req)).await??;
             let image = if want { Some(image_bytes(&out.image, me)?) } else { None };
-            Ok(ActionOutput { json: json!({"media": out.media, "stats": stats}), image })
+            Ok(ActionOutput { json: json!({"media": out.item, "stats": stats}), image })
         }
         "record_start" => {
             let req: RecordRequest = serde_json::from_value(args)?;

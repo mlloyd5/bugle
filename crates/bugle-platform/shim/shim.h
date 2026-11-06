@@ -44,7 +44,7 @@ int32_t bugle_list_displays(bugle_display_t *out, int32_t max);
 int32_t bugle_list_windows(bugle_window_t *out, int32_t max, int32_t on_screen_only);
 
 bugle_image_t bugle_capture_display(uint32_t display_id, int32_t show_cursor);
-bugle_image_t bugle_capture_rect(double x, double y, double w, double h, int32_t show_cursor);
+bugle_image_t bugle_capture_area(double x, double y, double w, double h, int32_t show_cursor);
 bugle_image_t bugle_capture_window(uint32_t window_id, int32_t shadow, int32_t show_cursor);
 
 int32_t bugle_ocr(const uint8_t *rgba, int32_t w, int32_t h, const char *langs_csv,
@@ -64,11 +64,34 @@ int32_t bugle_clipboard_write_text(const char *text);
 int32_t bugle_clipboard_write_file(const char *path);
 
 int32_t bugle_select_rect_blocking(double *x, double *y, double *w, double *h);
+// Non-blocking variant for hosts that already run the AppKit loop: returns 1
+// and later calls `cb` on the main thread (ok=0 when cancelled), or 0 when a
+// selection is already in progress (cb is then never called).
+typedef void (*bugle_select_callback_t)(void *ctx, int32_t ok, double x, double y, double w, double h);
+int32_t bugle_select_rect_begin(bugle_select_callback_t cb, void *ctx);
+int32_t bugle_select_rect_active(void);
+void bugle_select_rect_cancel(void);
 void bugle_pin_image_blocking(const uint8_t *png, size_t len, double x, double y, double w, double h, double opacity);
+int32_t bugle_pin_image_show(const uint8_t *png, size_t len, double x, double y, double w, double h, double opacity);
+void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const char *subtitle, const char *open_path,
+                      double seconds);
 
 int32_t bugle_export_audio_m4a(const char *in_path, const char *out_path);
 int32_t bugle_export_mp4(const char *in_path, const char *out_path);
+int32_t bugle_export_mov(const char *in_path, const char *out_path);
 double bugle_media_duration(const char *path);
 bugle_image_t bugle_video_frame(const char *path, double seconds);
 void bugle_play_sound(const char *name);
 void bugle_open_path(const char *path);
+
+// ScreenCaptureKit recorder: H.264 video + AAC system audio (+ AAC microphone
+// as a second audio track) written straight to an .mp4. `window_id` 0 records
+// the rect; `max_seconds` <= 0 disables the auto-stop. Stop finalises the
+// file and releases the handle.
+int32_t bugle_sck_record_available(void);
+void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t window_id, int32_t fps, int32_t retina,
+                             int32_t system_audio, int32_t microphone, int32_t show_cursor, double max_seconds,
+                             const char *out_path);
+int64_t bugle_sck_record_frames(void *handle);
+char *bugle_sck_record_warnings(void *handle);   // malloc'd, NULL when none
+int32_t bugle_sck_record_stop(void *handle);

@@ -8,7 +8,7 @@ description = "Bugle engine: capture, OCR, scrolling capture, recording, annotat
 [dependencies]
 bugle-core.workspace = true
 bugle-platform.workspace = true
-bugle-annotate.workspace = true
+bugle-markup.workspace = true
 bugle-ai.workspace = true
 anyhow.workspace = true
 serde.workspace = true

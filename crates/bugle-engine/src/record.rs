@@ -1,13 +1,18 @@
 //! Screen recording.
 //!
 //! * GIF: an in-process frame-grab loop encoded with the `image` crate.
-//! * Video: the system `screencapture -v` recorder (H.264 .mov, optional
-//!   microphone), remuxed to MP4 on request. System-audio capture needs an
-//!   SCStream audio tap and is not implemented yet.
+//! * Video: either the system `screencapture -v` recorder (H.264 .mov,
+//!   optional microphone, click highlight), remuxed to MP4 on request, or the
+//!   in-process ScreenCaptureKit recorder (`SCStream` + `AVAssetWriter`,
+//!   H.264 + AAC straight to .mp4) which is the only one that can capture
+//!   system audio. `recording.backend` picks between them; `auto` uses
+//!   ScreenCaptureKit whenever system audio is requested.
 
 use crate::Engine;
 use anyhow::{anyhow, bail, Context, Result};
-use bugle_core::{CaptureTarget, Media, MediaKind, RecordRequest, RecordingFormat, RecordingState, RecordingStatus};
+use bugle_core::config::RecordingBackend;
+use bugle_platform::{SckRecordOptions, SckRecorder};
+use bugle_core::{CaptureTarget, MediaItem, MediaKind, RecordRequest, RecordingFormat, RecordingState, RecordingStatus};
 use chrono::Utc;
 use image::codecs::gif::{GifEncoder, Repeat};
 use image::{Delay, Frame, RgbaImage};
@@ -18,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
-pub struct Recorder {
+pub struct RecorderState {
     inner: Mutex<Option<Active>>,
 }
 
@@ -37,19 +42,31 @@ struct Active {
 enum Backend {
     Gif { stop: Arc<AtomicBool>, handle: std::thread::JoinHandle<Result<u64>> },
     Video { child: std::process::Child, wants_mp4: bool },
+    /// ScreenCaptureKit stream written by AVAssetWriter. Always produces an
+    /// MP4; a `.mov` request is remuxed afterwards.
+    Sck { rec: SckRecorder, wants_mov: bool },
+}
+
+impl Active {
+    fn frames(&self) -> u64 {
+        match &self.backend {
+            Backend::Sck { rec, .. } => rec.frames(),
+            _ => self.frames.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl Engine {
     pub fn record_status(&self) -> RecordingStatus {
-        let g = self.recorder.inner.lock().unwrap();
+        let g = self.recorder_state.inner.lock().unwrap();
         match g.as_ref() {
             None => RecordingStatus { state: RecordingState::Idle, format: None, started_at: None, elapsed_seconds: 0.0, frames: 0, output: None },
             Some(a) => RecordingStatus {
-                state: RecordingState::Recording,
+                state: RecordingState::Active,
                 format: Some(a.format),
                 started_at: Some(a.started_at),
                 elapsed_seconds: a.started.elapsed().as_secs_f64(),
-                frames: a.frames.load(Ordering::Relaxed),
+                frames: a.frames(),
                 output: Some(a.output.display().to_string()),
             },
         }
@@ -59,7 +76,7 @@ impl Engine {
         if !bugle_platform::screen_access_preflight() {
             return Err(bugle_core::BugleError::PermissionDenied.into());
         }
-        let mut g = self.recorder.inner.lock().unwrap();
+        let mut g = self.recorder_state.inner.lock().unwrap();
         if g.is_some() {
             bail!("a recording is already in progress");
         }
@@ -79,7 +96,7 @@ impl Engine {
             CaptureTarget::Interactive => {
                 drop(g);
                 let r = self.select_area()?.ok_or_else(|| anyhow!("selection cancelled"))?;
-                g = self.recorder.inner.lock().unwrap();
+                g = self.recorder_state.inner.lock().unwrap();
                 (r, None)
             }
             CaptureTarget::AllScreens => (bugle_platform::main_display()?.frame, None),
@@ -95,8 +112,8 @@ impl Engine {
             RecordingFormat::Gif => {
                 let output = self.output_path(req.output.as_deref(), "gif", &vars);
                 let stop = Arc::new(AtomicBool::new(false));
-                let fps = req.fps.unwrap_or(self.config.recording.gif_fps).clamp(1, 30);
-                let max_size = self.config.recording.gif_max_size;
+                let fps = req.fps.unwrap_or(self.config.recordings.gif_frame_rate).clamp(1, 30);
+                let max_size = self.config.recordings.gif_max_size;
                 let max_secs = req.max_seconds;
                 let show_cursor = true;
                 let out = output.clone();
@@ -111,33 +128,76 @@ impl Engine {
             RecordingFormat::Mov | RecordingFormat::Mp4 => {
                 let wants_mp4 = req.format == RecordingFormat::Mp4;
                 let output = self.output_path(req.output.as_deref(), if wants_mp4 { "mp4" } else { "mov" }, &vars);
-                let tmp_mov = if wants_mp4 { output.with_extension("rec.mov") } else { output.clone() };
-                let mut cmd = std::process::Command::new("/usr/sbin/screencapture");
-                cmd.arg("-v").arg("-x");
-                match &window {
-                    Some(w) => {
-                        cmd.arg("-l").arg(w.id.to_string());
+                let microphone = req.microphone || self.config.recordings.microphone;
+                let system_audio = req.system_audio || self.config.recordings.system_audio;
+                let highlight_clicks = req.highlight_clicks || self.config.recordings.highlight_clicks;
+                let sck_available = bugle_platform::sck_record_available();
+                let use_sck = match self.config.recordings.backend {
+                    RecordingBackend::StreamCapture => {
+                        if !sck_available {
+                            tracing::warn!("recordings.backend = \"stream\" but ScreenCaptureKit recording needs macOS 14; using the system recorder");
+                        }
+                        sck_available
                     }
-                    None => {
-                        cmd.arg("-R").arg(format!("{},{},{},{}", rect.x, rect.y, rect.w, rect.h));
+                    RecordingBackend::SystemRecorder => false,
+                    RecordingBackend::Auto => {
+                        if system_audio && !sck_available {
+                            tracing::warn!("system audio needs the ScreenCaptureKit recorder (macOS 14+); recording without it");
+                        }
+                        system_audio && sck_available
                     }
+                };
+                if use_sck {
+                    if highlight_clicks {
+                        tracing::warn!("click highlighting is only available with the system recorder backend");
+                    }
+                    // AVAssetWriter writes the MP4 container directly; a .mov
+                    // request is remuxed on stop.
+                    let tmp = if wants_mp4 { output.clone() } else { output.with_extension("rec.mp4") };
+                    let opts = SckRecordOptions {
+                        rect,
+                        window_id: window.as_ref().map(|w| w.id),
+                        fps: req.fps.unwrap_or(self.config.recordings.video_fps).clamp(1, 60),
+                        retina: self.config.recordings.retina,
+                        system_audio,
+                        microphone,
+                        show_cursor: true,
+                        max_seconds: req.max_seconds,
+                    };
+                    let rec = SckRecorder::start(&opts, &tmp).context("starting ScreenCaptureKit recording")?;
+                    if let Some(w) = rec.warnings() {
+                        tracing::warn!("{w}");
+                    }
+                    (output, Backend::Sck { rec, wants_mov: !wants_mp4 })
+                } else {
+                    let tmp_mov = if wants_mp4 { output.with_extension("rec.mov") } else { output.clone() };
+                    let mut cmd = std::process::Command::new("/usr/sbin/screencapture");
+                    cmd.arg("-v").arg("-x");
+                    match &window {
+                        Some(w) => {
+                            cmd.arg("-l").arg(w.id.to_string());
+                        }
+                        None => {
+                            cmd.arg("-R").arg(format!("{},{},{},{}", rect.x, rect.y, rect.w, rect.h));
+                        }
+                    }
+                    if microphone {
+                        cmd.arg("-g");
+                    }
+                    if highlight_clicks {
+                        cmd.arg("-k");
+                    }
+                    if let Some(s) = req.max_seconds {
+                        cmd.arg("-V").arg(format!("{}", s.max(1.0) as u64));
+                    }
+                    cmd.arg(&tmp_mov);
+                    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+                    let child = cmd.spawn().context("starting screencapture")?;
+                    if system_audio {
+                        tracing::warn!("system audio capture is not supported by the screencapture backend; recording without it");
+                    }
+                    (output, Backend::Video { child, wants_mp4 })
                 }
-                if req.microphone || self.config.recording.microphone {
-                    cmd.arg("-g");
-                }
-                if req.highlight_clicks || self.config.recording.highlight_clicks {
-                    cmd.arg("-k");
-                }
-                if let Some(s) = req.max_seconds {
-                    cmd.arg("-V").arg(format!("{}", s.max(1.0) as u64));
-                }
-                cmd.arg(&tmp_mov);
-                cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
-                let child = cmd.spawn().context("starting screencapture")?;
-                if req.system_audio {
-                    tracing::warn!("system audio capture is not supported by the screencapture backend; recording without it");
-                }
-                (output, Backend::Video { child, wants_mp4 })
             }
         };
         let source = match &window {
@@ -160,8 +220,8 @@ impl Engine {
     }
 
     /// Stop the active recording and finalise the file.
-    pub fn record_stop(&self) -> Result<Media> {
-        let active = self.recorder.inner.lock().unwrap().take().ok_or_else(|| anyhow!("no recording in progress"))?;
+    pub fn record_stop(&self) -> Result<MediaItem> {
+        let active = self.recorder_state.inner.lock().unwrap().take().ok_or_else(|| anyhow!("no recording in progress"))?;
         let duration = active.started.elapsed().as_secs_f64();
         let kind = match active.backend {
             Backend::Gif { stop, handle } => {
@@ -213,8 +273,25 @@ impl Engine {
                 }
                 MediaKind::Video
             }
+            Backend::Sck { rec, wants_mov } => {
+                let warnings = rec.warnings();
+                let frames = rec.frames();
+                rec.stop()?;
+                if let Some(w) = warnings {
+                    tracing::warn!("{w}");
+                }
+                if frames == 0 {
+                    bail!("no frames were captured");
+                }
+                if wants_mov {
+                    let tmp = active.output.with_extension("rec.mp4");
+                    bugle_platform::export_mov(&tmp, &active.output)?;
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                MediaKind::Video
+            }
         };
-        let mut m = Media::new(kind, &active.output);
+        let mut m = MediaItem::new(kind, &active.output);
         m.duration_seconds = Some(if kind == MediaKind::Gif {
             duration
         } else {
@@ -265,7 +342,7 @@ fn gif_loop(
         next_tick += interval;
         let grab = match window_id {
             Some(id) => bugle_platform::capture_window(id, false, show_cursor),
-            None => bugle_platform::capture_rect(rect, show_cursor),
+            None => bugle_platform::capture_area(rect, show_cursor),
         };
         match grab {
             Ok(img) => {

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {
     Screenshot,
-    ScrollingCapture,
+    ScrollCapture,
     Annotated,
     Video,
     Gif,
@@ -17,7 +17,7 @@ pub enum MediaKind {
 
 /// One item of local history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Media {
+pub struct MediaItem {
     pub id: String,
     pub kind: MediaKind,
     pub path: PathBuf,
@@ -40,7 +40,7 @@ pub struct Media {
     pub bytes: Option<u64>,
 }
 
-impl Media {
+impl MediaItem {
     pub fn new(kind: MediaKind, path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_path_buf();
         let bytes = std::fs::metadata(&path).ok().map(|m| m.len());
@@ -66,7 +66,7 @@ impl Media {
     }
 
     pub fn is_image(&self) -> bool {
-        matches!(self.kind, MediaKind::Screenshot | MediaKind::ScrollingCapture | MediaKind::Annotated)
+        matches!(self.kind, MediaKind::Screenshot | MediaKind::ScrollCapture | MediaKind::Annotated)
     }
 
     pub fn is_video(&self) -> bool {

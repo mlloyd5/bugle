@@ -6,14 +6,14 @@
 pub mod config;
 pub mod geometry;
 pub mod history;
-pub mod media;
+pub mod media_item;
 pub mod naming;
 pub mod spec;
 
 pub use config::Config;
 pub use geometry::{Point, Rect, Size};
 pub use history::History;
-pub use media::{Media, MediaKind};
+pub use media_item::{MediaItem, MediaKind};
 pub use spec::*;
 
 /// Crate-wide error type. Most engine errors are `anyhow`, but a few

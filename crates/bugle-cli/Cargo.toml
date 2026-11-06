@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 bugle-core.workspace = true
 bugle-platform.workspace = true
-bugle-annotate.workspace = true
+bugle-markup.workspace = true
 bugle-ai.workspace = true
 bugle-engine.workspace = true
 bugle-api.workspace = true

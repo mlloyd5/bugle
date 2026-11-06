@@ -6,7 +6,7 @@ save_dir = "~/Desktop/Bugle"
 # Tokens: {date} {time} {datetime} {year} {month} {day} {hour} {minute} {second}
 #         {kind} {label} {id} {app} {title}
 filename_template = "Bugle {date} at {time}"
-sound = false
+shutter_sound = false
 copy_to_clipboard = false
 # history_path = "~/Library/Application Support/bugle/history.jsonl"
 
@@ -14,18 +14,22 @@ copy_to_clipboard = false
 format = "png"            # png | jpeg | webp | tiff
 jpeg_quality = 90
 window_shadow = true      # keep the window drop shadow in window captures
-hide_desktop_icons = false
+desktop_icons_hidden = false
 self_timer_seconds = 5.0
 downscale_retina = false  # save at 1x points instead of 2x pixels
 
-[recording]
-gif_fps = 12
+[recordings]
+gif_frame_rate = 12
 gif_max_size = 1200       # long edge, pixels
 video_fps = 30
 microphone = false
-system_audio = false      # not supported by the screencapture backend yet
-highlight_clicks = false
+system_audio = false      # needs the ScreenCaptureKit backend (macOS 14+)
+highlight_clicks = false  # screencapture backend only
 retina = true
+# auto: ScreenCaptureKit (SCStream + AVAssetWriter, H.264 + AAC .mp4) when system
+#       audio is requested, otherwise `screencapture -v`
+# stream | system: always use that recorder
+backend = "auto"
 
 [ocr]
 languages = []            # e.g. ["en-US", "de-DE"]; empty = automatic
@@ -33,7 +37,7 @@ accurate = true           # VNRequestTextRecognitionLevelAccurate
 language_correction = true
 engine = "vision"         # "vision" or an AI provider name
 
-[annotate]
+[markup]
 stroke_color = "#FF3B30"
 stroke_width = 4.0
 # font_path = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
@@ -47,6 +51,19 @@ shadow = true
 bind = "127.0.0.1:4848"
 # token = "change-me"     # bearer token required on every request when set
 cors = true
+
+# Global hotkeys for the menu-bar app (`bugle-app`). "mod+mod+key"; modifiers
+# cmd, shift, alt/option, ctrl; keys: letters, digits, F1..F24, space, enter…
+# An empty string unbinds the action.
+[hotkeys]
+capture_area = "cmd+shift+4"
+capture_screen = "cmd+shift+3"
+# capture_window = "cmd+shift+w"
+# scroll_capture = "cmd+shift+s"
+record = "cmd+shift+5"        # starts an MP4 recording, or stops the active one
+# record_gif = "cmd+shift+g"
+ocr_latest = "cmd+shift+2"
+pin_latest = "cmd+shift+p"
 
 # ---------------------------------------------------------------------------
 # AI providers. Kinds:

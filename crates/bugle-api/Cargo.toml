@@ -8,7 +8,7 @@ description = "Agent-facing HTTP and MCP servers for Bugle"
 [dependencies]
 bugle-core.workspace = true
 bugle-engine.workspace = true
-bugle-annotate.workspace = true
+bugle-markup.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
