@@ -1,10 +1,74 @@
 //! Screenshot pipeline: resolve target → grab pixels → post-process → save.
 
 use crate::Engine;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use bugle_core::{BugleError, CaptureRequest, CaptureTarget, DisplayInfo, MediaItem, MediaKind, Rect, WindowInfo};
 use image::RgbaImage;
 use std::collections::HashMap;
+
+/// Largest coordinate or size (in points) accepted for a capture rect.
+/// Generous enough for any real display arrangement.
+pub const MAX_RECT_POINTS: f64 = 100_000.0;
+/// Largest side and pixel count of the stitched `all_screens` canvas.
+pub const MAX_CANVAS_SIDE: u32 = 32_768;
+pub const MAX_CANVAS_PIXELS: u64 = 256 * 1024 * 1024;
+
+/// Reject rects the platform layer cannot sensibly capture: non-finite
+/// values, empty or negative sizes, and absurd coordinates.
+pub fn validate_rect(r: &Rect) -> Result<()> {
+    if ![r.x, r.y, r.w, r.h].iter().all(|v| v.is_finite()) {
+        return Err(BugleError::Invalid(format!("rect {r} has non-finite values")).into());
+    }
+    if r.w < 1.0 || r.h < 1.0 {
+        return Err(BugleError::Invalid(format!("rect {r} is empty (w and h must be at least 1)")).into());
+    }
+    if r.w > MAX_RECT_POINTS || r.h > MAX_RECT_POINTS || r.x.abs() > MAX_RECT_POINTS || r.y.abs() > MAX_RECT_POINTS {
+        return Err(BugleError::Invalid(format!("rect {r} is out of range (limit {MAX_RECT_POINTS} points)")).into());
+    }
+    Ok(())
+}
+
+/// Validate the rect of an area target (other targets carry none).
+pub fn validate_target(t: &CaptureTarget) -> Result<()> {
+    match t {
+        CaptureTarget::Area { rect } => validate_rect(rect),
+        _ => Ok(()),
+    }
+}
+
+/// Geometry of the `all_screens` canvas.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AllScreensCanvas {
+    /// Union of all display frames (points).
+    pub bounds: Rect,
+    /// Highest display scale; the canvas is rendered at this scale.
+    pub scale: f64,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Compute (and bound) the canvas that holds every display.
+pub fn all_screens_canvas(displays: &[DisplayInfo]) -> Result<AllScreensCanvas> {
+    if displays.is_empty() {
+        return Err(BugleError::Invalid("no displays to capture".into()).into());
+    }
+    let min_x = displays.iter().map(|d| d.frame.x).fold(f64::MAX, f64::min);
+    let min_y = displays.iter().map(|d| d.frame.y).fold(f64::MAX, f64::min);
+    let max_x = displays.iter().map(|d| d.frame.right()).fold(f64::MIN, f64::max);
+    let max_y = displays.iter().map(|d| d.frame.bottom()).fold(f64::MIN, f64::max);
+    let scale = displays.iter().map(|d| d.scale).filter(|s| s.is_finite()).fold(1.0, f64::max);
+    let bounds = Rect::new(min_x, min_y, max_x - min_x, max_y - min_y);
+    validate_rect(&bounds)?;
+    let w = (bounds.w * scale).round();
+    let h = (bounds.h * scale).round();
+    if w > MAX_CANVAS_SIDE as f64 || h > MAX_CANVAS_SIDE as f64 || w * h > MAX_CANVAS_PIXELS as f64 {
+        return Err(BugleError::Invalid(format!(
+            "all-screens canvas would be {w}x{h} pixels (limit {MAX_CANVAS_SIDE} per side, {MAX_CANVAS_PIXELS} pixels); capture displays individually"
+        ))
+        .into());
+    }
+    Ok(AllScreensCanvas { bounds, scale, width: w as u32, height: h as u32 })
+}
 
 #[derive(Debug)]
 pub struct CaptureOutcome {
@@ -75,6 +139,7 @@ impl Engine {
                 Ok((self.maybe_downscale(img, d.scale), Some(d.frame), None))
             }
             CaptureTarget::Area { rect } => {
+                validate_rect(rect)?;
                 let img = bugle_platform::capture_area(*rect, show_cursor)?;
                 let scale = img.width() as f64 / rect.w.max(1.0);
                 Ok((self.maybe_downscale(img, scale), Some(*rect), None))
@@ -86,20 +151,16 @@ impl Engine {
                 Ok((self.maybe_downscale(img, scale), Some(w.frame), Some(w)))
             }
             CaptureTarget::Interactive => {
-                let rect = self.select_area()?.ok_or_else(|| anyhow!("selection cancelled"))?;
+                let rect = self.select_area()?.ok_or(BugleError::Cancelled)?;
+                validate_rect(&rect)?;
                 let img = bugle_platform::capture_area(rect, show_cursor)?;
                 let scale = img.width() as f64 / rect.w.max(1.0);
                 Ok((self.maybe_downscale(img, scale), Some(rect), None))
             }
             CaptureTarget::AllScreens => {
                 let displays = bugle_platform::displays()?;
-                let min_x = displays.iter().map(|d| d.frame.x).fold(f64::MAX, f64::min);
-                let min_y = displays.iter().map(|d| d.frame.y).fold(f64::MAX, f64::min);
-                let max_x = displays.iter().map(|d| d.frame.right()).fold(f64::MIN, f64::max);
-                let max_y = displays.iter().map(|d| d.frame.bottom()).fold(f64::MIN, f64::max);
-                let scale = displays.iter().map(|d| d.scale).fold(1.0, f64::max);
-                let w = ((max_x - min_x) * scale).round() as u32;
-                let h = ((max_y - min_y) * scale).round() as u32;
+                let AllScreensCanvas { bounds, scale, width: w, height: h } = all_screens_canvas(&displays)?;
+                let (min_x, min_y) = (bounds.x, bounds.y);
                 let mut canvas = RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
                 for d in &displays {
                     let img = bugle_platform::capture_display(Some(d.id), show_cursor)?;
@@ -120,7 +181,7 @@ impl Engine {
                         ((d.frame.y - min_y) * scale) as i64,
                     );
                 }
-                Ok((self.maybe_downscale(canvas, scale), Some(Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)), None))
+                Ok((self.maybe_downscale(canvas, scale), Some(bounds), None))
             }
         }
     }
@@ -144,6 +205,7 @@ impl Engine {
             bugle_platform::screen_access_request();
             return Err(BugleError::PermissionDenied.into());
         }
+        validate_target(&req.target)?;
         let o = &req.options;
         if let Some(d) = o.delay {
             if d > 0.0 {
@@ -156,7 +218,8 @@ impl Engine {
         if self.config.general.shutter_sound {
             bugle_platform::play_sound("Tink");
         }
-        let format = o.format.unwrap_or(self.config.screenshots.format);
+        // `None` lets save_image infer the format from the output extension.
+        let format = o.format;
         let quality = o.quality.unwrap_or(self.config.screenshots.jpeg_quality);
         let mut vars = HashMap::new();
         vars.insert("kind", "screenshot".to_string());
@@ -192,5 +255,49 @@ impl Engine {
             self.copy_to_clipboard(&media.path, Some(&image))?;
         }
         Ok(CaptureOutcome { item: media, image, rect, window })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn display(id: u32, x: f64, y: f64, w: f64, h: f64, scale: f64) -> DisplayInfo {
+        DisplayInfo { id, frame: Rect::new(x, y, w, h), scale, is_main: id == 1 }
+    }
+
+    #[test]
+    fn rect_validation() {
+        assert!(validate_rect(&Rect::new(0.0, 0.0, 100.0, 50.0)).is_ok());
+        assert!(validate_rect(&Rect::new(-1440.0, -200.0, 1.0, 1.0)).is_ok());
+        for bad in [
+            Rect::new(f64::NAN, 0.0, 10.0, 10.0),
+            Rect::new(0.0, 0.0, f64::NAN, 10.0),
+            Rect::new(0.0, 0.0, 10.0, f64::INFINITY),
+            Rect::new(0.0, 0.0, 0.0, 10.0),
+            Rect::new(0.0, 0.0, -5.0, 10.0),
+            Rect::new(0.0, 0.0, 0.5, 10.0),
+            Rect::new(0.0, 0.0, 1e9, 10.0),
+            Rect::new(1e9, 0.0, 10.0, 10.0),
+        ] {
+            let err = validate_rect(&bad).unwrap_err();
+            assert!(matches!(err.downcast_ref::<BugleError>(), Some(BugleError::Invalid(_))), "{bad:?}");
+        }
+        assert!(validate_target(&CaptureTarget::Area { rect: Rect::new(0.0, 0.0, f64::NAN, 1.0) }).is_err());
+        assert!(validate_target(&CaptureTarget::AllScreens).is_ok());
+    }
+
+    #[test]
+    fn all_screens_canvas_bounds() {
+        let c = all_screens_canvas(&[display(1, 0.0, 0.0, 1512.0, 982.0, 2.0), display(2, -1920.0, -100.0, 1920.0, 1080.0, 1.0)])
+            .unwrap();
+        assert_eq!(c.bounds, Rect::new(-1920.0, -100.0, 3432.0, 1082.0));
+        assert_eq!(c.scale, 2.0);
+        assert_eq!((c.width, c.height), (6864, 2164));
+
+        assert!(all_screens_canvas(&[]).is_err());
+        let huge = all_screens_canvas(&[display(1, 0.0, 0.0, 20_000.0, 20_000.0, 2.0)]).unwrap_err();
+        assert!(matches!(huge.downcast_ref::<BugleError>(), Some(BugleError::Invalid(_))));
+        assert!(all_screens_canvas(&[display(1, 0.0, 0.0, f64::NAN, 100.0, 1.0)]).is_err());
     }
 }

@@ -86,7 +86,7 @@ pub fn catalog() -> Vec<ToolSpec> {
                     "languages":{"type":"array","items":{"type":"string"}},
                     "fast":{"type":"boolean"},
                     "region":rect_schema(),
-                    "engine":{"type":"string","description":"'vision' (default) or an AI provider name"}
+                    "engine":{"type":"string","description":"'vision' (Apple Vision, with boxes) or an AI provider name (text only, lines empty); defaults to [ocr] engine in the config"}
                 }
             }),
         },
@@ -256,7 +256,8 @@ fn inline_image(args: &Value, default: bool) -> bool {
 }
 
 fn max_edge(args: &Value) -> u32 {
-    args.get("max_edge").and_then(|v| v.as_u64()).unwrap_or(1600) as u32
+    let v = args.get("max_edge").and_then(|v| v.as_u64()).unwrap_or(1600);
+    v.clamp(bugle_engine::MIN_MAX_EDGE as u64, bugle_engine::MAX_MAX_EDGE as u64) as u32
 }
 
 fn image_bytes(img: &image::RgbaImage, max_edge: u32) -> Result<Vec<u8>> {
@@ -286,11 +287,7 @@ pub async fn run(engine: &Arc<Engine>, name: &str, args: Value) -> Result<Action
         "ocr" => {
             let source = source_of(&args);
             let opts: OcrOptions = serde_json::from_value(args.clone())?;
-            if let Some(engine_name) = opts.engine.as_deref().filter(|n| *n != "vision") {
-                let r = e.ocr_with_ai(&source, engine_name).await?;
-                return Ok(ActionOutput::json(json!(r)));
-            }
-            let (media, r) = tokio::task::spawn_blocking(move || e.ocr(&source, &opts)).await??;
+            let (media, r) = e.run_ocr(&source, &opts).await?;
             Ok(ActionOutput::json(json!({"media_id": media.id, "text": r.text, "lines": r.lines, "engine": r.engine})))
         }
         "describe" => {
@@ -316,6 +313,7 @@ pub async fn run(engine: &Arc<Engine>, name: &str, args: Value) -> Result<Action
         "annotate_schema" => Ok(ActionOutput::json(bugle_markup::schema_description())),
         "scroll_capture" => {
             let req: ScrollCaptureRequest = serde_json::from_value(args.clone())?;
+            bugle_engine::capture::validate_rect(&req.rect)?;
             let want = inline_image(&args, false);
             let me = max_edge(&args);
             let (out, stats) = tokio::task::spawn_blocking(move || e.scroll_capture(&req)).await??;
@@ -324,6 +322,7 @@ pub async fn run(engine: &Arc<Engine>, name: &str, args: Value) -> Result<Action
         }
         "record_start" => {
             let req: RecordRequest = serde_json::from_value(args)?;
+            bugle_engine::capture::validate_target(&req.target)?;
             Ok(ActionOutput::json(json!(tokio::task::spawn_blocking(move || e.record_start(&req)).await??)))
         }
         "record_stop" => Ok(ActionOutput::json(json!({"media": tokio::task::spawn_blocking(move || e.record_stop()).await??}))),
@@ -353,25 +352,30 @@ pub async fn run(engine: &Arc<Engine>, name: &str, args: Value) -> Result<Action
         }
         "history" => {
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
-            Ok(ActionOutput::json(json!(e.history.recent(limit)?)))
+            Ok(ActionOutput::json(json!(tokio::task::spawn_blocking(move || e.history.recent(limit)).await??)))
         }
         "get_media" => {
             let source = source_of(&args);
             let want = inline_image(&args, true);
             let me = max_edge(&args);
-            let media = e.resolve_media(&source)?;
-            let image = if want && media.is_image() {
-                let (_, img) = tokio::task::spawn_blocking(move || e.load_image(&source)).await??;
-                Some(image_bytes(&img, me)?)
-            } else {
-                None
-            };
+            let (media, image) = tokio::task::spawn_blocking(move || {
+                let media = e.resolve_media(&source)?;
+                let image = if want && media.is_image() {
+                    let (_, img) = e.load_image(&source)?;
+                    Some(image_bytes(&img, me)?)
+                } else {
+                    None
+                };
+                Ok::<_, anyhow::Error>((media, image))
+            })
+            .await??;
             Ok(ActionOutput { json: json!(media), image })
         }
         "delete_media" => {
-            let id = args.get("id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("id is required"))?;
+            let id = args.get("id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("id is required"))?.to_string();
             let f = args.get("delete_file").and_then(|v| v.as_bool()).unwrap_or(false);
-            Ok(ActionOutput::json(json!({"deleted": e.history.delete(id, f)?})))
+            let deleted = tokio::task::spawn_blocking(move || e.history.delete(&id, f)).await??;
+            Ok(ActionOutput::json(json!({"deleted": deleted})))
         }
         "pin" => {
             let source = source_of(&args);
@@ -410,20 +414,63 @@ pub async fn run(engine: &Arc<Engine>, name: &str, args: Value) -> Result<Action
     }
 }
 
-/// HTTP status for an error.
+/// HTTP status for an error. The first [`bugle_core::BugleError`] anywhere in
+/// the chain decides, so wrapping one in context (or in another error's
+/// `source`) keeps its status.
 pub fn status_for(err: &anyhow::Error) -> u16 {
     use bugle_core::BugleError as E;
-    match err.downcast_ref::<E>() {
+    match err.chain().find_map(|e| e.downcast_ref::<E>()) {
         Some(E::PermissionDenied) => 403,
         Some(E::NoSuchDisplay(_)) | Some(E::NoSuchWindow(_)) | Some(E::MediaNotFound(_)) => 404,
         Some(E::Invalid(_)) | Some(E::ProviderNotConfigured(_)) => 400,
+        Some(E::Cancelled) => 409,
         Some(E::Unsupported(_)) => 501,
         None => {
-            if err.downcast_ref::<serde_json::Error>().is_some() {
+            if err.chain().any(|e| e.downcast_ref::<serde_json::Error>().is_some()) {
                 400
             } else {
                 500
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+    use bugle_core::BugleError;
+
+    /// Stand-in for a crate-specific error that keeps a BugleError as its source.
+    #[derive(Debug)]
+    struct Outer(BugleError);
+    impl std::fmt::Display for Outer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "outer")
+        }
+    }
+    impl std::error::Error for Outer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn invalid_as_source_is_400() {
+        let e = anyhow::Error::new(Outer(BugleError::Invalid("x".into())));
+        assert_eq!(status_for(&e), 400);
+    }
+
+    #[test]
+    fn status_codes() {
+        assert_eq!(status_for(&BugleError::Cancelled.into()), 409);
+        assert_eq!(status_for(&BugleError::PermissionDenied.into()), 403);
+        assert_eq!(status_for(&BugleError::MediaNotFound("x".into()).into()), 404);
+        assert_eq!(status_for(&anyhow!("boom")), 500);
+        // Invalid wrapped in context still maps to 400.
+        let wrapped = Err::<(), _>(BugleError::Invalid("bad shape".into())).context("rendering annotation").unwrap_err();
+        assert_eq!(status_for(&wrapped), 400);
+        let json_err = serde_json::from_str::<u32>("x").context("parsing").unwrap_err();
+        assert_eq!(status_for(&json_err), 400);
     }
 }

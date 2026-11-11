@@ -203,7 +203,7 @@ fn run_action(engine: &Engine, action: Action) -> Result<Option<Notice>> {
             };
             let status = match engine.record_start(&req) {
                 Ok(s) => s,
-                Err(e) if format!("{e:#}").contains("selection cancelled") => return Ok(None),
+                Err(e) if is_cancelled(&e) => return Ok(None),
                 Err(e) => return Err(e),
             };
             Ok(Some(Notice {
@@ -275,11 +275,19 @@ fn run_action(engine: &Engine, action: Action) -> Result<Option<Notice>> {
     }
 }
 
+/// Whether an error means the user cancelled the area selection. Matches the
+/// `BugleError::Cancelled` variant; the message check covers paths that still
+/// return a plain `anyhow!("selection cancelled")`.
+fn is_cancelled(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| matches!(c.downcast_ref::<bugle_core::BugleError>(), Some(bugle_core::BugleError::Cancelled)))
+        || format!("{e:#}").contains("selection cancelled")
+}
+
 fn capture(engine: &Engine, target: CaptureTarget) -> Result<Option<Notice>> {
     let req = CaptureRequest { target, options: CaptureOptions::default() };
     let out = match engine.capture(&req) {
         Ok(o) => o,
-        Err(e) if format!("{e:#}").contains("selection cancelled") => return Ok(None),
+        Err(e) if is_cancelled(&e) => return Ok(None),
         Err(e) => return Err(e),
     };
     let what = match &out.window {
