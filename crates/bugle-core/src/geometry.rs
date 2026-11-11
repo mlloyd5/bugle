@@ -72,24 +72,77 @@ impl Rect {
         Rect::new(self.x * s, self.y * s, self.w * s, self.h * s)
     }
 
-    /// Parse `x,y,w,h` or `x,y,wxh`-style strings used on the CLI.
+    /// All four values are finite and the size is positive.
+    pub fn is_valid(&self) -> bool {
+        [self.x, self.y, self.w, self.h].iter().all(|v| v.is_finite()) && !self.is_empty()
+    }
+
+    /// Parse the `x,y,w,h` or `x,y,WxH` strings used on the CLI (commas or
+    /// whitespace separate the fields). Only finite decimal numbers are
+    /// accepted and the result must satisfy [`Rect::is_valid`].
     pub fn parse(s: &str) -> Option<Rect> {
-        let parts: Vec<f64> = s
-            .split(|c| c == ',' || c == 'x' || c == ' ')
-            .filter(|p| !p.is_empty())
-            .map(|p| p.trim().parse::<f64>())
-            .collect::<Result<_, _>>()
-            .ok()?;
-        if parts.len() == 4 {
-            Some(Rect::new(parts[0], parts[1], parts[2], parts[3]))
-        } else {
-            None
-        }
+        let num = |p: &str| p.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+        let fields: Vec<&str> = s.split(|c: char| c == ',' || c.is_whitespace()).filter(|p| !p.is_empty()).collect();
+        let r = match fields.as_slice() {
+            [x, y, w, h] => Rect::new(num(x)?, num(y)?, num(w)?, num(h)?),
+            [x, y, size] => {
+                let (w, h) = size.split_once(['x', 'X'])?;
+                Rect::new(num(x)?, num(y)?, num(w)?, num(h)?)
+            }
+            _ => return None,
+        };
+        r.is_valid().then_some(r)
     }
 }
 
 impl std::fmt::Display for Rect {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{},{},{},{}", self.x, self.y, self.w, self.h)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_accepts_both_forms() {
+        let want = Some(Rect::new(10.0, -20.0, 300.0, 200.5));
+        assert_eq!(Rect::parse("10,-20,300,200.5"), want);
+        assert_eq!(Rect::parse(" 10, -20, 300, 200.5 "), want);
+        assert_eq!(Rect::parse("10 -20 300 200.5"), want);
+        assert_eq!(Rect::parse("10,-20,300x200.5"), want);
+        assert_eq!(Rect::parse("10,-20,300X200.5"), want);
+        assert_eq!(Rect::parse("0,0,1e3,1e2"), Some(Rect::new(0.0, 0.0, 1000.0, 100.0)));
+    }
+
+    #[test]
+    fn parse_rejects_non_finite_and_malformed() {
+        for s in [
+            "nan,0,10,10",
+            "0,0,inf,10",
+            "0,0,10,-inf",
+            "0,0,infinity,10",
+            "0x10,0,10,10",
+            "0,0,0x10,10",
+            "0,0,10x10x10",
+            "0,0,10",
+            "1,2,3,4,5",
+            "",
+            "0,0,0,10",
+            "0,0,10,-5",
+            "a,b,c,d",
+        ] {
+            assert_eq!(Rect::parse(s), None, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn is_valid() {
+        assert!(Rect::new(-5.0, 0.0, 1.0, 1.0).is_valid());
+        assert!(!Rect::new(0.0, 0.0, 0.0, 1.0).is_valid());
+        assert!(!Rect::new(f64::NAN, 0.0, 1.0, 1.0).is_valid());
+        assert!(!Rect::new(0.0, 0.0, f64::INFINITY, 1.0).is_valid());
+        assert!(!Rect::new(0.0, 0.0, 1.0, f64::NAN).is_valid());
     }
 }
