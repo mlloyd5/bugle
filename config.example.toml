@@ -4,7 +4,8 @@
 [general]
 save_dir = "~/Desktop/Bugle"
 # Tokens: {date} {time} {datetime} {year} {month} {day} {hour} {minute} {second}
-#         {kind} {label} {id} {app} {title}
+#         {kind} {label} {id} {app} {title}; unknown tokens are dropped and name
+#         clashes get " 2", " 3", … appended
 filename_template = "Bugle {date} at {time}"
 shutter_sound = false
 copy_to_clipboard = false
@@ -14,8 +15,6 @@ copy_to_clipboard = false
 format = "png"            # png | jpeg | webp | tiff
 jpeg_quality = 90
 window_shadow = true      # keep the window drop shadow in window captures
-desktop_icons_hidden = false
-self_timer_seconds = 5.0
 downscale_retina = false  # save at 1x points instead of 2x pixels
 
 [recordings]
@@ -43,14 +42,14 @@ stroke_width = 4.0
 # font_path = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
 font_size = 28.0
 background = "none"       # default for canvas.background = "auto"
-padding = 48
-corner_radius = 12
-shadow = true
 
 [api]
 bind = "127.0.0.1:4848"
-# token = "change-me"     # bearer token required on every request when set
-cors = true
+# Bearer token required on every request when set. Recommended; required
+# when `bind` is not a loopback address (the server refuses to start).
+# token = "change-me"
+# Let browser pages call the API. Only takes effect when a token is set.
+cors = false
 
 # Global hotkeys for the menu-bar app (`bugle-app`). "mod+mod+key"; modifiers
 # cmd, shift, alt/option, ctrl; keys: letters, digits, F1..F24, space, enter…

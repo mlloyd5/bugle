@@ -34,6 +34,9 @@ typedef struct {
 
 void bugle_free(void *p);
 void bugle_image_free(bugle_image_t *img);
+// The calling thread's last error, handed over (free with bugle_free) and
+// cleared; NULL when none. Errors are per thread: read it on the thread that
+// made the failing call, before calling into the shim again.
 char *bugle_last_error(void);
 
 int32_t bugle_screen_access_preflight(void);
@@ -41,19 +44,23 @@ int32_t bugle_screen_access_request(void);
 int32_t bugle_accessibility_trusted(int32_t prompt);
 
 int32_t bugle_list_displays(bugle_display_t *out, int32_t max);
+// Writes up to `max` windows and returns the total count found (may exceed
+// `max`), or -1 on failure. `out` may be NULL when `max` is 0.
 int32_t bugle_list_windows(bugle_window_t *out, int32_t max, int32_t on_screen_only);
 
 bugle_image_t bugle_capture_display(uint32_t display_id, int32_t show_cursor);
+// Rejects non-finite rects and sides outside (0, 16384] points.
 bugle_image_t bugle_capture_area(double x, double y, double w, double h, int32_t show_cursor);
 bugle_image_t bugle_capture_window(uint32_t window_id, int32_t shadow, int32_t show_cursor);
 
-int32_t bugle_ocr(const uint8_t *rgba, int32_t w, int32_t h, const char *langs_csv,
+// `len` is the byte length of `rgba`; it must be at least w * h * 4.
+int32_t bugle_ocr(const uint8_t *rgba, size_t len, int32_t w, int32_t h, const char *langs_csv,
                   int32_t accurate, int32_t lang_correction,
                   bugle_ocr_line_t **out_lines, int32_t *out_count);
 void bugle_ocr_free(bugle_ocr_line_t *lines, int32_t count);
 
-int32_t bugle_register_translation(const uint8_t *ref_rgba, int32_t rw, int32_t rh,
-                                   const uint8_t *flt_rgba, int32_t fw, int32_t fh,
+int32_t bugle_register_translation(const uint8_t *ref_rgba, size_t ref_len, int32_t rw, int32_t rh,
+                                   const uint8_t *flt_rgba, size_t flt_len, int32_t fw, int32_t fh,
                                    double *dx, double *dy);
 
 int32_t bugle_post_scroll(double x, double y, int32_t dx_lines, int32_t dy_lines);
