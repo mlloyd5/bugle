@@ -73,23 +73,24 @@ impl Engine {
 
     /// Resolve `source` to a history item or a file on disk. Accepts a media
     /// id (or prefix), `latest`/`last`, or a path.
+    ///
+    /// A bare name is looked up in history first, so a file in the working
+    /// directory cannot shadow a media id. Anything that is unambiguously a
+    /// path (absolute, `~/…`, or containing `/`) only ever means a file.
     pub fn resolve_media(&self, source: &str) -> Result<MediaItem> {
         if source.is_empty() || source == "latest" || source == "last" {
             return self.history.latest()?.ok_or_else(|| BugleError::MediaNotFound("history is empty".into()).into());
         }
+        if !is_explicit_path(source) {
+            if let Some(m) = self.history.get(source)? {
+                return Ok(m);
+            }
+        }
         let p = bugle_core::config::expand_tilde(source);
         if p.exists() {
-            let kind = kind_from_path(&p);
-            let mut m = MediaItem::new(kind, &p);
-            if m.is_image() {
-                if let Ok(dim) = image::image_dimensions(&p) {
-                    m.width = Some(dim.0);
-                    m.height = Some(dim.1);
-                }
-            }
-            return Ok(m);
+            return Ok(media_from_file(&p));
         }
-        self.history.get(source)?.ok_or_else(|| BugleError::MediaNotFound(source.to_string()).into())
+        Err(BugleError::MediaNotFound(source.to_string()).into())
     }
 
     pub fn load_image(&self, source: &str) -> Result<(MediaItem, RgbaImage)> {
@@ -123,11 +124,16 @@ impl Engine {
     }
 
     /// Encode and save an image, sync it (see `[sync]`), record it in history.
+    ///
+    /// `format` is the format the request asked for (`None` = not given).
+    /// Without one, a recognised image extension on `output` decides, then
+    /// the configured default. An explicit format that disagrees with the
+    /// extension wins and the extension is corrected.
     pub fn save_image(
         &self,
         img: &RgbaImage,
         kind: MediaKind,
-        format: ImageFormat,
+        format: impl Into<Option<ImageFormat>>,
         quality: u8,
         output: Option<&str>,
         vars: &HashMap<&str, String>,
@@ -135,7 +141,8 @@ impl Engine {
         source: Option<String>,
         parent: Option<String>,
     ) -> Result<MediaItem> {
-        let path = self.output_path(output, format.extension(), vars);
+        let format = choose_image_format(format.into(), self.config.screenshots.format, output);
+        let path = match_extension(self.output_path(output, format.extension(), vars), format);
         encode_to_path(img, format, quality, &path)?;
         let mut m = MediaItem::new(kind, &path).with_size(img.width(), img.height());
         m.label = label;
@@ -161,24 +168,40 @@ impl Engine {
     // OCR
     // -----------------------------------------------------------------------
 
-    pub fn ocr_image(&self, img: &RgbaImage, opts: &OcrOptions) -> Result<OcrResult> {
-        let engine = opts.engine.clone().unwrap_or_else(|| self.config.ocr.engine.clone());
-        if engine != "vision" {
-            bail!("OCR engine '{engine}' is an AI provider; use `describe`/the async `ocr_with_ai` path");
-        }
-        let (img, offset) = match opts.region {
-            Some(r) => {
-                let x0 = r.x.max(0.0) as u32;
-                let y0 = r.y.max(0.0) as u32;
-                let w = (r.w as u32).min(img.width().saturating_sub(x0));
-                let h = (r.h as u32).min(img.height().saturating_sub(y0));
-                if w == 0 || h == 0 {
-                    return Err(BugleError::Invalid("OCR region is outside the image".into()).into());
-                }
-                (image::imageops::crop_imm(img, x0, y0, w, h).to_image(), (x0 as f64, y0 as f64))
+    /// The OCR engine for a request: its `engine`, else `[ocr] engine`.
+    pub fn ocr_engine(&self, opts: &OcrOptions) -> OcrEngine {
+        select_ocr_engine(opts.engine.as_deref(), &self.config.ocr.engine)
+    }
+
+    /// OCR with whichever engine [`Engine::ocr_engine`] picks. Every front
+    /// end goes through this (or [`Engine::run_ocr`]).
+    pub async fn ocr_image_any(self: &Arc<Self>, img: RgbaImage, opts: &OcrOptions) -> Result<OcrResult> {
+        match self.ocr_engine(opts) {
+            OcrEngine::Vision => {
+                let e = self.clone();
+                let opts = opts.clone();
+                tokio::task::spawn_blocking(move || e.ocr_image(&img, &opts)).await?
             }
-            None => (img.clone(), (0.0, 0.0)),
-        };
+            OcrEngine::Ai(provider) => self.ocr_image_ai(&img, opts, &provider).await,
+        }
+    }
+
+    /// Load `source` and OCR it with the selected engine.
+    pub async fn run_ocr(self: &Arc<Self>, source: &str, opts: &OcrOptions) -> Result<(MediaItem, OcrResult)> {
+        let e = self.clone();
+        let s = source.to_string();
+        let (m, img) = tokio::task::spawn_blocking(move || e.load_image(&s)).await??;
+        let r = self.ocr_image_any(img, opts).await?;
+        Ok((m, r))
+    }
+
+    /// Apple Vision OCR (blocking). Fails when the selected engine is an AI
+    /// provider; [`Engine::ocr_image_any`] routes automatically.
+    pub fn ocr_image(&self, img: &RgbaImage, opts: &OcrOptions) -> Result<OcrResult> {
+        if let OcrEngine::Ai(engine) = self.ocr_engine(opts) {
+            bail!("OCR engine '{engine}' is an AI provider; use the async `ocr_image_any`/`run_ocr` path");
+        }
+        let (img, offset) = crop_region(img, opts.region)?;
         let langs = opts.languages.clone().unwrap_or_else(|| self.config.ocr.languages.clone());
         let params = bugle_platform::OcrParams {
             languages: &langs,
@@ -194,14 +217,30 @@ impl Engine {
         Ok(OcrResult { text, lines, engine: "vision".into() })
     }
 
+    /// Blocking OCR of `source` with the selected engine, for callers outside
+    /// an async context (the menu-bar app). An AI engine runs on a private
+    /// runtime on a scoped thread, so this is safe from any thread.
     pub fn ocr(&self, source: &str, opts: &OcrOptions) -> Result<(MediaItem, OcrResult)> {
         let (m, img) = self.load_image(source)?;
-        Ok((m, self.ocr_image(&img, opts)?))
+        let r = match self.ocr_engine(opts) {
+            OcrEngine::Vision => self.ocr_image(&img, opts)?,
+            OcrEngine::Ai(provider) => std::thread::scope(|s| {
+                s.spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?
+                        .block_on(self.ocr_image_ai(&img, opts, &provider))
+                })
+                .join()
+                .map_err(|_| anyhow!("OCR thread panicked"))?
+            })?,
+        };
+        Ok((m, r))
     }
 
     /// OCR through a vision model instead of Apple Vision (no boxes).
-    pub async fn ocr_with_ai(&self, source: &str, provider: &str) -> Result<OcrResult> {
-        let (_, img) = self.load_image(source)?;
+    async fn ocr_image_ai(&self, img: &RgbaImage, opts: &OcrOptions, provider: &str) -> Result<OcrResult> {
+        let (img, _) = crop_region(img, opts.region)?;
         let p = self.ai.resolve(Some(provider), Role::Vision)?;
         let png = encode_png_bounded(&img, 2000)?;
         let text = p
@@ -248,7 +287,7 @@ impl Engine {
         let m = self.save_image(
             &out,
             MediaKind::Annotated,
-            self.config.screenshots.format,
+            None,
             self.config.screenshots.jpeg_quality,
             output,
             &vars,
@@ -274,7 +313,10 @@ impl Engine {
         });
         let mut ocr = None;
         if req.with_ocr && media.is_image() {
-            if let Ok(r) = self.ocr_image(&img, &OcrOptions::default()) {
+            // Grounding text always comes from Apple Vision: the vision model
+            // already sees the image, so a second AI pass adds nothing.
+            let vision = OcrOptions { engine: Some("vision".into()), ..Default::default() };
+            if let Ok(r) = self.ocr_image(&img, &vision) {
                 if !r.text.trim().is_empty() {
                     prompt.push_str("\n\nText recognised by OCR (may contain errors):\n");
                     prompt.push_str(&r.text);
@@ -335,10 +377,16 @@ impl Engine {
             SubtitleFormat::Vtt => "vtt",
         };
         let path = match output {
-            Some(o) => bugle_core::config::expand_tilde(o),
+            Some(o) => {
+                let p = bugle_core::config::expand_tilde(o);
+                if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+                    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+                }
+                p
+            }
             None => media.path.with_extension(ext),
         };
-        std::fs::write(&path, transcript.render(format))?;
+        std::fs::write(&path, transcript.render(format)).with_context(|| format!("writing {}", path.display()))?;
         let mut m = MediaItem::new(MediaKind::Subtitle, &path);
         m.parent = Some(media.id.clone());
         m.source = Some(format!("subtitles via {}", transcript.provider));
@@ -376,6 +424,15 @@ impl Engine {
         let mut child = cmd.spawn().context("spawning pin helper")?;
         if blocking {
             child.wait()?;
+        } else {
+            // Reap the helper when it exits so a long-running server does not
+            // accumulate zombie processes.
+            std::thread::Builder::new()
+                .name("bugle-pin-reaper".into())
+                .spawn(move || {
+                    let _ = child.wait();
+                })
+                .context("spawning pin reaper thread")?;
         }
         Ok(media)
     }
@@ -412,6 +469,108 @@ impl Engine {
 // Free helpers
 // ---------------------------------------------------------------------------
 
+/// Which OCR implementation handles a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OcrEngine {
+    /// Apple Vision (text plus per-line boxes).
+    Vision,
+    /// A vision-capable AI provider by name (text only, no boxes).
+    Ai(String),
+}
+
+/// The one rule for choosing an OCR engine: the request's value, else the
+/// configured default. `vision` (or nothing) means Apple Vision; any other
+/// name is an AI provider.
+pub fn select_ocr_engine(requested: Option<&str>, config_default: &str) -> OcrEngine {
+    let name = requested.map(str::trim).filter(|s| !s.is_empty()).unwrap_or_else(|| config_default.trim());
+    if name.is_empty() || name.eq_ignore_ascii_case("vision") {
+        OcrEngine::Vision
+    } else {
+        OcrEngine::Ai(name.to_string())
+    }
+}
+
+/// Crop to an OCR region (pixels); returns the image and the crop offset.
+fn crop_region(img: &RgbaImage, region: Option<Rect>) -> Result<(RgbaImage, (f64, f64))> {
+    let Some(r) = region else {
+        return Ok((img.clone(), (0.0, 0.0)));
+    };
+    if ![r.x, r.y, r.w, r.h].iter().all(|v| v.is_finite()) {
+        return Err(BugleError::Invalid("OCR region must be finite numbers".into()).into());
+    }
+    let x0 = r.x.max(0.0) as u32;
+    let y0 = r.y.max(0.0) as u32;
+    let w = (r.w.max(0.0) as u32).min(img.width().saturating_sub(x0));
+    let h = (r.h.max(0.0) as u32).min(img.height().saturating_sub(y0));
+    if w == 0 || h == 0 {
+        return Err(BugleError::Invalid("OCR region is outside the image".into()).into());
+    }
+    Ok((image::imageops::crop_imm(img, x0, y0, w, h).to_image(), (x0 as f64, y0 as f64)))
+}
+
+/// True when `source` can only mean a file: absolute, `~`-relative, or
+/// containing a path separator.
+fn is_explicit_path(source: &str) -> bool {
+    source.starts_with('/') || source.starts_with('~') || source.contains('/')
+}
+
+fn media_from_file(p: &Path) -> MediaItem {
+    let mut m = MediaItem::new(kind_from_path(p), p);
+    if m.is_image() {
+        if let Ok(dim) = image::image_dimensions(p) {
+            m.width = Some(dim.0);
+            m.height = Some(dim.1);
+        }
+    }
+    m
+}
+
+/// Image format implied by a path's extension, if it is one we can write.
+pub fn format_from_extension(p: &Path) -> Option<ImageFormat> {
+    p.extension().and_then(|e| e.to_str()).and_then(|e| e.parse().ok())
+}
+
+/// Decide the encode format: an explicit request wins, then a recognised
+/// image extension on the output path, then the configured default.
+pub fn choose_image_format(explicit: Option<ImageFormat>, default: ImageFormat, output: Option<&str>) -> ImageFormat {
+    if let Some(f) = explicit {
+        return f;
+    }
+    output.and_then(|o| format_from_extension(Path::new(o))).unwrap_or(default)
+}
+
+/// Make a recognised image extension agree with `format` (an explicit
+/// `--format png` with `-o shot.jpg` writes `shot.png`). Unrecognised or
+/// missing extensions are left alone.
+pub fn match_extension(path: PathBuf, format: ImageFormat) -> PathBuf {
+    match format_from_extension(&path) {
+        Some(f) if f != format => {
+            let fixed = path.with_extension(format.extension());
+            tracing::warn!("output {} does not match format {}; writing {}", path.display(), format.extension(), fixed.display());
+            fixed
+        }
+        _ => path,
+    }
+}
+
+/// Smallest and largest long edge [`encode_png_bounded`] accepts; requests
+/// outside the range are clamped.
+pub const MIN_MAX_EDGE: u32 = 16;
+pub const MAX_MAX_EDGE: u32 = 8192;
+
+/// Size that brings `(w, h)` down to a long edge of at most `max_edge`
+/// (clamped to `MIN_MAX_EDGE..=MAX_MAX_EDGE`), keeping the aspect ratio and
+/// never producing a zero side. `None` when the image already fits.
+pub fn bounded_size(w: u32, h: u32, max_edge: u32) -> Option<(u32, u32)> {
+    let max_edge = max_edge.clamp(MIN_MAX_EDGE, MAX_MAX_EDGE);
+    if w.max(h) <= max_edge {
+        return None;
+    }
+    let s = max_edge as f64 / w.max(h) as f64;
+    let side = |v: u32| (((v as f64) * s).round() as u32).clamp(1, max_edge);
+    Some((side(w), side(h)))
+}
+
 pub fn kind_from_path(p: &Path) -> MediaKind {
     match p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
         Some("mov") | Some("mp4") | Some("m4v") => MediaKind::Video,
@@ -441,17 +600,11 @@ pub fn encode_to_path(img: &RgbaImage, format: ImageFormat, quality: u8, path: &
 
 /// PNG-encode, downscaling so the long edge is at most `max_edge` pixels
 /// (vision models neither need nor want 5K screenshots).
+/// `max_edge` is clamped to [`MIN_MAX_EDGE`]`..=`[`MAX_MAX_EDGE`].
 pub fn encode_png_bounded(img: &RgbaImage, max_edge: u32) -> Result<Vec<u8>> {
-    let long = img.width().max(img.height());
     let scaled;
-    let src = if long > max_edge {
-        let s = max_edge as f64 / long as f64;
-        scaled = image::imageops::resize(
-            img,
-            ((img.width() as f64) * s).round() as u32,
-            ((img.height() as f64) * s).round() as u32,
-            image::imageops::FilterType::Triangle,
-        );
+    let src = if let Some((w, h)) = bounded_size(img.width(), img.height(), max_edge) {
+        scaled = image::imageops::resize(img, w, h, image::imageops::FilterType::Triangle);
         &scaled
     } else {
         img
@@ -498,4 +651,90 @@ fn join_lines(lines: &[bugle_core::OcrLine]) -> String {
         prev = Some(l);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ocr_engine_selection() {
+        assert_eq!(select_ocr_engine(None, "vision"), OcrEngine::Vision);
+        assert_eq!(select_ocr_engine(None, ""), OcrEngine::Vision);
+        assert_eq!(select_ocr_engine(None, "openai"), OcrEngine::Ai("openai".into()));
+        assert_eq!(select_ocr_engine(Some("vision"), "openai"), OcrEngine::Vision);
+        assert_eq!(select_ocr_engine(Some("Vision"), "openai"), OcrEngine::Vision);
+        assert_eq!(select_ocr_engine(Some("ollama"), "vision"), OcrEngine::Ai("ollama".into()));
+        assert_eq!(select_ocr_engine(Some(""), "ollama"), OcrEngine::Ai("ollama".into()));
+    }
+
+    #[test]
+    fn format_inference() {
+        use ImageFormat::*;
+        assert_eq!(choose_image_format(None, Png, Some("shot.jpg")), Jpeg);
+        assert_eq!(choose_image_format(None, Png, Some("~/x/shot.JPEG")), Jpeg);
+        assert_eq!(choose_image_format(None, Png, Some("shot.webp")), Webp);
+        assert_eq!(choose_image_format(None, Jpeg, Some("shot.tif")), Tiff);
+        assert_eq!(choose_image_format(None, Jpeg, Some("shot")), Jpeg);
+        assert_eq!(choose_image_format(None, Jpeg, Some("shot.bmp")), Jpeg);
+        assert_eq!(choose_image_format(None, Webp, None), Webp);
+        assert_eq!(choose_image_format(Some(Png), Jpeg, Some("shot.jpg")), Png);
+
+        assert_eq!(match_extension(PathBuf::from("/t/shot.jpg"), Png), PathBuf::from("/t/shot.png"));
+        assert_eq!(match_extension(PathBuf::from("/t/shot.jpeg"), Jpeg), PathBuf::from("/t/shot.jpeg"));
+        assert_eq!(match_extension(PathBuf::from("/t/shot.TIF"), Tiff), PathBuf::from("/t/shot.TIF"));
+        assert_eq!(match_extension(PathBuf::from("/t/shot"), Png), PathBuf::from("/t/shot"));
+        assert_eq!(match_extension(PathBuf::from("/t/shot.dat"), Png), PathBuf::from("/t/shot.dat"));
+    }
+
+    #[test]
+    fn bounded_encode_never_zero() {
+        assert_eq!(bounded_size(100, 50, 1600), None);
+        assert_eq!(bounded_size(3200, 1600, 1600), Some((1600, 800)));
+        // max_edge 0 is clamped up, extreme aspect ratios keep a 1px side.
+        assert_eq!(bounded_size(4000, 2, 0), Some((MIN_MAX_EDGE, 1)));
+        assert_eq!(bounded_size(1, 100_000, 1600), Some((1, 1600)));
+        assert_eq!(bounded_size(20_000, 10_000, u32::MAX), Some((MAX_MAX_EDGE, 4096)));
+
+        let img = RgbaImage::new(5000, 3);
+        let png = encode_png_bounded(&img, 0).unwrap();
+        let decoded = image::load_from_memory(&png).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (MIN_MAX_EDGE, 1));
+    }
+
+    #[test]
+    fn crop_region_rejects_bad_regions() {
+        let img = RgbaImage::new(100, 100);
+        assert!(crop_region(&img, Some(Rect::new(f64::NAN, 0.0, 10.0, 10.0))).is_err());
+        assert!(crop_region(&img, Some(Rect::new(200.0, 0.0, 10.0, 10.0))).is_err());
+        let (c, off) = crop_region(&img, Some(Rect::new(90.0, 10.0, 50.0, 20.0))).unwrap();
+        assert_eq!((c.width(), c.height(), off), (10, 20, (90.0, 10.0)));
+    }
+
+    #[test]
+    fn history_id_beats_relative_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.general.save_dir = dir.path().join("out").display().to_string();
+        config.general.history_path = Some(dir.path().join("history.jsonl").display().to_string());
+        let engine = Engine::new(config, false).unwrap();
+
+        // A file in the working directory whose name equals a media id.
+        let local = tempfile::Builder::new().prefix("bugle-resolve-test-").tempfile_in(".").unwrap();
+        let name = local.path().file_name().unwrap().to_str().unwrap().to_string();
+        let stored = dir.path().join("stored.png");
+        RgbaImage::new(2, 2).save(&stored).unwrap();
+        let mut item = MediaItem::new(MediaKind::Screenshot, &stored);
+        item.id = name.clone();
+        engine.history.push(&item).unwrap();
+
+        assert_eq!(engine.resolve_media(&name).unwrap().path, stored);
+        // With a separator it is a path again.
+        let explicit = format!("./{name}");
+        assert_eq!(engine.resolve_media(&explicit).unwrap().path, PathBuf::from(&explicit));
+        // Absolute paths resolve to files; unknown names are not found.
+        assert_eq!(engine.resolve_media(stored.to_str().unwrap()).unwrap().path, stored);
+        let missing = engine.resolve_media("no-such-id-or-file").unwrap_err();
+        assert!(matches!(missing.downcast_ref::<BugleError>(), Some(BugleError::MediaNotFound(_))));
+    }
 }

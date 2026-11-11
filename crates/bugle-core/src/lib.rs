@@ -35,4 +35,6 @@ pub enum BugleError {
     Invalid(String),
     #[error("not supported on this platform: {0}")]
     Unsupported(String),
+    #[error("selection cancelled")]
+    Cancelled,
 }

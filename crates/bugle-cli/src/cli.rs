@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use bugle_markup::{Annotation, Shape, Style};
 use bugle_core::{
-    CaptureOptions, CaptureRequest, CaptureTarget, Config, DescribeRequest, ImageFormat, OcrOptions, Point, RecordRequest,
+    BugleError, CaptureOptions, CaptureRequest, CaptureTarget, Config, DescribeRequest, ImageFormat, OcrOptions, Point, RecordRequest,
     RecordingFormat, Rect, ScrollCaptureRequest, SubtitleFormat,
 };
 use bugle_engine::Engine;
@@ -229,7 +229,7 @@ pub struct ScrollArgs {
     #[arg(long, default_value_t = 40)]
     pub max_frames: u32,
     /// Scroll wheel lines per step (negative = down/forward).
-    #[arg(long, default_value_t = -8)]
+    #[arg(long, default_value_t = -8, allow_negative_numbers = true)]
     pub step: i32,
     #[arg(long, default_value_t = 350)]
     pub settle_ms: u64,
@@ -246,11 +246,13 @@ pub struct ScrollArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum RecordCmd {
-    /// Start a recording; blocks until Ctrl-C (or --seconds) unless --detach.
+    /// Start a recording; blocks until Ctrl-C (or --seconds).
     Start(RecordArgs),
-    /// Stop a recording started with --detach (same process only via the API).
+    /// Explains how to stop a recording: Ctrl-C in the `record start`
+    /// terminal, or the `record_stop` action of a running API/MCP server.
     Stop,
-    /// Show recording status.
+    /// Explains where recording status lives: a recording belongs to the
+    /// process that started it (use the server's `record_status` action).
     Status,
 }
 
@@ -411,8 +413,12 @@ pub struct PinArgs {
 pub enum ConfigCmd {
     /// Write a default config file (does not overwrite).
     Init,
-    /// Print the effective configuration.
-    Show,
+    /// Print the effective configuration (secrets shown as "***").
+    Show {
+        /// Print tokens, API keys and auth headers in the clear.
+        #[arg(long)]
+        reveal: bool,
+    },
     /// Print the config file path.
     Path,
 }
@@ -465,7 +471,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             let out = e.capture(&req)?;
             let mut extra = json!({});
             if a.ocr {
-                let r = engine.ocr_image(&out.image, &OcrOptions::default())?;
+                let r = engine.ocr_image_any(out.image.clone(), &OcrOptions::default()).await?;
                 extra["ocr"] = json!(r);
                 if !json {
                     println!("{}", r.text);
@@ -496,8 +502,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Cmd::Scroll(a) => {
             let rect = match a.rect {
                 Some(r) => parse_rect(&r)?,
-                None => engine.select_area()?.ok_or_else(|| anyhow!("selection cancelled"))?,
+                None => engine.select_area()?.ok_or(BugleError::Cancelled)?,
             };
+            bugle_engine::capture::validate_rect(&rect)?;
             if a.delay > 0.0 {
                 eprintln!("starting in {:.0}s — keep the mouse over the scrollable area", a.delay);
                 tokio::time::sleep(std::time::Duration::from_secs_f64(a.delay)).await;
@@ -570,33 +577,30 @@ pub async fn run(cli: Cli) -> Result<()> {
             RecordCmd::Stop => {
                 bail!("`record stop` only applies to recordings started through the API server; press Ctrl-C in the recording terminal instead")
             }
-            RecordCmd::Status => println!("{}", json!(engine.record_status())),
+            RecordCmd::Status => {
+                // A recording lives in the process that started it, so a fresh
+                // CLI process never has one; say so instead of a bare "idle".
+                const NOTE: &str = "recordings belong to the process that started them: `bugle record start` runs until Ctrl-C in its terminal, and recordings started through the API/MCP server are queried with its `record_status` action";
+                if json {
+                    println!("{}", json!({"status": engine.record_status(), "note": NOTE}));
+                } else {
+                    println!("no recording in this process; {NOTE}");
+                }
+            }
         },
         Cmd::Ocr(a) => {
-            if let Some(eng) = a.engine.as_deref().filter(|e| *e != "vision") {
-                let r = engine.ocr_with_ai(&a.source, eng).await?;
-                if a.copy {
-                    bugle_platform::clipboard_write_text(&r.text)?;
-                }
-                if json {
-                    println!("{}", json!(r));
-                } else {
-                    println!("{}", r.text);
-                }
-                return Ok(());
-            }
             let opts = OcrOptions {
                 languages: a.lang.map(|l| l.split(',').map(|s| s.trim().to_string()).collect()),
                 fast: a.fast.then_some(true),
-                engine: None,
+                engine: a.engine,
                 region: a.region.as_deref().map(parse_rect).transpose()?,
             };
-            let (media, r) = engine.ocr(&a.source, &opts)?;
+            let (media, r) = engine.run_ocr(&a.source, &opts).await?;
             if a.copy {
                 bugle_platform::clipboard_write_text(&r.text)?;
             }
             if json {
-                println!("{}", json!({"media_id": media.id, "text": r.text, "lines": r.lines}));
+                println!("{}", json!({"media_id": media.id, "text": r.text, "lines": r.lines, "engine": r.engine}));
             } else {
                 println!("{}", r.text);
             }
@@ -826,7 +830,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         println!("wrote {}", path.display());
                     }
                 }
-                ConfigCmd::Show => println!("{}", toml_pretty(&engine.config)?),
+                ConfigCmd::Show { reveal } => println!("{}", toml_pretty(&engine.config, reveal)?),
                 ConfigCmd::Path => println!("{}", path.display()),
             }
         }
@@ -860,6 +864,99 @@ fn chrono_local() -> chrono::Local {
     chrono::Local
 }
 
-fn toml_pretty(c: &Config) -> Result<String> {
-    Ok(toml::to_string_pretty(c)?)
+fn toml_pretty(c: &Config, reveal: bool) -> Result<String> {
+    let mut v = toml::Value::try_from(c)?;
+    if !reveal {
+        redact_secrets(&mut v, false);
+    }
+    Ok(toml::to_string_pretty(&v)?)
+}
+
+/// Replace secret values with `"***"`: `token`, `api_key` and similar keys
+/// anywhere, and credential-looking entries inside `headers` tables. Names of
+/// environment variables (`*_env`) are not secrets and are kept.
+fn redact_secrets(v: &mut toml::Value, in_headers: bool) {
+    match v {
+        toml::Value::Table(t) => {
+            for (k, val) in t.iter_mut() {
+                let key = k.to_ascii_lowercase();
+                let secret = if in_headers {
+                    ["auth", "key", "token", "secret", "cookie", "password"].iter().any(|s| key.contains(s))
+                } else {
+                    !key.ends_with("_env")
+                        && (matches!(key.as_str(), "token" | "password" | "secret")
+                            || key.ends_with("api_key")
+                            || key.ends_with("_token")
+                            || key.ends_with("_secret")
+                            || key.ends_with("secret_key")
+                            || key.ends_with("_password"))
+                };
+                if secret && val.is_str() {
+                    *val = toml::Value::String("***".into());
+                } else {
+                    redact_secrets(val, key == "headers");
+                }
+            }
+        }
+        toml::Value::Array(a) => a.iter_mut().for_each(|x| redact_secrets(x, in_headers)),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negative_scroll_step_parses() {
+        let cli = Cli::try_parse_from(["bugle", "scroll", "--step", "-8", "--rect", "0,0,10,10"]).unwrap();
+        match cli.cmd {
+            Cmd::Scroll(a) => assert_eq!(a.step, -8),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_show_reveal_flag() {
+        let cli = Cli::try_parse_from(["bugle", "config", "show", "--reveal"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Config { cmd: ConfigCmd::Show { reveal: true } }));
+        let cli = Cli::try_parse_from(["bugle", "config", "show"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Config { cmd: ConfigCmd::Show { reveal: false } }));
+    }
+
+    #[test]
+    fn redacts_secrets() {
+        let src = r#"
+            [api]
+            token = "tok-123"
+            bind = "127.0.0.1:7070"
+            [ai.providers.remote]
+            api_key = "sk-abc"
+            api_key_env = "REMOTE_KEY"
+            max_tokens = 1024
+            [ai.providers.remote.headers]
+            Authorization = "Bearer xyz"
+            X-Title = "bugle"
+            [sync]
+            secret_key_env = "AWS_SECRET_ACCESS_KEY"
+        "#;
+        let mut v: toml::Value = toml::from_str(src).unwrap();
+        redact_secrets(&mut v, false);
+        assert_eq!(v["api"]["token"].as_str(), Some("***"));
+        assert_eq!(v["api"]["bind"].as_str(), Some("127.0.0.1:7070"));
+        let p = &v["ai"]["providers"]["remote"];
+        assert_eq!(p["api_key"].as_str(), Some("***"));
+        assert_eq!(p["api_key_env"].as_str(), Some("REMOTE_KEY"));
+        assert_eq!(p["max_tokens"].as_integer(), Some(1024));
+        assert_eq!(p["headers"]["Authorization"].as_str(), Some("***"));
+        assert_eq!(p["headers"]["X-Title"].as_str(), Some("bugle"));
+        assert_eq!(v["sync"]["secret_key_env"].as_str(), Some("AWS_SECRET_ACCESS_KEY"));
+
+        // The real config round-trips through the redacting printer.
+        let mut c = Config::default();
+        c.api.token = Some("tok-123".into());
+        let shown = toml_pretty(&c, false).unwrap();
+        assert!(!shown.contains("tok-123") && shown.contains("***"));
+        assert!(toml_pretty(&c, true).unwrap().contains("tok-123"));
+    }
 }
