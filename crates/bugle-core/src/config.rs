@@ -47,10 +47,6 @@ pub struct ScreenshotConfig {
     pub jpeg_quality: u8,
     /// Keep the window drop shadow in window captures.
     pub window_shadow: bool,
-    /// Hide desktop icons during capture.
-    pub desktop_icons_hidden: bool,
-    /// Self-timer default when `--delay` is given without a value.
-    pub self_timer_seconds: f64,
     /// Scale captures down to 1x (points) instead of keeping Retina pixels.
     pub downscale_retina: bool,
 }
@@ -106,9 +102,6 @@ pub struct MarkupConfig {
     pub font_size: f32,
     /// Default background preset for `canvas.background` when `"auto"`.
     pub background: String,
-    pub padding: u32,
-    pub corner_radius: u32,
-    pub shadow: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,8 +201,6 @@ impl Default for ScreenshotConfig {
             format: ImageFormat::Png,
             jpeg_quality: 90,
             window_shadow: true,
-            desktop_icons_hidden: false,
-            self_timer_seconds: 5.0,
             downscale_retina: false,
         }
     }
@@ -244,9 +235,6 @@ impl Default for MarkupConfig {
             font_path: None,
             font_size: 28.0,
             background: "none".into(),
-            padding: 48,
-            corner_radius: 12,
-            shadow: true,
         }
     }
 }
@@ -591,5 +579,26 @@ mod tests {
         assert_eq!(cfg.sync.mode, SyncMode::Move);
         assert_eq!(cfg.sync.kinds, vec![MediaKind::Screenshot]);
         assert!(cfg.sync.destination().is_err());
+    }
+
+    #[test]
+    fn removed_keys_in_old_configs_still_parse() {
+        let cfg: Config = toml::from_str(
+            "[screenshots]\ndesktop_icons_hidden = true\nself_timer_seconds = 3.0\njpeg_quality = 70\n\
+             [markup]\npadding = 10\ncorner_radius = 4\nshadow = false\nfont_size = 20.0\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.screenshots.jpeg_quality, 70);
+        assert_eq!(cfg.markup.font_size, 20.0);
+    }
+
+    #[test]
+    fn example_config_parses() {
+        let text = include_str!("../../../config.example.toml");
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg.general.filename_template, crate::naming::DEFAULT_TEMPLATE);
+        for key in ["desktop_icons_hidden", "self_timer_seconds", "corner_radius", "{counter}"] {
+            assert!(!text.contains(key), "config.example.toml still documents {key}");
+        }
     }
 }
