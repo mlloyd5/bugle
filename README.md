@@ -190,8 +190,14 @@ OpenRouter, Groq…). `kind = "command"` wraps a local executable, e.g. `whisper
 
 The other sections: `[general]` (save folder, filename template, clipboard),
 `[screenshots]`, `[recordings]` (backend, audio), `[ocr]`, `[markup]` defaults,
-`[api]` (bind address, token), `[hotkeys]` for the menu-bar app and `[sync]`
+`[api]` (bind address, token, CORS), `[hotkeys]` for the menu-bar app and `[sync]`
 below.
+
+The HTTP API is meant for local agents. Setting a token is recommended; without
+one any local process can call it. Binding to a non-loopback address (e.g.
+`--bind 0.0.0.0:4848`) is refused unless a token is set, a loopback listener
+rejects requests whose `Host` is not `127.0.0.1`, `localhost` or `[::1]`, and
+`cors = true` only takes effect together with a token.
 
 ### Sync
 
@@ -236,7 +242,7 @@ See [docs/AGENTS.md](docs/AGENTS.md). In short:
 claude mcp add bugle -- /path/to/bugle mcp
 
 # HTTP
-bugle serve --token secret
+bugle serve --token secret         # token recommended; required off loopback
 curl -H 'Authorization: Bearer secret' -H 'content-type: application/json' \
      -d '{"target":{"kind":"window","owner":"Safari"}}' http://127.0.0.1:4848/v1/capture
 ```

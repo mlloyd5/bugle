@@ -18,3 +18,7 @@ tower-http.workspace = true
 base64.workspace = true
 image.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower = { version = "0.5", features = ["util"] }

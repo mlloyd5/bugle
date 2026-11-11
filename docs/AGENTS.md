@@ -54,9 +54,18 @@ bugle serve --bind 127.0.0.1:4848 --token secret     # alias: bugle jameson
   `/v1/openapi.json`, `/v1/annotate/schema`, `/v1/media/{id}`,
   `/v1/media/{id}/file`; `DELETE /v1/media/{id}?file=1`.
 * Responses: `{"ok":true, ...}` with `image_base64`/`image_mime` when an image is
-  returned; errors are `{"ok":false,"error":"..."}` with 400/403/404/500.
+  returned; errors (including malformed JSON bodies) are `{"ok":false,"error":"..."}`
+  with a 4xx/5xx status.
 * Auth: `Authorization: Bearer <token>` or `X-Bugle-Token: <token>` when a token is
-  configured (`[api] token` or `--token`/`BUGLE_TOKEN`).
+  configured (`[api] token` or `--token`/`BUGLE_TOKEN`). A token is recommended, and
+  required when binding to a non-loopback address (the server refuses to start
+  otherwise).
+* On a loopback bind, requests whose `Host` is not `127.0.0.1`, `localhost` or
+  `[::1]` (with or without port) get 403, which blocks DNS-rebinding pages.
+* CORS (`[api] cors = true`) is off by default and only enabled when a token is
+  set; without one it is ignored with a warning.
+* `/v1/media/{id}/file` serves history items only (id, id prefix or `latest`),
+  never arbitrary file paths.
 
 ```bash
 H='Authorization: Bearer secret'; U=http://127.0.0.1:4848/v1

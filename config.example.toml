@@ -49,8 +49,11 @@ shadow = true
 
 [api]
 bind = "127.0.0.1:4848"
-# token = "change-me"     # bearer token required on every request when set
-cors = true
+# Bearer token required on every request when set. Recommended; required
+# when `bind` is not a loopback address (the server refuses to start).
+# token = "change-me"
+# Let browser pages call the API. Only takes effect when a token is set.
+cors = false
 
 # Global hotkeys for the menu-bar app (`bugle-app`). "mod+mod+key"; modifiers
 # cmd, shift, alt/option, ctrl; keys: letters, digits, F1..F24, space, enter…
