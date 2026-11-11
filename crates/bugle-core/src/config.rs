@@ -115,9 +115,11 @@ pub struct MarkupConfig {
 #[serde(default)]
 pub struct ApiConfig {
     pub bind: String,
-    /// Optional bearer token. When set every HTTP request must carry it.
+    /// Bearer token. When set every HTTP request must carry it. Recommended;
+    /// required when `bind` is not a loopback address.
     pub token: Option<String>,
-    /// Allow CORS from browsers (useful for local web agents).
+    /// Allow CORS from browsers (useful for local web agents). Only takes
+    /// effect when `token` is set, so web pages cannot drive the API.
     pub cors: bool,
 }
 
@@ -253,7 +255,7 @@ impl Default for MarkupConfig {
 
 impl Default for ApiConfig {
     fn default() -> Self {
-        Self { bind: "127.0.0.1:4848".into(), token: None, cors: true }
+        Self { bind: "127.0.0.1:4848".into(), token: None, cors: false }
     }
 }
 
