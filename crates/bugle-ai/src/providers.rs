@@ -47,7 +47,10 @@ pub struct Provider {
     name: String,
     kind: Result<Kind, String>,
     cfg: ProviderConfig,
-    client: Client,
+    /// The HTTP client, or why it could not be built (reported at call time
+    /// and by [`Provider::not_ready_reason`] rather than silently replaced by
+    /// a client without the configured timeout).
+    client: Result<Client, String>,
 }
 
 impl Provider {
@@ -55,7 +58,7 @@ impl Provider {
         let client = Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_seconds.max(5)))
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .map_err(|e| format!("could not build HTTP client: {e}"));
         let kind = Kind::parse(&cfg.kind).map_err(|e| e.to_string());
         Self { name, kind, cfg, client }
     }
@@ -79,14 +82,52 @@ impl Provider {
         self.cfg.base_url.clone().unwrap_or_default()
     }
 
+    /// Whether this provider can serve `role` right now: its kind offers the
+    /// role and every setting the kind needs is present.
     pub fn supports(&self, role: Role) -> bool {
-        match (&self.kind, role) {
-            (Ok(Kind::OpenAi), _) => true,
-            (Ok(Kind::Anthropic), Role::Vision | Role::Text) => true,
-            (Ok(Kind::Ollama), Role::Vision | Role::Text) => true,
-            (Ok(Kind::WhisperCpp), Role::Transcribe) => true,
-            (Ok(Kind::Command), _) => !self.cfg.command.is_empty(),
-            _ => false,
+        self.capable(role) && self.not_ready_reason().is_none()
+    }
+
+    /// Whether the provider's kind offers `role` at all, regardless of
+    /// whether the required settings are filled in.
+    pub fn capable(&self, role: Role) -> bool {
+        matches!(
+            (&self.kind, role),
+            (Ok(Kind::OpenAi), _)
+                | (Ok(Kind::Anthropic), Role::Vision | Role::Text)
+                | (Ok(Kind::Ollama), Role::Vision | Role::Text)
+                | (Ok(Kind::WhisperCpp), Role::Transcribe)
+                | (Ok(Kind::Command), _)
+        )
+    }
+
+    /// Why the provider cannot be used yet (missing settings, invalid kind…),
+    /// or `None` when it is ready.
+    pub fn not_ready_reason(&self) -> Option<String> {
+        let kind = match &self.kind {
+            Ok(k) => *k,
+            Err(e) => return Some(e.clone()),
+        };
+        let mut missing: Vec<&str> = vec![];
+        let has = |o: &Option<String>| o.as_deref().is_some_and(|s| !s.trim().is_empty());
+        if matches!(kind, Kind::OpenAi | Kind::Ollama | Kind::Anthropic | Kind::WhisperCpp) && !has(&self.cfg.base_url) {
+            missing.push("base_url");
+        }
+        if matches!(kind, Kind::OpenAi | Kind::Ollama | Kind::Anthropic) && !has(&self.cfg.model) {
+            missing.push("model");
+        }
+        if kind == Kind::Anthropic && self.cfg.resolve_api_key().is_none() {
+            missing.push("an API key (api_key_env or api_key)");
+        }
+        if kind == Kind::Command && self.cfg.command.first().is_none_or(|p| p.trim().is_empty()) {
+            missing.push("command");
+        }
+        if !missing.is_empty() {
+            return Some(format!("missing {}", missing.join(", ")));
+        }
+        match &self.client {
+            Err(e) if kind != Kind::Command => Some(e.clone()),
+            _ => None,
         }
     }
 
@@ -103,12 +144,13 @@ impl Provider {
         self.cfg.model.as_deref().ok_or_else(|| anyhow!("provider '{}' has no model", self.name))
     }
 
-    fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
-        let mut rb = self.client.request(method, url);
+    fn request(&self, method: reqwest::Method, url: String) -> Result<reqwest::RequestBuilder> {
+        let client = self.client.as_ref().map_err(|e| anyhow!("provider '{}': {e}", self.name))?;
+        let mut rb = client.request(method, url);
         for (k, v) in &self.cfg.headers {
             rb = rb.header(k, v);
         }
-        rb
+        Ok(rb)
     }
 
     fn system_prompt<'a>(&'a self, explicit: Option<&'a str>) -> Option<&'a str> {
@@ -134,22 +176,17 @@ impl Provider {
             "max_tokens": self.cfg.max_tokens,
             "stream": false,
         });
-        let mut rb = self.request(reqwest::Method::POST, self.url("chat/completions")?).json(&body);
+        let mut rb = self.request(reqwest::Method::POST, self.url("chat/completions")?)?.json(&body);
         if let Some(key) = self.cfg.resolve_api_key() {
             rb = rb.bearer_auth(key);
         }
         let v: Value = send_json(rb).await?;
-        v["choices"][0]["message"]["content"]
-            .as_str()
-            .map(|s| s.trim().to_string())
-            .ok_or_else(|| anyhow!("unexpected chat response: {}", truncate(&v.to_string())))
+        openai_message_text(&v)
     }
 
     async fn openai_transcribe(&self, audio: &Path, language: Option<&str>) -> Result<Transcript> {
-        let bytes = tokio::fs::read(audio).await.with_context(|| format!("reading {}", audio.display()))?;
-        let filename = audio.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or("audio.m4a".into());
         let mut form = reqwest::multipart::Form::new()
-            .part("file", reqwest::multipart::Part::bytes(bytes).file_name(filename))
+            .part("file", file_part(audio).await?)
             .text("response_format", "verbose_json")
             .text("timestamp_granularities[]", "segment");
         if let Some(m) = &self.cfg.model {
@@ -158,7 +195,7 @@ impl Provider {
         if let Some(l) = language {
             form = form.text("language", l.to_string());
         }
-        let mut rb = self.request(reqwest::Method::POST, self.url("audio/transcriptions")?).multipart(form);
+        let mut rb = self.request(reqwest::Method::POST, self.url("audio/transcriptions")?)?.multipart(form);
         if let Some(key) = self.cfg.resolve_api_key() {
             rb = rb.bearer_auth(key);
         }
@@ -188,7 +225,7 @@ impl Provider {
             .resolve_api_key()
             .ok_or_else(|| anyhow!("provider '{}' needs an API key (api_key_env = \"ANTHROPIC_API_KEY\")", self.name))?;
         let rb = self
-            .request(reqwest::Method::POST, self.url("v1/messages")?)
+            .request(reqwest::Method::POST, self.url("v1/messages")?)?
             .header("x-api-key", key)
             .header("anthropic-version", "2023-06-01")
             .json(&body);
@@ -213,7 +250,7 @@ impl Provider {
         let imgs: Vec<String> = images.iter().map(|i| base64::engine::general_purpose::STANDARD.encode(&i.bytes)).collect();
         messages.push(json!({"role": "user", "content": prompt, "images": imgs}));
         let body = json!({"model": self.model_or_err()?, "messages": messages, "stream": false});
-        let v: Value = send_json(self.request(reqwest::Method::POST, self.url("api/chat")?).json(&body)).await?;
+        let v: Value = send_json(self.request(reqwest::Method::POST, self.url("api/chat")?)?.json(&body)).await?;
         v["message"]["content"]
             .as_str()
             .map(|s| s.trim().to_string())
@@ -223,16 +260,14 @@ impl Provider {
     // ---- whisper.cpp server -------------------------------------------------
 
     async fn whisper_cpp_transcribe(&self, audio: &Path, language: Option<&str>) -> Result<Transcript> {
-        let bytes = tokio::fs::read(audio).await.with_context(|| format!("reading {}", audio.display()))?;
-        let filename = audio.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or("audio.m4a".into());
         let mut form = reqwest::multipart::Form::new()
-            .part("file", reqwest::multipart::Part::bytes(bytes).file_name(filename))
+            .part("file", file_part(audio).await?)
             .text("response_format", "verbose_json")
             .text("temperature", "0.0");
         if let Some(l) = language {
             form = form.text("language", l.to_string());
         }
-        let rb = self.request(reqwest::Method::POST, self.url("inference")?).multipart(form);
+        let rb = self.request(reqwest::Method::POST, self.url("inference")?)?.multipart(form);
         let v: Value = send_json(rb).await?;
         Ok(parse_verbose_json(&v, &self.name))
     }
@@ -242,21 +277,30 @@ impl Provider {
     async fn run_command(&self, input: Option<&Path>, prompt: &str, language: Option<&str>, want_srt: bool) -> Result<String> {
         let tmp = tempfile::Builder::new().prefix("bugle-cmd-").tempdir()?;
         let output = tmp.path().join(if want_srt { "out.srt" } else { "out.txt" });
-        let subst = |s: &str| {
-            s.replace("{input}", &input.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default())
-                .replace("{output}", &output.to_string_lossy())
-                .replace("{prompt}", prompt)
-                .replace("{language}", language.unwrap_or("auto"))
-                .replace("{model}", self.cfg.model.as_deref().unwrap_or(""))
-        };
-        let argv: Vec<String> = self.cfg.command.iter().map(|a| subst(a)).collect();
+        let input_s = input.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let output_s = output.to_string_lossy().into_owned();
+        let vars = [
+            ("input", input_s.as_str()),
+            ("output", output_s.as_str()),
+            ("prompt", prompt),
+            ("language", language.unwrap_or("auto")),
+            ("model", self.cfg.model.as_deref().unwrap_or("")),
+        ];
+        let argv: Vec<String> = self.cfg.command.iter().map(|a| substitute(a, &vars)).collect();
         let (prog, args) = argv.split_first().ok_or_else(|| anyhow!("provider '{}' has an empty command", self.name))?;
         tracing::debug!("running {prog} {args:?}");
-        let out = tokio::process::Command::new(prog)
+        let limit = Duration::from_secs(self.cfg.timeout_seconds.max(1));
+        // `kill_on_drop` makes both the timeout below and a dropped request
+        // (the caller's future going away) terminate the child.
+        let child = tokio::process::Command::new(prog)
             .args(args)
-            .output()
-            .await
-            .with_context(|| format!("running {prog}"))?;
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        let out = match tokio::time::timeout(limit, child).await {
+            Ok(r) => r.with_context(|| format!("running {prog}"))?,
+            Err(_) => bail!("{prog} timed out after {}s (timeout_seconds)", limit.as_secs()),
+        };
         if !out.status.success() {
             bail!("{prog} exited with {}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim());
         }
@@ -340,12 +384,79 @@ async fn send_json(rb: reqwest::RequestBuilder) -> Result<Value> {
     serde_json::from_str(&text).with_context(|| format!("non-JSON response: {}", truncate(&text)))
 }
 
+/// Shorten `s` to at most 600 bytes for error messages, cutting on a
+/// character boundary.
 fn truncate(s: &str) -> String {
-    if s.len() > 600 {
-        format!("{}…", &s[..600])
-    } else {
-        s.to_string()
+    const MAX: usize = 600;
+    if s.len() <= MAX {
+        return s.to_string();
     }
+    let mut end = MAX;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+/// Replace `{name}` placeholders in one left-to-right pass, so text that a
+/// value brings in (a prompt containing `{output}`, say) is never expanded.
+/// Unknown placeholders are left as they are.
+fn substitute(template: &str, vars: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let hit = after
+            .find('}')
+            .and_then(|close| vars.iter().find(|(k, _)| *k == &after[..close]).map(|(_, v)| (close, *v)));
+        match hit {
+            Some((close, value)) => {
+                out.push_str(value);
+                rest = &after[close + 1..];
+            }
+            None => {
+                out.push('{');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A multipart file part that streams `path` from disk instead of reading it
+/// into memory.
+async fn file_part(path: &Path) -> Result<reqwest::multipart::Part> {
+    let file = tokio::fs::File::open(path).await.with_context(|| format!("opening {}", path.display()))?;
+    let len = file.metadata().await.with_context(|| format!("reading {}", path.display()))?.len();
+    let filename = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or("audio.m4a".into());
+    Ok(reqwest::multipart::Part::stream_with_length(reqwest::Body::from(file), len).file_name(filename))
+}
+
+/// The assistant text of an OpenAI-compatible chat completion. `content` may
+/// be a string, an array of content parts, or null alongside a `refusal`.
+fn openai_message_text(v: &Value) -> Result<String> {
+    let msg = &v["choices"][0]["message"];
+    match &msg["content"] {
+        Value::String(s) => return Ok(s.trim().to_string()),
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter(|p| p["type"].as_str().is_none_or(|t| t == "text" || t == "output_text"))
+                .filter_map(|p| p["text"].as_str().or_else(|| p["text"]["value"].as_str()).or_else(|| p.as_str()))
+                .collect::<Vec<_>>()
+                .join("");
+            if !text.trim().is_empty() {
+                return Ok(text.trim().to_string());
+            }
+        }
+        _ => {}
+    }
+    if let Some(refusal) = msg["refusal"].as_str().filter(|r| !r.is_empty()) {
+        bail!("the model refused: {}", truncate(refusal.trim()));
+    }
+    Err(anyhow!("unexpected chat response: {}", truncate(&v.to_string())))
 }
 
 /// Parse OpenAI/whisper.cpp `verbose_json`.
@@ -376,12 +487,27 @@ fn num(v: &Value) -> Option<f64> {
 }
 
 /// Parse SRT text into a transcript.
+///
+/// Cues are separated by blank lines (which may contain whitespace); cue
+/// settings after the end timestamp (`align:start` …) are ignored.
 pub fn parse_srt(srt: &str) -> Transcript {
     let mut segments = vec![];
-    for block in srt.replace("\r\n", "\n").split("\n\n") {
-        let lines: Vec<&str> = block.lines().collect();
+    let srt = srt.trim_start_matches('\u{feff}');
+    let mut blocks: Vec<Vec<&str>> = vec![vec![]];
+    for line in srt.lines() {
+        if line.trim().is_empty() {
+            if !blocks.last().is_some_and(|b| b.is_empty()) {
+                blocks.push(vec![]);
+            }
+        } else if let Some(b) = blocks.last_mut() {
+            b.push(line.trim_end());
+        }
+    }
+    for lines in blocks {
         let Some(ts_idx) = lines.iter().position(|l| l.contains("-->")) else { continue };
-        let (a, b) = lines[ts_idx].split_once("-->").unwrap();
+        let Some((a, b)) = lines[ts_idx].split_once("-->") else { continue };
+        let a = a.split_whitespace().last().unwrap_or("");
+        let b = b.split_whitespace().next().unwrap_or("");
         let (Some(start), Some(end)) = (parse_ts(a), parse_ts(b)) else { continue };
         let text = lines[ts_idx + 1..].join("\n").trim().to_string();
         if !text.is_empty() {
@@ -430,10 +556,203 @@ mod tests {
 
     #[test]
     fn roles() {
-        let p = crate::adhoc("anthropic", "https://api.anthropic.com", Some("m"));
+        let p = Provider::new(
+            "a".into(),
+            ProviderConfig {
+                kind: "anthropic".into(),
+                base_url: Some("https://api.anthropic.com".into()),
+                model: Some("m".into()),
+                api_key: Some("k".into()),
+                ..Default::default()
+            },
+        );
         assert!(p.supports(Role::Vision));
         assert!(!p.supports(Role::Transcribe));
         let w = crate::adhoc("whisper_cpp", "http://localhost:8178", None);
         assert!(w.supports(Role::Transcribe));
+    }
+
+    fn provider(cfg: ProviderConfig) -> Provider {
+        Provider::new("p".into(), cfg)
+    }
+
+    #[test]
+    fn readiness_reports_missing_settings() {
+        // openai without a model: capable of transcription, but not ready.
+        let p = crate::adhoc("openai", "http://127.0.0.1:1", None);
+        assert!(p.capable(Role::Transcribe));
+        assert!(!p.supports(Role::Transcribe));
+        assert!(p.not_ready_reason().unwrap().contains("model"));
+
+        let o = provider(ProviderConfig { kind: "ollama".into(), ..Default::default() });
+        let r = o.not_ready_reason().unwrap();
+        assert!(r.contains("base_url") && r.contains("model"), "{r}");
+        assert!(!o.supports(Role::Vision));
+
+        let a = provider(ProviderConfig {
+            kind: "anthropic".into(),
+            base_url: Some("https://x".into()),
+            model: Some("m".into()),
+            api_key_env: Some("BUGLE_TEST_SURELY_UNSET_KEY".into()),
+            ..Default::default()
+        });
+        assert!(a.not_ready_reason().unwrap().contains("API key"));
+
+        let c = provider(ProviderConfig { kind: "command".into(), ..Default::default() });
+        assert!(!c.supports(Role::Text));
+        assert!(provider(ProviderConfig { kind: "bogus".into(), ..Default::default() }).not_ready_reason().is_some());
+
+        let mut cfg = bugle_core::config::AiConfig::default();
+        cfg.providers.insert("o".into(), ProviderConfig { kind: "ollama".into(), ..Default::default() });
+        cfg.providers.insert("w".into(), ProviderConfig { kind: "whisper".into(), base_url: Some("http://x".into()), ..Default::default() });
+        cfg.default_vision = Some("o".into());
+        let reg = crate::Registry::from_config(&cfg);
+        let all = reg.describe_all();
+        assert_eq!(all[0]["name"], "o");
+        assert_eq!(all[0]["ready"], false);
+        assert!(all[0]["reason"].as_str().unwrap().contains("model"));
+        assert_eq!(all[0]["roles"], json!(["vision", "text"]));
+        assert_eq!(all[0]["default_for"], json!(["vision"]));
+        assert_eq!(all[1]["ready"], true);
+        assert!(all[1]["reason"].is_null());
+        let err = reg.resolve(None, Role::Vision).err().unwrap().to_string();
+        assert!(err.contains("not ready"), "{err}");
+        assert!(reg.resolve(Some("w"), Role::Transcribe).is_ok());
+    }
+
+    #[test]
+    fn truncate_respects_char_boundaries() {
+        let s = format!("{}é{}", "a".repeat(599), "b".repeat(50));
+        let t = truncate(&s);
+        assert!(t.ends_with('…'));
+        assert_eq!(t.trim_end_matches('…'), "a".repeat(599));
+        let emoji = "🙂".repeat(300);
+        assert!(truncate(&emoji).len() <= 600 + '…'.len_utf8());
+        assert_eq!(truncate("short"), "short");
+    }
+
+    #[test]
+    fn substitute_is_single_pass() {
+        let vars = [("prompt", "say {output} and {model}"), ("output", "/tmp/o"), ("model", "m")];
+        assert_eq!(substitute("{prompt}", &vars), "say {output} and {model}");
+        assert_eq!(substitute("-o={output} -m {model}", &vars), "-o=/tmp/o -m m");
+        assert_eq!(substitute("{unknown} {{output}} {", &vars), "{unknown} {/tmp/o} {");
+    }
+
+    #[tokio::test]
+    async fn command_prompt_placeholders_are_not_expanded() {
+        let p = provider(ProviderConfig {
+            kind: "command".into(),
+            model: Some("MODEL".into()),
+            command: vec!["printf".into(), "%s".into(), "{prompt}|{model}".into()],
+            ..Default::default()
+        });
+        let out = p.complete("x {output} {language} {model}", None).await.unwrap();
+        assert_eq!(out, "x {output} {language} {model}|MODEL");
+    }
+
+    #[tokio::test]
+    async fn command_times_out_and_is_killed() {
+        let p = provider(ProviderConfig {
+            kind: "command".into(),
+            timeout_seconds: 1,
+            command: vec!["sleep".into(), "30".into()],
+            ..Default::default()
+        });
+        let started = std::time::Instant::now();
+        let err = p.complete("hi", None).await.unwrap_err().to_string();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn srt_whitespace_separators_and_cue_settings() {
+        let srt = "\u{feff}1\r\n00:01.000 --> 00:02.000 align:start position:10%\r\nOne\r\n  \r\n2\n00:00:03,000 --> 00:00:04,500\nTwo\nlines\n\t\n\n3\n00:05.000-->00:06.000\nThree\n";
+        let t = parse_srt(srt);
+        assert_eq!(t.segments.len(), 3, "{:?}", t.segments.iter().map(|s| &s.text).collect::<Vec<_>>());
+        assert_eq!((t.segments[0].start, t.segments[0].end), (1.0, 2.0));
+        assert_eq!(t.segments[0].text, "One");
+        assert_eq!((t.segments[1].start, t.segments[1].end), (3.0, 4.5));
+        assert_eq!(t.segments[1].text, "Two\nlines");
+        assert_eq!((t.segments[2].start, t.segments[2].end), (5.0, 6.0));
+    }
+
+    #[test]
+    fn openai_content_shapes() {
+        let s = json!({"choices":[{"message":{"content":" hi "}}]});
+        assert_eq!(openai_message_text(&s).unwrap(), "hi");
+        let parts = json!({"choices":[{"message":{"content":[{"type":"text","text":"a "},{"type":"image_url","image_url":{}},{"type":"text","text":"b"}]}}]});
+        assert_eq!(openai_message_text(&parts).unwrap(), "a b");
+        let refusal = json!({"choices":[{"message":{"content":null,"refusal":"I can't help with that."}}]});
+        let e = openai_message_text(&refusal).unwrap_err().to_string();
+        assert!(e.contains("refused") && e.contains("can't help"), "{e}");
+        assert!(openai_message_text(&json!({"x":1})).unwrap_err().to_string().contains("unexpected chat response"));
+    }
+
+    // ---- local HTTP server tests -------------------------------------------
+
+    use axum::extract::{Multipart, State};
+    use axum::routing::post;
+    use std::sync::{Arc, Mutex};
+
+    async fn serve(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn openai_chat_over_http() {
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            post(|axum::Json(body): axum::Json<Value>| async move {
+                let prompt = body["messages"][0]["content"][0]["text"].as_str().unwrap_or("").to_string();
+                match prompt.as_str() {
+                    "parts" => (axum::http::StatusCode::OK, axum::Json(json!({"choices":[{"message":{"content":[{"type":"text","text":"from parts"}]}}]}))),
+                    "refuse" => (axum::http::StatusCode::OK, axum::Json(json!({"choices":[{"message":{"content":null,"refusal":"no"}}]}))),
+                    // An error body whose byte 600 falls inside a multi-byte character.
+                    _ => (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({"error": format!("{}{}", "x".repeat(587), "é".repeat(400))}))),
+                }
+            }),
+        );
+        let base = serve(app).await;
+        let p = crate::adhoc("openai", &base, Some("m"));
+        assert_eq!(p.complete("parts", None).await.unwrap(), "from parts");
+        assert!(p.complete("refuse", None).await.unwrap_err().to_string().contains("refused"));
+        let e = p.complete("boom", None).await.unwrap_err().to_string();
+        assert!(e.contains("HTTP 400") && e.ends_with('…'), "{e}");
+    }
+
+    #[tokio::test]
+    async fn transcription_upload_streams_file() {
+        type Seen = Arc<Mutex<Option<(String, Vec<u8>)>>>;
+        let seen: Seen = Arc::default();
+        let app = axum::Router::new()
+            .route(
+                "/audio/transcriptions",
+                post(|State(seen): State<Seen>, mut mp: Multipart| async move {
+                    while let Some(field) = mp.next_field().await.unwrap() {
+                        if field.name() == Some("file") {
+                            let name = field.file_name().unwrap_or("").to_string();
+                            let bytes = field.bytes().await.unwrap().to_vec();
+                            *seen.lock().unwrap() = Some((name, bytes));
+                        }
+                    }
+                    axum::Json(json!({"text":"hello","segments":[{"start":0.0,"end":1.0,"text":"hello"}]}))
+                }),
+            )
+            .with_state(seen.clone());
+        let base = serve(app).await;
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("clip.wav");
+        let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&audio, &payload).unwrap();
+        let p = crate::adhoc("openai", &base, Some("whisper-1"));
+        let t = p.transcribe(&audio, None).await.unwrap();
+        assert_eq!(t.text, "hello");
+        let (name, bytes) = seen.lock().unwrap().take().unwrap();
+        assert_eq!(name, "clip.wav");
+        assert_eq!(bytes, payload);
     }
 }
