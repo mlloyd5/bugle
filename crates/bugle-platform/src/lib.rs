@@ -17,6 +17,9 @@ use std::path::Path;
 #[cfg(not(target_os = "macos"))]
 compile_error!("bugle-platform currently supports macOS only");
 
+/// Takes the shim's error for the current thread. The shim keeps one error
+/// per thread, so this must run on the thread that made the failing call,
+/// before any other shim call on it.
 fn last_error() -> String {
     unsafe {
         let p = ffi::bugle_last_error();
@@ -42,10 +45,40 @@ fn take_image(mut img: ffi::bugle_image_t) -> Result<RgbaImage> {
         bail!("{e}");
     }
     let (w, h) = (img.width as u32, img.height as u32);
-    let len = (w as usize) * (h as usize) * 4;
+    let Some(len) = rgba_len(w, h) else {
+        unsafe { ffi::bugle_image_free(&mut img) };
+        bail!("platform returned an image of impossible size {w}x{h}");
+    };
     let buf = unsafe { std::slice::from_raw_parts(img.data, len) }.to_vec();
     unsafe { ffi::bugle_image_free(&mut img) };
     RgbaImage::from_raw(w, h, buf).ok_or_else(|| anyhow!("bad image buffer"))
+}
+
+/// Largest capture side the shim accepts, in points (and in pixels for the
+/// ScreenCaptureKit configuration). Mirrors `BUGLE_MAX_PX` in shim.m.
+const MAX_CAPTURE_SIDE: f64 = 16384.0;
+
+/// Byte length of a `w` x `h` RGBA8 image, or `None` when it overflows.
+fn rgba_len(w: u32, h: u32) -> Option<usize> {
+    (w as usize).checked_mul(h as usize)?.checked_mul(4)
+}
+
+/// Validates an RGBA8 image for the FFI: both sides positive and within
+/// `i32`, and the buffer at least `w * h * 4` bytes long.
+fn ffi_dims(w: u32, h: u32, buf_len: usize) -> Result<(i32, i32)> {
+    if w == 0 || h == 0 {
+        return Err(BugleError::Invalid(format!("empty image ({w}x{h})")).into());
+    }
+    let (Ok(wi), Ok(hi)) = (i32::try_from(w), i32::try_from(h)) else {
+        return Err(BugleError::Invalid(format!("image too large ({w}x{h})")).into());
+    };
+    match rgba_len(w, h) {
+        Some(need) if buf_len >= need => Ok((wi, hi)),
+        Some(need) => {
+            Err(BugleError::Invalid(format!("image buffer is {buf_len} bytes, {w}x{h} needs {need}")).into())
+        }
+        None => Err(BugleError::Invalid(format!("image too large ({w}x{h})")).into()),
+    }
 }
 
 fn cstr(s: &str) -> Result<CString> {
@@ -111,12 +144,24 @@ fn c_field(buf: &[libc::c_char]) -> String {
 /// Windows known to the window server. Titles are only populated when the
 /// process has Screen Recording access (macOS privacy rule).
 pub fn windows(on_screen_only: bool) -> Result<Vec<WindowInfo>> {
-    let mut buf: Vec<ffi::bugle_window_t> = Vec::with_capacity(1024);
-    let n = unsafe { ffi::bugle_list_windows(buf.as_mut_ptr(), 1024, on_screen_only as i32) };
-    if n < 0 {
-        bail!("could not enumerate windows");
-    }
-    unsafe { buf.set_len(n as usize) };
+    // SAFETY: an all-zero bugle_window_t is valid (integers, floats, char arrays).
+    let zero: ffi::bugle_window_t = unsafe { std::mem::zeroed() };
+    let mut cap = 512usize;
+    let buf = loop {
+        let mut buf = vec![zero; cap];
+        let total = unsafe { ffi::bugle_list_windows(buf.as_mut_ptr(), cap as i32, on_screen_only as i32) };
+        if total < 0 {
+            bail!("could not enumerate windows");
+        }
+        let total = total as usize;
+        if total <= cap {
+            buf.truncate(total);
+            break buf;
+        }
+        // More windows than room: grow (with slack, the list can change
+        // between calls) and ask again.
+        cap = total + total / 4 + 16;
+    };
     Ok(buf
         .iter()
         .map(|w| WindowInfo {
@@ -148,8 +193,14 @@ pub fn capture_display(display_id: Option<u32>, show_cursor: bool) -> Result<Rgb
 }
 
 pub fn capture_area(rect: Rect, show_cursor: bool) -> Result<RgbaImage> {
+    if ![rect.x, rect.y, rect.w, rect.h].iter().all(|v| v.is_finite()) {
+        return Err(BugleError::Invalid(format!("non-finite capture rect {rect}")).into());
+    }
     if rect.is_empty() {
         return Err(BugleError::Invalid("empty capture rect".into()).into());
+    }
+    if rect.w > MAX_CAPTURE_SIDE || rect.h > MAX_CAPTURE_SIDE {
+        return Err(BugleError::Invalid(format!("capture rect {rect} exceeds {MAX_CAPTURE_SIDE} points per side")).into());
     }
     take_image(unsafe { ffi::bugle_capture_area(rect.x, rect.y, rect.w, rect.h, show_cursor as i32) })
 }
@@ -171,14 +222,16 @@ pub struct OcrParams<'a> {
 /// Apple Vision text recognition. Bounding boxes are returned in image
 /// pixels with a top-left origin, reading order top to bottom.
 pub fn ocr(img: &RgbaImage, params: &OcrParams) -> Result<Vec<OcrLine>> {
+    let (w, h) = ffi_dims(img.width(), img.height(), img.as_raw().len())?;
     let langs = cstr(&params.languages.join(","))?;
     let mut lines: *mut ffi::bugle_ocr_line_t = std::ptr::null_mut();
     let mut count: i32 = 0;
     let rc = unsafe {
         ffi::bugle_ocr(
             img.as_raw().as_ptr(),
-            img.width() as i32,
-            img.height() as i32,
+            img.as_raw().len(),
+            w,
+            h,
             langs.as_ptr(),
             params.accurate as i32,
             params.language_correction as i32,
@@ -189,10 +242,18 @@ pub fn ocr(img: &RgbaImage, params: &OcrParams) -> Result<Vec<OcrLine>> {
     if rc != 0 {
         bail!("{}", last_error());
     }
+    if lines.is_null() || count <= 0 {
+        unsafe { ffi::bugle_ocr_free(lines, count.max(0)) };
+        return Ok(Vec::new());
+    }
     let mut out = Vec::with_capacity(count as usize);
     for i in 0..count as usize {
         let l = unsafe { &*lines.add(i) };
-        let text = unsafe { CStr::from_ptr(l.text) }.to_string_lossy().into_owned();
+        let text = if l.text.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(l.text) }.to_string_lossy().into_owned()
+        };
         out.push(OcrLine { text, bbox: Rect::new(l.x, l.y, l.w, l.h), confidence: l.confidence });
     }
     unsafe { ffi::bugle_ocr_free(lines, count) };
@@ -219,15 +280,19 @@ pub fn sort_reading_order(lines: &mut [OcrLine]) {
 /// Translation (dx, dy) in pixels that aligns `floating` onto `reference`,
 /// via `VNTranslationalImageRegistrationRequest`.
 pub fn register_translation(reference: &RgbaImage, floating: &RgbaImage) -> Result<(f64, f64)> {
+    let (rw, rh) = ffi_dims(reference.width(), reference.height(), reference.as_raw().len())?;
+    let (fw, fh) = ffi_dims(floating.width(), floating.height(), floating.as_raw().len())?;
     let (mut dx, mut dy) = (0.0, 0.0);
     let rc = unsafe {
         ffi::bugle_register_translation(
             reference.as_raw().as_ptr(),
-            reference.width() as i32,
-            reference.height() as i32,
+            reference.as_raw().len(),
+            rw,
+            rh,
             floating.as_raw().as_ptr(),
-            floating.width() as i32,
-            floating.height() as i32,
+            floating.as_raw().len(),
+            fw,
+            fh,
             &mut dx,
             &mut dy,
         )
@@ -550,6 +615,136 @@ mod tests {
         let (dx, dy) = register_translation(&base, &shifted).expect("registration");
         assert!(dx.abs() < 1.5, "dx={dx}");
         assert!((dy.abs() - shift as f64).abs() < 1.5, "dy={dy}");
+    }
+
+    fn invalid_msg(e: &anyhow::Error) -> String {
+        match e.downcast_ref::<BugleError>() {
+            Some(BugleError::Invalid(m)) => m.clone(),
+            other => panic!("expected BugleError::Invalid, got {other:?} / {e}"),
+        }
+    }
+
+    #[test]
+    fn ffi_dims_validation() {
+        assert_eq!(ffi_dims(4, 3, 48).unwrap(), (4, 3));
+        assert_eq!(ffi_dims(4, 3, 64).unwrap(), (4, 3));
+        assert!(invalid_msg(&ffi_dims(0, 3, 0).unwrap_err()).contains("empty"));
+        assert!(invalid_msg(&ffi_dims(4, 3, 47).unwrap_err()).contains("needs 48"));
+        let big = i32::MAX as u32 + 1;
+        assert!(invalid_msg(&ffi_dims(big, 1, usize::MAX).unwrap_err()).contains("too large"));
+        assert!(invalid_msg(&ffi_dims(1, big, usize::MAX).unwrap_err()).contains("too large"));
+        assert_eq!(rgba_len(u32::MAX, u32::MAX), None);
+        assert_eq!(rgba_len(70_000, 70_000), Some(70_000 * 70_000 * 4));
+    }
+
+    #[test]
+    fn ocr_and_registration_reject_empty_images() {
+        let empty = RgbaImage::new(0, 0);
+        let ok = RgbaImage::new(8, 8);
+        let p = OcrParams { languages: &[], accurate: false, language_correction: false };
+        invalid_msg(&ocr(&empty, &p).unwrap_err());
+        invalid_msg(&register_translation(&empty, &ok).unwrap_err());
+        invalid_msg(&register_translation(&ok, &empty).unwrap_err());
+    }
+
+    #[test]
+    fn capture_area_rejects_bad_rects() {
+        for r in [
+            Rect::new(f64::NAN, 0.0, 10.0, 10.0),
+            Rect::new(0.0, f64::INFINITY, 10.0, 10.0),
+            Rect::new(0.0, 0.0, f64::NAN, 10.0),
+            Rect::new(0.0, 0.0, 10.0, f64::NEG_INFINITY),
+            Rect::new(0.0, 0.0, 0.0, 10.0),
+            Rect::new(0.0, 0.0, 20000.0, 10.0),
+            Rect::new(0.0, 0.0, 10.0, 1e300),
+        ] {
+            invalid_msg(&capture_area(r, false).unwrap_err());
+        }
+    }
+
+    #[test]
+    fn shim_rejects_bad_inputs() {
+        // Bypass the Rust-side checks to exercise the shim's own validation.
+        unsafe {
+            for (x, y, w, h) in [(f64::NAN, 0.0, 10.0, 10.0), (0.0, 0.0, f64::INFINITY, 10.0), (0.0, 0.0, 1e9, 10.0)] {
+                let img = ffi::bugle_capture_area(x, y, w, h, 0);
+                assert!(img.data.is_null());
+                assert!(last_error().contains("invalid capture area"));
+            }
+            let buf = [0u8; 16];
+            let (mut lines, mut count) = (std::ptr::null_mut(), 0);
+            let langs = CString::new("").unwrap();
+            // 4x4 needs 64 bytes; 16 are given.
+            let rc = ffi::bugle_ocr(buf.as_ptr(), buf.len(), 4, 4, langs.as_ptr(), 0, 0, &mut lines, &mut count);
+            assert_eq!(rc, -1);
+            assert!(lines.is_null());
+            assert!(last_error().contains("OCR: invalid image"));
+            let rc = ffi::bugle_ocr(buf.as_ptr(), buf.len(), i32::MAX, i32::MAX, langs.as_ptr(), 0, 0, &mut lines, &mut count);
+            assert_eq!(rc, -1);
+            assert!(last_error().contains("OCR: invalid image"));
+            let (mut dx, mut dy) = (0.0, 0.0);
+            let rc = ffi::bugle_register_translation(buf.as_ptr(), 16, 2, 2, buf.as_ptr(), 15, 2, 2, &mut dx, &mut dy);
+            assert_eq!(rc, -1);
+            assert!(last_error().contains("registration: invalid image"));
+            // The error was handed over: nothing left for this thread.
+            assert_eq!(last_error(), "unknown platform error");
+        }
+    }
+
+    /// Hammers capture/OCR from many threads with valid and invalid input
+    /// and checks every error is the one its own call produced.
+    #[test]
+    fn concurrent_calls_keep_errors_per_thread() {
+        let screen = screen_access_preflight();
+        if !screen {
+            eprintln!("Screen Recording not granted: skipping the capture part of this test");
+        }
+        let threads: Vec<_> = (1..=8u32)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    let mut text = RgbaImage::from_pixel(96, 48, image::Rgba([255, 255, 255, 255]));
+                    for (x, y, p) in text.enumerate_pixels_mut() {
+                        if (x / 6 + y / 6 + t) % 3 == 0 {
+                            *p = image::Rgba([0, 0, 0, 255]);
+                        }
+                    }
+                    let langs = CString::new("").unwrap();
+                    for i in 0..6u32 {
+                        // Invalid OCR whose message names this thread's size.
+                        let w = (1000 * t + i) as i32;
+                        let buf = [0u8; 4];
+                        let (mut lines, mut count) = (std::ptr::null_mut(), 0);
+                        let rc = unsafe {
+                            ffi::bugle_ocr(buf.as_ptr(), buf.len(), w, 7, langs.as_ptr(), 0, 0, &mut lines, &mut count)
+                        };
+                        assert_eq!(rc, -1);
+                        let e = last_error();
+                        assert!(e.contains(&format!("({w}x7, 4 bytes)")), "thread {t} got foreign error {e:?}");
+
+                        // Valid OCR must succeed regardless of other threads' errors.
+                        let p = OcrParams { languages: &[], accurate: false, language_correction: false };
+                        ocr(&text, &p).expect("valid OCR");
+
+                        // Invalid capture whose message names this thread's x.
+                        let x = (t * 100 + i) as f64;
+                        let img = unsafe { ffi::bugle_capture_area(x, 0.0, f64::NAN, 10.0, 0) };
+                        assert!(img.data.is_null());
+                        let e = last_error();
+                        assert!(e.contains(&format!("invalid capture area {x},0 ")), "thread {t} got foreign error {e:?}");
+
+                        if screen {
+                            let img = capture_area(Rect::new(0.0, 0.0, 40.0 + t as f64, 30.0), false).expect("capture");
+                            assert!(img.width() > 0 && img.height() > 0);
+                            assert!(capture_window(u32::MAX - t, false, false).is_err());
+                            windows(true).expect("windows");
+                        }
+                    }
+                })
+            })
+            .collect();
+        for th in threads {
+            th.join().expect("worker thread panicked");
+        }
     }
 
     #[test]

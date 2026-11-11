@@ -17,18 +17,34 @@
 // Errors / memory
 // ---------------------------------------------------------------------------
 
-static NSString *g_last_error = nil;
+// The last error is per thread: the engine calls into the shim from many
+// threads at once, and each caller reads the error on the thread that made the
+// failing call. A plain malloc'd C string (no ARC object) so nothing is shared.
+static _Thread_local char *t_last_error = NULL;
+
+static void clear_error(void) {
+    free(t_last_error);
+    t_last_error = NULL;
+}
+
+static BOOL has_error(void) { return t_last_error != NULL; }
 
 static void set_error(NSString *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    g_last_error = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
+    const char *u = s.UTF8String;
+    free(t_last_error);
+    t_last_error = strdup(u ? u : "unknown error");
 }
 
+/// Hands the calling thread's last error to the caller (free with
+/// `bugle_free`) and clears it. NULL when there is none.
 char *bugle_last_error(void) {
-    if (!g_last_error) return NULL;
-    return strdup(g_last_error.UTF8String);
+    char *e = t_last_error;
+    t_last_error = NULL;
+    return e;
 }
 
 void bugle_free(void *p) { free(p); }
@@ -45,18 +61,32 @@ void bugle_image_free(bugle_image_t *img) {
 // Image conversion
 // ---------------------------------------------------------------------------
 
+// Largest image side accepted from or handed to the frameworks, in pixels.
+#define BUGLE_MAX_PX 16384
+
+/// Byte length of a w x h RGBA8 image, or 0 when the size is not positive or
+/// does not fit (each side must fit in int32_t; the product must fit size_t).
+static size_t rgba_len(int64_t w, int64_t h) {
+    if (w <= 0 || h <= 0 || w > INT32_MAX || h > INT32_MAX) return 0;
+    if ((uint64_t)w > SIZE_MAX / 4 / (uint64_t)h) return 0;
+    return (size_t)w * (size_t)h * 4;
+}
+
 static bugle_image_t cg_to_rgba(CGImageRef img) {
     bugle_image_t out = {0};
     if (!img) return out;
     size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
-    if (w == 0 || h == 0) return out;
+    if (w > INT32_MAX || h > INT32_MAX || rgba_len((int64_t)w, (int64_t)h) == 0) {
+        set_error(@"image of %zux%zu pixels is too large", w, h);
+        return out;
+    }
     uint8_t *buf = calloc(w * h * 4, 1);
-    if (!buf) return out;
+    if (!buf) { set_error(@"out of memory for a %zux%zu image", w, h); return out; }
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, w * 4, cs,
                                              kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
     CGColorSpaceRelease(cs);
-    if (!ctx) { free(buf); return out; }
+    if (!ctx) { free(buf); set_error(@"could not create a %zux%zu bitmap context", w, h); return out; }
     CGContextSetBlendMode(ctx, kCGBlendModeCopy);
     CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img);
     CGContextRelease(ctx);
@@ -76,9 +106,13 @@ static bugle_image_t cg_to_rgba(CGImageRef img) {
     return out;
 }
 
-static CGImageRef cg_from_rgba(const uint8_t *rgba, int32_t w, int32_t h) {
-    if (!rgba || w <= 0 || h <= 0) return NULL;
-    CFDataRef d = CFDataCreate(NULL, rgba, (CFIndex)w * h * 4);
+/// Wraps a caller-supplied RGBA8 buffer. NULL when the pointer is NULL, the
+/// size is not positive, or `len` is shorter than `w * h * 4`.
+static CGImageRef cg_from_rgba(const uint8_t *rgba, size_t len, int32_t w, int32_t h) {
+    size_t need = rgba_len(w, h);
+    if (!rgba || need == 0 || len < need || need > (size_t)LONG_MAX) return NULL;
+    CFDataRef d = CFDataCreate(NULL, rgba, (CFIndex)need);
+    if (!d) return NULL;
     CGDataProviderRef p = CGDataProviderCreateWithCFData(d);
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGImageRef img = CGImageCreate(w, h, 8, 32, (size_t)w * 4, cs,
@@ -97,6 +131,8 @@ static CGImageRef cg_from_rgba(const uint8_t *rgba, int32_t w, int32_t h) {
 int32_t bugle_screen_access_preflight(void) { return CGPreflightScreenCaptureAccess() ? 1 : 0; }
 int32_t bugle_screen_access_request(void) { return CGRequestScreenCaptureAccess() ? 1 : 0; }
 
+// Called from arbitrary threads. AXIsProcessTrustedWithOptions is a plain
+// C call into the accessibility server and needs no main-thread hop.
 int32_t bugle_accessibility_trusted(int32_t prompt) {
     NSDictionary *opts = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt : @(prompt != 0)};
     return AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts) ? 1 : 0;
@@ -124,12 +160,25 @@ int32_t bugle_list_displays(bugle_display_t *out, int32_t max) {
     return count;
 }
 
+/// Copies `s` as NUL-terminated UTF-8, truncating at a character boundary so a
+/// multi-byte sequence is never cut in half.
 static void copy_str(char *dst, size_t cap, NSString *s) {
-    if (!s) { dst[0] = 0; return; }
-    strncpy(dst, s.UTF8String ?: "", cap - 1);
-    dst[cap - 1] = 0;
+    if (cap == 0) return;
+    const char *src = [s isKindOfClass:[NSString class]] ? s.UTF8String : NULL;
+    if (!src) { dst[0] = 0; return; }
+    size_t n = strlen(src);
+    if (n > cap - 1) {
+        n = cap - 1;
+        // Back off to the start of the sequence that straddles the limit.
+        while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80) n--;
+    }
+    memcpy(dst, src, n);
+    dst[n] = 0;
 }
 
+/// Writes up to `max` windows to `out` and returns the total number of
+/// windows found (which may exceed `max`; the caller grows and retries).
+/// `out` may be NULL when `max` is 0.
 int32_t bugle_list_windows(bugle_window_t *out, int32_t max, int32_t on_screen_only) {
     CGWindowListOption opt = kCGWindowListExcludeDesktopElements;
     if (on_screen_only) opt |= kCGWindowListOptionOnScreenOnly;
@@ -137,8 +186,10 @@ int32_t bugle_list_windows(bugle_window_t *out, int32_t max, int32_t on_screen_o
     if (!list) return -1;
     int32_t count = 0;
     NSArray *arr = CFBridgingRelease(list);
+    if (!out || max < 0) max = 0;
     for (NSDictionary *w in arr) {
-        if (count >= max) break;
+        if (count == INT32_MAX) break;
+        if (count >= max) { count++; continue; }
         bugle_window_t win;
         memset(&win, 0, sizeof win);
         win.id = [w[(__bridge NSString *)kCGWindowNumber] unsignedIntValue];
@@ -173,6 +224,9 @@ static SCShareableContent *sck_content(void) {
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     __block SCShareableContent *content = nil;
     __block NSError *err = nil;
+    // On timeout the handler may still run later; its writes go to the
+    // heap-held __block storage and are released by ARC with it, so a late
+    // delivery leaks nothing and nobody reads it.
     [SCShareableContent getShareableContentExcludingDesktopWindows:NO
                                               onScreenWindowsOnly:YES
                                                 completionHandler:^(SCShareableContent *c, NSError *e) {
@@ -190,6 +244,11 @@ static SCShareableContent *sck_content(void) {
 
 static CGImageRef sck_screenshot(SCContentFilter *filter, CGSize pixelSize, BOOL hasSource, CGRect sourceRect,
                                  BOOL showCursor, BOOL ignoreShadow) {
+    if (!isfinite(pixelSize.width) || !isfinite(pixelSize.height) || pixelSize.width < 0.5 ||
+        pixelSize.height < 0.5 || pixelSize.width > BUGLE_MAX_PX || pixelSize.height > BUGLE_MAX_PX) {
+        set_error(@"capture size %.0fx%.0f px is outside 1...%d", pixelSize.width, pixelSize.height, BUGLE_MAX_PX);
+        return NULL;
+    }
     SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
     cfg.width = (size_t)llround(pixelSize.width);
     cfg.height = (size_t)llround(pixelSize.height);
@@ -201,16 +260,31 @@ static CGImageRef sck_screenshot(SCContentFilter *filter, CGSize pixelSize, BOOL
     cfg.shouldBeOpaque = NO;
     if (hasSource) cfg.sourceRect = sourceRect;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    // The completion handler can fire after we gave up waiting. `abandoned`
+    // (guarded by `guard`) tells it not to retain an image nobody will release.
+    NSObject *guard = [[NSObject alloc] init];
+    __block BOOL abandoned = NO;
     __block CGImageRef out = NULL;
     __block NSError *err = nil;
     [SCScreenshotManager captureImageWithFilter:filter
                                   configuration:cfg
                               completionHandler:^(CGImageRef img, NSError *e) {
-        if (img) out = CGImageRetain(img);
-        err = e;
+        @synchronized (guard) {
+            if (!abandoned) {
+                if (img) out = CGImageRetain(img);
+                err = e;
+            }
+        }
         dispatch_semaphore_signal(sem);
     }];
     if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC)) != 0) {
+        CGImageRef late = NULL;
+        @synchronized (guard) {
+            abandoned = YES;
+            late = out;  // non-NULL only if the handler ran just before this
+            out = NULL;
+        }
+        if (late) return late;
         set_error(@"ScreenCaptureKit: screenshot timed out");
         return NULL;
     }
@@ -237,7 +311,7 @@ static CGDirectDisplayID display_for_rect(CGRect r) {
 
 bugle_image_t bugle_capture_display(uint32_t display_id, int32_t show_cursor) {
     @autoreleasepool {
-        g_last_error = nil;
+        clear_error();
         if (display_id == 0) display_id = CGMainDisplayID();
         CGImageRef img = NULL;
         if (sck_available()) {
@@ -252,7 +326,7 @@ bugle_image_t bugle_capture_display(uint32_t display_id, int32_t show_cursor) {
             }
         }
         if (!img) img = CGDisplayCreateImage(display_id);
-        if (!img) { if (!g_last_error) set_error(@"display %u could not be captured", display_id); return (bugle_image_t){0}; }
+        if (!img) { if (!has_error()) set_error(@"display %u could not be captured", display_id); return (bugle_image_t){0}; }
         bugle_image_t out = cg_to_rgba(img);
         CGImageRelease(img);
         return out;
@@ -261,7 +335,15 @@ bugle_image_t bugle_capture_display(uint32_t display_id, int32_t show_cursor) {
 
 bugle_image_t bugle_capture_area(double x, double y, double w, double h, int32_t show_cursor) {
     @autoreleasepool {
-        g_last_error = nil;
+        clear_error();
+        // Reject NaN/infinite or absurd rects before they reach llround() and
+        // SCStreamConfiguration (llround(NaN) is undefined).
+        if (!isfinite(x) || !isfinite(y) || !isfinite(w) || !isfinite(h) || w <= 0 || h <= 0 ||
+            w > BUGLE_MAX_PX || h > BUGLE_MAX_PX) {
+            set_error(@"invalid capture area %g,%g %gx%g (sides must be finite and in (0, %d] points)", x, y, w, h,
+                      BUGLE_MAX_PX);
+            return (bugle_image_t){0};
+        }
         CGRect rect = CGRectMake(x, y, w, h);
         CGImageRef img = NULL;
         CGDirectDisplayID did = display_for_rect(rect);
@@ -282,7 +364,7 @@ bugle_image_t bugle_capture_area(double x, double y, double w, double h, int32_t
             img = CGWindowListCreateImage(rect, kCGWindowListOptionOnScreenOnly, kCGNullWindowID,
                                           kCGWindowImageBestResolution);
         }
-        if (!img) { if (!g_last_error) set_error(@"area could not be captured"); return (bugle_image_t){0}; }
+        if (!img) { if (!has_error()) set_error(@"area could not be captured"); return (bugle_image_t){0}; }
         bugle_image_t out = cg_to_rgba(img);
         CGImageRelease(img);
         return out;
@@ -291,7 +373,7 @@ bugle_image_t bugle_capture_area(double x, double y, double w, double h, int32_t
 
 bugle_image_t bugle_capture_window(uint32_t window_id, int32_t shadow, int32_t show_cursor) {
     @autoreleasepool {
-        g_last_error = nil;
+        clear_error();
         CGImageRef img = NULL;
         if (shadow) {
             // ScreenCaptureKit clips single-window captures to the window
@@ -319,7 +401,7 @@ bugle_image_t bugle_capture_window(uint32_t window_id, int32_t shadow, int32_t s
             if (!shadow) opt |= kCGWindowImageBoundsIgnoreFraming;
             img = CGWindowListCreateImage(CGRectNull, kCGWindowListOptionIncludingWindow, window_id, opt);
         }
-        if (!img) { if (!g_last_error) set_error(@"window %u could not be captured", window_id); return (bugle_image_t){0}; }
+        if (!img) { if (!has_error()) set_error(@"window %u could not be captured", window_id); return (bugle_image_t){0}; }
         bugle_image_t out = cg_to_rgba(img);
         CGImageRelease(img);
         return out;
@@ -331,14 +413,15 @@ bugle_image_t bugle_capture_window(uint32_t window_id, int32_t shadow, int32_t s
 // language correction, configurable languages).
 // ---------------------------------------------------------------------------
 
-int32_t bugle_ocr(const uint8_t *rgba, int32_t w, int32_t h, const char *langs_csv, int32_t accurate,
+int32_t bugle_ocr(const uint8_t *rgba, size_t len, int32_t w, int32_t h, const char *langs_csv, int32_t accurate,
                   int32_t lang_correction, bugle_ocr_line_t **out_lines, int32_t *out_count) {
     @autoreleasepool {
-        g_last_error = nil;
+        clear_error();
+        if (!out_lines || !out_count) { set_error(@"OCR: NULL output pointer"); return -1; }
         *out_lines = NULL;
         *out_count = 0;
-        CGImageRef img = cg_from_rgba(rgba, w, h);
-        if (!img) { set_error(@"OCR: invalid image"); return -1; }
+        CGImageRef img = cg_from_rgba(rgba, len, w, h);
+        if (!img) { set_error(@"OCR: invalid image (%dx%d, %zu bytes)", w, h, len); return -1; }
         VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] init];
         req.recognitionLevel = accurate ? VNRequestTextRecognitionLevelAccurate : VNRequestTextRecognitionLevelFast;
         req.usesLanguageCorrection = lang_correction != 0;
@@ -354,13 +437,22 @@ int32_t bugle_ocr(const uint8_t *rgba, int32_t w, int32_t h, const char *langs_c
         CGImageRelease(img);
         if (!ok) { set_error(@"OCR: %@", err.localizedDescription); return -1; }
         NSArray *obs = req.results;
+        if (obs.count >= INT32_MAX) { set_error(@"OCR: too many results"); return -1; }
         bugle_ocr_line_t *lines = calloc(obs.count + 1, sizeof(bugle_ocr_line_t));
+        if (!lines) { set_error(@"OCR: out of memory"); return -1; }
         int32_t n = 0;
         for (VNRecognizedTextObservation *o in obs) {
             VNRecognizedText *top = [o topCandidates:1].firstObject;
             if (!top) continue;
             CGRect bb = o.boundingBox;  // normalized, bottom-left origin
-            lines[n].text = strdup(top.string.UTF8String);
+            const char *utf8 = top.string.UTF8String;
+            char *text = strdup(utf8 ? utf8 : "");
+            if (!text) {
+                bugle_ocr_free(lines, n);
+                set_error(@"OCR: out of memory");
+                return -1;
+            }
+            lines[n].text = text;
             lines[n].x = bb.origin.x * w;
             lines[n].y = (1.0 - bb.origin.y - bb.size.height) * h;
             lines[n].w = bb.size.width * w;
@@ -386,13 +478,20 @@ void bugle_ocr_free(bugle_ocr_line_t *lines, int32_t count) {
 // Returns the translation that maps the floating image onto the reference.
 // ---------------------------------------------------------------------------
 
-int32_t bugle_register_translation(const uint8_t *ref_rgba, int32_t rw, int32_t rh, const uint8_t *flt_rgba,
-                                   int32_t fw, int32_t fh, double *dx, double *dy) {
+int32_t bugle_register_translation(const uint8_t *ref_rgba, size_t ref_len, int32_t rw, int32_t rh,
+                                   const uint8_t *flt_rgba, size_t flt_len, int32_t fw, int32_t fh, double *dx,
+                                   double *dy) {
     @autoreleasepool {
-        g_last_error = nil;
-        CGImageRef ref = cg_from_rgba(ref_rgba, rw, rh);
-        CGImageRef flt = cg_from_rgba(flt_rgba, fw, fh);
-        if (!ref || !flt) { set_error(@"registration: invalid image"); return -1; }
+        clear_error();
+        if (!dx || !dy) { set_error(@"registration: NULL output pointer"); return -1; }
+        CGImageRef ref = cg_from_rgba(ref_rgba, ref_len, rw, rh);
+        CGImageRef flt = cg_from_rgba(flt_rgba, flt_len, fw, fh);
+        if (!ref || !flt) {
+            if (ref) CGImageRelease(ref);
+            if (flt) CGImageRelease(flt);
+            set_error(@"registration: invalid image");
+            return -1;
+        }
         VNTranslationalImageRegistrationRequest *req =
             [[VNTranslationalImageRegistrationRequest alloc] initWithTargetedCGImage:flt options:@{}];
         VNSequenceRequestHandler *seq = [[VNSequenceRequestHandler alloc] init];
@@ -430,6 +529,12 @@ void bugle_cursor_position(double *x, double *y) {
     *x = p.x;
     *y = p.y;
 }
+
+// Clipboard, sound and workspace calls below run on whichever thread the
+// engine uses (often a blocking-pool worker). NSPasteboard, NSSound playback
+// and -[NSWorkspace openURL:] are safe off the main thread in practice, and a
+// hop to the main queue would deadlock hosts whose main thread is not running
+// a run loop (the CLI), so they are deliberately called in place.
 
 int32_t bugle_clipboard_write_image(const uint8_t *png, size_t len) {
     @autoreleasepool {
@@ -873,7 +978,7 @@ void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const c
 
 int32_t bugle_export_audio_m4a(const char *in_path, const char *out_path) {
     @autoreleasepool {
-        g_last_error = nil;
+        clear_error();
         NSURL *in = [NSURL fileURLWithPath:[NSString stringWithUTF8String:in_path]];
         NSURL *out = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
         [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
@@ -899,7 +1004,7 @@ int32_t bugle_export_audio_m4a(const char *in_path, const char *out_path) {
 
 static int32_t remux(const char *in_path, const char *out_path, AVFileType type) {
     @autoreleasepool {
-        g_last_error = nil;
+        clear_error();
         NSURL *in = [NSURL fileURLWithPath:[NSString stringWithUTF8String:in_path]];
         NSURL *out = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
         [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
@@ -938,7 +1043,7 @@ double bugle_media_duration(const char *path) {
 
 bugle_image_t bugle_video_frame(const char *path, double seconds) {
     @autoreleasepool {
-        g_last_error = nil;
+        clear_error();
         NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
         AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
         AVAssetImageGenerator *gen = [[AVAssetImageGenerator alloc] initWithAsset:asset];
@@ -1002,7 +1107,8 @@ void bugle_open_path(const char *path) {
 @property (nonatomic) int32_t fps;
 @property (nonatomic) CVPixelBufferRef lastFrame;  // retained
 @property (nonatomic) CMTime lastPts;
-@property (nonatomic, strong) NSString *failure;
+@property (nonatomic, strong) NSString *failure;   // guarded by `lock`
+@property (nonatomic) BOOL captureRequested;        // startCapture was called
 @property (nonatomic, strong) NSMutableArray<NSString *> *warnings;
 @end
 
@@ -1035,6 +1141,7 @@ void bugle_open_path(const char *path) {
     [self.lock unlock];
 }
 
+// Caller holds `lock`.
 - (void)noteWriterFailure {
     if (self.writer.status == AVAssetWriterStatusFailed && !self.failure) {
         self.failure = self.writer.error.localizedDescription ?: @"asset writer failed";
@@ -1244,6 +1351,7 @@ void bugle_open_path(const char *path) {
     }
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     __block NSError *startErr = nil;
+    self.captureRequested = YES;
     [self.stream startCaptureWithCompletionHandler:^(NSError *e) {
         startErr = e;
         dispatch_semaphore_signal(sem);
@@ -1268,7 +1376,7 @@ void bugle_open_path(const char *path) {
         [self.lock unlock];
         if (already) return;
         if (self.micSession) [self.micSession stopRunning];
-        if (self.stream) {
+        if (self.stream && self.captureRequested) {
             dispatch_semaphore_t sem = dispatch_semaphore_create(0);
             [self.stream stopCaptureWithCompletionHandler:^(NSError *e) { dispatch_semaphore_signal(sem); }];
             dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
@@ -1296,13 +1404,16 @@ void bugle_open_path(const char *path) {
         if (self.finished) return self.result;
         self.finished = YES;
         self.result = -1;
+        [self.lock lock];
+        NSString *failure = self.failure;
+        [self.lock unlock];
         if (!self.sessionStarted) {
             [self.writer cancelWriting];
-            set_error(@"no frames were captured%@", self.failure ? [NSString stringWithFormat:@" (%@)", self.failure] : @"");
+            set_error(@"no frames were captured%@", failure ? [NSString stringWithFormat:@" (%@)", failure] : @"");
             return -1;
         }
         if (self.writer.status != AVAssetWriterStatusWriting) {
-            set_error(@"recording failed: %@", self.failure ?: self.writer.error.localizedDescription ?: @"unknown writer state");
+            set_error(@"recording failed: %@", failure ?: self.writer.error.localizedDescription ?: @"unknown writer state");
             return -1;
         }
         [self.videoInput markAsFinished];
@@ -1331,6 +1442,8 @@ int32_t bugle_sck_record_available(void) {
 }
 
 static size_t even_px(double v) {
+    if (!isfinite(v)) v = 2;
+    if (v > BUGLE_MAX_PX) v = BUGLE_MAX_PX;
     long long n = llround(v);
     if (n < 2) n = 2;
     return (size_t)(n & ~1LL);
@@ -1340,10 +1453,16 @@ void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t wi
                              int32_t system_audio, int32_t microphone, int32_t show_cursor, double max_seconds,
                              const char *out_path) {
     @autoreleasepool {
-        g_last_error = nil;
+        clear_error();
         if (!bugle_sck_record_available()) { set_error(@"ScreenCaptureKit recording needs macOS 14 or later"); return NULL; }
         if (fps < 1) fps = 1;
         if (fps > 120) fps = 120;
+        if (!out_path) { set_error(@"recording: no output path"); return NULL; }
+        if (window_id == 0 && (!isfinite(x) || !isfinite(y) || !isfinite(w) || !isfinite(h) || w > BUGLE_MAX_PX ||
+                               h > BUGLE_MAX_PX)) {
+            set_error(@"invalid recording rect %g,%g %gx%g", x, y, w, h);
+            return NULL;
+        }
         SCShareableContent *content = sck_content();
         if (!content) return NULL;
         SCContentFilter *filter = nil;
@@ -1374,6 +1493,10 @@ void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t wi
             }
             if (!filter) { set_error(@"display %u is not capturable", did); return NULL; }
             double s = retina ? filter.pointPixelScale : 1.0;
+            if (w * s > BUGLE_MAX_PX || h * s > BUGLE_MAX_PX) {
+                set_error(@"recording size %.0fx%.0f px exceeds %d px per side", w * s, h * s, BUGLE_MAX_PX);
+                return NULL;
+            }
             cfg.sourceRect = CGRectMake(x - db.origin.x, y - db.origin.y, w, h);
             cfg.width = even_px(w * s);
             cfg.height = even_px(h * s);
@@ -1394,6 +1517,10 @@ void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t wi
         NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
         BugleSckRecorder *rec = [[BugleSckRecorder alloc] init];
         if (![rec startWithFilter:filter config:cfg url:url fps:fps systemAudio:system_audio != 0 microphone:microphone != 0]) {
+            // Whatever failed, make sure nothing keeps running: a stream whose
+            // start was requested (even one that timed out and may still come
+            // up) is stopped, and so is the microphone session.
+            [rec stopCapture];
             [rec.writer cancelWriting];
             [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
             return NULL;
@@ -1429,7 +1556,7 @@ char *bugle_sck_record_warnings(void *handle) {
 int32_t bugle_sck_record_stop(void *handle) {
     if (!handle) return -1;
     @autoreleasepool {
-        g_last_error = nil;
+        clear_error();
         BugleSckRecorder *rec = (__bridge_transfer BugleSckRecorder *)handle;
         return [rec finish];
     }
