@@ -40,23 +40,29 @@ impl Renderer {
         )
     }
 
+    /// Render `doc` over `src`. The document is checked first with
+    /// [`Annotation::validate`] and [`Annotation::output_size`]; violations
+    /// are [`bugle_core::BugleError::Invalid`] errors naming the field.
     pub fn render(&self, src: &RgbaImage, doc: &Annotation) -> Result<RgbaImage> {
+        doc.validate()?;
         let mut img = match doc.crop {
             Some(r) => crop(src, r)?,
             None => src.clone(),
         };
+        doc.output_size(img.width(), img.height())?;
         let base = doc.style.merged(&self.defaults);
         let mut counter = 0u32;
         for shape in &doc.shapes {
             self.draw_shape(&mut img, shape, &base, &mut counter)?;
         }
         if let Some(canvas) = &doc.canvas {
-            img = apply_canvas(&img, canvas);
+            img = apply_canvas(&img, canvas)?;
         }
         if let Some(s) = doc.scale {
             if s > 0.0 && (s - 1.0).abs() > 1e-3 {
-                let w = ((img.width() as f32) * s).round().max(1.0) as u32;
-                let h = ((img.height() as f32) * s).round().max(1.0) as u32;
+                let (w, h) =
+                    scaled_size(img.width(), img.height(), s).ok_or_else(|| invalid("scale", "output image is too large"))?;
+                check_pixels("scale", w, h)?;
                 img = imageops::resize(&img, w, h, imageops::FilterType::Lanczos3);
             }
         }
@@ -117,7 +123,7 @@ impl Renderer {
             Shape::Highlight { rect, style } => {
                 let st = style.merged(base);
                 let c = st.color.unwrap_or(Color::YELLOW);
-                multiply_rect(img, rect, c);
+                multiply_rect(img, rect, c, apply_opacity(c, &st));
             }
             Shape::Counter { at, number, style } => {
                 let st = style.merged(base);
@@ -127,7 +133,7 @@ impl Renderer {
                         *n
                     }
                     None => {
-                        *counter += 1;
+                        *counter = counter.saturating_add(1);
                         *counter
                     }
                 };
@@ -155,14 +161,18 @@ impl Renderer {
             Shape::Redact { rect, mode, strength } => redact(img, rect, *mode, *strength),
             Shape::Spotlight { rect, dim } => spotlight(img, rect, *dim),
             Shape::Image { at, path, scale } => {
+                // Check the header before decoding so a huge file is never
+                // fully loaded.
+                let (iw, ih) = image::image_dimensions(path).with_context(|| format!("loading {path}"))?;
+                check_pixels("image.path", iw, ih)?;
                 let overlay = image::open(path).with_context(|| format!("loading {path}"))?.to_rgba8();
                 let overlay = if (*scale - 1.0).abs() > 1e-3 && *scale > 0.0 {
-                    imageops::resize(
-                        &overlay,
-                        ((overlay.width() as f32) * scale).max(1.0) as u32,
-                        ((overlay.height() as f32) * scale).max(1.0) as u32,
-                        imageops::FilterType::Lanczos3,
-                    )
+                    let w = ((overlay.width() as f64) * *scale as f64).max(1.0);
+                    let h = ((overlay.height() as f64) * *scale as f64).max(1.0);
+                    if !(w * h).is_finite() || w * h > limits::MAX_PIXELS as f64 {
+                        return Err(invalid("image.scale", "scaled image is too large"));
+                    }
+                    imageops::resize(&overlay, w as u32, h as u32, imageops::FilterType::Lanczos3)
                 } else {
                     overlay
                 };
@@ -218,7 +228,7 @@ pub fn load_font(path: Option<&Path>) -> Result<FontVec> {
             }
         }
     }
-    Err(anyhow!("no usable font found; set annotate.font_path in the config"))
+    Err(anyhow!("no usable font found; set font_path in the [markup] section of the config"))
 }
 
 // ---------------------------------------------------------------------------
@@ -255,21 +265,47 @@ fn sdf_round_rect(px: f64, py: f64, r: &Rect, radius: f32) -> f64 {
     outside + inside - rad
 }
 
-/// Approximate signed distance to an ellipse inscribed in `r`.
+/// Signed distance to the ellipse inscribed in `r` (negative inside).
+///
+/// Finds the closest point on the ellipse with a few Newton-like steps on
+/// the curve's evolute, working in the first quadrant. Converges to well under
+/// a hundredth of a pixel for any aspect ratio, and is negative everywhere in
+/// the interior, including the exact centre.
 fn sdf_ellipse(px: f64, py: f64, r: &Rect) -> f64 {
-    let rx = (r.w / 2.0).max(0.5);
-    let ry = (r.h / 2.0).max(0.5);
-    let cx = r.x + rx;
-    let cy = r.y + ry;
-    let nx = (px - cx) / rx;
-    let ny = (py - cy) / ry;
-    let k = (nx * nx + ny * ny).sqrt();
-    // Gradient-normalised approximation: good to a fraction of a pixel for
-    // the aspect ratios screenshots use.
-    let gx = nx / rx;
-    let gy = ny / ry;
-    let g = (gx * gx + gy * gy).sqrt().max(1e-6);
-    (k - 1.0) * k / g
+    let a = (r.w / 2.0).max(0.5);
+    let b = (r.h / 2.0).max(0.5);
+    let qx = (px - (r.x + a)).abs();
+    let qy = (py - (r.y + b)).abs();
+    let (mut tx, mut ty) = (std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2);
+    for _ in 0..4 {
+        let (x, y) = (a * tx, b * ty);
+        // Centre of curvature of the ellipse at (x, y).
+        let ex = (a * a - b * b) * tx.powi(3) / a;
+        let ey = (b * b - a * a) * ty.powi(3) / b;
+        let (rx, ry) = (x - ex, y - ey);
+        let (dx, dy) = (qx - ex, qy - ey);
+        let rlen = rx.hypot(ry);
+        let dlen = dx.hypot(dy);
+        if dlen < 1e-9 {
+            // The point sits on the centre of curvature (the centre of a
+            // circle): every direction is equally close, keep the current one.
+            break;
+        }
+        let nx = ((dx * rlen / dlen + ex) / a).clamp(0.0, 1.0);
+        let ny = ((dy * rlen / dlen + ey) / b).clamp(0.0, 1.0);
+        let t = nx.hypot(ny);
+        if t < 1e-12 {
+            break;
+        }
+        tx = nx / t;
+        ty = ny / t;
+    }
+    let dist = (qx - a * tx).hypot(qy - b * ty);
+    if (qx / a).powi(2) + (qy / b).powi(2) < 1.0 {
+        -dist
+    } else {
+        dist
+    }
 }
 
 fn sdf_segment(px: f64, py: f64, a: Point, b: Point) -> f64 {
@@ -423,20 +459,25 @@ fn clamp_rect(img: &RgbaImage, r: &Rect) -> Option<(u32, u32, u32, u32)> {
     (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0))
 }
 
-fn multiply_rect(img: &mut RgbaImage, r: &Rect, c: Color) {
+/// Multiply the pixels under `r` by `c`, mixed in with strength `alpha`
+/// (0 leaves the pixels alone, 255 is a full multiply).
+fn multiply_rect(img: &mut RgbaImage, r: &Rect, c: Color, alpha: u8) {
     let Some((x0, y0, w, h)) = clamp_rect(img, r) else { return };
+    let a = alpha as u32;
     for y in y0..y0 + h {
         for x in x0..x0 + w {
             let p = img.get_pixel_mut(x, y);
             for i in 0..3 {
-                p.0[i] = ((p.0[i] as u32 * c.0[i] as u32) / 255) as u8;
+                let d = p.0[i] as u32;
+                let m = (d * c.0[i] as u32) / 255;
+                p.0[i] = ((d * (255 - a) + m * a + 127) / 255) as u8;
             }
         }
     }
 }
 
 fn spotlight(img: &mut RgbaImage, r: &Rect, dim: f32) {
-    let keep = (1.0 - dim.clamp(0.0, 1.0)) as f32;
+    let keep = 1.0 - dim.clamp(0.0, 1.0);
     let (w, h) = (img.width(), img.height());
     for y in 0..h {
         for x in 0..w {
@@ -463,12 +504,12 @@ fn pixelate_region(img: &mut RgbaImage, x0: u32, y0: u32, w: u32, h: u32, block:
             for y in by..by + bh {
                 for x in bx..bx + bw {
                     let p = img.get_pixel(x, y);
-                    for i in 0..4 {
-                        sum[i] += p.0[i] as u64;
+                    for (s, v) in sum.iter_mut().zip(p.0) {
+                        *s += v as u64;
                     }
                 }
             }
-            let n = (bw * bh) as u64;
+            let n = bw as u64 * bh as u64;
             let avg = Rgba([(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8, (sum[3] / n) as u8]);
             for y in by..by + bh {
                 for x in bx..bx + bw {
@@ -483,11 +524,14 @@ fn pixelate_region(img: &mut RgbaImage, x0: u32, y0: u32, w: u32, h: u32, block:
 
 fn blur_region(img: &mut RgbaImage, x0: u32, y0: u32, w: u32, h: u32, sigma: f32) {
     // Blur a padded crop so edges do not darken, then paste the centre back.
+    // Saturating arithmetic: callers clamp the region to the image, but the
+    // pad comes from a caller-supplied sigma.
+    let sigma = if sigma.is_finite() { sigma.clamp(0.1, limits::MAX_BLUR_SIGMA) } else { 1.0 };
     let pad = (sigma * 3.0).ceil() as u32;
     let px0 = x0.saturating_sub(pad);
     let py0 = y0.saturating_sub(pad);
-    let px1 = (x0 + w + pad).min(img.width());
-    let py1 = (y0 + h + pad).min(img.height());
+    let px1 = x0.saturating_add(w).saturating_add(pad).min(img.width());
+    let py1 = y0.saturating_add(h).saturating_add(pad).min(img.height());
     let sub = img.view(px0, py0, px1 - px0, py1 - py0).to_image();
     let blurred = imageops::blur(&sub, sigma);
     for y in y0..y0 + h {
@@ -529,11 +573,14 @@ fn crop(src: &RgbaImage, r: Rect) -> Result<RgbaImage> {
 // Canvas: padding, gradient background, rounded corners, drop shadow
 // ---------------------------------------------------------------------------
 
-fn apply_canvas(img: &RgbaImage, canvas: &Canvas) -> RgbaImage {
+fn apply_canvas(img: &RgbaImage, canvas: &Canvas) -> Result<RgbaImage> {
     let pad = canvas.padding;
     let bw = canvas.border_width;
     let (iw, ih) = (img.width(), img.height());
-    let (ow, oh) = (iw + 2 * (pad + bw), ih + 2 * (pad + bw));
+    // Checked even though `validate` bounds padding and border: this is the
+    // allocation size.
+    let (ow, oh) = canvas_size(iw, ih, canvas)?;
+    check_pixels("canvas", ow, oh)?;
     let mut out = RgbaImage::from_pixel(ow, oh, Rgba([0, 0, 0, 0]));
 
     if let Some((from, to, angle)) = canvas.background.resolve() {
@@ -544,16 +591,16 @@ fn apply_canvas(img: &RgbaImage, canvas: &Canvas) -> RgbaImage {
             for x in 0..ow {
                 let proj = (x as f64 - ow as f64 / 2.0) * dx + (y as f64 - oh as f64 / 2.0) * dy;
                 let t = ((proj / span) + 0.5).clamp(0.0, 1.0) as f32;
-                let mut p = [0u8; 4];
-                for i in 0..4 {
-                    p[i] = (from.0[i] as f32 + (to.0[i] as f32 - from.0[i] as f32) * t).round() as u8;
-                }
+                let p = std::array::from_fn(|i| (from.0[i] as f32 + (to.0[i] as f32 - from.0[i] as f32) * t).round() as u8);
                 out.put_pixel(x, y, Rgba(p));
             }
         }
     }
 
-    let inner = Rect::new((pad + bw) as f64, (pad + bw) as f64, iw as f64, ih as f64);
+    // `canvas_size` succeeded, so `pad + bw` and `iw + 2 * bw` fit in u32;
+    // the geometry below is in f64 anyway.
+    let inset = pad as f64 + bw as f64;
+    let inner = Rect::new(inset, inset, iw as f64, ih as f64);
     let radius = canvas.corner_radius as f32;
 
     if canvas.shadow && pad > 0 {
@@ -576,7 +623,7 @@ fn apply_canvas(img: &RgbaImage, canvas: &Canvas) -> RgbaImage {
     }
 
     if let (Some(bc), true) = (canvas.border, bw > 0) {
-        let br = Rect::new(pad as f64, pad as f64, (iw + 2 * bw) as f64, (ih + 2 * bw) as f64);
+        let br = Rect::new(pad as f64, pad as f64, iw as f64 + 2.0 * bw as f64, ih as f64 + 2.0 * bw as f64);
         fill_coverage(&mut out, expand(&br, 1.0), bc, |x, y| coverage(sdf_round_rect(x, y, &br, radius + bw as f32)));
     }
 
@@ -593,7 +640,7 @@ fn apply_canvas(img: &RgbaImage, canvas: &Canvas) -> RgbaImage {
             blend(out.get_pixel_mut(inner.x as u32 + x, inner.y as u32 + y), Color(s.0), cov);
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -641,6 +688,202 @@ mod tests {
         let out = render(&base(), &doc).unwrap();
         assert_eq!(*out.get_pixel(70, 50), Rgba([0, 0, 255, 255])); // centre
         assert_eq!(*out.get_pixel(22, 22), Rgba([240, 240, 240, 255])); // bbox corner untouched
+    }
+
+    #[test]
+    fn odd_sized_ellipse_centre_pixel() {
+        // 61x41 at (20,20): the centre of pixel (50,40) is the exact ellipse centre.
+        let filled: Annotation = serde_json::from_value(serde_json::json!({
+            "shapes": [{"type":"ellipse","rect":{"x":20,"y":20,"w":61,"h":41},"fill":"#0000FF","color":"#FF0000","stroke_width":2}]
+        }))
+        .unwrap();
+        let out = render(&base(), &filled).unwrap();
+        assert_eq!(*out.get_pixel(50, 40), Rgba([0, 0, 255, 255]), "filled ellipse centre");
+
+        let stroked: Annotation = serde_json::from_value(serde_json::json!({
+            "shapes": [{"type":"ellipse","rect":{"x":20,"y":20,"w":61,"h":41},"color":"#FF0000","stroke_width":2}]
+        }))
+        .unwrap();
+        let out = render(&base(), &stroked).unwrap();
+        assert_eq!(*out.get_pixel(50, 40), Rgba([240, 240, 240, 255]), "stroked ellipse centre");
+    }
+
+    #[test]
+    fn ellipse_distance_is_negative_inside() {
+        for &(w, h) in &[(61.0, 41.0), (200.0, 6.0), (7.0, 151.0), (50.0, 50.0), (1.0, 1.0)] {
+            let r = Rect::new(0.0, 0.0, w, h);
+            let (rx, ry) = (w / 2.0, h / 2.0);
+            for i in 0..=40 {
+                for j in 0..=40 {
+                    let x = w * i as f64 / 40.0;
+                    let y = h * j as f64 / 40.0;
+                    let k = ((x - rx) / rx).powi(2) + ((y - ry) / ry).powi(2);
+                    let d = sdf_ellipse(x, y, &r);
+                    if k < 0.999 {
+                        assert!(d < 0.0, "{w}x{h} at ({x},{y}): {d}");
+                    } else if k > 1.001 {
+                        assert!(d > 0.0, "{w}x{h} at ({x},{y}): {d}");
+                    }
+                }
+            }
+            // Centre is as deep as the short semi-axis.
+            assert!((sdf_ellipse(rx, ry, &r) + rx.min(ry)).abs() < 1e-6);
+        }
+        // Exact distances on the axes.
+        let r = Rect::new(0.0, 0.0, 100.0, 40.0);
+        assert!((sdf_ellipse(103.0, 20.0, &r) - 3.0).abs() < 1e-6);
+        assert!((sdf_ellipse(50.0, 15.0, &r) + 15.0).abs() < 1e-6);
+        assert!((sdf_ellipse(50.0, -2.0, &r) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ellipse_distance_matches_brute_force() {
+        let r = Rect::new(0.0, 0.0, 300.0, 12.0);
+        let (a, b) = (150.0, 6.0);
+        let samples: Vec<(f64, f64)> = (0..200_000)
+            .map(|i| {
+                let t = i as f64 / 200_000.0 * std::f64::consts::TAU;
+                (a + a * t.cos(), b + b * t.sin())
+            })
+            .collect();
+        for &(x, y) in &[(150.0, 6.0), (10.0, 6.0), (149.0, 1.0), (290.0, 8.0), (300.5, 6.0), (20.0, -4.0), (151.0, 14.0)] {
+            let brute = samples.iter().map(|&(sx, sy)| (sx - x).hypot(sy - y)).fold(f64::MAX, f64::min);
+            let d = sdf_ellipse(x, y, &r);
+            assert!((d.abs() - brute).abs() < 0.02, "({x},{y}): sdf {d}, brute force {brute}");
+        }
+    }
+
+    fn rejected(doc: serde_json::Value) -> String {
+        let doc: Annotation = serde_json::from_value(doc).unwrap();
+        let err = render(&base(), &doc).expect_err("render should reject the document");
+        match err.downcast_ref::<bugle_core::BugleError>() {
+            Some(bugle_core::BugleError::Invalid(m)) => m.clone(),
+            other => panic!("expected BugleError::Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_validates_first() {
+        assert!(rejected(serde_json::json!({"canvas":{"padding":u32::MAX,"border_width":u32::MAX}})).contains("canvas.padding"));
+        assert!(rejected(serde_json::json!({"scale":1000})).contains("scale"));
+        assert!(rejected(serde_json::json!({"shapes":[
+            {"type":"redact","rect":{"x":0,"y":0,"w":10,"h":10},"mode":"blur","strength":1e30}
+        ]}))
+        .contains("shapes[0].strength"));
+        // Output size is checked against the actual (cropped) image size:
+        // 200x120 at 8x is fine, 2000x1000 at 8x (128 megapixels) is not.
+        let doc = Annotation { scale: Some(8.0), ..Default::default() };
+        assert_eq!(render(&base(), &doc).unwrap().dimensions(), (1600, 960));
+        let big = RgbaImage::new(2000, 1000);
+        let doc = Annotation { scale: Some(8.0), canvas: Some(Canvas { padding: 0, shadow: false, ..Default::default() }), ..Default::default() };
+        let err = Renderer::with_defaults().unwrap().render(&big, &doc).unwrap_err();
+        assert!(err.to_string().contains("scale"), "{err}");
+    }
+
+    #[test]
+    fn apply_canvas_checks_arithmetic() {
+        // Bypasses `validate`: overflow must be an error, not a panic or a
+        // giant allocation.
+        let img = RgbaImage::new(4, 4);
+        for (padding, border_width) in [(u32::MAX, 0), (u32::MAX / 2, 1), (0, u32::MAX), (1 << 20, 0)] {
+            let c = Canvas { padding, border_width, ..Default::default() };
+            assert!(apply_canvas(&img, &c).is_err(), "padding {padding}, border {border_width}");
+        }
+        let c = Canvas { padding: 3, border_width: 2, border: Some(Color::RED), ..Default::default() };
+        assert_eq!(apply_canvas(&img, &c).unwrap().dimensions(), (14, 14));
+    }
+
+    #[test]
+    fn blur_region_saturates() {
+        let mut img = base();
+        // Region at the image edge, absurd sigma: no overflow, sigma clamped.
+        blur_region(&mut img, 190, 110, 10, 10, f32::MAX);
+        blur_region(&mut img, 190, 110, 10, 10, f32::NAN);
+        blur_region(&mut img, 0, 0, 200, 120, 1e9);
+        pixelate_region(&mut img, 190, 110, 10, 10, u32::MAX);
+    }
+
+    #[test]
+    fn highlight_honours_opacity_and_alpha() {
+        let px = |doc: serde_json::Value| {
+            let doc: Annotation = serde_json::from_value(doc).unwrap();
+            *render(&base(), &doc).unwrap().get_pixel(10, 10)
+        };
+        let rect = serde_json::json!({"x":0,"y":0,"w":50,"h":50});
+        // Full strength: plain multiply (240 * 0x80 / 255 = 120), as before.
+        assert_eq!(px(serde_json::json!({"shapes":[{"type":"highlight","rect":rect,"color":"#FF8000"}]})), Rgba([240, 120, 0, 255]));
+        // Opacity 0 and a transparent colour leave the image alone.
+        assert_eq!(
+            px(serde_json::json!({"shapes":[{"type":"highlight","rect":rect,"color":"#FF8000","opacity":0}]})),
+            Rgba([240, 240, 240, 255])
+        );
+        assert_eq!(
+            px(serde_json::json!({"shapes":[{"type":"highlight","rect":rect,"color":"#FF800000"}]})),
+            Rgba([240, 240, 240, 255])
+        );
+        // Half alpha, or half opacity: half way between.
+        let half = Rgba([240, 180, 120, 255]);
+        assert_eq!(px(serde_json::json!({"shapes":[{"type":"highlight","rect":rect,"color":"#FF8000FF","opacity":128}]})), half);
+        assert_eq!(px(serde_json::json!({"shapes":[{"type":"highlight","rect":rect,"color":"#FF800080"}]})), half);
+    }
+
+    #[test]
+    fn counter_number_does_not_overflow() {
+        let doc: Annotation = serde_json::from_value(serde_json::json!({"shapes":[
+            {"type":"counter","at":{"x":30,"y":30},"number":u32::MAX},
+            {"type":"counter","at":{"x":90,"y":30}}
+        ]}))
+        .unwrap();
+        render(&base(), &doc).unwrap();
+    }
+
+    /// A PNG file that has only a header: enough for `image_dimensions`.
+    fn png_header(w: u32, h: u32) -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut c = !0u32;
+            for &b in data {
+                c ^= b as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+            }
+            !c
+        }
+        fn chunk(out: &mut Vec<u8>, kind: &[u8], data: &[u8]) {
+            out.extend((data.len() as u32).to_be_bytes());
+            let start = out.len();
+            out.extend(kind);
+            out.extend(data);
+            let crc = crc32(&out[start..]);
+            out.extend(crc.to_be_bytes());
+        }
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::new();
+        ihdr.extend(w.to_be_bytes());
+        ihdr.extend(h.to_be_bytes());
+        ihdr.extend([8, 6, 0, 0, 0]);
+        chunk(&mut out, b"IHDR", &ihdr);
+        chunk(&mut out, b"IDAT", &[]);
+        chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    #[test]
+    fn image_shape_limits_size() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/bugle-markup-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let huge = dir.join("huge.png");
+        std::fs::write(&huge, png_header(20_000, 20_000)).unwrap();
+        let msg = rejected(serde_json::json!({"shapes":[{"type":"image","at":{"x":0,"y":0},"path":huge}]}));
+        assert!(msg.contains("image.path"), "{msg}");
+
+        let small = dir.join("small.png");
+        RgbaImage::from_pixel(1300, 1300, Rgba([1, 2, 3, 255])).save(&small).unwrap();
+        let msg = rejected(serde_json::json!({"shapes":[{"type":"image","at":{"x":0,"y":0},"path":small,"scale":8}]}));
+        assert!(msg.contains("image.scale"), "{msg}");
+        let doc: Annotation =
+            serde_json::from_value(serde_json::json!({"shapes":[{"type":"image","at":{"x":10,"y":10},"path":small,"scale":0.05}]})).unwrap();
+        assert_eq!(*render(&base(), &doc).unwrap().get_pixel(20, 20), Rgba([1, 2, 3, 255]));
     }
 
     #[test]
