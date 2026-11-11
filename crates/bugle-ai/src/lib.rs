@@ -119,18 +119,25 @@ impl Registry {
             .get(name)
             .cloned()
             .ok_or_else(|| BugleError::ProviderNotConfigured(format!("unknown provider '{name}'")))?;
-        if !p.supports(role) {
+        if !p.capable(role) {
             return Err(anyhow!("provider '{name}' (kind {}) does not support {role}", p.kind()));
+        }
+        if let Some(reason) = p.not_ready_reason() {
+            return Err(BugleError::ProviderNotConfigured(format!("provider '{name}' is not ready: {reason}")).into());
         }
         Ok(p)
     }
 
+    /// One JSON object per provider. `roles` lists what the provider's kind
+    /// offers; `ready` is false (with a `reason`) while required settings
+    /// such as `base_url` or `model` are missing.
     pub fn describe_all(&self) -> Vec<serde_json::Value> {
         let roles = [Role::Vision, Role::Text, Role::Transcribe];
         self.providers
             .values()
             .map(|p| {
-                let supported: Vec<String> = roles.iter().filter(|r| p.supports(**r)).map(|r| r.to_string()).collect();
+                let supported: Vec<String> = roles.iter().filter(|r| p.capable(**r)).map(|r| r.to_string()).collect();
+                let reason = p.not_ready_reason();
                 let defaults: Vec<String> = [
                     (Role::Vision, self.default_vision.as_deref()),
                     (Role::Text, self.default_text.as_deref()),
@@ -147,6 +154,8 @@ impl Registry {
                     "base_url": p.base_url(),
                     "roles": supported,
                     "default_for": defaults,
+                    "ready": reason.is_none(),
+                    "reason": reason,
                 })
             })
             .collect()
