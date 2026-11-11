@@ -1,6 +1,6 @@
 # 005 — Scrolling capture: panics, unbounded canvas, quadratic stitching
 
-Status: open
+Status: closed (fixed on `audit/fixes`)
 Severity: medium
 Area: `crates/bugle-engine/src/{scroll.rs,stitch.rs}`
 

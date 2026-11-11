@@ -1,6 +1,6 @@
 # 006 — Platform shim: data race on the last-error global, unchecked sizes
 
-Status: open
+Status: closed (fixed on `audit/fixes`)
 Severity: high
 Area: `crates/bugle-platform/shim/{shim.m,shim.h}`, `crates/bugle-platform/src/{lib.rs,ffi.rs}`
 

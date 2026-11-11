@@ -1,6 +1,6 @@
 # 008 — AI providers and the MCP server
 
-Status: open
+Status: closed (fixed on `audit/fixes`)
 Severity: medium
 Area: `crates/bugle-ai/src/{providers.rs,lib.rs}`, `crates/bugle-api/src/mcp.rs`
 

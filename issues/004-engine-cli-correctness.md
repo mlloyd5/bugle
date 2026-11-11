@@ -1,6 +1,6 @@
 # 004 — Engine and CLI correctness
 
-Status: open
+Status: closed (fixed on `audit/fixes`)
 Severity: medium
 Area: `crates/bugle-engine/src/{lib.rs,capture.rs}`, `crates/bugle-api/src/actions.rs`, `crates/bugle-cli/src/cli.rs`,
 `crates/bugle-core/src/lib.rs` (error enum), `crates/bugle-app/src/main.rs` (cancel detection only)

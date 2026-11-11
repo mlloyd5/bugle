@@ -114,7 +114,7 @@ impl Engine {
 
         let mut vars = HashMap::new();
         vars.insert("kind", "scroll".to_string());
-        let format = req.options.format.unwrap_or(self.config.screenshots.format);
+        let format = req.options.format;
         let media = self.save_image(
             &canvas,
             MediaKind::ScrollCapture,

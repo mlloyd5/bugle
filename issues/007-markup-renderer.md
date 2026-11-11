@@ -1,6 +1,6 @@
 # 007 — Annotation renderer: stray dot in ellipses, panics on hostile documents
 
-Status: open
+Status: closed (fixed on `audit/fixes`)
 Severity: medium
 Area: `crates/bugle-markup/src/{render.rs,model.rs,lib.rs}`
 

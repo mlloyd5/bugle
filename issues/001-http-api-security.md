@@ -1,6 +1,6 @@
 # 001 — HTTP API: any web page can drive the API with default settings
 
-Status: open
+Status: closed (fixed on `audit/fixes`)
 Severity: high
 Area: `crates/bugle-api/src/http.rs`, `ApiConfig` in `crates/bugle-core/src/config.rs`, docs
 

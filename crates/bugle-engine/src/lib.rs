@@ -81,12 +81,16 @@ impl Engine {
         if source.is_empty() || source == "latest" || source == "last" {
             return self.history.latest()?.ok_or_else(|| BugleError::MediaNotFound("history is empty".into()).into());
         }
+        let p = bugle_core::config::expand_tilde(source);
         if !is_explicit_path(source) {
-            if let Some(m) = self.history.get(source)? {
-                return Ok(m);
+            match self.history.get(source) {
+                Ok(Some(m)) => return Ok(m),
+                Ok(None) => {}
+                // Too short or ambiguous as an id: still fine as a file name.
+                Err(e) if !p.exists() => return Err(e),
+                Err(_) => {}
             }
         }
-        let p = bugle_core::config::expand_tilde(source);
         if p.exists() {
             return Ok(media_from_file(&p));
         }

@@ -104,7 +104,7 @@ recorder state machine, and exposes one method per user-facing action:
   recorder comment: the writer session opens before the stream starts, a static
   screen's stale first-frame timestamp is clamped, and the last frame is
   re-appended at the stop time so the video track covers the whole recording.
-* `ocr`, `ocr_with_ai`, `describe` (images or sampled video frames), `transcribe`
+* `ocr` (Apple Vision or an AI provider, per request or `[ocr] engine`), `describe` (images or sampled video frames), `transcribe`
   (extracts the audio track first), `subtitles`, `annotate`, `pin`, `select_area`.
 * `sync` (`sync.rs`) — runs after every successful save (`save_image`, so
   screenshots, scrolling captures and annotation output; `record_stop`) for the

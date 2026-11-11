@@ -441,7 +441,7 @@ struct App {
 
 impl App {
     fn is_recording(&self) -> bool {
-        self.engine.record_status().state == RecordingState::Active
+        self.engine.record_status().state != RecordingState::Idle
     }
 
     fn toast(&self, n: &Notice) {
@@ -522,7 +522,7 @@ impl App {
 
     fn update_recording_ui(&mut self) {
         let st = self.engine.record_status();
-        let recording = st.state == RecordingState::Active;
+        let recording = st.state != RecordingState::Idle;
         self.items.stop.set_enabled(recording);
         self.items.record_video.set_enabled(!recording);
         self.items.record_gif.set_enabled(!recording);

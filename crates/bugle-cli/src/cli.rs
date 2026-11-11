@@ -434,6 +434,21 @@ fn parse_rect(s: &str) -> Result<Rect> {
     Rect::parse(s).ok_or_else(|| anyhow!("bad rect '{s}'; expected x,y,w,h"))
 }
 
+/// Pin frames follow the platform convention: a negative origin means "top
+/// right of the main screen" and a zero size means "the image's own size",
+/// so unlike capture rects they may be empty.
+fn parse_pin_frame(s: &str) -> Result<Rect> {
+    let v: Vec<f64> = s
+        .split(',')
+        .map(|p| p.trim().parse::<f64>().ok().filter(|n| n.is_finite()))
+        .collect::<Option<_>>()
+        .ok_or_else(|| anyhow!("bad frame '{s}'; expected x,y,w,h"))?;
+    match v.as_slice() {
+        [x, y, w, h] if *w >= 0.0 && *h >= 0.0 => Ok(Rect::new(*x, *y, *w, *h)),
+        _ => bail!("bad frame '{s}'; expected x,y,w,h"),
+    }
+}
+
 fn parse_point(s: &str) -> Result<Point> {
     let parts: Vec<f64> = s.split(',').map(|p| p.trim().parse()).collect::<Result<_, _>>().map_err(|_| anyhow!("bad point '{s}'"))?;
     if parts.len() != 2 {
@@ -714,7 +729,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
         Cmd::Pin(a) => {
-            let frame = a.at.as_deref().map(parse_rect).transpose()?;
+            let frame = a.at.as_deref().map(parse_pin_frame).transpose()?;
             engine.pin(&a.source, frame, a.opacity, true)?;
         }
         Cmd::Select => {

@@ -301,7 +301,7 @@ impl Engine {
                 (w.frame, Some(w))
             }
             CaptureTarget::Interactive => {
-                let r = self.select_area()?.ok_or_else(|| anyhow!("selection cancelled"))?;
+                let r = self.select_area()?.ok_or(BugleError::Cancelled)?;
                 (r, None)
             }
             CaptureTarget::AllScreens => {

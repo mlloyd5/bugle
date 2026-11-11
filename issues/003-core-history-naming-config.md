@@ -1,6 +1,6 @@
 # 003 — Core: history deletes the wrong item, naming and config drift
 
-Status: open
+Status: closed (fixed on `audit/fixes`)
 Severity: high (item 1), otherwise low
 Area: `crates/bugle-core/src/{history.rs,naming.rs,geometry.rs,config.rs}`, `config.example.toml`
 

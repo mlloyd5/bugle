@@ -1,6 +1,6 @@
 # 002 — Recording lifecycle: lost recordings, stuck state, unbounded memory
 
-Status: open
+Status: closed (fixed on `audit/fixes`)
 Severity: high
 Area: `crates/bugle-engine/src/record.rs`
 
