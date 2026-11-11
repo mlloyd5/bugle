@@ -12,15 +12,24 @@ use crate::Engine;
 use anyhow::{anyhow, bail, Context, Result};
 use bugle_core::config::RecordingBackend;
 use bugle_platform::{SckRecordOptions, SckRecorder};
-use bugle_core::{CaptureTarget, MediaItem, MediaKind, RecordRequest, RecordingFormat, RecordingState, RecordingStatus};
+use bugle_core::{BugleError, CaptureTarget, MediaItem, MediaKind, Rect, RecordRequest, RecordingFormat, RecordingState, RecordingStatus};
 use chrono::Utc;
 use image::codecs::gif::{GifEncoder, Repeat};
 use image::{Delay, Frame, RgbaImage};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+/// GIF frames are kept decoded until the recording stops; stop capturing once
+/// they take this much memory.
+const GIF_MAX_BYTES: u64 = 1 << 30;
+/// Longest GIF recording, whatever `max_seconds` says.
+const GIF_MAX_SECONDS: f64 = 600.0;
+/// How long `screencapture` must survive after spawning before the recording
+/// is considered started.
+const SCREENCAPTURE_STARTUP: Duration = Duration::from_millis(300);
 
 #[derive(Default)]
 pub struct RecorderState {
@@ -36,39 +45,238 @@ struct Active {
     source: String,
     backend: Backend,
     frames: Arc<AtomicU64>,
-    auto_stop: bool,
+    max_seconds: Option<f64>,
+    /// When the backend was first seen to have stopped by itself.
+    finished_at: Option<Instant>,
 }
 
+/// A running recorder. Dropping it stops the recorder (the file may or may
+/// not be finalised); `Engine::finalize` is the orderly path.
 enum Backend {
-    Gif { stop: Arc<AtomicBool>, handle: std::thread::JoinHandle<Result<u64>> },
+    Gif {
+        stop: Arc<AtomicBool>,
+        /// Set by the frame loop once it stops capturing (before encoding).
+        capture_done: Arc<AtomicBool>,
+        /// `None` once joined.
+        handle: Option<std::thread::JoinHandle<Result<u64>>>,
+    },
     Video { child: std::process::Child, wants_mp4: bool },
     /// ScreenCaptureKit stream written by AVAssetWriter. Always produces an
-    /// MP4; a `.mov` request is remuxed afterwards.
-    Sck { rec: SckRecorder, wants_mov: bool },
+    /// MP4; a `.mov` request is remuxed afterwards. `rec` is `None` once
+    /// stopped.
+    Sck { rec: Option<SckRecorder>, wants_mov: bool },
+}
+
+impl Backend {
+    /// Whether the recorder has stopped capturing without being asked to
+    /// (deadline reached, process exited, frame cap hit).
+    fn stopped_by_itself(&mut self, elapsed: f64, max_seconds: Option<f64>) -> bool {
+        match self {
+            Backend::Gif { capture_done, handle, .. } => {
+                capture_done.load(Ordering::Relaxed) || handle.as_ref().is_none_or(|h| h.is_finished())
+            }
+            Backend::Video { child, .. } => !matches!(child.try_wait(), Ok(None)),
+            // The stream stops itself at the deadline; the recorder exposes
+            // no other "finished" signal.
+            Backend::Sck { rec, .. } => rec.is_none() || deadline_passed(elapsed, max_seconds),
+        }
+    }
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        match self {
+            Backend::Gif { stop, handle, .. } => {
+                stop.store(true, Ordering::Relaxed);
+                if let Some(h) = handle.take() {
+                    let _ = h.join();
+                }
+            }
+            Backend::Video { child, .. } => interrupt_child(child),
+            // SckRecorder stops and finalises itself when dropped.
+            Backend::Sck { rec, .. } => drop(rec.take()),
+        }
+    }
+}
+
+/// SIGINT a still-running child (screencapture finalises the file on
+/// SIGINT), wait for it, and kill it if it does not exit within 5 s.
+fn interrupt_child(child: &mut std::process::Child) {
+    if !matches!(child.try_wait(), Ok(None)) {
+        return;
+    }
+    unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    for _ in 0..50 {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    tracing::warn!("screencapture did not exit after SIGINT; killing it");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn deadline_passed(elapsed: f64, max_seconds: Option<f64>) -> bool {
+    max_seconds.is_some_and(|m| elapsed >= m)
 }
 
 impl Active {
     fn frames(&self) -> u64 {
         match &self.backend {
-            Backend::Sck { rec, .. } => rec.frames(),
+            Backend::Sck { rec: Some(rec), .. } => rec.frames(),
             _ => self.frames.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Check whether the backend stopped by itself and remember when.
+    fn poll(&mut self) -> RecordingState {
+        if self.finished_at.is_none() {
+            let elapsed = self.started.elapsed().as_secs_f64();
+            if self.backend.stopped_by_itself(elapsed, self.max_seconds) {
+                self.finished_at = Some(Instant::now());
+            }
+        }
+        if self.finished_at.is_some() {
+            RecordingState::Finishing
+        } else {
+            RecordingState::Active
+        }
+    }
+
+    /// Seconds recorded; frozen once the backend has stopped by itself and
+    /// never more than the requested maximum.
+    fn elapsed_seconds(&self) -> f64 {
+        let end = self.finished_at.unwrap_or_else(Instant::now);
+        let e = end.saturating_duration_since(self.started).as_secs_f64();
+        match self.max_seconds {
+            Some(m) if m > 0.0 => e.min(m),
+            _ => e,
+        }
+    }
+
+    fn status(&mut self) -> RecordingStatus {
+        let state = self.poll();
+        RecordingStatus {
+            state,
+            format: Some(self.format),
+            started_at: Some(self.started_at),
+            elapsed_seconds: self.elapsed_seconds(),
+            frames: self.frames(),
+            output: Some(self.output.display().to_string()),
         }
     }
 }
 
+/// Recording targets must be real, finite areas of at least 2x2 points.
+fn validate_record_rect(r: &Rect) -> std::result::Result<(), BugleError> {
+    if !(r.x.is_finite() && r.y.is_finite() && r.w.is_finite() && r.h.is_finite()) {
+        return Err(BugleError::Invalid(format!("recording rect is not finite: {r}")));
+    }
+    if r.w < 2.0 || r.h < 2.0 {
+        return Err(BugleError::Invalid(format!("recording rect must be at least 2x2 points: {r}")));
+    }
+    Ok(())
+}
+
+/// `screencapture -R` takes integer points. Rounds the edges so the result
+/// covers the same pixels, never narrower than 1 point.
+fn screencapture_rect_arg(r: &Rect) -> String {
+    let x0 = r.x.round();
+    let y0 = r.y.round();
+    let w = ((r.x + r.w).round() - x0).max(1.0);
+    let h = ((r.y + r.h).round() - y0).max(1.0);
+    format!("{},{},{},{}", x0 as i64, y0 as i64, w as i64, h as i64)
+}
+
+/// Size of a GIF frame after fitting its long side into `max_size`; never 0.
+fn gif_frame_dims(w: u32, h: u32, max_size: u32) -> (u32, u32) {
+    let long = w.max(h);
+    if long <= max_size {
+        return (w.max(1), h.max(1));
+    }
+    let s = max_size as f64 / long as f64;
+    ((((w as f64) * s) as u32).max(1), (((h as f64) * s) as u32).max(1))
+}
+
+/// Why the GIF loop must stop regardless of the caller's deadline.
+fn gif_cap_reason(bytes: u64, elapsed: f64) -> Option<String> {
+    if bytes >= GIF_MAX_BYTES {
+        Some(format!("frames reached the {} MiB memory cap", GIF_MAX_BYTES >> 20))
+    } else if elapsed >= GIF_MAX_SECONDS {
+        Some(format!("reached the {} minute length cap", GIF_MAX_SECONDS / 60.0))
+    } else {
+        None
+    }
+}
+
+/// The `foo.rec.mov` / `foo.rec.mp4` intermediate file next to `output`.
+fn temp_path(output: &Path, ext: &str) -> PathBuf {
+    output.with_extension(format!("rec.{ext}"))
+}
+
+fn file_nonempty(p: &Path) -> bool {
+    std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
+}
+
+/// A conversion of `tmp` failed: drop any partial output and keep the raw
+/// recording under its final name (`foo.rec.mov` -> `foo.mov`) so neither
+/// the recording is lost nor a temp file left behind. Returns the error to
+/// report.
+fn keep_raw_after_failed_export(tmp: &Path, output: &Path, ext: &str, e: anyhow::Error) -> anyhow::Error {
+    let _ = std::fs::remove_file(output);
+    if !file_nonempty(tmp) {
+        let _ = std::fs::remove_file(tmp);
+        return e;
+    }
+    let keep = output.with_extension(ext);
+    match std::fs::rename(tmp, &keep) {
+        Ok(()) => e.context(format!("converting the recording failed; the original was kept at {}", keep.display())),
+        Err(_) => {
+            let _ = std::fs::remove_file(tmp);
+            e.context("converting the recording failed")
+        }
+    }
+}
+
+/// Read whatever the child wrote to its piped stderr.
+fn child_stderr(child: &mut std::process::Child) -> String {
+    let mut err = String::new();
+    if let Some(mut e) = child.stderr.take() {
+        use std::io::Read;
+        let _ = e.read_to_string(&mut err);
+    }
+    err.trim().to_string()
+}
+
 impl Engine {
     pub fn record_status(&self) -> RecordingStatus {
-        let g = self.recorder_state.inner.lock().unwrap();
-        match g.as_ref() {
+        let mut g = self.recorder_state.inner.lock().unwrap();
+        match g.as_mut() {
             None => RecordingStatus { state: RecordingState::Idle, format: None, started_at: None, elapsed_seconds: 0.0, frames: 0, output: None },
-            Some(a) => RecordingStatus {
-                state: RecordingState::Active,
-                format: Some(a.format),
-                started_at: Some(a.started_at),
-                elapsed_seconds: a.started.elapsed().as_secs_f64(),
-                frames: a.frames(),
-                output: Some(a.output.display().to_string()),
-            },
+            Some(a) => a.status(),
+        }
+    }
+
+    /// Lock the recorder state with no recording in it. A recording whose
+    /// backend already stopped by itself is finalised first (as
+    /// `record_stop` would); one that is still capturing is an error.
+    fn idle_recorder(&self) -> Result<MutexGuard<'_, Option<Active>>> {
+        loop {
+            let mut g = self.recorder_state.inner.lock().unwrap();
+            let state = match g.as_mut() {
+                None => return Ok(g),
+                Some(a) => a.poll(),
+            };
+            if state != RecordingState::Finishing {
+                bail!("a recording is already in progress");
+            }
+            let finished = g.take().expect("checked above");
+            drop(g);
+            match self.finalize(finished) {
+                Ok(m) => tracing::info!("finalised the previous recording: {}", m.path.display()),
+                Err(e) => tracing::warn!("finalising the previous recording failed: {e:#}"),
+            }
         }
     }
 
@@ -76,10 +284,9 @@ impl Engine {
         if !bugle_platform::screen_access_preflight() {
             return Err(bugle_core::BugleError::PermissionDenied.into());
         }
-        let mut g = self.recorder_state.inner.lock().unwrap();
-        if g.is_some() {
-            bail!("a recording is already in progress");
-        }
+        // Fail before asking the user for a selection; checked again below
+        // since the lock is not held while the target is resolved.
+        drop(self.idle_recorder()?);
         let (rect, window) = match &req.target {
             CaptureTarget::Screen { display } => {
                 let d = match display {
@@ -94,13 +301,18 @@ impl Engine {
                 (w.frame, Some(w))
             }
             CaptureTarget::Interactive => {
-                drop(g);
                 let r = self.select_area()?.ok_or_else(|| anyhow!("selection cancelled"))?;
-                g = self.recorder_state.inner.lock().unwrap();
                 (r, None)
             }
-            CaptureTarget::AllScreens => (bugle_platform::main_display()?.frame, None),
+            CaptureTarget::AllScreens => {
+                return Err(BugleError::Invalid(
+                    "recordings support screen (one display), area, window and interactive targets, not all screens".into(),
+                )
+                .into())
+            }
         };
+        validate_record_rect(&rect)?;
+        let mut g = self.idle_recorder()?;
         let mut vars = HashMap::new();
         vars.insert("kind", "recording".to_string());
         if let Some(w) = &window {
@@ -112,18 +324,20 @@ impl Engine {
             RecordingFormat::Gif => {
                 let output = self.output_path(req.output.as_deref(), "gif", &vars);
                 let stop = Arc::new(AtomicBool::new(false));
+                let capture_done = Arc::new(AtomicBool::new(false));
                 let fps = req.fps.unwrap_or(self.config.recordings.gif_frame_rate).clamp(1, 30);
                 let max_size = self.config.recordings.gif_max_size;
                 let max_secs = req.max_seconds;
                 let show_cursor = true;
                 let out = output.clone();
                 let stop2 = stop.clone();
+                let done2 = capture_done.clone();
                 let frames2 = frames.clone();
                 let window_id = window.as_ref().map(|w| w.id);
                 let handle = std::thread::Builder::new().name("bugle-gif".into()).spawn(move || {
-                    gif_loop(rect, window_id, fps, max_size, max_secs, show_cursor, stop2, frames2, out)
+                    gif_loop(rect, window_id, fps, max_size, max_secs, show_cursor, stop2, done2, frames2, out)
                 })?;
-                (output, Backend::Gif { stop, handle })
+                (output, Backend::Gif { stop, capture_done, handle: Some(handle) })
             }
             RecordingFormat::Mov | RecordingFormat::Mp4 => {
                 let wants_mp4 = req.format == RecordingFormat::Mp4;
@@ -153,7 +367,7 @@ impl Engine {
                     }
                     // AVAssetWriter writes the MP4 container directly; a .mov
                     // request is remuxed on stop.
-                    let tmp = if wants_mp4 { output.clone() } else { output.with_extension("rec.mp4") };
+                    let tmp = if wants_mp4 { output.clone() } else { temp_path(&output, "mp4") };
                     let opts = SckRecordOptions {
                         rect,
                         window_id: window.as_ref().map(|w| w.id),
@@ -168,9 +382,9 @@ impl Engine {
                     if let Some(w) = rec.warnings() {
                         tracing::warn!("{w}");
                     }
-                    (output, Backend::Sck { rec, wants_mov: !wants_mp4 })
+                    (output, Backend::Sck { rec: Some(rec), wants_mov: !wants_mp4 })
                 } else {
-                    let tmp_mov = if wants_mp4 { output.with_extension("rec.mov") } else { output.clone() };
+                    let tmp_mov = if wants_mp4 { temp_path(&output, "mov") } else { output.clone() };
                     let mut cmd = std::process::Command::new("/usr/sbin/screencapture");
                     cmd.arg("-v").arg("-x");
                     match &window {
@@ -178,7 +392,7 @@ impl Engine {
                             cmd.arg("-l").arg(w.id.to_string());
                         }
                         None => {
-                            cmd.arg("-R").arg(format!("{},{},{},{}", rect.x, rect.y, rect.w, rect.h));
+                            cmd.arg("-R").arg(screencapture_rect_arg(&rect));
                         }
                     }
                     if microphone {
@@ -192,7 +406,20 @@ impl Engine {
                     }
                     cmd.arg(&tmp_mov);
                     cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
-                    let child = cmd.spawn().context("starting screencapture")?;
+                    let mut child = cmd.spawn().context("starting screencapture")?;
+                    // A bad window id or missing permission makes it exit
+                    // straight away; report that now rather than at stop.
+                    let t0 = Instant::now();
+                    while t0.elapsed() < SCREENCAPTURE_STARTUP {
+                        std::thread::sleep(Duration::from_millis(50));
+                        if let Some(status) = child.try_wait()? {
+                            let err = child_stderr(&mut child);
+                            if !file_nonempty(&tmp_mov) {
+                                let _ = std::fs::remove_file(&tmp_mov);
+                            }
+                            bail!("screencapture exited immediately (status {status}): {err}");
+                        }
+                    }
                     if system_audio {
                         tracing::warn!("system audio capture is not supported by the screencapture backend; recording without it");
                     }
@@ -213,7 +440,8 @@ impl Engine {
             source,
             backend,
             frames,
-            auto_stop: req.max_seconds.is_some(),
+            max_seconds: req.max_seconds,
+            finished_at: None,
         });
         drop(g);
         Ok(self.record_status())
@@ -222,21 +450,38 @@ impl Engine {
     /// Stop the active recording and finalise the file.
     pub fn record_stop(&self) -> Result<MediaItem> {
         let active = self.recorder_state.inner.lock().unwrap().take().ok_or_else(|| anyhow!("no recording in progress"))?;
-        let duration = active.started.elapsed().as_secs_f64();
-        let kind = match active.backend {
-            Backend::Gif { stop, handle } => {
+        self.finalize(active)
+    }
+
+    /// Stop `active`'s backend (if still running), finish the file and add
+    /// it to the history. Error paths remove the intermediate files.
+    fn finalize(&self, mut active: Active) -> Result<MediaItem> {
+        // Freezes the elapsed time if the backend already stopped by itself.
+        active.poll();
+        let duration = active.elapsed_seconds();
+        let auto_stop = active.max_seconds.is_some();
+        let kind = match &mut active.backend {
+            Backend::Gif { stop, handle, .. } => {
                 stop.store(true, Ordering::Relaxed);
-                let n = handle.join().map_err(|_| anyhow!("gif thread panicked"))??;
+                let h = handle.take().ok_or_else(|| anyhow!("gif recorder already stopped"))?;
+                let n = match h.join().map_err(|_| anyhow!("gif thread panicked")).and_then(|r| r) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&active.output);
+                        return Err(e);
+                    }
+                };
                 if n == 0 {
                     bail!("no frames were captured");
                 }
                 MediaKind::Gif
             }
-            Backend::Video { mut child, wants_mp4 } => {
+            Backend::Video { child, wants_mp4 } => {
+                let wants_mp4 = *wants_mp4;
                 // With a deadline, screencapture stops by itself; give it a
                 // few seconds to finalise before interrupting it.
                 let mut exited = child.try_wait()?.is_some();
-                if !exited && active.auto_stop {
+                if !exited && auto_stop {
                     for _ in 0..40 {
                         std::thread::sleep(Duration::from_millis(100));
                         if child.try_wait()?.is_some() {
@@ -251,42 +496,51 @@ impl Engine {
                 let status = child.wait()?;
                 // screencapture exits 0 on a clean stop; a non-zero status with
                 // no file means it never started (permission etc.).
-                let tmp_mov = if wants_mp4 { active.output.with_extension("rec.mov") } else { active.output.clone() };
+                let tmp_mov = if wants_mp4 { temp_path(&active.output, "mov") } else { active.output.clone() };
                 // Give the muxer a moment to flush the moov atom.
                 for _ in 0..40 {
-                    if tmp_mov.exists() && std::fs::metadata(&tmp_mov).map(|m| m.len() > 0).unwrap_or(false) {
+                    if file_nonempty(&tmp_mov) {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                if !tmp_mov.exists() {
-                    let mut err = String::new();
-                    if let Some(mut e) = child.stderr.take() {
-                        use std::io::Read;
-                        let _ = e.read_to_string(&mut err);
-                    }
-                    bail!("screencapture produced no file (status {status}): {}", err.trim());
+                if !file_nonempty(&tmp_mov) {
+                    let _ = std::fs::remove_file(&tmp_mov);
+                    let err = child_stderr(child);
+                    bail!("screencapture produced no file (status {status}): {err}");
                 }
                 if wants_mp4 {
-                    bugle_platform::export_mp4(&tmp_mov, &active.output)?;
+                    if let Err(e) = bugle_platform::export_mp4(&tmp_mov, &active.output) {
+                        return Err(keep_raw_after_failed_export(&tmp_mov, &active.output, "mov", e));
+                    }
                     let _ = std::fs::remove_file(&tmp_mov);
                 }
                 MediaKind::Video
             }
             Backend::Sck { rec, wants_mov } => {
+                let wants_mov = *wants_mov;
+                let rec = rec.take().ok_or_else(|| anyhow!("recorder already stopped"))?;
+                // The file AVAssetWriter writes: the output itself, or a
+                // temp MP4 when a .mov was asked for.
+                let written = if wants_mov { temp_path(&active.output, "mp4") } else { active.output.clone() };
                 let warnings = rec.warnings();
                 let frames = rec.frames();
-                rec.stop()?;
+                if let Err(e) = rec.stop() {
+                    let _ = std::fs::remove_file(&written);
+                    return Err(e);
+                }
                 if let Some(w) = warnings {
                     tracing::warn!("{w}");
                 }
                 if frames == 0 {
+                    let _ = std::fs::remove_file(&written);
                     bail!("no frames were captured");
                 }
                 if wants_mov {
-                    let tmp = active.output.with_extension("rec.mp4");
-                    bugle_platform::export_mov(&tmp, &active.output)?;
-                    let _ = std::fs::remove_file(&tmp);
+                    if let Err(e) = bugle_platform::export_mov(&written, &active.output) {
+                        return Err(keep_raw_after_failed_export(&written, &active.output, "mp4", e));
+                    }
+                    let _ = std::fs::remove_file(&written);
                 }
                 MediaKind::Video
             }
@@ -297,8 +551,8 @@ impl Engine {
         } else {
             bugle_platform::media_duration(&active.output).ok().filter(|d| d.is_finite() && *d > 0.0).unwrap_or(duration)
         });
-        m.label = active.label;
-        m.source = Some(active.source);
+        m.label = active.label.take();
+        m.source = Some(std::mem::take(&mut active.source));
         if kind == MediaKind::Gif {
             if let Ok(d) = image::image_dimensions(&active.output) {
                 m.width = Some(d.0);
@@ -320,12 +574,14 @@ fn gif_loop(
     max_secs: Option<f64>,
     show_cursor: bool,
     stop: Arc<AtomicBool>,
+    capture_done: Arc<AtomicBool>,
     frames_counter: Arc<AtomicU64>,
     output: PathBuf,
 ) -> Result<u64> {
     let interval = Duration::from_secs_f64(1.0 / fps as f64);
     let start = Instant::now();
     let mut frames: Vec<RgbaImage> = Vec::new();
+    let mut bytes: u64 = 0;
     let mut next_tick = start;
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -335,6 +591,10 @@ fn gif_loop(
             if start.elapsed().as_secs_f64() >= m {
                 break;
             }
+        }
+        if let Some(why) = gif_cap_reason(bytes, start.elapsed().as_secs_f64()) {
+            tracing::warn!("GIF recording stopped: {why}");
+            break;
         }
         let now = Instant::now();
         if now < next_tick {
@@ -347,24 +607,20 @@ fn gif_loop(
         };
         match grab {
             Ok(img) => {
-                let long = img.width().max(img.height());
-                let img = if long > max_size {
-                    let s = max_size as f64 / long as f64;
-                    image::imageops::resize(
-                        &img,
-                        ((img.width() as f64) * s) as u32,
-                        ((img.height() as f64) * s) as u32,
-                        image::imageops::FilterType::Triangle,
-                    )
+                let (w, h) = gif_frame_dims(img.width(), img.height(), max_size);
+                let img = if (w, h) != img.dimensions() {
+                    image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle)
                 } else {
                     img
                 };
+                bytes += img.as_raw().len() as u64;
                 frames.push(img);
                 frames_counter.store(frames.len() as u64, Ordering::Relaxed);
             }
             Err(e) => tracing::warn!("gif frame grab failed: {e}"),
         }
     }
+    capture_done.store(true, Ordering::Relaxed);
     if frames.is_empty() {
         return Ok(0);
     }
@@ -375,4 +631,241 @@ fn gif_loop(
     let n = frames.len() as u64;
     enc.encode_frames(frames.into_iter().map(move |f| Frame::from_parts(f, 0, 0, delay)))?;
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bugle_core::Config;
+
+    fn active(backend: Backend, output: PathBuf, max_seconds: Option<f64>) -> Active {
+        Active {
+            format: RecordingFormat::Gif,
+            started: Instant::now(),
+            started_at: Utc::now(),
+            output,
+            label: None,
+            source: "test".into(),
+            backend,
+            frames: Arc::new(AtomicU64::new(0)),
+            max_seconds,
+            finished_at: None,
+        }
+    }
+
+    fn video(program: &str, args: &[&str]) -> Backend {
+        let child = std::process::Command::new(program).args(args).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        Backend::Video { child, wants_mp4: false }
+    }
+
+    /// A GIF backend whose "frame loop" waits for the stop flag (or for
+    /// `release`) and then runs `finish`.
+    fn gif<F>(release: Arc<AtomicBool>, finish: F) -> (Backend, Arc<AtomicBool>)
+    where
+        F: FnOnce() -> Result<u64> + Send + 'static,
+    {
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let (stop2, done2) = (stop.clone(), done.clone());
+        let handle = std::thread::spawn(move || {
+            while !stop2.load(Ordering::Relaxed) && !release.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            done2.store(true, Ordering::Relaxed);
+            finish()
+        });
+        (Backend::Gif { stop: stop.clone(), capture_done: done, handle: Some(handle) }, stop)
+    }
+
+    fn wait_until(mut f: impl FnMut() -> bool) {
+        let t0 = Instant::now();
+        while !f() {
+            assert!(t0.elapsed() < Duration::from_secs(5), "timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn engine_in(tmp: &Path) -> Engine {
+        let mut cfg = Config::default();
+        cfg.general.save_dir = tmp.join("save").display().to_string();
+        cfg.general.history_path = Some(tmp.join("history.jsonl").display().to_string());
+        Engine::new(cfg, false).unwrap()
+    }
+
+    #[test]
+    fn rect_validation() {
+        assert!(validate_record_rect(&Rect::new(-1440.0, 10.5, 2.0, 300.0)).is_ok());
+        for r in [
+            Rect::new(0.0, 0.0, 0.0, 100.0),
+            Rect::new(0.0, 0.0, 100.0, -5.0),
+            Rect::new(0.0, 0.0, 1.5, 100.0),
+            Rect::new(f64::NAN, 0.0, 100.0, 100.0),
+            Rect::new(0.0, 0.0, f64::INFINITY, 100.0),
+            Rect::new(0.0, f64::NEG_INFINITY, 100.0, 100.0),
+        ] {
+            assert!(matches!(validate_record_rect(&r), Err(BugleError::Invalid(_))), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn screencapture_rect_is_integral() {
+        assert_eq!(screencapture_rect_arg(&Rect::new(10.5, 20.0, 300.25, 200.0)), "11,20,300,200");
+        assert_eq!(screencapture_rect_arg(&Rect::new(0.0, 0.0, 1440.0, 900.0)), "0,0,1440,900");
+        assert_eq!(screencapture_rect_arg(&Rect::new(-1440.4, -0.6, 0.3, 0.2)), "-1440,-1,1,1");
+    }
+
+    #[test]
+    fn gif_dims_never_zero() {
+        assert_eq!(gif_frame_dims(800, 600, 1200), (800, 600));
+        assert_eq!(gif_frame_dims(2400, 1200, 1200), (1200, 600));
+        assert_eq!(gif_frame_dims(5000, 2, 1200), (1200, 1));
+        assert_eq!(gif_frame_dims(1, 100_000, 1200), (1, 1200));
+        assert_eq!(gif_frame_dims(10, 10, 0), (1, 1));
+    }
+
+    #[test]
+    fn gif_caps() {
+        assert!(gif_cap_reason(0, 0.0).is_none());
+        assert!(gif_cap_reason(GIF_MAX_BYTES - 1, GIF_MAX_SECONDS - 0.1).is_none());
+        assert!(gif_cap_reason(GIF_MAX_BYTES, 1.0).unwrap().contains("memory"));
+        assert!(gif_cap_reason(0, GIF_MAX_SECONDS).unwrap().contains("length"));
+    }
+
+    #[test]
+    fn deadline() {
+        assert!(!deadline_passed(100.0, None));
+        assert!(!deadline_passed(1.9, Some(2.0)));
+        assert!(deadline_passed(2.0, Some(2.0)));
+    }
+
+    #[test]
+    fn exited_child_reports_finishing_with_frozen_elapsed() {
+        let mut a = active(video("/usr/bin/true", &[]), PathBuf::from("/nonexistent/x.mov"), None);
+        wait_until(|| a.poll() == RecordingState::Finishing);
+        let e1 = a.status().elapsed_seconds;
+        std::thread::sleep(Duration::from_millis(50));
+        let s = a.status();
+        assert_eq!(s.state, RecordingState::Finishing);
+        assert_eq!(s.elapsed_seconds, e1);
+    }
+
+    #[test]
+    fn running_child_is_active_and_interrupted_on_drop() {
+        let mut a = active(video("/bin/sleep", &["30"]), PathBuf::from("/nonexistent/x.mov"), None);
+        let pid = match &a.backend {
+            Backend::Video { child, .. } => child.id() as i32,
+            _ => unreachable!(),
+        };
+        assert_eq!(a.poll(), RecordingState::Active);
+        let t0 = Instant::now();
+        drop(a);
+        assert!(t0.elapsed() < Duration::from_secs(5), "child should exit on SIGINT");
+        // Reaped: the pid no longer exists.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+
+    #[test]
+    fn gif_backend_finishing_and_drop_joins() {
+        let release = Arc::new(AtomicBool::new(false));
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = ran.clone();
+        let (backend, stop) = gif(release.clone(), move || {
+            ran2.store(true, Ordering::Relaxed);
+            Ok(0)
+        });
+        let mut a = active(backend, PathBuf::from("/nonexistent/x.gif"), Some(5.0));
+        assert_eq!(a.poll(), RecordingState::Active);
+        drop(a);
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(ran.load(Ordering::Relaxed), "drop must join the thread");
+
+        // Stopping by itself (deadline / cap) shows as Finishing.
+        let (backend, _) = gif(release.clone(), || Ok(0));
+        let mut a = active(backend, PathBuf::from("/nonexistent/x.gif"), None);
+        release.store(true, Ordering::Relaxed);
+        wait_until(|| a.poll() == RecordingState::Finishing);
+    }
+
+    #[test]
+    fn sck_deadline_counts_as_finished_and_elapsed_is_capped() {
+        let mut a = active(Backend::Sck { rec: None, wants_mov: false }, PathBuf::from("/nonexistent/x.mp4"), Some(0.01));
+        a.started -= Duration::from_secs(3);
+        assert_eq!(a.poll(), RecordingState::Finishing);
+        assert_eq!(a.elapsed_seconds(), 0.01);
+    }
+
+    #[test]
+    fn start_refuses_running_but_reaps_finished() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_in(tmp.path());
+        assert!(engine.idle_recorder().is_ok());
+
+        // Still capturing: refused, and left alone.
+        let release = Arc::new(AtomicBool::new(false));
+        let (backend, stop) = gif(release.clone(), || Ok(0));
+        *engine.recorder_state.inner.lock().unwrap() = Some(active(backend, tmp.path().join("a.gif"), None));
+        let err = engine.idle_recorder().err().expect("should refuse");
+        assert!(err.to_string().contains("already in progress"));
+        assert_eq!(engine.record_status().state, RecordingState::Active);
+        assert!(!stop.load(Ordering::Relaxed));
+
+        // Stopped by itself: finalised (into the history) and the slot freed.
+        let out = tmp.path().join("b.gif");
+        let out2 = out.clone();
+        let (backend, _) = gif(release.clone(), move || {
+            let img = RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]));
+            let file = std::fs::File::create(&out2)?;
+            let mut enc = GifEncoder::new(file);
+            enc.encode_frames(std::iter::once(Frame::new(img)))?;
+            Ok(1)
+        });
+        // Replacing the slot drops (stops and joins) the first recording.
+        *engine.recorder_state.inner.lock().unwrap() = Some(active(backend, out.clone(), None));
+        assert!(stop.load(Ordering::Relaxed));
+        release.store(true, Ordering::Relaxed);
+        wait_until(|| engine.record_status().state == RecordingState::Finishing);
+        let g = engine.idle_recorder().unwrap();
+        assert!(g.is_none());
+        drop(g);
+        let items = engine.history.all().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path, out);
+        assert_eq!(items[0].width, Some(4));
+        assert_eq!(engine.record_status().state, RecordingState::Idle);
+    }
+
+    #[test]
+    fn failed_gif_finalise_removes_partial_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_in(tmp.path());
+        let out = tmp.path().join("partial.gif");
+        std::fs::write(&out, b"GIF89a partial").unwrap();
+        let (backend, _) = gif(Arc::new(AtomicBool::new(false)), || bail!("encoder failed"));
+        *engine.recorder_state.inner.lock().unwrap() = Some(active(backend, out.clone(), None));
+        assert!(engine.record_stop().is_err());
+        assert!(!out.exists());
+        assert!(engine.record_stop().is_err(), "slot is free after a failed stop");
+    }
+
+    #[test]
+    fn failed_export_keeps_raw_recording_without_temp_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("clip.mp4");
+        let raw = temp_path(&output, "mov");
+        assert_eq!(raw, tmp.path().join("clip.rec.mov"));
+        std::fs::write(&raw, b"movie").unwrap();
+        std::fs::write(&output, b"partial").unwrap();
+        let e = keep_raw_after_failed_export(&raw, &output, "mov", anyhow!("boom"));
+        assert!(format!("{e:#}").contains("clip.mov"));
+        assert!(!raw.exists());
+        assert!(!output.exists());
+        assert_eq!(std::fs::read(tmp.path().join("clip.mov")).unwrap(), b"movie");
+
+        // An empty temp file is just removed.
+        std::fs::remove_file(tmp.path().join("clip.mov")).unwrap();
+        std::fs::write(&raw, b"").unwrap();
+        keep_raw_after_failed_export(&raw, &output, "mov", anyhow!("boom"));
+        assert!(!raw.exists());
+        assert!(!tmp.path().join("clip.mov").exists());
+    }
 }
