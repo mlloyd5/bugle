@@ -67,6 +67,7 @@ extern "C" {
 
     pub fn bugle_ocr(
         rgba: *const u8,
+        len: size_t,
         w: i32,
         h: i32,
         langs_csv: *const c_char,
@@ -79,9 +80,11 @@ extern "C" {
 
     pub fn bugle_register_translation(
         ref_rgba: *const u8,
+        ref_len: size_t,
         rw: i32,
         rh: i32,
         flt_rgba: *const u8,
+        flt_len: size_t,
         fw: i32,
         fh: i32,
         dx: *mut c_double,
