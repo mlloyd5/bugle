@@ -23,7 +23,7 @@ gif_max_size = 1200       # long edge, pixels
 video_fps = 30
 microphone = false
 system_audio = false      # needs the ScreenCaptureKit backend (macOS 14+)
-highlight_clicks = false  # screencapture backend only
+highlight_clicks = false  # stream backend: macOS 15+
 retina = true
 # auto: ScreenCaptureKit (SCStream + AVAssetWriter, H.264 + AAC .mp4) when system
 #       audio is requested, otherwise `screencapture -v`

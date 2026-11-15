@@ -46,7 +46,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `pin_image_blocking`, `pin_image_show` | floating borderless window, drag/resize/close; blocking or fire-and-forget |
 | `toast_show` | non-activating `NSPanel` with `NSVisualEffectView`, thumbnail + two lines, fades out |
 | `clipboard_*` | `NSPasteboard` |
-| `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
+| `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
 | `export_audio_m4a`, `export_mp4`, `export_mov`, `video_frame`, `media_duration` | `AVAssetExportSession`, `AVAssetImageGenerator` |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
 
@@ -100,7 +100,8 @@ recorder state machine, and exposes one method per user-facing action:
   `.mp4` (a `.mov` request is remuxed afterwards). The microphone is an
   `AVCaptureSession` audio tap written as a second AAC track, retimed to the host
   clock; `export_audio_m4a` mixes both tracks when transcribing. Click highlighting
-  is only available with the system recorder (`"system"`). Timing details live in the shim's
+  uses `screencapture -k` or, on the stream recorder, `SCStreamConfiguration.showMouseClicks`
+  (macOS 15+). Timing details live in the shim's
   recorder comment: the writer session opens before the stream starts, a static
   screen's stale first-frame timestamp is clamped, and the last frame is
   re-appended at the stop time so the video track covers the whole recording.

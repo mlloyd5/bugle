@@ -1450,8 +1450,8 @@ static size_t even_px(double v) {
 }
 
 void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t window_id, int32_t fps, int32_t retina,
-                             int32_t system_audio, int32_t microphone, int32_t show_cursor, double max_seconds,
-                             const char *out_path) {
+                             int32_t system_audio, int32_t microphone, int32_t show_cursor, int32_t show_clicks,
+                             double max_seconds, const char *out_path) {
     @autoreleasepool {
         clear_error();
         if (!bugle_sck_record_available()) { set_error(@"ScreenCaptureKit recording needs macOS 14 or later"); return NULL; }
@@ -1504,6 +1504,14 @@ void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t wi
         cfg.minimumFrameInterval = CMTimeMake(1, fps);
         cfg.queueDepth = 8;
         cfg.showsCursor = show_cursor != 0;
+        BOOL clicksUnsupported = NO;
+        if (show_clicks) {
+            if (@available(macOS 15.0, *)) {
+                cfg.showMouseClicks = YES;
+            } else {
+                clicksUnsupported = YES;
+            }
+        }
         cfg.pixelFormat = kCVPixelFormatType_32BGRA;
         cfg.colorSpaceName = kCGColorSpaceSRGB;
         cfg.captureResolution = SCCaptureResolutionBest;
@@ -1516,6 +1524,7 @@ void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t wi
         }
         NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
         BugleSckRecorder *rec = [[BugleSckRecorder alloc] init];
+        if (clicksUnsupported) [rec warn:@"click highlighting needs macOS 15 with this recorder; recording without it"];
         if (![rec startWithFilter:filter config:cfg url:url fps:fps systemAudio:system_audio != 0 microphone:microphone != 0]) {
             // Whatever failed, make sure nothing keeps running: a stream whose
             // start was requested (even one that timed out and may still come

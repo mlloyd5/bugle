@@ -93,12 +93,13 @@ void bugle_open_path(const char *path);
 
 // ScreenCaptureKit recorder: H.264 video + AAC system audio (+ AAC microphone
 // as a second audio track) written straight to an .mp4. `window_id` 0 records
-// the rect; `max_seconds` <= 0 disables the auto-stop. Stop finalises the
-// file and releases the handle.
+// the rect; `show_clicks` draws mouse clicks into the frames (macOS 15+, a
+// warning otherwise); `max_seconds` <= 0 disables the auto-stop. Stop
+// finalises the file and releases the handle.
 int32_t bugle_sck_record_available(void);
 void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t window_id, int32_t fps, int32_t retina,
-                             int32_t system_audio, int32_t microphone, int32_t show_cursor, double max_seconds,
-                             const char *out_path);
+                             int32_t system_audio, int32_t microphone, int32_t show_cursor, int32_t show_clicks,
+                             double max_seconds, const char *out_path);
 int64_t bugle_sck_record_frames(void *handle);
 char *bugle_sck_record_warnings(void *handle);   // malloc'd, NULL when none
 int32_t bugle_sck_record_stop(void *handle);

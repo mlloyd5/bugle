@@ -4,8 +4,8 @@
 //! * Video: either the system `screencapture -v` recorder (H.264 .mov,
 //!   optional microphone, click highlight), remuxed to MP4 on request, or the
 //!   in-process ScreenCaptureKit recorder (`SCStream` + `AVAssetWriter`,
-//!   H.264 + AAC straight to .mp4) which is the only one that can capture
-//!   system audio. `recording.backend` picks between them; `auto` uses
+//!   H.264 + AAC straight to .mp4, click highlight on macOS 15+) which is the
+//!   only one that can capture system audio. `recording.backend` picks between them; `auto` uses
 //!   ScreenCaptureKit whenever system audio is requested.
 
 use crate::Engine;
@@ -362,9 +362,6 @@ impl Engine {
                     }
                 };
                 if use_sck {
-                    if highlight_clicks {
-                        tracing::warn!("click highlighting is only available with the system recorder backend");
-                    }
                     // AVAssetWriter writes the MP4 container directly; a .mov
                     // request is remuxed on stop.
                     let tmp = if wants_mp4 { output.clone() } else { temp_path(&output, "mp4") };
@@ -376,6 +373,7 @@ impl Engine {
                         system_audio,
                         microphone,
                         show_cursor: true,
+                        highlight_clicks,
                         max_seconds: req.max_seconds,
                     };
                     let rec = SckRecorder::start(&opts, &tmp).context("starting ScreenCaptureKit recording")?;

@@ -488,6 +488,8 @@ pub struct SckRecordOptions {
     pub system_audio: bool,
     pub microphone: bool,
     pub show_cursor: bool,
+    /// Draw a highlight around mouse clicks (macOS 15+; a warning otherwise).
+    pub highlight_clicks: bool,
     /// Stop capturing by itself after this long; `stop` then only finalises.
     pub max_seconds: Option<f64>,
 }
@@ -521,6 +523,7 @@ impl SckRecorder {
                 opts.system_audio as i32,
                 opts.microphone as i32,
                 opts.show_cursor as i32,
+                opts.highlight_clicks as i32,
                 opts.max_seconds.unwrap_or(0.0),
                 out.as_ptr(),
             )

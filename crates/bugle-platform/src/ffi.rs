@@ -133,6 +133,7 @@ extern "C" {
         system_audio: i32,
         microphone: i32,
         show_cursor: i32,
+        show_clicks: i32,
         max_seconds: f64,
         out_path: *const c_char,
     ) -> *mut c_void;
