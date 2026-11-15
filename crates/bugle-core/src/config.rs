@@ -569,11 +569,19 @@ pub struct QuickAccessConfig {
     pub timeout_seconds: f64,
     /// Screen corner: `top-right`, `top-left`, `bottom-right`, `bottom-left`.
     pub position: PanelCorner,
+    /// Bundle id of the app *Annotate* opens the capture in (its markup
+    /// tools edit the saved file). Falls back to the default app for the file.
+    pub annotate_app: String,
 }
 
 impl Default for QuickAccessConfig {
     fn default() -> Self {
-        Self { enabled: true, timeout_seconds: 8.0, position: PanelCorner::TopRight }
+        Self {
+            enabled: true,
+            timeout_seconds: 8.0,
+            position: PanelCorner::TopRight,
+            annotate_app: "com.apple.Preview".into(),
+        }
     }
 }
 

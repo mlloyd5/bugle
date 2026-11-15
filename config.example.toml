@@ -70,6 +70,7 @@ pin_latest = "cmd+shift+p"
 enabled = true
 timeout_seconds = 8.0     # closes by itself (paused while hovered); 0 = stay open
 position = "top-right"    # top-right | top-left | bottom-right | bottom-left
+annotate_app = "com.apple.Preview"   # bundle id Annotate opens the file in (Markup toolbar)
 
 # ---------------------------------------------------------------------------
 # Sync every new capture to storage you own. There is no hosted service: pick
