@@ -10,7 +10,10 @@ mod ffi;
 #[cfg(target_os = "macos")]
 mod panel;
 #[cfg(target_os = "macos")]
-pub use panel::{open_with, panel_active, panel_dismiss, panel_hovered, panel_set_image, panel_show, reveal_path, Corner, PanelChoice};
+pub use panel::{
+    open_with, panel_active, panel_clear, panel_dismiss, panel_hovered, panel_set_image, panel_show, reveal_path, Corner, Opened,
+    PanelChoice,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bugle_core::{BugleError, DisplayInfo, OcrLine, Point, Rect, WindowInfo};

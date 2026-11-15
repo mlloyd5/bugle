@@ -32,7 +32,7 @@ extern "C" {
     fn bugle_panel_active() -> i32;
     fn bugle_panel_hovered() -> i32;
     fn bugle_reveal_path(path: *const c_char);
-    fn bugle_open_with(path: *const c_char, bundle_id: *const c_char) -> i32;
+    fn bugle_open_with(path: *const c_char, bundle_id: *const c_char, err: *mut c_char, err_len: usize) -> i32;
 }
 
 /// What the user clicked on the panel. The panel has already closed itself.
@@ -132,21 +132,58 @@ pub fn panel_hovered() -> bool {
     unsafe { bugle_panel_hovered() == 1 }
 }
 
-/// Select `path` in a Finder window.
-pub fn reveal_path(path: &Path) {
-    if let Ok(c) = path_cstr(path) {
-        unsafe { bugle_reveal_path(c.as_ptr()) }
-    }
+/// Close the panel at once, including one still fading out, so the next
+/// screen capture cannot contain it.
+pub fn panel_clear() {
+    unsafe { bugle_panel_dismiss(0) }
 }
 
-/// Open `path` with the application whose bundle id is `bundle_id`, falling
-/// back to the default application for the file when it is not installed.
-pub fn open_with(path: &Path, bundle_id: &str) -> Result<()> {
-    let (p, b) = (path_cstr(path)?, cstr(bundle_id)?);
-    if unsafe { bugle_open_with(p.as_ptr(), b.as_ptr()) } != 1 {
-        bail!("could not open {}", path.display());
+/// Select `path` in a Finder window.
+pub fn reveal_path(path: &Path) -> Result<()> {
+    if !path.exists() {
+        bail!("{} no longer exists", path.display());
     }
+    let c = path_cstr(path)?;
+    unsafe { bugle_reveal_path(c.as_ptr()) }
     Ok(())
+}
+
+/// How [`open_with`] opened the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opened {
+    /// With the requested application (or the default one when none was asked for).
+    AsRequested,
+    /// With the default application, because the requested bundle id is not installed.
+    FellBack,
+}
+
+/// Open `path` with the application whose bundle id is `bundle_id` (`None`:
+/// the default application) and wait until the workspace reports back.
+/// Blocks for as long as the application takes to accept the file, so call
+/// it off the main thread.
+pub fn open_with(path: &Path, bundle_id: Option<&str>) -> Result<Opened> {
+    if !path.exists() {
+        bail!("{} no longer exists", path.display());
+    }
+    let p = path_cstr(path)?;
+    let b = bundle_id.map(cstr).transpose()?;
+    let mut err = vec![0u8; 512];
+    let r = unsafe {
+        bugle_open_with(
+            p.as_ptr(),
+            b.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
+            err.as_mut_ptr() as *mut c_char,
+            err.len(),
+        )
+    };
+    match r {
+        1 => Ok(Opened::AsRequested),
+        2 => Ok(Opened::FellBack),
+        _ => {
+            let msg = std::ffi::CStr::from_bytes_until_nul(&err).map(|c| c.to_string_lossy().into_owned()).unwrap_or_default();
+            bail!("could not open {}: {}", path.display(), if msg.is_empty() { "unknown error" } else { &msg })
+        }
+    }
 }
 
 #[cfg(test)]

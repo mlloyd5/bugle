@@ -929,6 +929,7 @@ void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const c
         panel.backgroundColor = [NSColor clearColor];
         panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
         panel.hidesOnDeactivate = NO;
+        panel.sharingType = NSWindowSharingNone; // keep it out of screen captures where honoured
 
         BugleToastView *root = [[BugleToastView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
         root.material = NSVisualEffectMaterialHUDWindow;

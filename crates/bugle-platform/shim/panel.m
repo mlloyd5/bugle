@@ -24,6 +24,9 @@ static NSImageView *g_panel_thumb = nil;
 static bugle_panel_callback_t g_panel_cb = NULL;
 static bugle_panel_free_t g_panel_free = NULL;
 static void *g_panel_ctx = NULL;
+// Panels still fading out: off limits for clicks, and ordered out at once
+// when the app needs the screen clear (before a capture).
+static NSMutableArray<NSPanel *> *g_panel_fading = nil;
 
 /// Release the Rust context exactly once.
 static void panel_release_ctx(void) {
@@ -40,11 +43,16 @@ static void panel_close(BOOL animated) {
     g_panel = nil;
     g_panel_thumb = nil;
     panel_release_ctx();
-    if (!p) return;
     if (!animated) {
+        for (NSPanel *f in g_panel_fading) [f orderOut:nil];
+        [g_panel_fading removeAllObjects];
         [p orderOut:nil];
         return;
     }
+    if (!p) return;
+    p.ignoresMouseEvents = YES;
+    if (!g_panel_fading) g_panel_fading = [NSMutableArray array];
+    [g_panel_fading addObject:p];
     [NSAnimationContext
         runAnimationGroup:^(NSAnimationContext *ctx) {
           ctx.duration = 0.2;
@@ -52,6 +60,7 @@ static void panel_close(BOOL animated) {
         }
         completionHandler:^{
           [p orderOut:nil];
+          [g_panel_fading removeObject:p];
         }];
 }
 
@@ -81,14 +90,19 @@ static void panel_choose(int32_t choice) {
 @end
 @implementation BuglePanelThumb
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
-- (void)mouseDown:(NSEvent *)e { panel_choose(BUGLE_PANEL_THUMBNAIL); }
+- (void)mouseDown:(NSEvent *)e {
+    // A click on a panel that is already closing must not reach the next one.
+    if (self.window == g_panel) panel_choose(BUGLE_PANEL_THUMBNAIL);
+}
 - (void)resetCursorRects { [self addCursorRect:self.bounds cursor:[NSCursor pointingHandCursor]]; }
 @end
 
 @interface BuglePanelTarget : NSObject
 @end
 @implementation BuglePanelTarget
-- (void)clicked:(BuglePanelButton *)sender { panel_choose(sender.choice); }
+- (void)clicked:(BuglePanelButton *)sender {
+    if (sender.window == g_panel) panel_choose(sender.choice);
+}
 @end
 
 static BuglePanelTarget *g_panel_target = nil;
@@ -168,6 +182,9 @@ int32_t bugle_panel_show(const uint8_t *png, size_t len, const char *title, cons
                                    NSWindowCollectionBehaviorIgnoresCycle;
         panel.hidesOnDeactivate = NO;
         panel.becomesKeyOnlyIfNeeded = YES;
+        // Keep it out of screen captures where the window server honours this;
+        // the app also closes the panel before every capture it starts.
+        panel.sharingType = NSWindowSharingNone;
         panel.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
 
         NSVisualEffectView *root = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
@@ -260,17 +277,42 @@ void bugle_reveal_path(const char *path) {
     }
 }
 
-/// Open `path` with the application `bundle_id`; falls back to the default
-/// application when that one is missing. Returns 0 when nothing could open it.
-int32_t bugle_open_with(const char *path, const char *bundle_id) {
+/// Open `path` with the application `bundle_id` (or the default application
+/// when `bundle_id` is NULL/empty or not installed) and wait for the result.
+/// Returns 1 on success, 2 when it fell back to the default application
+/// because `bundle_id` is not installed, 0 on failure with a message in
+/// `err` (NUL-terminated, truncated to `err_len`). Not on the main thread:
+/// it blocks until the workspace reports back.
+int32_t bugle_open_with(const char *path, const char *bundle_id, char *err, size_t err_len) {
     @autoreleasepool {
         NSWorkspace *ws = [NSWorkspace sharedWorkspace];
         NSURL *u = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
-        NSURL *app = bundle_id ? [ws URLForApplicationWithBundleIdentifier:[NSString stringWithUTF8String:bundle_id]] : nil;
-        if (!app) return [ws openURL:u] ? 1 : 0;
+        NSString *bid = (bundle_id && *bundle_id) ? [NSString stringWithUTF8String:bundle_id] : nil;
+        NSURL *app = bid ? [ws URLForApplicationWithBundleIdentifier:bid] : nil;
+        int32_t fell_back = (bid && !app) ? 1 : 0;
+        if (!app) app = [ws URLForApplicationToOpenURL:u];
+        if (!app) {
+            if (err && err_len) snprintf(err, err_len, "no application opens %s", path);
+            return 0;
+        }
         NSWorkspaceOpenConfiguration *cfg = [NSWorkspaceOpenConfiguration configuration];
         cfg.activates = YES;
-        [ws openURLs:@[ u ] withApplicationAtURL:app configuration:cfg completionHandler:nil];
-        return 1;
+        dispatch_semaphore_t done = dispatch_semaphore_create(0);
+        __block NSString *failure = nil;
+        [ws openURLs:@[ u ]
+            withApplicationAtURL:app
+                   configuration:cfg
+               completionHandler:^(NSRunningApplication *running, NSError *error) {
+                 if (error) failure = error.localizedDescription ?: @"could not open the file";
+                 dispatch_semaphore_signal(done);
+               }];
+        if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC)) != 0) {
+            failure = @"timed out waiting for the application";
+        }
+        if (failure) {
+            if (err && err_len) snprintf(err, err_len, "%s", failure.UTF8String);
+            return 0;
+        }
+        return fell_back ? 2 : 1;
     }
 }
