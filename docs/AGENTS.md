@@ -100,7 +100,7 @@ curl -s -H "$H" -H 'content-type: application/json' \
 | `delete_media` | `id`, `delete_file` | `deleted` |
 | `pin` | `source`, `frame`, `opacity` | `pinned` |
 | `copy` | `source` | `copied` |
-| `sync` | `source` | `media` (new `path`/`url`), `sync` (`action`, `destination`) |
+| `sync` | `source` | `media` (new `path`/`url`), `sync` (`action`, `destination`, `sidecars`) |
 | `select_area` | – | `rect` (user drags) |
 | `providers` | – | provider list with roles |
 | `permissions` | – | `screen_recording`, `accessibility` |

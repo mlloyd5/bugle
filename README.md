@@ -40,7 +40,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | HTTP API + OpenAPI | axum, bearer token | ✅ |
 | MCP server (stdio) | JSON-RPC 2.0, image content | ✅ |
 | Menu-bar app, global hotkeys | `bugle-app`: `NSStatusItem` via `tray-icon`, Carbon hotkeys via `global-hotkey`, in-app overlays | ✅ |
-| Sync to your own storage | folder copy/move, or SigV4 `PUT` to any S3-compatible bucket | ✅ |
+| Sync to your own storage | folder copy/move, or SigV4 uploads (multipart for large files) to any S3-compatible bucket; a destination per media kind; subtitles follow their video | ✅ |
 | Post-capture video editor | — | see [feature ideas](docs/ARCHITECTURE.md#feature-ideas) |
 
 ## Build
@@ -227,11 +227,28 @@ secret_key_env = "AWS_SECRET_ACCESS_KEY"
 # public_url = "https://captures.example.com"
 ```
 
-Uploads are SigV4-signed `PUT`s (path-style, no SDK). The object URL is stored
+Uploads are SigV4-signed (path-style, no SDK) and stream from disk; files of
+`multipart_threshold_mb` (64) or more go up as a multipart upload in
+`part_size_mb` (16) parts, each retried on its own, and the upload is aborted if
+it cannot finish. The object URL is stored
 in the history item (`url`) and copied to the clipboard unless
 `general.copy_to_clipboard` already puts the image there. `bugle sync latest`,
 the `sync` agent action and *Sync Latest* in the menu bar do the same on demand,
 even with `enabled = false`.
+
+Each media kind can have its own destination; kinds without one use the default:
+
+```toml
+[sync.destinations.video]
+prefix = "recordings"            # sub-folder / key prefix under the default destination
+[sync.destinations.gif]
+folder = "~/Dropbox/GIFs"        # or a [sync.destinations.gif.s3] table
+mode = "move"
+```
+
+With `sidecars = true` (the default), a video's `.srt` / `.vtt` subtitles are
+synced to the video's destination under the video's synced name (`clip 2.mp4` →
+`clip 2.srt`), including subtitles generated after the video was synced.
 
 ## Agents
 

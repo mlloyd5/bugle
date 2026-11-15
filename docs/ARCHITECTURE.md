@@ -25,7 +25,8 @@ an obvious home.
 ### `bugle-core`
 Pure data: `Rect`/`Point`, `CaptureTarget`, `CaptureOptions`, `OcrResult`,
 `Transcript` (with SRT/VTT rendering), `MediaItem`/`MediaKind`, the TOML `Config`
-(including `SyncConfig`: folder *or* S3 destination, copy/move, kinds), filename
+(including `SyncConfig`: folder *or* S3 destination, copy/move, kinds, per-kind
+`destinations`), filename
 templates (`naming`) and the JSON-lines `History`. A history line whose id is
 already present replaces the earlier record, which is how a moved file or a new
 sync URL is stored without rewriting the file.
@@ -108,14 +109,23 @@ recorder state machine, and exposes one method per user-facing action:
   (extracts the audio track first), `subtitles`, `annotate`, `pin`, `select_area`.
 * `sync` (`sync.rs`) — runs after every successful save (`save_image`, so
   screenshots, scrolling captures and annotation output; `record_stop`) for the
-  kinds listed in `[sync]`, before the item is written to history. A folder
-  destination copies or moves the file (unique name on collision; a move updates
-  the item's path). An S3 destination reads the credentials from the named
-  environment variables, hand-rolls an AWS SigV4 `Authorization` header with
-  `ring` (HMAC-SHA256, verified against the AWS test vectors) and `PUT`s the
-  file path-style through `reqwest` on a throw-away single-thread runtime, so it
-  works from the CLI's runtime, the servers' blocking pool and the app's worker
-  thread alike. The object URL lands in `MediaItem.url` and on the clipboard when
+  kinds listed in `[sync]` (or given their own `[sync.destinations.<kind>]`),
+  before the item is written to history. The destination and mode are resolved
+  per kind, falling back to the default. A folder destination copies or moves
+  the file (unique name on collision; a move updates the item's path). An S3
+  destination reads the credentials from the named environment variables,
+  hand-rolls an AWS SigV4 `Authorization` header with `ring` (HMAC-SHA256,
+  verified against the AWS test vectors) and talks path-style through `reqwest`
+  on a throw-away single-thread runtime, so it works from the CLI's runtime, the
+  servers' blocking pool and the app's worker thread alike. Bodies stream from
+  disk in 256 KiB reads with a signed `Content-Length`: one `PUT` below
+  `multipart_threshold_mb`, otherwise create / upload-part / complete, each
+  request signed afresh and retried with backoff (5xx, 429, transport errors, a
+  200 carrying `<Error>`), and an abort when the upload fails. The name the copy
+  got is kept in `MediaItem.synced_as`; a video's `.srt` / `.vtt` sidecars go to
+  the same destination under that stem (`clip 2.mp4` → `clip 2.srt`), and
+  `subtitles` written later follow a synced video. Tests drive the S3 path
+  against an in-process axum mock that re-verifies every signature. The object URL lands in `MediaItem.url` and on the clipboard when
   `general.copy_to_clipboard` is off. A failed sync is logged and never fails the
   capture; `sync_media` (CLI `bugle sync`, action `sync`, menu *Sync Latest*)
   syncs on demand regardless of `enabled`/`kinds` and updates history.
@@ -157,5 +167,3 @@ earn its keep.
   taking the front-most window; a hotkey for every menu item.
 * **Packaging** — a signed `.app` bundle so notifications, Login Items and the
   permission prompts carry Bugle's own name.
-* **Sync extras** — a destination per media kind, streaming multipart uploads
-  for long recordings, and syncing sidecar subtitles next to their video.
