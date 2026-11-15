@@ -6,16 +6,19 @@
 //! so the menu stays responsive, and the worker asks the main thread to show
 //! the selection overlay or pin windows through [`UiHost`].
 
+mod commands;
 mod icon;
+mod picker;
 
 use anyhow::{anyhow, Context, Result};
 use bugle_core::{
     CaptureOptions, CaptureRequest, CaptureTarget, Config, MediaKind, OcrOptions, RecordRequest, RecordingFormat,
-    RecordingState, Rect, ScrollCaptureRequest,
+    RecordingState, Rect, ScrollCaptureRequest, WindowInfo,
 };
+use commands::{Command, Slot};
 use bugle_engine::{Engine, UiHost};
 use clap::Parser;
-use global_hotkey::{hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -49,7 +52,8 @@ struct Cli {
 // Events and actions
 // ---------------------------------------------------------------------------
 
-/// What the user can ask for. Hotkeys and menu items both map to these.
+/// Engine work the user can ask for; [`commands::MENU`] maps menu items and
+/// hotkeys to these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     CaptureArea,
@@ -64,25 +68,6 @@ enum Action {
     SyncLatest,
 }
 
-impl Action {
-    /// Hotkey/menu identifiers; the hotkey ones match `[hotkeys]` keys.
-    fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "capture_area" => Self::CaptureArea,
-            "capture_window" => Self::CaptureWindow,
-            "capture_screen" => Self::CaptureScreen,
-            "scroll_capture" => Self::ScrollCapture,
-            "record" | "record_video" => Self::RecordVideo,
-            "record_gif" => Self::RecordGif,
-            "stop_recording" => Self::StopRecording,
-            "ocr_latest" => Self::OcrLatest,
-            "pin_latest" => Self::PinLatest,
-            "sync_latest" => Self::SyncLatest,
-            _ => return None,
-        })
-    }
-}
-
 /// Something to tell the user once an action finished.
 struct Notice {
     title: String,
@@ -95,6 +80,8 @@ struct Notice {
 enum UiRequest {
     Select(Sender<Option<Rect>>),
     Pin { png: Vec<u8>, frame: Option<Rect>, opacity: f64, reply: Sender<Result<(), String>> },
+    /// Hover-to-highlight window picker; `None` when cancelled.
+    PickWindow { timeout: Duration, reply: Sender<Option<WindowInfo>> },
 }
 
 enum AppEvent {
@@ -150,14 +137,18 @@ impl UiHost for AppUiHost {
 
 fn worker(engine: Arc<Engine>, rx: Receiver<Action>, proxy: Proxy) {
     for action in rx {
-        let result = run_action(&engine, action).map_err(|e| format!("{e:#}"));
+        let result = run_action(&engine, action, &proxy).map_err(|e| format!("{e:#}"));
         proxy.send(AppEvent::Done(action, result));
     }
 }
 
-fn run_action(engine: &Engine, action: Action) -> Result<Option<Notice>> {
+fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<Notice>> {
     match action {
         Action::CaptureArea => capture(engine, CaptureTarget::Interactive),
+        Action::CaptureWindow if engine.config.screenshots.window_picker => {
+            let Some(w) = picker::pick(proxy, picker::PICK_TIMEOUT)? else { return Ok(None) };
+            capture(engine, CaptureTarget::Window { id: Some(w.id), title: None, owner: None })
+        }
         Action::CaptureWindow => {
             // Let the status menu fade before grabbing.
             std::thread::sleep(Duration::from_millis(150));
@@ -367,57 +358,37 @@ struct MenuItems {
     api: MenuItem,
 }
 
-fn accelerator(config: &Config, key: &str) -> Option<Accelerator> {
-    config
-        .hotkeys
-        .bindings()
-        .into_iter()
-        .find(|(name, _)| *name == key)
-        .and_then(|(_, s)| s.parse::<Accelerator>().ok())
-}
-
-fn build_menu(config: &Config) -> Result<MenuItems> {
-    let item = |id: &str, text: &str, hotkey: Option<&str>| {
-        MenuItem::with_id(id, text, true, hotkey.and_then(|k| accelerator(config, k)))
-    };
-    let capture_area = item("capture_area", "Capture Area", Some("capture_area"));
-    let capture_window = item("capture_window", "Capture Window", Some("capture_window"));
-    let capture_screen = item("capture_screen", "Capture Screen", Some("capture_screen"));
-    let scrolling = item("scroll_capture", "Scrolling Capture", Some("scroll_capture"));
-    let record_video = item("record_video", "Record Video", Some("record"));
-    let record_gif = item("record_gif", "Record GIF", Some("record_gif"));
-    let stop = MenuItem::with_id("stop_recording", "Stop Recording", false, None);
-    let ocr = item("ocr_latest", "OCR Latest", Some("ocr_latest"));
-    let pin = item("pin_latest", "Pin Latest", Some("pin_latest"));
-    let sync_enabled = matches!(config.sync.destination(), Ok(Some(_)));
-    let sync = MenuItem::with_id("sync_latest", "Sync Latest", sync_enabled, None);
+/// Build the status menu from [`commands::MENU`]. `keys` maps entry names to
+/// the hotkeys that registered, shown as the items' key equivalents.
+fn build_menu(config: &Config, keys: &HashMap<&'static str, String>) -> Result<MenuItems> {
+    let menu = Menu::new();
     let recent = Submenu::with_id("recent", "Recent Captures", true);
-    let open_folder = MenuItem::with_id("open_folder", "Open History Folder", true, None);
-    let api = MenuItem::with_id("api_toggle", format!("Start Agent API ({})", config.api.bind), true, None);
-    let prefs = MenuItem::with_id("prefs", "Preferences…", true, None);
-    let quit = MenuItem::with_id("quit", "Quit Bugle", true, Some(Accelerator::new(tray_icon::menu::accelerator::Modifiers::META, tray_icon::menu::accelerator::Code::KeyQ)));
-    let menu = Menu::with_items(&[
-        &capture_area,
-        &capture_window,
-        &capture_screen,
-        &scrolling,
-        &PredefinedMenuItem::separator(),
-        &record_video,
-        &record_gif,
-        &stop,
-        &PredefinedMenuItem::separator(),
-        &ocr,
-        &pin,
-        &sync,
-        &recent,
-        &open_folder,
-        &PredefinedMenuItem::separator(),
-        &api,
-        &prefs,
-        &PredefinedMenuItem::separator(),
-        &quit,
-    ])?;
-    Ok(MenuItems { menu, record_video, record_gif, stop, recent, api })
+    let mut by_name: HashMap<&'static str, MenuItem> = HashMap::new();
+    for slot in commands::MENU {
+        match slot {
+            Slot::Separator => menu.append(&PredefinedMenuItem::separator())?,
+            Slot::Recent => menu.append(&recent)?,
+            Slot::Item(e) => {
+                let key = keys.get(e.name).map(String::as_str).or(e.menu_key);
+                let item = MenuItem::with_id(e.name, e.label, true, key.and_then(|k| k.parse::<Accelerator>().ok()));
+                menu.append(&item)?;
+                by_name.insert(e.name, item);
+            }
+        }
+    }
+    let mut take = |name: &str| by_name.remove(name).ok_or_else(|| anyhow!("menu table has no {name}"));
+    let items = MenuItems {
+        record_video: take("record")?,
+        record_gif: take("record_gif")?,
+        stop: take("stop_recording")?,
+        api: take("toggle_api")?,
+        menu,
+        recent,
+    };
+    take("sync_latest")?.set_enabled(matches!(config.sync.destination(), Ok(Some(_))));
+    items.stop.set_enabled(false);
+    items.api.set_text(format!("Start Agent API ({})", config.api.bind));
+    Ok(items)
 }
 
 // ---------------------------------------------------------------------------
@@ -432,7 +403,7 @@ struct App {
     worker_tx: Sender<Action>,
     busy: bool,
     api: Option<ApiHandle>,
-    hotkeys: HashMap<u32, &'static str>,
+    hotkeys: HashMap<u32, Command>,
     _hotkey_manager: GlobalHotKeyManager,
     history_mtime: Option<SystemTime>,
     proxy: Proxy,
@@ -461,7 +432,7 @@ impl App {
         if action == Action::StopRecording && !recording {
             return;
         }
-        if self.busy || bugle_platform::select_rect_active() {
+        if self.busy || bugle_platform::select_rect_active() || bugle_platform::window_pick_active() {
             tracing::debug!("ignoring {action:?}: busy");
             return;
         }
@@ -478,15 +449,20 @@ impl App {
             bugle_platform::open_path(std::path::Path::new(path));
             return;
         }
-        match id {
-            "quit" => self.quit(control_flow),
-            "prefs" => self.open_preferences(),
-            "open_folder" => bugle_platform::open_path(&self.engine.config.save_dir()),
-            "api_toggle" => self.toggle_api(),
-            other => match Action::from_name(other) {
-                Some(a) => self.dispatch(a),
-                None => tracing::warn!("unknown menu item {other}"),
-            },
+        match commands::find(id) {
+            Some(e) => self.run_command(e.command, control_flow),
+            None => tracing::warn!("unknown menu item {id}"),
+        }
+    }
+
+    /// The one entry point for menu items and hotkeys.
+    fn run_command(&mut self, command: Command, control_flow: &mut ControlFlow) {
+        match command {
+            Command::Run(a) => self.dispatch(a),
+            Command::OpenFolder => bugle_platform::open_path(&self.engine.config.save_dir()),
+            Command::ToggleApi => self.toggle_api(),
+            Command::Preferences => self.open_preferences(),
+            Command::Quit => self.quit(control_flow),
         }
     }
 
@@ -505,6 +481,13 @@ impl App {
             }
             UiRequest::Pin { png, frame, opacity, reply } => {
                 let _ = reply.send(bugle_platform::pin_image_show(&png, frame, opacity).map_err(|e| e.to_string()));
+            }
+            UiRequest::PickWindow { timeout, reply } => {
+                // When it does not start, `reply` is dropped and the worker
+                // gets an error instead of waiting.
+                if !picker::begin(timeout, reply) {
+                    tracing::warn!("window picker not started");
+                }
             }
         }
     }
@@ -663,8 +646,38 @@ fn main() -> Result<()> {
         bugle_platform::screen_access_request();
     }
 
+    // Global hotkeys, resolved against the menu table. Bad bindings are
+    // logged and skipped, never fatal.
+    let hotkey_manager = GlobalHotKeyManager::new().context("installing hotkey handler")?;
+    let mut hotkeys: HashMap<u32, Command> = HashMap::new();
+    let mut menu_keys: HashMap<&'static str, String> = HashMap::new();
+    let (pairs, mut hotkey_warnings) = commands::config_pairs(&engine.config.hotkeys);
+    let (plan, plan_warnings) = commands::plan(&pairs);
+    hotkey_warnings.extend(plan_warnings);
+    for b in plan {
+        match hotkey_manager.register(b.hotkey) {
+            Ok(()) => {
+                tracing::info!("hotkey {} → {}", b.combo, b.entry.name);
+                hotkeys.insert(b.hotkey.id(), b.entry.command);
+                menu_keys.insert(b.entry.name, b.combo);
+            }
+            Err(e) => hotkey_warnings.push(format!("[hotkeys] could not register {} for {}: {e}", b.combo, b.entry.name)),
+        }
+    }
+    for w in &hotkey_warnings {
+        tracing::warn!("{w}");
+    }
+    {
+        let p = proxy.clone();
+        GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
+            if e.state() == HotKeyState::Pressed {
+                p.send(AppEvent::HotKey(e.id()));
+            }
+        }));
+    }
+
     // Menu + status item.
-    let items = build_menu(&engine.config)?;
+    let items = build_menu(&engine.config, &menu_keys)?;
     let tray = TrayIconBuilder::new()
         .with_id("bugle")
         .with_menu(Box::new(items.menu.clone()))
@@ -675,30 +688,6 @@ fn main() -> Result<()> {
     {
         let p = proxy.clone();
         MenuEvent::set_event_handler(Some(move |e: MenuEvent| p.send(AppEvent::Menu(e.id))));
-    }
-
-    // Global hotkeys.
-    let hotkey_manager = GlobalHotKeyManager::new().context("installing hotkey handler")?;
-    let mut hotkeys: HashMap<u32, &'static str> = HashMap::new();
-    for (name, binding) in engine.config.hotkeys.bindings() {
-        match binding.parse::<HotKey>() {
-            Ok(hk) => match hotkey_manager.register(hk) {
-                Ok(()) => {
-                    hotkeys.insert(hk.id(), name);
-                    tracing::info!("hotkey {binding} → {name}");
-                }
-                Err(e) => tracing::warn!("could not register {binding} for {name}: {e}"),
-            },
-            Err(e) => tracing::warn!("bad hotkey {binding:?} for {name}: {e}"),
-        }
-    }
-    {
-        let p = proxy.clone();
-        GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
-            if e.state() == HotKeyState::Pressed {
-                p.send(AppEvent::HotKey(e.id()));
-            }
-        }));
     }
 
     // Worker.
@@ -729,6 +718,10 @@ fn main() -> Result<()> {
         app.toggle_api();
     }
     tracing::info!("Bugle is in the menu bar (saving to {})", engine.config.save_dir().display());
+    if let Some(first) = hotkey_warnings.first() {
+        let n = hotkey_warnings.len();
+        app.toast_error(&format!("{n} hotkey binding{} skipped: {first}", if n == 1 { "" } else { "s" }));
+    }
 
     let smoke_started = cli.smoke_test.then(|| smoke_test(engine.clone(), proxy.clone()));
 
@@ -742,13 +735,17 @@ fn main() -> Result<()> {
                         tracing::info!("smoke test: cancelling overlay");
                         bugle_platform::select_rect_cancel();
                     }
+                    if t0.elapsed() > Duration::from_secs(12) && bugle_platform::window_pick_active() {
+                        tracing::info!("smoke test: cancelling window picker");
+                        bugle_platform::window_pick_cancel();
+                    }
                 }
             }
             Event::UserEvent(e) => match e {
                 AppEvent::Menu(id) => app.on_menu(&id, control_flow),
                 AppEvent::HotKey(id) => {
-                    if let Some(action) = app.hotkeys.get(&id).and_then(|n| Action::from_name(n)) {
-                        app.dispatch(action);
+                    if let Some(command) = app.hotkeys.get(&id).copied() {
+                        app.run_command(command, control_flow);
                     }
                 }
                 AppEvent::Ui(req) => app.on_ui(req),
@@ -789,6 +786,16 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
             Ok(m) => eprintln!("smoke test: pinned {}", m.path.display()),
             Err(e) => eprintln!("smoke test: pin skipped ({e:#})"),
         }
+        // The picker must close itself: give it a short timeout and check
+        // that the answer comes back. A click during the test only reports
+        // the window, nothing is captured.
+        let t = Instant::now();
+        let r = picker::pick(&proxy, Duration::from_millis(1500));
+        eprintln!(
+            "smoke test: window picker → {:?} after {:.1}s",
+            r.map(|w| w.map(|w| picker::label(&w))),
+            t.elapsed().as_secs_f64()
+        );
         std::thread::sleep(Duration::from_millis(1500));
         proxy.send(AppEvent::Quit);
     });
@@ -798,6 +805,7 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use global_hotkey::hotkey::HotKey;
 
     #[test]
     fn default_hotkeys_parse() {
@@ -806,7 +814,7 @@ mod tests {
         assert!(b.iter().any(|(n, _)| *n == "capture_area"));
         for (name, s) in &b {
             let hk: HotKey = s.parse().unwrap_or_else(|e| panic!("{name}: {s}: {e}"));
-            assert!(Action::from_name(name).is_some(), "{name} has no action");
+            assert!(commands::find(name).is_some(), "{name} has no menu entry");
             let _ = hk.id();
         }
         let ids: std::collections::HashSet<u32> = b.iter().map(|(_, s)| s.parse::<HotKey>().unwrap().id()).collect();
