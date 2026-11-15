@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {
     Screenshot,
@@ -42,6 +42,10 @@ pub struct MediaItem {
     /// bucket (see `[sync]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// File name the synced copy got at its destination (`clip 2.mp4` after
+    /// a folder collision). Sidecar subtitles are synced under the same stem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced_as: Option<String>,
 }
 
 impl MediaItem {
@@ -61,6 +65,7 @@ impl MediaItem {
             parent: None,
             bytes,
             url: None,
+            synced_as: None,
         }
     }
 

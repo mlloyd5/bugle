@@ -226,7 +226,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "sync",
-            description: "Copy, move or upload a media item to the user's own sync destination ([sync] in the config: a folder Dropbox/iCloud Drive mirrors, or an S3-compatible bucket). Returns the new path and, for buckets, the object URL.",
+            description: "Copy, move or upload a media item to the user's own sync destination ([sync] in the config: a folder Dropbox/iCloud Drive mirrors, or an S3-compatible bucket; optionally one per media kind). A video takes its .srt/.vtt sidecars along. Returns the new path and, for buckets, the object URL.",
             input_schema: json!({"type":"object","properties":{"source":{"type":"string","default":"latest"}}}),
         },
         ToolSpec {

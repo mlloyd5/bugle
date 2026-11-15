@@ -86,9 +86,14 @@ pin_latest = "cmd+shift+p"
 enabled = false
 mode = "copy"             # copy | move  (move: the history entry follows the file;
                           # uploads always keep the local file)
+# Kinds synced automatically. Only saves run the automatic step: screenshot,
+# scroll_capture, annotated, video, gif — plus subtitle, for files `bugle subtitles`
+# writes. audio and text are synced only on demand (`bugle sync`).
 kinds = ["screenshot", "scroll_capture", "annotated", "video", "gif"]
 # folder = "~/Library/Mobile Documents/com~apple~CloudDocs/Bugle"   # iCloud Drive
 # folder = "~/Dropbox/Bugle"
+sidecars = true           # .srt/.vtt subtitles follow their video, under its synced name;
+                          # a file Bugle did not write is never replaced (a unique name is used)
 
 # [sync.s3]
 # endpoint = "https://s3.eu-west-1.amazonaws.com"   # or http://127.0.0.1:9000 (MinIO),
@@ -99,8 +104,28 @@ kinds = ["screenshot", "scroll_capture", "annotated", "video", "gif"]
 # access_key_env = "AWS_ACCESS_KEY_ID"              # credentials stay in your environment
 # secret_key_env = "AWS_SECRET_ACCESS_KEY"
 # public_url = "https://captures.example.com"       # link base; default {endpoint}/{bucket}
+# multipart_threshold_mb = 64     # larger files stream up as a multipart upload… (max 5120)
+# part_size_mb = 16               # …in parts of this size (5..=5120)
+# Tip: add a bucket lifecycle rule that aborts incomplete multipart uploads after a
+# day or so; an upload cut short by a crash or a lost response is otherwise kept.
 # The object URL is written to history (`url`) and, unless general.copy_to_clipboard
 # puts the image there, copied to the clipboard.
+
+# A destination per media kind (screenshot, scroll_capture, annotated, video, gif,
+# audio, subtitle, text). Kinds without an entry use the destination above. An
+# entry also makes its kind sync automatically when that kind is saved (see `kinds`
+# for which are). Each entry takes its own `folder` or `[...s3]` table, or just
+# `prefix` (a relative sub-folder / key prefix under the default destination, no
+# `..`), and an optional `mode` (folders only). A `subtitle` entry takes subtitles
+# away from their video's destination; they keep the video's name.
+# [sync.destinations.video]
+# prefix = "recordings"
+# [sync.destinations.gif]
+# folder = "~/Dropbox/GIFs"
+# mode = "move"
+# [sync.destinations.screenshot.s3]
+# endpoint = "http://127.0.0.1:9000"
+# bucket = "screenshots"
 
 # ---------------------------------------------------------------------------
 # AI providers. Kinds:

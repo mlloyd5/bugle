@@ -305,7 +305,7 @@ fn saved_subtitle(engine: &Engine, item: &bugle_core::MediaItem) -> String {
     }
     let name = file_name(&item.path);
     if engine.config.sync.applies_to(item.kind) {
-        if let Some(label) = engine.sync_destination_label() {
+        if let Some(label) = engine.sync_destination_label_for(item.kind) {
             return format!("{name} → {label}");
         }
     }
@@ -389,7 +389,7 @@ fn build_menu(config: &Config, keys: &HashMap<&'static str, String>) -> Result<M
         menu,
         recent,
     };
-    take("sync_latest")?.set_enabled(matches!(config.sync.destination(), Ok(Some(_))));
+    take("sync_latest")?.set_enabled(config.sync.has_destination());
     items.stop.set_enabled(false);
     items.api.set_text(format!("Start Agent API ({})", config.api.bind));
     Ok(items)

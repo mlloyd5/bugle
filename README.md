@@ -40,7 +40,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | HTTP API + OpenAPI | axum, bearer token | ✅ |
 | MCP server (stdio) | JSON-RPC 2.0, image content | ✅ |
 | Menu-bar app, global hotkeys | `bugle-app`: `NSStatusItem` via `tray-icon`, Carbon hotkeys via `global-hotkey`, in-app overlays | ✅ |
-| Sync to your own storage | folder copy/move, or SigV4 `PUT` to any S3-compatible bucket | ✅ |
+| Sync to your own storage | folder copy/move, or SigV4 uploads (multipart for large files) to any S3-compatible bucket; a destination per media kind; subtitles follow their video | ✅ |
 | Post-capture video editor | — | see [feature ideas](docs/ARCHITECTURE.md#feature-ideas) |
 
 ## Build
@@ -244,11 +244,42 @@ secret_key_env = "AWS_SECRET_ACCESS_KEY"
 # public_url = "https://captures.example.com"
 ```
 
-Uploads are SigV4-signed `PUT`s (path-style, no SDK). The object URL is stored
+Uploads are SigV4-signed (path-style, no SDK) and stream from disk; files of
+`multipart_threshold_mb` (64, at most 5120) or more go up as a multipart upload
+in `part_size_mb` (16, 5..=5120) parts. Each request is retried up to six times
+with a capped, jittered backoff (and the server's `Retry-After`), and the upload
+is aborted if it cannot finish or the file changes meanwhile. An upload cut
+short by a crash, or a create request whose response was lost, can leave an
+incomplete upload behind: add a lifecycle rule to the bucket that aborts
+incomplete multipart uploads after a day. The sync runs right after the save,
+on the same thread: the capture is in history at once, but `record_stop` (and
+the menu-bar action) returns when the upload has finished. The object URL is stored
 in the history item (`url`) and copied to the clipboard unless
 `general.copy_to_clipboard` already puts the image there. `bugle sync latest`,
 the `sync` agent action and *Sync Latest* in the menu bar do the same on demand,
 even with `enabled = false`.
+
+Automatic sync covers what Bugle saves: screenshots, scrolling captures,
+annotations, recordings and GIFs (as listed in `kinds`), and subtitles written by
+`bugle subtitles`. Audio and text files are synced on demand with `bugle sync`.
+Each media kind can have its own destination; kinds without one use the default,
+and a kind with its own entry syncs automatically when it is saved:
+
+```toml
+[sync.destinations.video]
+prefix = "recordings"            # sub-folder / key prefix under the default destination
+[sync.destinations.gif]
+folder = "~/Dropbox/GIFs"        # or a [sync.destinations.gif.s3] table
+mode = "move"
+```
+
+With `sidecars = true` (the default), a video's `.srt` / `.vtt` subtitles are
+synced to the video's destination (or to `[sync.destinations.subtitle]` when
+that is set) under the video's synced name (`clip 2.mp4` → `clip 2.srt`),
+including subtitles generated after the video was synced. A file there that
+Bugle did not write for that video is never replaced: the subtitle gets a unique
+name instead. A subtitle written to an explicit `--output` is copied even in
+move mode. `prefix` must be relative and free of `.` / `..` segments.
 
 ## Agents
 
