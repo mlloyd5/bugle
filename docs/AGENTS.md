@@ -95,7 +95,6 @@ curl -s -H "$H" -H 'content-type: application/json' \
 | `transcribe` | `source`, `provider`, `language` | `transcript`, `srt` |
 | `subtitles` | `source`, `format` (srt/vtt), `provider`, `language`, `output` | `path`, `segments`, `text` |
 | `edit_video` | `source`, `start`, `end` (seconds, negative = from the end), `preset` (original/lossless/high/hevc/1080p/720p/540p/gif/gif-small), `fps` (re-encodes video; resamples GIF), `max_size` (GIF long edge), `output`, `label` | `media` (parent = source when it is a history item) |
-
 | `complete` | `prompt`, `provider`, `system` | `text` |
 | `history` | `limit` | media list |
 | `get_media` | `source`, `inline_image`, `max_edge` | media (+ image) |

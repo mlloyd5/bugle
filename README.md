@@ -160,9 +160,30 @@ Menu: Capture Area · Capture Window · Capture Screen ·
 Scrolling Capture · Record Video · Record GIF · Stop Recording · OCR Latest
 (copies the text) · Pin Latest · Recent Captures (last five, click to open) ·
 Open History Folder · Start/Stop Agent API · Preferences… (opens the config
-file) · Quit. While recording, the status item shows `● m:ss`. After each
-action a small toast in the top-right corner shows a thumbnail and the file
-name; clicking it opens the file.
+file) · Quit. While recording, the status item shows `● m:ss`. Other actions
+report through a small toast in the top-right corner (thumbnail and file name;
+click to open).
+
+After a capture or recording, the **quick-access panel** takes the toast's
+place, in the bottom-right corner by default: the thumbnail (click to open)
+with **Copy**, **Annotate**, **Pin**, **Sync** and **Reveal** in Finder, plus a
+close (×) button. **Annotate** opens the file in Preview (or the app named by
+`annotate_app`); edits made there change the saved capture in place. **Sync**
+appears when a `[sync]` destination is set and the file is not there yet — so
+it is also the retry when the automatic sync failed. The panel never takes
+keyboard focus, so it has no keyboard shortcut: it goes away after any button,
+the × button, or `timeout_seconds`. It does not time out while the pointer is
+over it, and stays up to 2 s after the pointer leaves. Starting another capture
+or recording from the menu or a hotkey closes it first so it is not captured.
+Configure it in `[quick_access]`:
+
+```toml
+[quick_access]
+enabled = true            # false: plain toast instead
+timeout_seconds = 8.0     # 0: stays until a button or × is clicked
+position = "bottom-right" # bottom-left | top-right | top-left
+annotate_app = "com.apple.Preview"
+```
 
 *Capture Window* dims the screen slightly and highlights the window under the
 pointer with its app, title and size; click to capture it. Esc, a right click
@@ -222,8 +243,8 @@ OpenRouter, Groq…). `kind = "command"` wraps a local executable, e.g. `whisper
 
 The other sections: `[general]` (save folder, filename template, clipboard),
 `[screenshots]`, `[recordings]` (backend, audio), `[ocr]`, `[markup]` defaults,
-`[api]` (bind address, token, CORS), `[hotkeys]` for the menu-bar app and `[sync]`
-below.
+`[api]` (bind address, token, CORS), `[hotkeys]` and `[quick_access]` for the
+menu-bar app and `[sync]` below.
 
 The HTTP API is meant for local agents. Setting a token is recommended; without
 one any local process can call it. Binding to a non-loopback address (e.g.

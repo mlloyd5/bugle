@@ -9,6 +9,8 @@
 mod commands;
 mod icon;
 mod picker;
+mod quick_access;
+mod quick_panel;
 
 use anyhow::{anyhow, Context, Result};
 use bugle_core::{
@@ -42,7 +44,7 @@ struct Cli {
     /// Debug logging.
     #[arg(short, long)]
     verbose: bool,
-    /// Show the overlay, a toast and a pin for a few seconds, then exit.
+    /// Show the overlay, a toast, a pin and the quick-access panel, then exit.
     /// Exercises the in-app UI plumbing without needing a keyboard.
     #[arg(long, hide = true)]
     smoke_test: bool,
@@ -91,6 +93,7 @@ enum AppEvent {
     Ui(UiRequest),
     Done(Action, Result<Option<Notice>, String>),
     ApiStopped(Option<String>),
+    QuickAccess(quick_access::QuickEvent),
     Quit,
 }
 
@@ -413,6 +416,7 @@ struct App {
     history_mtime: Option<SystemTime>,
     proxy: Proxy,
     last_tick: Instant,
+    quick: quick_access::QuickAccess,
 }
 
 impl App {
@@ -441,6 +445,7 @@ impl App {
             tracing::debug!("ignoring {action:?}: busy");
             return;
         }
+        self.quick_before_action(action);
         self.busy = true;
         if self.worker_tx.send(action).is_err() {
             self.busy = false;
@@ -504,6 +509,7 @@ impl App {
     fn on_done(&mut self, action: Action, result: Result<Option<Notice>, String>) {
         self.busy = false;
         match result {
+            Ok(Some(n)) if self.quick_show(action, &n) => {}
             Ok(Some(n)) => self.toast(&n),
             Ok(None) => {}
             Err(e) => self.toast_error(&format!("{action:?}: {e}")),
@@ -610,6 +616,7 @@ impl App {
 
     /// Periodic housekeeping: recording timer in the status bar, recent list.
     fn tick(&mut self) {
+        self.quick_tick();
         if self.last_tick.elapsed() < Duration::from_millis(900) {
             return;
         }
@@ -720,6 +727,7 @@ fn main() -> Result<()> {
         history_mtime: None,
         proxy: proxy.clone(),
         last_tick: Instant::now() - Duration::from_secs(5),
+        quick: quick_access::QuickAccess::new(engine.config.quick_access.clone()),
     };
     app.refresh_recent();
     app.update_recording_ui();
@@ -760,6 +768,7 @@ fn main() -> Result<()> {
                 AppEvent::Ui(req) => app.on_ui(req),
                 AppEvent::Done(action, result) => app.on_done(action, result),
                 AppEvent::ApiStopped(err) => app.on_api_stopped(err),
+                AppEvent::QuickAccess(e) => app.on_quick(e),
                 AppEvent::Quit => app.quit(control_flow),
             },
             Event::LoopDestroyed => {
@@ -805,6 +814,7 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
             r.map(|w| w.map(|w| picker::label(&w))),
             t.elapsed().as_secs_f64()
         );
+        quick_panel::smoke(&proxy);
         std::thread::sleep(Duration::from_millis(1500));
         proxy.send(AppEvent::Quit);
     });

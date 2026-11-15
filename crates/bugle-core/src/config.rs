@@ -23,6 +23,7 @@ pub struct Config {
     pub ai: AiConfig,
     pub hotkeys: HotkeyConfig,
     pub sync: SyncConfig,
+    pub quick_access: QuickAccessConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +189,7 @@ impl Default for Config {
             ai: AiConfig::default_registry(),
             hotkeys: HotkeyConfig::default(),
             sync: SyncConfig::default(),
+            quick_access: QuickAccessConfig::default(),
         }
     }
 }
@@ -755,6 +757,49 @@ impl ProviderConfig {
     }
 }
 
+/// The menu-bar app's quick-access panel: after a capture, a floating panel
+/// with the thumbnail and Copy / Annotate / Pin / Sync / Reveal buttons
+/// instead of the plain toast.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QuickAccessConfig {
+    /// Show the panel after captures; `false` keeps the plain toast.
+    pub enabled: bool,
+    /// Seconds before the panel closes by itself. It does not close while the
+    /// pointer is over it and stays up to 2 s after the pointer leaves. `0`
+    /// (or a negative or out-of-range value) keeps it open until a button or
+    /// the close button is clicked.
+    pub timeout_seconds: f64,
+    /// Screen corner: `top-right`, `top-left`, `bottom-right`, `bottom-left`.
+    pub position: PanelCorner,
+    /// Bundle id of the app *Annotate* opens the capture in; edits made there
+    /// change the saved file in place. When it is not installed the default
+    /// app for the file is used and a warning is logged.
+    pub annotate_app: String,
+}
+
+impl Default for QuickAccessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_seconds: 8.0,
+            position: PanelCorner::BottomRight,
+            annotate_app: "com.apple.Preview".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PanelCorner {
+    TopRight,
+    TopLeft,
+    /// Default: away from the toasts, which use the top-right corner.
+    #[default]
+    BottomRight,
+    BottomLeft,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -869,6 +914,18 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.screenshots.jpeg_quality, 70);
         assert_eq!(cfg.markup.font_size, 20.0);
+    }
+
+    #[test]
+    fn quick_access_defaults_and_overrides() {
+        let d = Config::default().quick_access;
+        assert!(d.enabled);
+        assert_eq!(d.position, PanelCorner::BottomRight);
+        let cfg: Config =
+            toml::from_str("[quick_access]\nenabled = false\ntimeout_seconds = 0\nposition = \"bottom-left\"\n").unwrap();
+        assert!(!cfg.quick_access.enabled);
+        assert_eq!(cfg.quick_access.timeout_seconds, 0.0);
+        assert_eq!(cfg.quick_access.position, PanelCorner::BottomLeft);
     }
 
     #[test]
