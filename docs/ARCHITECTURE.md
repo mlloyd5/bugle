@@ -43,6 +43,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `register_translation` | `VNTranslationalImageRegistrationRequest` via `VNSequenceRequestHandler` |
 | `post_scroll`, `cursor_position` | `CGEventCreateScrollWheelEvent`, `CGEventPost` |
 | `select_rect_blocking`, `select_rect_begin`/`_cancel` | borderless `NSWindow` per screen, dim fill, crosshair, size label; blocking (`[NSApp run]`) or callback-based for a host with its own run loop |
+| `window_pick_begin`/`_highlight`/`_cancel` (`shim/picker.m`) | see-through `NSWindow` per screen with an always-active `NSTrackingArea`; reports pointer moves and the final click/Esc/timeout through a C callback and draws whatever rect the host hands back |
 | `pin_image_blocking`, `pin_image_show` | floating borderless window, drag/resize/close; blocking or fire-and-forget |
 | `toast_show` | non-activating `NSPanel` with `NSVisualEffectView`, thumbnail + two lines, fades out |
 | `clipboard_*` | `NSPasteboard` |
@@ -133,7 +134,18 @@ Clap front end. Runs the tokio runtime on the main thread so AppKit overlays wor
 The menu-bar app. `tao` owns the main thread and the AppKit run loop (activation
 policy *accessory*, so no Dock icon); `tray-icon`/`muda` build the `NSStatusItem`
 and its `NSMenu`; `global-hotkey` registers Carbon `RegisterEventHotKey` bindings
-from `[hotkeys]`. Menu and hotkey events are forwarded to the loop as user events.
+from `[hotkeys]`. One table (`commands::MENU`) lists every menu row; the menu is
+built by walking it and `[hotkeys]` keys are resolved against its names, so every
+item is bindable and the two cannot drift. Unknown keys, unparsable or duplicate
+combinations and bindings the OS refuses are logged, summarised in one toast and
+skipped. Menu and hotkey events are forwarded to the loop as user events.
+*Capture Window* opens the window picker (`picker.rs`): the main thread snapshots
+the on-screen window list, shows the shim's overlay and, on every pointer move,
+asks `window_at` — a pure function over the z-ordered list that skips Bugle's
+own windows, non-zero layers, off-screen and sub-50-point windows — which window
+to highlight. A click captures that window by id; Esc, a right click or the
+30-second timeout cancel. `[screenshots] window_picker = false` restores the
+immediate front-most capture, which the CLI and API always use.
 Engine actions run on one worker thread so the menu never blocks; when an action
 needs the crosshair overlay or a pin window, the engine's `UiHost` (implemented
 here) sends a request to the main thread and blocks the worker on a channel until
@@ -153,8 +165,8 @@ earn its keep.
   asked; click highlighting on the ScreenCaptureKit recorder.
 * **Quick-access panel** after a capture (the toast with a thumbnail is the
   minimal version): annotate, copy, pin or send from one place.
-* **Window-picking mode** for *Capture Window* (hover to highlight) instead of
-  taking the front-most window; a hotkey for every menu item.
+* **Window picker extras** — Space to switch to area selection, a picker for
+  window recordings, and offering the picker to API callers through `UiHost`.
 * **Packaging** — a signed `.app` bundle so notifications, Login Items and the
   permission prompts carry Bugle's own name.
 * **Sync extras** — a destination per media kind, streaming multipart uploads
