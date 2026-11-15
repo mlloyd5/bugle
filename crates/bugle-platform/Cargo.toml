@@ -15,3 +15,6 @@ tracing.workspace = true
 
 [build-dependencies]
 cc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
