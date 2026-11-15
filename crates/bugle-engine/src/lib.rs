@@ -5,6 +5,7 @@
 //! milliseconds; async front ends wrap them in `spawn_blocking`.
 
 pub mod capture;
+pub mod edit;
 pub mod record;
 pub mod scroll;
 pub mod stitch;
@@ -24,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub use capture::CaptureOutcome;
+pub use edit::{EditRequest, ExportPreset};
 pub use record::RecorderState;
 pub use sync::SyncReport;
 
