@@ -13,7 +13,7 @@ mod picker;
 use anyhow::{anyhow, Context, Result};
 use bugle_core::{
     CaptureOptions, CaptureRequest, CaptureTarget, Config, MediaKind, OcrOptions, RecordRequest, RecordingFormat,
-    RecordingState, Rect, ScrollCaptureRequest, WindowInfo,
+    RecordingState, Rect, ScrollCaptureRequest,
 };
 use commands::{Command, Slot};
 use bugle_engine::{Engine, UiHost};
@@ -81,7 +81,8 @@ enum UiRequest {
     Select(Sender<Option<Rect>>),
     Pin { png: Vec<u8>, frame: Option<Rect>, opacity: f64, reply: Sender<Result<(), String>> },
     /// Hover-to-highlight window picker; `None` when cancelled.
-    PickWindow { timeout: Duration, reply: Sender<Option<WindowInfo>> },
+    /// Not opened after `deadline`, when the worker may have stopped waiting.
+    PickWindow { timeout: Duration, deadline: Instant, reply: picker::PickReply },
 }
 
 enum AppEvent {
@@ -147,6 +148,9 @@ fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<N
         Action::CaptureArea => capture(engine, CaptureTarget::Interactive),
         Action::CaptureWindow if engine.config.screenshots.window_picker => {
             let Some(w) = picker::pick(proxy, picker::PICK_TIMEOUT)? else { return Ok(None) };
+            // The overlay activated Bugle; give the target app a moment to
+            // become active again so its window is not captured dimmed.
+            std::thread::sleep(Duration::from_millis(150));
             capture(engine, CaptureTarget::Window { id: Some(w.id), title: None, owner: None })
         }
         Action::CaptureWindow => {
@@ -351,7 +355,7 @@ impl ApiHandle {
 
 struct MenuItems {
     menu: Menu,
-    record_video: MenuItem,
+    record: MenuItem,
     record_gif: MenuItem,
     stop: MenuItem,
     recent: Submenu,
@@ -378,7 +382,7 @@ fn build_menu(config: &Config, keys: &HashMap<&'static str, String>) -> Result<M
     }
     let mut take = |name: &str| by_name.remove(name).ok_or_else(|| anyhow!("menu table has no {name}"));
     let items = MenuItems {
-        record_video: take("record")?,
+        record: take("record")?,
         record_gif: take("record_gif")?,
         stop: take("stop_recording")?,
         api: take("toggle_api")?,
@@ -457,6 +461,13 @@ impl App {
 
     /// The one entry point for menu items and hotkeys.
     fn run_command(&mut self, command: Command, control_flow: &mut ControlFlow) {
+        // While an overlay is up (it covers the screen), only Quit acts;
+        // anything else would happen invisibly behind it.
+        let overlay = bugle_platform::window_pick_active() || bugle_platform::select_rect_active();
+        if overlay && command != Command::Quit {
+            tracing::debug!("ignoring {command:?}: an overlay is open");
+            return;
+        }
         match command {
             Command::Run(a) => self.dispatch(a),
             Command::OpenFolder => bugle_platform::open_path(&self.engine.config.save_dir()),
@@ -482,12 +493,9 @@ impl App {
             UiRequest::Pin { png, frame, opacity, reply } => {
                 let _ = reply.send(bugle_platform::pin_image_show(&png, frame, opacity).map_err(|e| e.to_string()));
             }
-            UiRequest::PickWindow { timeout, reply } => {
-                // When it does not start, `reply` is dropped and the worker
-                // gets an error instead of waiting.
-                if !picker::begin(timeout, reply) {
-                    tracing::warn!("window picker not started");
-                }
+            UiRequest::PickWindow { timeout, deadline, reply } => {
+                // On failure `begin` answers `reply` with the reason itself.
+                picker::begin(timeout, deadline, reply);
             }
         }
     }
@@ -507,7 +515,7 @@ impl App {
         let st = self.engine.record_status();
         let recording = st.state != RecordingState::Idle;
         self.items.stop.set_enabled(recording);
-        self.items.record_video.set_enabled(!recording);
+        self.items.record.set_enabled(!recording);
         self.items.record_gif.set_enabled(!recording);
         if recording {
             let secs = st.elapsed_seconds as u64;
