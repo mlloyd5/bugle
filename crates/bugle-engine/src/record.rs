@@ -64,7 +64,7 @@ enum Backend {
     /// ScreenCaptureKit stream written by AVAssetWriter. Always produces an
     /// MP4; a `.mov` request is remuxed afterwards. `rec` is `None` once
     /// stopped.
-    Sck { rec: Option<SckRecorder>, wants_mov: bool },
+    Sck { rec: Option<SckRecorder>, wants_mov: bool, mix_audio: bool },
 }
 
 impl Backend {
@@ -239,6 +239,27 @@ fn keep_raw_after_failed_export(tmp: &Path, output: &Path, ext: &str, e: anyhow:
     }
 }
 
+/// Fold the audio tracks of the finished recording at `path` into one,
+/// replacing the file. With fewer than two tracks there is nothing to do; a
+/// failed mix is logged and leaves the separate tracks in place, since the
+/// recording itself is fine.
+fn mix_audio_in_place(path: &Path) {
+    let mixed = path.with_extension("mix.mp4");
+    match bugle_platform::mix_audio_tracks(path, &mixed) {
+        Ok(true) => {
+            if let Err(e) = std::fs::rename(&mixed, path) {
+                let _ = std::fs::remove_file(&mixed);
+                tracing::warn!("replacing the recording with its mixed copy failed; keeping separate audio tracks: {e}");
+            }
+        }
+        Ok(false) => tracing::debug!("fewer than two audio tracks; nothing to mix"),
+        Err(e) => {
+            let _ = std::fs::remove_file(&mixed);
+            tracing::warn!("mixing the audio tracks failed; keeping them separate: {e:#}");
+        }
+    }
+}
+
 /// Read whatever the child wrote to its piped stderr.
 fn child_stderr(child: &mut std::process::Child) -> String {
     let mut err = String::new();
@@ -344,6 +365,7 @@ impl Engine {
                 let output = self.output_path(req.output.as_deref(), if wants_mp4 { "mp4" } else { "mov" }, &vars);
                 let microphone = req.microphone || self.config.recordings.microphone;
                 let system_audio = req.system_audio || self.config.recordings.system_audio;
+                let mix_audio = req.mix_audio || self.config.recordings.mix_audio;
                 let highlight_clicks = req.highlight_clicks || self.config.recordings.highlight_clicks;
                 let sck_available = bugle_platform::sck_record_available();
                 let use_sck = match self.config.recordings.backend {
@@ -380,7 +402,7 @@ impl Engine {
                     if let Some(w) = rec.warnings() {
                         tracing::warn!("{w}");
                     }
-                    (output, Backend::Sck { rec: Some(rec), wants_mov: !wants_mp4 })
+                    (output, Backend::Sck { rec: Some(rec), wants_mov: !wants_mp4, mix_audio })
                 } else {
                     let tmp_mov = if wants_mp4 { temp_path(&output, "mov") } else { output.clone() };
                     let mut cmd = std::process::Command::new("/usr/sbin/screencapture");
@@ -515,8 +537,8 @@ impl Engine {
                 }
                 MediaKind::Video
             }
-            Backend::Sck { rec, wants_mov } => {
-                let wants_mov = *wants_mov;
+            Backend::Sck { rec, wants_mov, mix_audio } => {
+                let (wants_mov, mix_audio) = (*wants_mov, *mix_audio);
                 let rec = rec.take().ok_or_else(|| anyhow!("recorder already stopped"))?;
                 // The file AVAssetWriter writes: the output itself, or a
                 // temp MP4 when a .mov was asked for.
@@ -533,6 +555,9 @@ impl Engine {
                 if frames == 0 {
                     let _ = std::fs::remove_file(&written);
                     bail!("no frames were captured");
+                }
+                if mix_audio {
+                    mix_audio_in_place(&written);
                 }
                 if wants_mov {
                     if let Err(e) = bugle_platform::export_mov(&written, &active.output) {
@@ -786,7 +811,7 @@ mod tests {
 
     #[test]
     fn sck_deadline_counts_as_finished_and_elapsed_is_capped() {
-        let mut a = active(Backend::Sck { rec: None, wants_mov: false }, PathBuf::from("/nonexistent/x.mp4"), Some(0.01));
+        let mut a = active(Backend::Sck { rec: None, wants_mov: false, mix_audio: false }, PathBuf::from("/nonexistent/x.mp4"), Some(0.01));
         a.started -= Duration::from_secs(3);
         assert_eq!(a.poll(), RecordingState::Finishing);
         assert_eq!(a.elapsed_seconds(), 0.01);
@@ -843,6 +868,28 @@ mod tests {
         assert!(engine.record_stop().is_err());
         assert!(!out.exists());
         assert!(engine.record_stop().is_err(), "slot is free after a failed stop");
+    }
+
+    #[test]
+    fn mixing_in_place_folds_tracks_and_tolerates_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = tmp.path().join("clip.rec.mp4");
+        bugle_platform::write_tone_tracks(&rec, 2, 1.0).unwrap();
+        mix_audio_in_place(&rec);
+        assert_eq!(bugle_platform::audio_track_count(&rec).unwrap(), 1);
+        assert!(!tmp.path().join("clip.rec.mix.mp4").exists());
+
+        // One track: untouched.
+        let before = std::fs::read(&rec).unwrap();
+        mix_audio_in_place(&rec);
+        assert_eq!(std::fs::read(&rec).unwrap(), before);
+
+        // Unreadable file: left as it is, no temp file behind.
+        let junk = tmp.path().join("junk.mp4");
+        std::fs::write(&junk, b"not a movie").unwrap();
+        mix_audio_in_place(&junk);
+        assert_eq!(std::fs::read(&junk).unwrap(), b"not a movie");
+        assert!(!tmp.path().join("junk.mix.mp4").exists());
     }
 
     #[test]

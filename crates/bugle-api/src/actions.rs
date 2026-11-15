@@ -151,6 +151,7 @@ pub fn catalog() -> Vec<ToolSpec> {
                     "fps":{"type":"integer","description":"gif only"},
                     "microphone":{"type":"boolean"},
                     "system_audio":{"type":"boolean","description":"capture system audio (ScreenCaptureKit backend)"},
+                    "mix_audio":{"type":"boolean","description":"fold microphone and system audio into one track"},
                     "max_seconds":{"type":"number","description":"auto-stop"},
                     "highlight_clicks":{"type":"boolean"},
                     "output":{"type":"string"},

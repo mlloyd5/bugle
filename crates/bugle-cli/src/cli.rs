@@ -271,6 +271,9 @@ pub struct RecordArgs {
     /// Record system audio (uses the ScreenCaptureKit recorder).
     #[arg(long)]
     pub system_audio: bool,
+    /// Fold the microphone and system audio into one audio track.
+    #[arg(long)]
+    pub mix_audio: bool,
     /// Stop automatically after N seconds.
     #[arg(long, short = 's')]
     pub seconds: Option<f64>,
@@ -560,6 +563,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     fps: a.fps,
                     microphone: a.mic,
                     system_audio: a.system_audio,
+                    mix_audio: a.mix_audio,
                     max_seconds: a.seconds,
                     highlight_clicks: a.clicks,
                     output: a.output,

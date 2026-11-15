@@ -225,6 +225,9 @@ pub struct RecordRequest {
     /// Record system audio.
     #[serde(default)]
     pub system_audio: bool,
+    /// Fold the microphone and system-audio tracks into one.
+    #[serde(default)]
+    pub mix_audio: bool,
     /// Stop automatically after this many seconds.
     #[serde(default)]
     pub max_seconds: Option<f64>,
