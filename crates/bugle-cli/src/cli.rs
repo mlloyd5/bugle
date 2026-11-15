@@ -363,10 +363,11 @@ pub struct EditArgs {
     /// End time, same forms as --start (`-2` drops the last two seconds).
     #[arg(long, short = 'e', allow_hyphen_values = true)]
     pub end: Option<String>,
-    /// Export preset (see --list-presets).
+    /// Export preset (see --list-presets). `original` re-encodes a cut that does not
+    /// start on a keyframe so nothing before it stays in the file; `lossless` never does.
     #[arg(long, short = 'p', default_value = "original")]
     pub preset: String,
-    /// Output frame rate (re-encodes video, resamples GIF).
+    /// Output frame rate: re-encodes a video (not with `lossless`), resamples a GIF.
     #[arg(long)]
     pub fps: Option<u32>,
     /// Long edge of GIF output, in pixels.

@@ -196,7 +196,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_video",
-            description: "Trim a recording (video or GIF) and export it with a preset: original (lossless trim), high, hevc, 1080p, 720p, 540p, gif, gif-small. Times are seconds; negative counts from the end. Saves a new media item whose parent is the source.",
+            description: "Trim a recording (video or GIF) and export it with a preset: original (same format; copied when the cut starts on a keyframe, otherwise re-encoded so nothing before the cut stays in the file), lossless (always copied; may keep up to one keyframe interval before the cut in the file, hidden), high, hevc, 1080p, 720p, 540p, gif, gif-small. Times are seconds; negative counts from the end. Saves a new media item (parent = the source when it is a history item).",
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -204,7 +204,7 @@ pub fn catalog() -> Vec<ToolSpec> {
                     "start":{"type":"number","description":"seconds; negative = from the end"},
                     "end":{"type":"number","description":"seconds; negative = from the end (-2 drops the last two seconds)"},
                     "preset":{"type":"string","enum":bugle_engine::ExportPreset::ALL.iter().map(|p| p.name()).collect::<Vec<_>>(),"default":"original"},
-                    "fps":{"type":"integer","description":"output frame rate (re-encodes video, resamples GIF)"},
+                    "fps":{"type":"integer","description":"output frame rate: re-encodes a video (not with lossless), resamples a GIF"},
                     "max_size":{"type":"integer","description":"long edge of GIF output in pixels"},
                     "output":{"type":"string"},
                     "label":{"type":"string"}
@@ -461,7 +461,7 @@ pub fn status_for(err: &anyhow::Error) -> u16 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use anyhow::Context;
     use bugle_core::BugleError;
@@ -486,11 +486,45 @@ mod tests {
         assert_eq!(status_for(&e), 400);
     }
 
+    /// A 4-frame, 0.4 s GIF (red, red, blue, blue) at `p`.
+    pub(crate) fn fixture_gif(p: &std::path::Path) {
+        use image::codecs::gif::GifEncoder;
+        let file = std::fs::File::create(p).unwrap();
+        let mut enc = GifEncoder::new(file);
+        for c in [[255, 0, 0], [255, 0, 0], [0, 0, 255], [0, 0, 255]] {
+            let img = image::RgbaImage::from_pixel(8, 6, image::Rgba([c[0], c[1], c[2], 255]));
+            enc.encode_frame(image::Frame::from_parts(img, 0, 0, image::Delay::from_numer_denom_ms(100, 1))).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_video_runs_through_the_action_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = bugle_core::Config::default();
+        cfg.general.save_dir = tmp.path().join("save").display().to_string();
+        cfg.general.history_path = Some(tmp.path().join("history.jsonl").display().to_string());
+        let engine = Arc::new(Engine::new(cfg, false).unwrap());
+        let src = tmp.path().join("in.gif");
+        fixture_gif(&src);
+        let out = run(&engine, "edit_video", json!({"source": src, "start": 0.2, "preset": "gif"})).await.unwrap();
+        let media = &out.json["media"];
+        assert_eq!(media["kind"], "gif");
+        assert_eq!(media["duration_seconds"], 0.2);
+        assert!(media["parent"].is_null(), "a path source is not a history item");
+        let id = media["id"].as_str().unwrap().to_string();
+        // Chained from history: the parent is recorded.
+        let out = run(&engine, "edit_video", json!({"end": -0.1})).await.unwrap();
+        assert_eq!(out.json["media"]["parent"], json!(id));
+        let err = run(&engine, "edit_video", json!({"source": src, "preset": "lossless"})).await.err().unwrap();
+        assert_eq!(status_for(&err), 400);
+    }
+
     #[test]
     fn edit_video_is_catalogued_with_every_preset() {
         let spec = catalog().into_iter().find(|t| t.name == "edit_video").expect("edit_video in catalog");
         let names = spec.input_schema["properties"]["preset"]["enum"].as_array().unwrap().len();
         assert_eq!(names, bugle_engine::ExportPreset::ALL.len());
+        assert!(spec.description.contains("lossless"));
         // A bad preset is a 400, not a 500.
         let err = serde_json::from_value::<bugle_engine::EditRequest>(json!({"preset":"4k"})).map_err(anyhow::Error::from).unwrap_err();
         assert_eq!(status_for(&err), 400);

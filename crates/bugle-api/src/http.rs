@@ -481,6 +481,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_alias_trims_a_recording() {
+        let f = fixture();
+        let app = router(f.engine.clone(), None, false);
+        let src = f.tmp.path().join("in.gif");
+        crate::actions::tests::fixture_gif(&src);
+        let post = |body: Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/edit")
+                .header(header::HOST, "127.0.0.1")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let (status, _, body) = send(&app, post(json!({"source": src, "end": 0.3, "preset": "gif-small"}))).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["media"]["kind"], "gif");
+        assert_eq!(v["media"]["duration_seconds"], 0.3);
+        assert!(std::path::Path::new(v["media"]["path"].as_str().unwrap()).exists());
+        let (status, _, body) = send(&app, post(json!({"source": src, "preset": "4k"}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        envelope(&body);
+    }
+
+    #[tokio::test]
     async fn non_loopback_bind_needs_a_token() {
         let f = fixture();
         for token in [None, Some(String::new())] {
