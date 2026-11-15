@@ -33,7 +33,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | Pin to screen | Floating AppKit panel (drag, scroll-to-resize, Esc/double-click closes) | ✅ |
 | GIF recording | In-process frame grab loop + `image` GIF encoder | ✅ |
 | Video recording | `screencapture -v` (H.264 .mov → remuxed .mp4), microphone, click highlight | ✅ |
-| System audio in recordings | ScreenCaptureKit `SCStream` audio tap + `AVAssetWriter` (H.264 + AAC .mp4), microphone as a second track | ✅ (macOS 14+) |
+| System audio in recordings | ScreenCaptureKit `SCStream` audio tap + `AVAssetWriter` (H.264 + AAC .mp4), microphone as a second track or mixed into one (`--mix-audio`) | ✅ (macOS 14+) |
 | Describe image / video frames with a vision model | OpenAI-compatible, Ollama, Anthropic, command | ✅ |
 | Transcribe / subtitles (SRT, VTT) | whisper.cpp server, OpenAI-compatible, command | ✅ |
 | History | JSON-lines file, ids, delete | ✅ |
@@ -78,6 +78,7 @@ bugle scroll --rect 0,120,1200,800 --max-frames 60 --step -10
 bugle record start area --rect 0,30,1280,720 -f gif --fps 10 -s 8
 bugle record start window --app Xcode -f mp4 --mic --subtitles   # Ctrl-C to stop
 bugle record start screen -f mp4 --system-audio -s 30              # ScreenCaptureKit backend
+bugle record start screen --system-audio --mic --mix-audio --clicks # one audio track, clicks shown
 
 bugle ocr latest                   # Apple Vision, reading order, --json for boxes
 bugle ocr latest --engine llama    # OCR through a vision model instead

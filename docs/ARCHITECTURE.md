@@ -48,6 +48,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
 | `export_audio_m4a`, `export_mp4`, `export_mov`, `video_frame`, `media_duration` | `AVAssetExportSession`, `AVAssetImageGenerator` |
+| `mix_audio_tracks`, `audio_track_count` | `AVAssetReaderAudioMixOutput` → `AVAssetWriter` (AAC), video samples copied as is |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
 
 Window shadows: ScreenCaptureKit clips single-window screenshots to the window
@@ -99,7 +100,12 @@ recorder state machine, and exposes one method per user-facing action:
   sample buffers, `AVAssetWriter` encodes them to H.264 + AAC straight into the
   `.mp4` (a `.mov` request is remuxed afterwards). The microphone is an
   `AVCaptureSession` audio tap written as a second AAC track, retimed to the host
-  clock; `export_audio_m4a` mixes both tracks when transcribing. Click highlighting
+  clock; `export_audio_m4a` mixes both tracks when transcribing. With
+  `mix_audio` (`[recordings]`, `--mix-audio`, action argument) a post-pass on the
+  finished file folds all audio tracks into one AAC track before any `.mov`
+  remux; mixing after capture keeps the real-time path unchanged (no
+  cross-clock resampling or buffering between two live sources), and a failed
+  mix only logs a warning and keeps the two tracks. Click highlighting
   uses `screencapture -k` or, on the stream recorder, `SCStreamConfiguration.showMouseClicks`
   (macOS 15+). Timing details live in the shim's
   recorder comment: the writer session opens before the stream starts, a static
@@ -150,8 +156,8 @@ earn its keep.
 
 * **Post-capture video editor** — trim, auto-zoom on clicks, cursor smoothing,
   export presets.
-* **Audio mixing** — fold the microphone and system-audio tracks into one when
-  asked; click highlighting on the ScreenCaptureKit recorder.
+* **Audio mixing extras** — per-source levels (or ducking system audio under
+  the microphone) for the mixed track.
 * **Quick-access panel** after a capture (the toast with a thumbnail is the
   minimal version): annotate, copy, pin or send from one place.
 * **Window-picking mode** for *Capture Window* (hover to highlight) instead of
