@@ -41,7 +41,8 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | MCP server (stdio) | JSON-RPC 2.0, image content | ✅ |
 | Menu-bar app, global hotkeys | `bugle-app`: `NSStatusItem` via `tray-icon`, Carbon hotkeys via `global-hotkey`, in-app overlays | ✅ |
 | Sync to your own storage | folder copy/move, or SigV4 `PUT` to any S3-compatible bucket | ✅ |
-| `Bugle.app` bundle, Open at Login | `cargo xtask bundle` (hardened runtime, ad-hoc or Developer ID), `SMAppService` | ✅ (notarization needs your credentials) |
+| `Bugle.app` bundle | `cargo xtask bundle` (hardened runtime, ad-hoc or Developer ID) | ✅ ad-hoc; Developer ID signing and notarization not yet exercised |
+| Open at Login | `SMAppService.mainAppService` | built, status read verified; registering not yet exercised |
 | Post-capture video editor | — | see [feature ideas](docs/ARCHITECTURE.md#feature-ideas) |
 
 ## Build
@@ -63,49 +64,80 @@ cargo xtask bundle --zip           # also dist/Bugle-<version>.zip
 cargo xtask verify --smoke-test    # re-check a bundle and launch it briefly
 ```
 
-`bundle` builds the release binaries (`--no-build` reuses them) and assembles
-`dist/Bugle.app`: an `Info.plist` with the workspace version, `LSUIElement`
-(menu-bar only, no Dock icon) and the screen-capture and microphone usage
-strings; `Bugle.icns`, rendered from the menu-bar glyph; `Contents/MacOS/bugle-app`
-and the `bugle` CLI next to it. Both executables are signed with the hardened
-runtime and [`packaging/Bugle.entitlements`](packaging/Bugle.entitlements)
-(microphone only; the app is not sandboxed), then checked with `plutil -lint`,
-`codesign --verify --deep --strict`, `iconutil` and `--version`.
+`bundle` builds the release binaries (taking their paths from cargo, so a custom
+target directory works) and assembles the bundle in `dist/.staging`: an
+`Info.plist` with the workspace version, `LSUIElement` (menu-bar only, no Dock
+icon) and the microphone usage string; `Bugle.icns`, rendered from the menu-bar
+glyph; `Contents/MacOS/bugle-app` and the `bugle` CLI next to it. Both
+executables are signed with the hardened runtime and
+[`packaging/Bugle.entitlements`](packaging/Bugle.entitlements) (microphone only;
+the app is not sandboxed), then checked with `plutil -lint` (Info.plist and the
+entitlements embedded in each signature), `codesign --verify --deep --strict`,
+`iconutil` and `--version`. Only a bundle that passes replaces `dist/Bugle.app`.
 
-Running from the bundle makes the Screen Recording, Microphone and Accessibility
-prompts and the Login Items list show **Bugle** instead of the terminal that
-launched it, and adds **Open at Login** to the menu. To use the CLI from the
-bundle, link it onto your `PATH`:
+The binaries are built for the host architecture only (arm64 on Apple silicon,
+x86_64 on Intel); the bundle does not launch on the other kind of Mac.
+
+When Bugle.app is launched from Finder, the Dock, `open` or as a login item,
+the Screen Recording, Microphone and Accessibility prompts and System Settings
+name **Bugle** rather than the terminal (running
+`Bugle.app/Contents/MacOS/bugle-app` from a shell still attributes permissions
+to the terminal). The menu also gains **Open at Login**. Register it from the
+installed copy (for example in `/Applications`), not from `dist/`: the login
+item points at the bundle's location, so moving the bundle or rebuilding it in
+`dist/` leaves a stale entry; turn it off first, or remove the entry in System
+Settings → General → Login Items.
+
+To use the CLI from the bundle, link it into a directory on your `PATH` (no
+`sudo`; add `~/.local/bin` to `PATH` in your shell profile if it is not there):
 
 ```bash
-ln -s /Applications/Bugle.app/Contents/MacOS/bugle /usr/local/bin/bugle
+mkdir -p ~/.local/bin
+ln -sf /Applications/Bugle.app/Contents/MacOS/bugle ~/.local/bin/bugle
 ```
 
 | Option | Environment | Default |
 |---|---|---|
 | `--sign IDENTITY` | `BUGLE_SIGN_IDENTITY` | `-` (ad-hoc) |
-| `--bundle-id ID` | `BUGLE_BUNDLE_ID` | `io.github.mlloyd.bugle` (the CLI is signed as `<id>.cli`) |
+| `--bundle-id ID` | `BUGLE_BUNDLE_ID` | `bundle_id` under `[workspace.metadata.bugle]` in the root `Cargo.toml` (the CLI is signed as `<id>.cli`) |
 | `--build-number N` | `BUGLE_BUILD_NUMBER` | the workspace version |
 | `--out DIR` | — | `dist/` |
 
+The default bundle id is provisional until the project's final domain is
+chosen; it is defined only in `Cargo.toml`. macOS keys permission grants and the
+login item to the bundle id, so changing it after installing a build resets
+those: grant the permissions again and re-enable Open at Login.
+
 An ad-hoc signature is enough to run the bundle on the machine that built it.
-macOS ties privacy permissions to the signature, so each ad-hoc rebuild may ask
-again. To distribute it, sign with a Developer ID Application identity from your
-keychain (`security find-identity -v -p codesigning` lists them) and notarize:
+macOS identifies an ad-hoc signed app by the hash of its code, so after a
+rebuild the old grant may still be listed (even switched on) in System Settings
+while capture is denied. Reset the entries and grant them again:
 
 ```bash
-# once: store notary credentials in the keychain
+tccutil reset ScreenCapture <bundle id>
+tccutil reset Microphone <bundle id>
+tccutil reset Accessibility <bundle id>
+```
+
+To distribute the bundle, sign it with a Developer ID Application identity from
+your keychain (`security find-identity -v -p codesigning` lists them) and
+notarize it:
+
+```bash
+# once: store notary credentials in the keychain (prompts for the password)
 xcrun notarytool store-credentials bugle-notary --apple-id you@example.com --team-id TEAMID
 BUGLE_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
 BUGLE_NOTARY_PROFILE=bugle-notary cargo xtask bundle --notarize
 ```
 
-`--notarize` zips the bundle, submits it with `xcrun notarytool submit --wait`,
-staples the ticket and re-zips. Instead of a profile it accepts
-`BUGLE_NOTARY_APPLE_ID`, `BUGLE_NOTARY_TEAM_ID` and `BUGLE_NOTARY_PASSWORD` (an
-app-specific password). Without a Developer ID identity or credentials it prints
-why and skips the step. With a Developer ID signature, `bundle` also runs
-`spctl --assess` to show Gatekeeper's verdict.
+`--notarize` zips the staged bundle under a temporary name, submits it with
+`xcrun notarytool submit --wait`, staples the ticket, checks it with
+`spctl --assess` and only then writes `dist/Bugle-<version>.zip`. Instead of a
+keychain profile it accepts an App Store Connect API key: `BUGLE_NOTARY_KEY`
+(path to the `.p8` file), `BUGLE_NOTARY_KEY_ID` and `BUGLE_NOTARY_ISSUER`. No
+secret is passed on the command line, and identifiers are masked in the log.
+`--notarize` fails before building when the identity is ad-hoc or the
+credentials are missing or incomplete; any failing step fails the run.
 
 ## Permissions
 

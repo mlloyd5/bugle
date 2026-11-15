@@ -143,7 +143,10 @@ runtime thread (`http::serve_with_shutdown`) and shares the same `Engine`, so AP
 callers get the in-app overlay too. Feedback is a transient toast (`toast_show`)
 plus the shutter sound; the status item title shows `● m:ss` while recording.
 When the process runs from `Bugle.app`, an *Open at Login* check item
-(`login.rs`) registers the bundle with `SMAppService`.
+(`login.rs`) registers the bundle with `SMAppService`. Its check mark is
+re-read on the periodic tick (every 5 s) and set only for an enabled item; a
+pending approval is shown in the title, and clicking it then opens System
+Settings → Login Items.
 
 The status-bar glyph is a signed distance field (`icon/glyph.rs`) that scales
 its stroke widths with the render size, so the same drawing serves the 36 px
@@ -151,12 +154,17 @@ template image and the application icon.
 
 ### `xtask` (packaging)
 `cargo xtask bundle` (alias in `.cargo/config.toml`) builds `bugle-app` and
-`bugle` in release mode and assembles `dist/Bugle.app`:
+`bugle` in release mode, taking the executable paths from
+`cargo build --message-format=json` and the target directory from
+`cargo metadata`, and assembles the bundle in `dist/.staging`. The bundle id
+is read from `[workspace.metadata.bugle] bundle_id` in the root `Cargo.toml`
+(its only definition; `--bundle-id` overrides it and is validated):
 
 ```
 Bugle.app/Contents/
   Info.plist          generated (plist.rs): bundle id, workspace version, LSUIElement,
-                      NSScreenCaptureUsageDescription, NSMicrophoneUsageDescription
+                      NSMicrophoneUsageDescription (Screen Recording and
+                      Accessibility have no usage key)
   PkgInfo
   MacOS/bugle-app     CFBundleExecutable
   MacOS/bugle         the CLI, signed as <bundle id>.cli
@@ -168,11 +176,14 @@ Signing is inside-out (CLI, then the bundle) with `--options runtime` and
 `packaging/Bugle.entitlements` (`device.audio-input`, which the hardened runtime
 requires for the microphone); ad-hoc by default, a Developer ID identity from
 `--sign`/`BUGLE_SIGN_IDENTITY` adds a secure timestamp. Verification runs
-`plutil -lint`, `codesign --verify --deep --strict`, checks the runtime flag and
-entitlements, round-trips the icon through `iconutil` and runs both binaries
-with `--version`. `--notarize` submits a `ditto` zip to `notarytool`, staples and
-re-zips, and is skipped (with a message) without a Developer ID identity or
-credentials.
+`plutil -lint` on Info.plist, `codesign --verify --deep --strict`, checks the
+runtime flag and lints the entitlements embedded in both signatures (app and
+CLI), round-trips the icon through `iconutil` and runs both binaries with
+`--version`. `--notarize` needs a Developer ID identity and a keychain profile
+or an App Store Connect API key file (never a password in argv) and fails up
+front without them; it submits a temporary `ditto` zip to `notarytool`,
+staples, and requires `spctl --assess` to pass. Only then is the staged bundle
+renamed over `dist/Bugle.app` and the final zip written.
 
 ## Feature ideas
 
@@ -187,7 +198,8 @@ earn its keep.
   minimal version): annotate, copy, pin or send from one place.
 * **Window-picking mode** for *Capture Window* (hover to highlight) instead of
   taking the front-most window; a hotkey for every menu item.
-* **Packaging extras** — a universal (arm64 + x86_64) build, a DMG, and system
+* **Packaging extras** — a universal (arm64 + x86_64) build (bundles are
+  host-architecture only today), a DMG, the final bundle id, and system
   notifications (`UNUserNotificationCenter`) alongside the toast now that the
   bundle gives them Bugle's name.
 * **Sync extras** — a destination per media kind, streaming multipart uploads
