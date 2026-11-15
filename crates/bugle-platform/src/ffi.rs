@@ -4,6 +4,17 @@
 use libc::{c_char, c_double, c_void, size_t};
 
 #[repr(C)]
+#[derive(Default)]
+pub struct bugle_video_info_t {
+    pub width: i32,
+    pub height: i32,
+    pub nominal_fps: f64,
+    pub start: f64,
+    pub duration: f64,
+    pub stored_samples: i64,
+}
+
+#[repr(C)]
 pub struct bugle_image_t {
     pub data: *mut u8,
     pub width: i32,
@@ -118,7 +129,8 @@ extern "C" {
     pub fn bugle_export_mov(in_path: *const c_char, out_path: *const c_char) -> i32;
     pub fn bugle_media_duration(path: *const c_char) -> f64;
     pub fn bugle_video_frame(path: *const c_char, seconds: f64) -> bugle_image_t;
-    pub fn bugle_video_size(path: *const c_char, out_w: *mut i32, out_h: *mut i32) -> i32;
+    pub fn bugle_video_info(path: *const c_char, out: *mut bugle_video_info_t) -> i32;
+    pub fn bugle_video_sync_at(path: *const c_char, seconds: f64) -> i32;
     pub fn bugle_export_video(
         in_path: *const c_char,
         out_path: *const c_char,
@@ -127,13 +139,14 @@ extern "C" {
         preset: i32,
         mp4: i32,
         fps: i32,
+        timeout: f64,
     ) -> i32;
     pub fn bugle_frames_open(path: *const c_char, tolerance: f64) -> *mut c_void;
     pub fn bugle_frames_at(handle: *mut c_void, seconds: f64) -> bugle_image_t;
     pub fn bugle_frames_close(handle: *mut c_void);
-    pub fn bugle_writer_open(path: *const c_char, w: i32, h: i32, fps: i32, mp4: i32) -> *mut c_void;
+    pub fn bugle_writer_open(path: *const c_char, w: i32, h: i32, fps: i32, mp4: i32, hevc: i32) -> *mut c_void;
     pub fn bugle_writer_append(handle: *mut c_void, rgba: *const u8, len: size_t, w: i32, h: i32) -> i32;
-    pub fn bugle_writer_finish(handle: *mut c_void) -> i32;
+    pub fn bugle_writer_finish(handle: *mut c_void, timeout: f64) -> i32;
     pub fn bugle_writer_cancel(handle: *mut c_void);
     pub fn bugle_play_sound(name: *const c_char);
     pub fn bugle_open_path(path: *const c_char);

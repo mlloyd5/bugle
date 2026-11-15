@@ -1067,17 +1067,70 @@ static AVAssetTrack *first_video_track(AVAsset *asset) {
     return [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
 }
 
-int32_t bugle_video_size(const char *path, int32_t *out_w, int32_t *out_h) {
+static AVURLAsset *precise_asset(const char *path) {
+    return [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:path]]
+                               options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
+}
+
+/// Wait for `sem` at most `timeout` seconds (<= 0: forever). YES when signalled.
+static BOOL wait_bounded(dispatch_semaphore_t sem, double timeout) {
+    dispatch_time_t t = timeout > 0 ? dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)) : DISPATCH_TIME_FOREVER;
+    return dispatch_semaphore_wait(sem, t) == 0;
+}
+
+/// Media time of the sample shown at track time `t` (edit lists map the
+/// track timeline onto the media; plain files map 1:1).
+static CMTime media_time_for(AVAssetTrack *track, CMTime t) {
+    AVAssetTrackSegment *seg = [track segmentForTrackTime:t];
+    if (!seg || seg.isEmpty) return t;
+    CMTimeMapping m = seg.timeMapping;
+    return CMTimeAdd(m.source.start, CMTimeSubtract(t, m.target.start));
+}
+
+int32_t bugle_video_info(const char *path, bugle_video_info_t *out) {
     @autoreleasepool {
         clear_error();
-        if (!path || !out_w || !out_h) { set_error(@"video size: NULL argument"); return -1; }
-        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:path]] options:nil];
+        if (!path || !out) { set_error(@"video info: NULL argument"); return -1; }
+        memset(out, 0, sizeof(*out));
+        AVURLAsset *asset = precise_asset(path);
         AVAssetTrack *track = first_video_track(asset);
         if (!track) { set_error(@"%s has no video track", path); return -1; }
         CGSize s = CGSizeApplyAffineTransform(track.naturalSize, track.preferredTransform);
-        *out_w = (int32_t)llround(fabs(s.width));
-        *out_h = (int32_t)llround(fabs(s.height));
+        out->width = (int32_t)llround(fabs(s.width));
+        out->height = (int32_t)llround(fabs(s.height));
+        out->nominal_fps = track.nominalFrameRate;
+        out->start = CMTimeGetSeconds(track.timeRange.start);
+        out->duration = CMTimeGetSeconds(track.timeRange.duration);
+        // Every sample stored in the media, including any an edit list hides.
+        out->stored_samples = -1;
+        if (track.canProvideSampleCursors) {
+            AVSampleCursor *c = [track makeSampleCursorAtFirstSampleInDecodeOrder];
+            if (c) {
+                int64_t n = 1;
+                while ([c stepInDecodeOrderByCount:1] == 1) n++;
+                out->stored_samples = n;
+            }
+        }
         return 0;
+    }
+}
+
+int32_t bugle_video_sync_at(const char *path, double seconds) {
+    @autoreleasepool {
+        clear_error();
+        if (!path || !isfinite(seconds)) { set_error(@"sync check: invalid argument"); return -1; }
+        AVURLAsset *asset = precise_asset(path);
+        AVAssetTrack *track = first_video_track(asset);
+        if (!track) { set_error(@"%s has no video track", path); return -1; }
+        if (!track.canProvideSampleCursors) return 0;
+        CMTime t = CMTimeMakeWithSeconds(seconds, 60000);
+        CMTime mt = media_time_for(track, t);
+        AVSampleCursor *c = [track makeSampleCursorWithPresentationTimeStamp:mt];
+        if (!c) return 0;
+        // The cursor lands on the sample shown at `mt`; a cut is clean when
+        // that sample is a full sync sample starting (within 1 ms) at the cut.
+        double delta = fabs(CMTimeGetSeconds(CMTimeSubtract(c.presentationTimeStamp, mt)));
+        return (c.currentSampleSyncInfo.sampleIsFullSync && delta < 0.001) ? 1 : 0;
     }
 }
 
@@ -1094,7 +1147,7 @@ static NSString *edit_preset_name(int32_t preset) {
 }
 
 int32_t bugle_export_video(const char *in_path, const char *out_path, double start, double end, int32_t preset,
-                           int32_t mp4, int32_t fps) {
+                           int32_t mp4, int32_t fps, double timeout) {
     @autoreleasepool {
         clear_error();
         NSString *name = edit_preset_name(preset);
@@ -1105,13 +1158,13 @@ int32_t bugle_export_video(const char *in_path, const char *out_path, double sta
             return -1;
         }
         if (fps < 0 || fps > 240) { set_error(@"invalid frame rate %d", fps); return -1; }
-        NSURL *in = [NSURL fileURLWithPath:[NSString stringWithUTF8String:in_path]];
+        if (fps > 0 && preset == 0) { set_error(@"a frame rate needs a re-encoding preset"); return -1; }
         NSURL *out = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
-        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:in options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
-        if (!first_video_track(asset)) { set_error(@"%s has no video track", in_path); return -1; }
+        AVURLAsset *asset = precise_asset(in_path);
+        if (!first_video_track(asset)) { set_error(@"the source has no video track"); return -1; }
         // Passthrough is never listed as "compatible" but always works.
         if (preset != 0 && ![[AVAssetExportSession exportPresetsCompatibleWithAsset:asset] containsObject:name]) {
-            set_error(@"export preset %@ is not available for %s", name, in_path);
+            set_error(@"export preset %@ is not available for this source", name);
             return -1;
         }
         AVAssetExportSession *s = [[AVAssetExportSession alloc] initWithAsset:asset presetName:name];
@@ -1126,14 +1179,29 @@ int32_t bugle_export_video(const char *in_path, const char *out_path, double sta
         s.outputFileType = type;
         s.shouldOptimizeForNetworkUse = YES;
         s.timeRange = CMTimeRangeFromTimeToTime(CMTimeMakeWithSeconds(start, 60000), CMTimeMakeWithSeconds(end, 60000));
-        if (fps > 0 && preset != 0) {
+        if (preset != 0) {
+            // Re-encodes always render through a video composition: without
+            // one the encoder starts at the keyframe before the cut and hides
+            // the extra frames with an edit list, leaving cut footage in the
+            // file. The composition renders only frames inside the range.
             AVMutableVideoComposition *vc = [AVMutableVideoComposition videoCompositionWithPropertiesOfAsset:asset];
-            vc.frameDuration = CMTimeMake(1, fps);
+            if (fps > 0) {
+                vc.frameDuration = CMTimeMake(1, fps);
+                // Without this the source track's own frame timing wins and
+                // frameDuration is ignored.
+                vc.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid;
+            }
             s.videoComposition = vc;
         }
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         [s exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
-        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        if (!wait_bounded(sem, timeout)) {
+            [s cancelExport];
+            wait_bounded(sem, 10);
+            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+            set_error(@"export timed out after %.0f s and was cancelled", timeout);
+            return -1;
+        }
         if (s.status != AVAssetExportSessionStatusCompleted) {
             set_error(@"export failed: %@", s.error.localizedDescription ?: @"unknown error");
             [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
@@ -1147,9 +1215,8 @@ void *bugle_frames_open(const char *path, double tolerance) {
     @autoreleasepool {
         clear_error();
         if (!path) { set_error(@"frames: NULL path"); return NULL; }
-        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:path]]
-                                                options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
-        if (!first_video_track(asset)) { set_error(@"%s has no video track", path); return NULL; }
+        AVURLAsset *asset = precise_asset(path);
+        if (!first_video_track(asset)) { set_error(@"the source has no video track"); return NULL; }
         AVAssetImageGenerator *gen = [[AVAssetImageGenerator alloc] initWithAsset:asset];
         gen.appliesPreferredTrackTransform = YES;
         CMTime tol = (isfinite(tolerance) && tolerance > 0) ? CMTimeMakeWithSeconds(tolerance, 60000) : kCMTimeZero;
@@ -1192,7 +1259,7 @@ void bugle_frames_close(void *handle) {
 @implementation BugleFrameWriter
 @end
 
-void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int32_t mp4) {
+void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int32_t mp4, int32_t hevc) {
     @autoreleasepool {
         clear_error();
         if (!path) { set_error(@"writer: NULL path"); return NULL; }
@@ -1211,17 +1278,18 @@ void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int
         writer.shouldOptimizeForNetworkUse = YES;
         // Same budget as the recorder: ~0.1 bit per pixel per frame.
         double bitrate = fmax(1.0e6, fmin(40.0e6, (double)w * (double)h * (double)fps * 0.1));
+        NSMutableDictionary *compression = [@{
+            AVVideoAverageBitRateKey: @((int64_t)bitrate),
+            AVVideoExpectedSourceFrameRateKey: @(fps),
+            AVVideoMaxKeyFrameIntervalKey: @(fps),
+            AVVideoAllowFrameReorderingKey: @NO,
+        } mutableCopy];
+        if (!hevc) compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel;
         NSDictionary *video = @{
-            AVVideoCodecKey: AVVideoCodecTypeH264,
+            AVVideoCodecKey: hevc ? AVVideoCodecTypeHEVC : AVVideoCodecTypeH264,
             AVVideoWidthKey: @(w),
             AVVideoHeightKey: @(h),
-            AVVideoCompressionPropertiesKey: @{
-                AVVideoAverageBitRateKey: @((int64_t)bitrate),
-                AVVideoExpectedSourceFrameRateKey: @(fps),
-                AVVideoMaxKeyFrameIntervalKey: @(fps),
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-                AVVideoAllowFrameReorderingKey: @NO,
-            },
+            AVVideoCompressionPropertiesKey: compression,
         };
         AVAssetWriterInput *input = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:video];
         input.expectsMediaDataInRealTime = NO;
@@ -1233,10 +1301,10 @@ void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int
         AVAssetWriterInputPixelBufferAdaptor *adaptor =
             [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:input
                                                                              sourcePixelBufferAttributes:attrs];
-        if (![writer canAddInput:input]) { set_error(@"writer refused the H.264 video track"); return NULL; }
+        if (![writer canAddInput:input]) { set_error(@"writer refused the %@ video track", hevc ? @"HEVC" : @"H.264"); return NULL; }
         [writer addInput:input];
         if (![writer startWriting]) {
-            set_error(@"could not start writing %@: %@", url.path, writer.error.localizedDescription);
+            set_error(@"could not start writing the movie: %@", writer.error.localizedDescription);
             [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
             return NULL;
         }
@@ -1297,7 +1365,7 @@ int32_t bugle_writer_append(void *handle, const uint8_t *rgba, size_t len, int32
     }
 }
 
-int32_t bugle_writer_finish(void *handle) {
+int32_t bugle_writer_finish(void *handle, double timeout) {
     @autoreleasepool {
         clear_error();
         if (!handle) { set_error(@"writer: NULL handle"); return -1; }
@@ -1313,9 +1381,15 @@ int32_t bugle_writer_finish(void *handle) {
         [fw.writer endSessionAtSourceTime:CMTimeMake(fw.frames, fw.fps)];
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         [fw.writer finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
-        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        if (!wait_bounded(sem, timeout)) {
+            [fw.writer cancelWriting];
+            wait_bounded(sem, 10);
+            [[NSFileManager defaultManager] removeItemAtURL:fw.url error:nil];
+            set_error(@"finalising the movie timed out after %.0f s", timeout);
+            return -1;
+        }
         if (fw.writer.status != AVAssetWriterStatusCompleted) {
-            set_error(@"finalising %@ failed: %@", fw.url.path, fw.writer.error.localizedDescription);
+            set_error(@"finalising the movie failed: %@", fw.writer.error.localizedDescription);
             [[NSFileManager defaultManager] removeItemAtURL:fw.url error:nil];
             return -1;
         }
