@@ -168,6 +168,19 @@ impl Engine {
         }
     }
 
+    /// Put a media item on the clipboard: image data for images, a file
+    /// reference for everything else.
+    pub fn copy_media(&self, source: &str) -> Result<MediaItem> {
+        let m = self.resolve_media(source)?;
+        if m.is_image() {
+            let (_, img) = self.load_image(source)?;
+            self.copy_to_clipboard(&m.path, Some(&img))?;
+        } else {
+            self.copy_to_clipboard(&m.path, None)?;
+        }
+        Ok(m)
+    }
+
     // -----------------------------------------------------------------------
     // OCR
     // -----------------------------------------------------------------------

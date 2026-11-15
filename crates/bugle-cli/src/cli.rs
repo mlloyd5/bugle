@@ -784,13 +784,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             println!("{}", if ok { "deleted" } else { "not found" });
         }
         Cmd::Copy { source } => {
-            let m = engine.resolve_media(&source)?;
-            if m.is_image() {
-                let (_, img) = engine.load_image(&source)?;
-                engine.copy_to_clipboard(&m.path, Some(&img))?;
-            } else {
-                engine.copy_to_clipboard(&m.path, None)?;
-            }
+            let m = engine.copy_media(&source)?;
             println!("copied {}", m.path.display());
         }
         Cmd::Open { source } => {

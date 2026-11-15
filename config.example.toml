@@ -64,6 +64,13 @@ record = "cmd+shift+5"        # starts an MP4 recording, or stops the active one
 ocr_latest = "cmd+shift+2"
 pin_latest = "cmd+shift+p"
 
+# Quick-access panel shown by `bugle-app` after a capture: thumbnail plus
+# Copy · Annotate · Pin · Sync · Reveal. `enabled = false` keeps the plain toast.
+[quick_access]
+enabled = true
+timeout_seconds = 8.0     # closes by itself (paused while hovered); 0 = stay open
+position = "top-right"    # top-right | top-left | bottom-right | bottom-left
+
 # ---------------------------------------------------------------------------
 # Sync every new capture to storage you own. There is no hosted service: pick
 # a folder that Dropbox / iCloud Drive / Syncthing already mirrors, or an

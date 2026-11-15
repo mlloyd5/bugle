@@ -386,17 +386,7 @@ pub async fn run(engine: &Arc<Engine>, name: &str, args: Value) -> Result<Action
         }
         "copy" => {
             let source = source_of(&args);
-            let media = tokio::task::spawn_blocking(move || {
-                let m = e.resolve_media(&source)?;
-                if m.is_image() {
-                    let (_, img) = e.load_image(&source)?;
-                    e.copy_to_clipboard(&m.path, Some(&img))?;
-                } else {
-                    e.copy_to_clipboard(&m.path, None)?;
-                }
-                Ok::<_, anyhow::Error>(m)
-            })
-            .await??;
+            let media = tokio::task::spawn_blocking(move || e.copy_media(&source)).await??;
             Ok(ActionOutput::json(json!({"copied": media.id})))
         }
         "sync" => {
