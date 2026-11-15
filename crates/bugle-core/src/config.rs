@@ -330,7 +330,8 @@ pub struct SyncConfig {
     pub sidecars: bool,
     /// Per-kind destinations (`[sync.destinations.video]`, …). Kinds without
     /// an entry use `folder` / `s3` above; a kind with an entry is synced
-    /// automatically even when it is not listed in `kinds`.
+    /// automatically (when saves of that kind run the step) even when it is
+    /// not listed in `kinds`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub destinations: BTreeMap<MediaKind, SyncTarget>,
 }
@@ -339,7 +340,7 @@ pub struct SyncConfig {
 /// (a sub-folder / key prefix under the default destination). `mode`
 /// overrides `[sync] mode` for this kind.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SyncTarget {
     pub folder: Option<String>,
     pub s3: Option<S3Config>,
@@ -376,10 +377,10 @@ pub struct S3Config {
     /// are served from somewhere else than the API endpoint (a CDN, a custom
     /// domain). Defaults to `{endpoint}/{bucket}`.
     pub public_url: Option<String>,
-    /// Files at least this large (MiB) are sent as a multipart upload that
-    /// streams from disk part by part instead of one `PUT`.
+    /// Files at least this large (MiB, at most 5120) are sent as a multipart
+    /// upload that streams from disk part by part instead of one `PUT`.
     pub multipart_threshold_mb: u64,
-    /// Multipart part size in MiB (at least 5, the S3 minimum).
+    /// Multipart part size in MiB, 5..=5120 (the S3 limits).
     pub part_size_mb: u64,
 }
 
@@ -420,9 +421,13 @@ pub enum SyncDestination {
     S3(S3Config),
 }
 
+/// Bounds S3 puts on a part (5 MiB … 5 GiB) and on a single `PUT` (5 GiB).
+pub const S3_PART_MB: std::ops::RangeInclusive<u64> = 5..=5120;
+pub const S3_MAX_THRESHOLD_MB: u64 = 5120;
+
 impl SyncConfig {
     /// The default destination; `None` when neither `folder` nor `s3` is
-    /// set, an error when both are.
+    /// set, an error when both are or a setting is out of range.
     pub fn destination(&self) -> Result<Option<SyncDestination>> {
         resolve_target(self.folder.as_deref(), self.s3.as_ref(), "[sync]")
     }
@@ -432,6 +437,9 @@ impl SyncConfig {
     pub fn destination_for(&self, kind: MediaKind) -> Result<Option<SyncDestination>> {
         let Some(t) = self.destinations.get(&kind) else { return self.destination() };
         let section = format!("[sync.destinations.{}]", kind_key(kind));
+        if let Some(p) = t.prefix.as_deref() {
+            check_prefix(p, &section, false)?;
+        }
         if let Some(dest) = resolve_target(t.folder.as_deref(), t.s3.as_ref(), &section)? {
             return Ok(Some(with_prefix(dest, t.prefix.as_deref())));
         }
@@ -441,14 +449,20 @@ impl SyncConfig {
         }
     }
 
+    /// Whether `kind` has its own `[sync.destinations.<kind>]` entry.
+    pub fn has_entry(&self, kind: MediaKind) -> bool {
+        self.destinations.contains_key(&kind)
+    }
+
     /// `[sync] mode`, unless the kind's entry overrides it.
     pub fn mode_for(&self, kind: MediaKind) -> SyncMode {
         self.destinations.get(&kind).and_then(|t| t.mode).unwrap_or(self.mode)
     }
 
-    /// Whether any destination (default or per kind) is configured.
+    /// Whether any destination (default or per kind) resolves without error.
     pub fn has_destination(&self) -> bool {
-        matches!(self.destination(), Ok(Some(_))) || !self.destinations.is_empty()
+        matches!(self.destination(), Ok(Some(_)))
+            || self.destinations.keys().any(|k| matches!(self.destination_for(*k), Ok(Some(_))))
     }
 
     /// Check the default and every per-kind destination.
@@ -460,9 +474,28 @@ impl SyncConfig {
         Ok(())
     }
 
-    /// Whether the automatic step applies to `kind`.
+    /// Settings that parse and resolve but do nothing, worth a log line.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (kind, t) in &self.destinations {
+            if t.mode.is_some() && matches!(self.destination_for(*kind), Ok(Some(SyncDestination::S3(_)))) {
+                out.push(format!(
+                    "[sync.destinations.{}] sets `mode`, which has no effect on a bucket: uploads always keep the local file",
+                    kind_key(*kind)
+                ));
+            }
+        }
+        out
+    }
+
+    /// Whether the automatic step applies to `kind`: sync is enabled, the
+    /// kind is listed in `kinds` or has its own entry, and its destination
+    /// resolves. Only saves run the step (screenshots, scrolling captures,
+    /// annotations, recordings) plus subtitles written by `subtitles`.
     pub fn applies_to(&self, kind: MediaKind) -> bool {
-        self.enabled && (self.kinds.contains(&kind) || self.destinations.contains_key(&kind))
+        self.enabled
+            && (self.kinds.contains(&kind) || self.destinations.contains_key(&kind))
+            && matches!(self.destination_for(kind), Ok(Some(_)))
     }
 }
 
@@ -482,10 +515,39 @@ fn resolve_target(folder: Option<&str>, s3: Option<&S3Config>, section: &str) ->
             if s3.endpoint.trim().is_empty() {
                 anyhow::bail!("{section} s3 needs an `endpoint`");
             }
+            check_prefix(&s3.prefix, &format!("{section} s3"), true)?;
+            if !S3_PART_MB.contains(&s3.part_size_mb) {
+                anyhow::bail!(
+                    "{section} s3 part_size_mb = {} is out of range: S3 parts are {}..={} MiB",
+                    s3.part_size_mb,
+                    S3_PART_MB.start(),
+                    S3_PART_MB.end()
+                );
+            }
+            if s3.multipart_threshold_mb > S3_MAX_THRESHOLD_MB {
+                anyhow::bail!(
+                    "{section} s3 multipart_threshold_mb = {} is too large: a single upload is at most {S3_MAX_THRESHOLD_MB} MiB",
+                    s3.multipart_threshold_mb
+                );
+            }
             Ok(Some(SyncDestination::S3(s3.clone())))
         }
         (None, None) => Ok(None),
     }
+}
+
+/// Reject `.` / `..` segments (they would escape the folder, or make the
+/// signed path differ from the one the HTTP client sends) and, for folder
+/// sub-paths, absolute paths.
+fn check_prefix(prefix: &str, section: &str, leading_slash_ok: bool) -> Result<()> {
+    let p = prefix.trim();
+    if !leading_slash_ok && (p.starts_with('/') || p.starts_with('~')) {
+        anyhow::bail!("{section} prefix {p:?} must be relative (a sub-folder / key prefix), not an absolute path");
+    }
+    if p.contains('\\') || p.split('/').any(|seg| seg == "." || seg == "..") {
+        anyhow::bail!("{section} prefix {p:?} must not contain `.` or `..` segments or backslashes");
+    }
+    Ok(())
 }
 
 /// A sub-folder of a folder destination, or a longer key prefix in a bucket.
@@ -709,6 +771,37 @@ mod tests {
             toml::from_str("[sync.destinations.video]\nfolder = \"/a\"\ns3 = { bucket = \"b\", endpoint = \"http://h\" }\n").unwrap();
         assert!(cfg.sync.validate().is_err());
         assert!(toml::from_str::<Config>("[sync.destinations.movie]\nfolder = \"/a\"\n").is_err(), "unknown kinds are rejected");
+    }
+
+    #[test]
+    fn sync_bounds_prefixes_and_unknown_keys() {
+        let parse = |t: &str| toml::from_str::<Config>(t).unwrap().sync;
+        let s3 = "[sync.s3]\nbucket = \"b\"\nendpoint = \"http://h\"\n";
+        assert!(parse(s3).validate().is_ok());
+        for bad in ["part_size_mb = 4", "part_size_mb = 6000", "part_size_mb = 9223372036854775807", "multipart_threshold_mb = 5121"] {
+            let sync = parse(&format!("{s3}{bad}\n"));
+            assert!(sync.validate().is_err(), "{bad} should be rejected");
+            assert!(!sync.has_destination());
+        }
+        assert!(parse(&format!("{s3}part_size_mb = 5120\nmultipart_threshold_mb = 5120\n")).validate().is_ok());
+        // `.` / `..` segments never pass, in a bucket prefix or a per-kind prefix.
+        assert!(parse(&format!("{s3}prefix = \"team/../other\"\n")).validate().is_err());
+        assert!(parse(&format!("{s3}prefix = \"/team/bugle/\"\n")).validate().is_ok(), "a leading slash in a key prefix is fine");
+        for bad in ["../../escaped", "a/./b", "/abs", "~/x", "a\\\\b"] {
+            let sync = parse(&format!("[sync]\nenabled = true\nfolder = \"/f\"\n[sync.destinations.video]\nprefix = \"{bad}\"\n"));
+            assert!(sync.validate().is_err(), "{bad} should be rejected");
+            assert!(!sync.applies_to(MediaKind::Video), "an invalid entry does not sync");
+            assert!(sync.applies_to(MediaKind::Screenshot), "other kinds keep syncing");
+        }
+        // A typo in a per-kind table is an error, not a silent fallback.
+        assert!(toml::from_str::<Config>("[sync.destinations.video]\nfolderr = \"/v\"\n").is_err());
+        // A prefix-only entry with no default resolves to nothing usable.
+        let sync = parse("[sync]\nenabled = true\n[sync.destinations.video]\nprefix = \"v\"\n");
+        assert!(!sync.has_destination() && !sync.applies_to(MediaKind::Video));
+        // `mode` on a bucket entry is reported.
+        let sync = parse("[sync.destinations.gif]\nmode = \"move\"\n[sync.destinations.gif.s3]\nbucket = \"b\"\nendpoint = \"http://h\"\n");
+        assert_eq!(sync.warnings().len(), 1, "{:?}", sync.warnings());
+        assert!(parse("[sync]\nfolder = \"/f\"\n[sync.destinations.gif]\nmode = \"move\"\n").warnings().is_empty());
     }
 
     #[test]
