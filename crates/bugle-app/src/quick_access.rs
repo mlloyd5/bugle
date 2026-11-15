@@ -7,7 +7,7 @@
 //! recorder instead of the clipboard and Finder.
 
 use anyhow::Result;
-use bugle_core::config::{PanelCorner, QuickAccessConfig};
+use bugle_core::config::{PanelCorner, QuickAccessConfig, SyncDestination};
 use bugle_core::{MediaItem, MediaKind};
 use bugle_platform::{Corner, PanelChoice};
 use std::path::{Path, PathBuf};
@@ -49,10 +49,10 @@ impl PanelAction {
     }
 
     /// Whether the action may block (clipboard encoding, network, the pin
-    /// request that round-trips through the main thread) and so must run off
-    /// the main thread.
+    /// request that round-trips through the main thread, waiting for an app
+    /// to accept a file) and so must run off the main thread.
     pub fn runs_off_main(self) -> bool {
-        matches!(self, Self::Copy | Self::Pin | Self::Sync)
+        matches!(self, Self::Copy | Self::Pin | Self::Sync | Self::Annotate | Self::Open)
     }
 }
 
@@ -61,12 +61,13 @@ impl PanelAction {
 pub struct SyncState {
     /// A `[sync]` destination is configured.
     pub destination: bool,
-    /// The automatic sync after save already handled this kind.
-    pub automatic: bool,
+    /// This file already reached the destination (see [`already_synced`]).
+    pub synced: bool,
 }
 
 /// The buttons a capture gets, in order. Sync only shows up when a
-/// destination exists and the automatic sync did not already send the file.
+/// destination exists and the file is not there yet — including when the
+/// automatic sync after save failed, so the button doubles as a retry.
 pub fn actions_for(kind: MediaKind, sync: SyncState) -> Vec<PanelAction> {
     let mut v = vec![PanelAction::Copy];
     let image = matches!(kind, MediaKind::Screenshot | MediaKind::ScrollCapture | MediaKind::Annotated);
@@ -74,7 +75,7 @@ pub fn actions_for(kind: MediaKind, sync: SyncState) -> Vec<PanelAction> {
         v.push(PanelAction::Annotate);
         v.push(PanelAction::Pin);
     }
-    if sync.destination && !sync.automatic {
+    if sync.destination && !sync.synced {
         v.push(PanelAction::Sync);
     }
     v.push(PanelAction::Reveal);
@@ -88,18 +89,43 @@ pub struct Target {
     pub source: String,
     pub path: PathBuf,
     pub kind: MediaKind,
+    /// Object URL from an earlier upload, if any.
+    pub url: Option<String>,
 }
 
 /// Find the history record for a just-saved file so engine actions update
 /// that record (sync moves, URLs) instead of treating it as a loose file.
 pub fn resolve_target(recent: &[MediaItem], path: &Path) -> Target {
     match recent.iter().find(|m| m.path == path) {
-        Some(m) => Target { source: m.id.clone(), path: m.path.clone(), kind: m.kind },
+        Some(m) => Target { source: m.id.clone(), path: m.path.clone(), kind: m.kind, url: m.url.clone() },
         None => Target {
             source: path.display().to_string(),
             path: path.to_path_buf(),
             kind: bugle_engine::kind_from_path(path),
+            url: None,
         },
+    }
+}
+
+/// Whether the file already reached `dest`, judged from the item itself
+/// rather than from the config (an automatic sync can fail): an upload left
+/// its URL; a move put the file in the folder; a copy left a file of the same
+/// name and size there.
+pub fn already_synced(target: &Target, dest: Option<&SyncDestination>) -> bool {
+    match dest {
+        None => false,
+        Some(SyncDestination::S3(_)) => target.url.is_some(),
+        Some(SyncDestination::Folder(dir)) => {
+            let canon = |p: &Path| p.canonicalize().ok();
+            if target.path.parent().and_then(canon).is_some_and(|p| Some(p) == canon(dir)) {
+                return true;
+            }
+            let Some(name) = target.path.file_name() else { return false };
+            match (std::fs::metadata(&target.path), std::fs::metadata(dir.join(name))) {
+                (Ok(a), Ok(b)) => a.is_file() && b.is_file() && a.len() == b.len(),
+                _ => false,
+            }
+        }
     }
 }
 
@@ -152,9 +178,14 @@ impl QuickAccess {
         Self { config, generation: 0, shown: None }
     }
 
+    /// `None` (stay open) for 0, negative, non-finite or absurdly large values.
     fn timeout(&self) -> Option<Duration> {
         let s = self.config.timeout_seconds;
-        (s.is_finite() && s > 0.0).then(|| Duration::from_secs_f64(s))
+        if s > 0.0 {
+            Duration::try_from_secs_f64(s).ok()
+        } else {
+            None
+        }
     }
 
     /// Whether a finished capture should get the panel rather than a toast.
@@ -165,7 +196,8 @@ impl QuickAccess {
     /// Start a new panel (replacing any current one); returns its generation.
     pub fn open(&mut self, target: Target, actions: Vec<PanelAction>, now: Instant) -> u64 {
         self.generation += 1;
-        let deadline = self.timeout().map(|t| now + t);
+        // An `Instant` that would overflow means "never": stay open.
+        let deadline = self.timeout().and_then(|t| now.checked_add(t));
         self.shown = Some(Shown { generation: self.generation, target, actions, deadline });
         self.generation
     }
@@ -193,16 +225,17 @@ impl QuickAccess {
         Some((action, shown.target))
     }
 
-    /// Advance the clock. Hovering keeps the panel up for a short grace
-    /// period after the pointer leaves. Returns `true` when the panel timed
-    /// out and should be closed.
+    /// Advance the clock. The panel never closes while the pointer is over
+    /// it; once the pointer leaves it stays at least [`HOVER_GRACE`] longer
+    /// (or the whole timeout, if shorter). Hovering before the deadline does
+    /// not add time. Returns `true` when the panel timed out and should close.
     pub fn tick(&mut self, now: Instant, hovered: bool) -> bool {
         let grace = self.timeout().map(|t| t.min(HOVER_GRACE));
         let Some(shown) = self.shown.as_mut() else { return false };
         let Some(deadline) = shown.deadline else { return false };
         if hovered {
             if let Some(g) = grace {
-                shown.deadline = Some(deadline.max(now + g));
+                shown.deadline = Some(now.checked_add(g).map_or(deadline, |d| deadline.max(d)));
             }
             return false;
         }
@@ -226,8 +259,8 @@ pub trait Backend {
     fn pin(&self, source: &str) -> Result<()>;
     /// Returns the sync verb (`copied`, `uploaded`, …) and the destination.
     fn sync(&self, source: &str) -> Result<(String, String)>;
-    fn reveal(&self, path: &Path);
-    fn open(&self, path: &Path);
+    fn reveal(&self, path: &Path) -> Result<()>;
+    fn open(&self, path: &Path) -> Result<()>;
 }
 
 /// Run one panel action; the result says what, if anything, to toast.
@@ -244,14 +277,8 @@ pub fn perform(backend: &dyn Backend, action: PanelAction, target: &Target) -> R
             let (verb, destination) = backend.sync(&target.source)?;
             Ok(Some(Feedback { title: format!("{}: {name}", capitalise(&verb)), subtitle: destination }))
         }
-        PanelAction::Reveal => {
-            backend.reveal(&target.path);
-            Ok(None)
-        }
-        PanelAction::Open => {
-            backend.open(&target.path);
-            Ok(None)
-        }
+        PanelAction::Reveal => backend.reveal(&target.path).map(|_| None),
+        PanelAction::Open => backend.open(&target.path).map(|_| None),
         PanelAction::Dismiss => Ok(None),
     }
 }
@@ -274,14 +301,14 @@ mod tests {
     use std::cell::RefCell;
 
     fn target() -> Target {
-        Target { source: "abc123".into(), path: PathBuf::from("/tmp/Bugle shot.png"), kind: MediaKind::Screenshot }
+        Target { source: "abc123".into(), path: PathBuf::from("/tmp/Bugle shot.png"), kind: MediaKind::Screenshot, url: None }
     }
 
     fn cfg(timeout: f64) -> QuickAccessConfig {
         QuickAccessConfig { timeout_seconds: timeout, ..QuickAccessConfig::default() }
     }
 
-    const NO_SYNC: SyncState = SyncState { destination: false, automatic: false };
+    const NO_SYNC: SyncState = SyncState { destination: false, synced: false };
 
     #[test]
     fn buttons_depend_on_kind_and_sync() {
@@ -289,11 +316,51 @@ mod tests {
         assert_eq!(actions_for(MediaKind::Screenshot, NO_SYNC), vec![Copy, Annotate, Pin, Reveal]);
         assert_eq!(actions_for(MediaKind::ScrollCapture, NO_SYNC), vec![Copy, Annotate, Pin, Reveal]);
         assert_eq!(actions_for(MediaKind::Video, NO_SYNC), vec![Copy, Reveal]);
-        let manual = SyncState { destination: true, automatic: false };
-        assert_eq!(actions_for(MediaKind::Screenshot, manual), vec![Copy, Annotate, Pin, Sync, Reveal]);
-        assert_eq!(actions_for(MediaKind::Gif, manual), vec![Copy, Sync, Reveal]);
-        let auto = SyncState { destination: true, automatic: true };
-        assert!(!actions_for(MediaKind::Screenshot, auto).contains(&Sync), "already synced on save");
+        let pending = SyncState { destination: true, synced: false };
+        assert_eq!(actions_for(MediaKind::Screenshot, pending), vec![Copy, Annotate, Pin, Sync, Reveal]);
+        assert_eq!(actions_for(MediaKind::Gif, pending), vec![Copy, Sync, Reveal]);
+        let done = SyncState { destination: true, synced: true };
+        assert!(!actions_for(MediaKind::Screenshot, done).contains(&Sync), "already at the destination");
+    }
+
+    /// A fresh, empty directory under the system temp dir.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bugle-qa-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn synced_state_comes_from_the_item_not_the_config() {
+        let root = scratch_dir("sync");
+        let saves = root.join("saves");
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&saves).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        let shot = saves.join("a.png");
+        std::fs::write(&shot, b"12345").unwrap();
+        let t = Target { source: "id".into(), path: shot.clone(), kind: MediaKind::Screenshot, url: None };
+        let folder = SyncDestination::Folder(dest.clone());
+
+        assert!(!already_synced(&t, None));
+        // Automatic sync configured but it failed: nothing in the folder yet.
+        assert!(!already_synced(&t, Some(&folder)));
+        // A copy with the same name and size landed.
+        std::fs::write(dest.join("a.png"), b"12345").unwrap();
+        assert!(already_synced(&t, Some(&folder)));
+        // Same name, different content: not this file.
+        std::fs::write(dest.join("a.png"), b"1").unwrap();
+        assert!(!already_synced(&t, Some(&folder)));
+        // Moved into the folder.
+        let moved = Target { path: dest.join("a.png"), ..t.clone() };
+        assert!(already_synced(&moved, Some(&folder)));
+
+        let s3 = SyncDestination::S3(Default::default());
+        assert!(!already_synced(&t, Some(&s3)), "no upload URL");
+        let up = Target { url: Some("https://b.example/a.png".into()), ..t };
+        assert!(already_synced(&up, Some(&s3)));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -324,6 +391,7 @@ mod tests {
 
         let g = q.open(target(), vec![PanelAction::Copy], now);
         assert_eq!(q.on_choice(g, PanelChoice::Button(5)), None, "out of range");
+        assert!(!q.is_open() && !q.is_current(g), "an out-of-range click still ends the panel");
         let g = q.open(target(), vec![PanelAction::Copy], now);
         assert_eq!(q.on_choice(g, PanelChoice::Close).unwrap().0, PanelAction::Dismiss);
         let g = q.open(target(), vec![PanelAction::Copy], now);
@@ -343,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn times_out_and_hover_pauses() {
+    fn hover_past_the_deadline_holds_then_grace_after_leaving() {
         let mut q = QuickAccess::new(cfg(5.0));
         let t0 = Instant::now();
         q.open(target(), vec![PanelAction::Copy], t0);
@@ -356,6 +424,39 @@ mod tests {
         assert!(q.tick(t0 + Duration::from_secs(33), false));
         assert!(!q.is_open());
         assert!(!q.tick(t0 + Duration::from_secs(40), false), "nothing left to close");
+    }
+
+    #[test]
+    fn hover_before_the_deadline_adds_no_time() {
+        let mut q = QuickAccess::new(cfg(8.0));
+        let t0 = Instant::now();
+        q.open(target(), vec![PanelAction::Copy], t0);
+        assert!(!q.tick(t0 + Duration::from_secs(1), true));
+        assert!(!q.tick(t0 + Duration::from_secs(3), true));
+        assert!(q.tick(t0 + Duration::from_secs(8), false), "closes on the original deadline");
+    }
+
+    #[test]
+    fn short_timeout_grace_is_capped_by_the_timeout() {
+        let mut q = QuickAccess::new(cfg(1.0));
+        let t0 = Instant::now();
+        q.open(target(), vec![PanelAction::Copy], t0);
+        assert!(!q.tick(t0 + Duration::from_millis(1_500), true), "hovered: stays");
+        // Grace is min(timeout, 2 s) = 1 s after the last hovered tick.
+        assert!(!q.tick(t0 + Duration::from_millis(2_400), false));
+        assert!(q.tick(t0 + Duration::from_millis(2_500), false));
+    }
+
+    #[test]
+    fn out_of_range_timeouts_stay_open_without_panicking() {
+        let t0 = Instant::now();
+        for s in [1e19, 1e30, 1e300, f64::INFINITY, f64::NAN, -5.0] {
+            let mut q = QuickAccess::new(cfg(s));
+            q.open(target(), vec![PanelAction::Copy], t0);
+            assert!(!q.tick(t0 + Duration::from_secs(86_400 * 365), false), "{s}");
+            assert!(!q.tick(t0 + Duration::from_secs(10), true), "{s} hovered");
+            assert!(q.is_open(), "{s}");
+        }
     }
 
     #[test]
@@ -398,11 +499,13 @@ mod tests {
             self.0.borrow_mut().push(format!("sync {source}"));
             Ok(("uploaded".into(), "https://b.example/x.png".into()))
         }
-        fn reveal(&self, path: &Path) {
+        fn reveal(&self, path: &Path) -> Result<()> {
             self.0.borrow_mut().push(format!("reveal {}", path.display()));
+            anyhow::bail!("{} no longer exists", path.display())
         }
-        fn open(&self, path: &Path) {
+        fn open(&self, path: &Path) -> Result<()> {
             self.0.borrow_mut().push(format!("open {}", path.display()));
+            Ok(())
         }
     }
 
@@ -418,7 +521,8 @@ mod tests {
         let fb = perform(&b, PanelAction::Sync, &t).unwrap().unwrap();
         assert_eq!(fb.title, "Uploaded: Bugle shot.png");
         assert_eq!(fb.subtitle, "https://b.example/x.png");
-        assert_eq!(perform(&b, PanelAction::Reveal, &t).unwrap(), None);
+        let err = perform(&b, PanelAction::Reveal, &t).unwrap_err();
+        assert!(err.to_string().contains("no longer exists"), "reveal failures surface");
         assert_eq!(perform(&b, PanelAction::Open, &t).unwrap(), None);
         assert_eq!(perform(&b, PanelAction::Dismiss, &t).unwrap(), None);
         assert_eq!(
@@ -435,15 +539,16 @@ mod tests {
     }
 
     #[test]
-    fn blocking_actions_leave_the_main_thread() {
+    fn blocking_actions_are_marked_off_main() {
         assert!(PanelAction::Pin.runs_off_main(), "pin round-trips through the main thread");
         assert!(PanelAction::Copy.runs_off_main() && PanelAction::Sync.runs_off_main());
+        assert!(PanelAction::Annotate.runs_off_main() && PanelAction::Open.runs_off_main(), "wait for the app");
         assert!(!PanelAction::Reveal.runs_off_main() && !PanelAction::Dismiss.runs_off_main());
     }
 
     #[test]
     fn corners_map() {
         assert_eq!(corner(PanelCorner::BottomLeft), Corner::BottomLeft);
-        assert_eq!(corner(PanelCorner::default()), Corner::TopRight);
+        assert_eq!(corner(PanelCorner::default()), Corner::BottomRight);
     }
 }

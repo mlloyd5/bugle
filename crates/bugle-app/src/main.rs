@@ -469,6 +469,7 @@ impl App {
             tracing::debug!("ignoring {action:?}: busy");
             return;
         }
+        self.quick_before_action(action);
         self.busy = true;
         if self.worker_tx.send(action).is_err() {
             self.busy = false;

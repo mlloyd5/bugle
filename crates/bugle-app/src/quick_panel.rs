@@ -25,7 +25,16 @@ impl Backend for EngineBackend<'_> {
         self.engine.copy_media(source).map(|_| ())
     }
     fn annotate(&self, path: &Path) -> Result<()> {
-        bugle_platform::open_with(path, &self.engine.config.quick_access.annotate_app)
+        let app = self.engine.config.quick_access.annotate_app.trim();
+        let opened = bugle_platform::open_with(path, (!app.is_empty()).then_some(app))?;
+        if opened == bugle_platform::Opened::FellBack {
+            tracing::warn!(
+                "[quick_access] annotate_app {app:?} is not an installed application's bundle id \
+                 (e.g. \"com.apple.Preview\"); opened {} with the default app",
+                file_name(path)
+            );
+        }
+        Ok(())
     }
     fn pin(&self, source: &str) -> Result<()> {
         self.engine.pin(source, None, 1.0, false).map(|_| ())
@@ -33,15 +42,32 @@ impl Backend for EngineBackend<'_> {
     fn sync(&self, source: &str) -> Result<(String, String)> {
         self.engine.sync_media(source).map(|(_, r)| (r.action, r.destination))
     }
-    fn reveal(&self, path: &Path) {
+    fn reveal(&self, path: &Path) -> Result<()> {
         bugle_platform::reveal_path(path)
     }
-    fn open(&self, path: &Path) {
-        bugle_platform::open_path(path)
+    fn open(&self, path: &Path) -> Result<()> {
+        bugle_platform::open_with(path, None).map(|_| ())
     }
 }
 
 impl App {
+    /// Before an action that grabs the screen goes to the worker: take the
+    /// panel (and one still fading out) off screen at once, so the capture or
+    /// recording cannot contain it. Actions that only act on an existing item
+    /// leave it alone. The window server drops the window before the grab:
+    /// screen and window captures wait 150 ms first, area captures and
+    /// recordings wait for the selection overlay.
+    pub(crate) fn quick_before_action(&mut self, action: Action) {
+        if matches!(action, Action::OcrLatest | Action::PinLatest | Action::SyncLatest) {
+            return;
+        }
+        if self.quick.is_open() || bugle_platform::panel_active() {
+            tracing::debug!("quick access: clearing the panel before {action:?}");
+        }
+        self.quick.forget();
+        bugle_platform::panel_clear();
+    }
+
     /// Show the panel for a finished action. `false` means the caller should
     /// fall back to the plain toast (panel disabled, nothing saved, or an
     /// action that only reports on an existing item).
@@ -55,10 +81,8 @@ impl App {
         let Some(path) = n.open.as_deref() else { return false };
         let recent = self.engine.history.recent(20).unwrap_or_default();
         let target = quick_access::resolve_target(&recent, path);
-        let sync = SyncState {
-            destination: matches!(self.engine.config.sync.destination(), Ok(Some(_))),
-            automatic: self.engine.config.sync.applies_to(target.kind),
-        };
+        let dest = self.engine.config.sync.destination().ok().flatten();
+        let sync = SyncState { destination: dest.is_some(), synced: quick_access::already_synced(&target, dest.as_ref()) };
         let actions = quick_access::actions_for(target.kind, sync);
         let labels: Vec<&str> = actions.iter().map(|a| a.label()).collect();
         let generation = self.quick.open(target.clone(), actions, Instant::now());
@@ -72,8 +96,11 @@ impl App {
             move |choice| proxy.send(AppEvent::QuickAccess(QuickEvent::Choice { generation, choice })),
         );
         if let Err(e) = shown {
+            // The shim was never reached, so the previous panel may still be
+            // up with nothing left to time it out: close it too.
             tracing::warn!("quick access: {e:#}");
             self.quick.forget();
+            bugle_platform::panel_dismiss(false);
             return false;
         }
         tracing::info!("quick access: panel {generation} for {} with {labels:?}", file_name(&target.path));
@@ -146,9 +173,10 @@ fn spawn_sharper_thumb(proxy: Proxy, generation: u64, target: Target) {
 }
 
 /// `--smoke-test` step: show the panel for a synthetic capture (a gradient
-/// PNG in the temp directory, not added to history), then close it through
-/// the same choice path a click takes. The first panel of the process is
-/// generation 1.
+/// PNG in the temp directory, not added to history), then close it by
+/// injecting the `Choice` event the panel's click callback would send (no
+/// real click: the shim's click path is not exercised here). The first panel
+/// of the process is generation 1. The PNG is removed afterwards.
 pub(crate) fn smoke(proxy: &Proxy) {
     let img = image::RgbaImage::from_fn(640, 400, |x, y| image::Rgba([(x / 3) as u8, (y / 2) as u8, 180, 255]));
     let path = std::env::temp_dir().join("bugle-smoke-quick-access.png");
@@ -163,7 +191,7 @@ pub(crate) fn smoke(proxy: &Proxy) {
             title: "Quick access smoke test".into(),
             subtitle: "bugle-smoke-quick-access.png".into(),
             thumb,
-            open: Some(path),
+            open: Some(path.clone()),
         })),
     ));
     std::thread::sleep(Duration::from_millis(1500));
@@ -171,4 +199,8 @@ pub(crate) fn smoke(proxy: &Proxy) {
         generation: 1,
         choice: bugle_platform::PanelChoice::Close,
     }));
+    std::thread::sleep(Duration::from_millis(300));
+    if let Err(e) = std::fs::remove_file(&path) {
+        eprintln!("smoke test: could not remove {} ({e})", path.display());
+    }
 }

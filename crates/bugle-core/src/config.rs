@@ -564,13 +564,16 @@ impl ProviderConfig {
 pub struct QuickAccessConfig {
     /// Show the panel after captures; `false` keeps the plain toast.
     pub enabled: bool,
-    /// Seconds before the panel closes by itself (paused while the pointer
-    /// is over it). `0` keeps it open until an action or the close button.
+    /// Seconds before the panel closes by itself. It does not close while the
+    /// pointer is over it and stays up to 2 s after the pointer leaves. `0`
+    /// (or a negative or out-of-range value) keeps it open until a button or
+    /// the close button is clicked.
     pub timeout_seconds: f64,
     /// Screen corner: `top-right`, `top-left`, `bottom-right`, `bottom-left`.
     pub position: PanelCorner,
-    /// Bundle id of the app *Annotate* opens the capture in (its markup
-    /// tools edit the saved file). Falls back to the default app for the file.
+    /// Bundle id of the app *Annotate* opens the capture in; edits made there
+    /// change the saved file in place. When it is not installed the default
+    /// app for the file is used and a warning is logged.
     pub annotate_app: String,
 }
 
@@ -579,7 +582,7 @@ impl Default for QuickAccessConfig {
         Self {
             enabled: true,
             timeout_seconds: 8.0,
-            position: PanelCorner::TopRight,
+            position: PanelCorner::BottomRight,
             annotate_app: "com.apple.Preview".into(),
         }
     }
@@ -588,9 +591,10 @@ impl Default for QuickAccessConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum PanelCorner {
-    #[default]
     TopRight,
     TopLeft,
+    /// Default: away from the toasts, which use the top-right corner.
+    #[default]
     BottomRight,
     BottomLeft,
 }
@@ -639,7 +643,7 @@ mod tests {
     fn quick_access_defaults_and_overrides() {
         let d = Config::default().quick_access;
         assert!(d.enabled);
-        assert_eq!(d.position, PanelCorner::TopRight);
+        assert_eq!(d.position, PanelCorner::BottomRight);
         let cfg: Config =
             toml::from_str("[quick_access]\nenabled = false\ntimeout_seconds = 0\nposition = \"bottom-left\"\n").unwrap();
         assert!(!cfg.quick_access.enabled);
