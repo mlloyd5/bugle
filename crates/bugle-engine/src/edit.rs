@@ -201,6 +201,9 @@ pub fn resolve_range(start: Option<f64>, end: Option<f64>, duration: f64) -> std
     if !s.is_finite() || !e.is_finite() {
         return Err(BugleError::Invalid("start and end must be finite numbers".into()));
     }
+    if abs(s) >= duration {
+        return Err(BugleError::Invalid(format!("start {:.2}s is at or past the end of the {duration:.2}s source", abs(s))));
+    }
     let (s, e) = (abs(s).clamp(0.0, duration), abs(e).clamp(0.0, duration));
     if e - s < MIN_CLIP_SECONDS {
         return Err(BugleError::Invalid(format!(
