@@ -176,6 +176,7 @@ pub fn windows(on_screen_only: bool) -> Result<Vec<WindowInfo>> {
             frame: Rect::new(w.x, w.y, w.w, w.h),
             layer: w.layer,
             on_screen: w.on_screen != 0,
+            alpha: w.alpha,
         })
         .collect())
 }

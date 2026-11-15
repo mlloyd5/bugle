@@ -24,6 +24,7 @@ typedef struct {
     int32_t on_screen;
     char owner[256];
     char title[512];
+    double alpha;        // kCGWindowAlpha, 1.0 when absent
 } bugle_window_t;
 
 typedef struct {
@@ -73,7 +74,7 @@ int32_t bugle_clipboard_write_file(const char *path);
 int32_t bugle_select_rect_blocking(double *x, double *y, double *w, double *h);
 // Non-blocking variant for hosts that already run the AppKit loop: returns 1
 // and later calls `cb` on the main thread (ok=0 when cancelled), or 0 when a
-// selection is already in progress (cb is then never called).
+// selection or window picker is already up (cb is then never called).
 typedef void (*bugle_select_callback_t)(void *ctx, int32_t ok, double x, double y, double w, double h);
 int32_t bugle_select_rect_begin(bugle_select_callback_t cb, void *ctx);
 int32_t bugle_select_rect_active(void);
@@ -105,7 +106,8 @@ int32_t bugle_sck_record_stop(void *handle);
 
 // Window picker overlay (picker.m). `cb` gets kind 0 for every pointer move
 // (global top-left points), then exactly one final call: 1 = clicked at
-// (x, y), 2 = cancelled (Esc, right click, timeout, bugle_pick_cancel). The
+// (x, y), 2 = cancelled (Esc, right click, timeout, Bugle losing active
+// status, bugle_pick_cancel). The
 // final call arrives on a later main-queue turn, after the overlay is gone.
 // Returns 0 (cb never called) when a picker or selection is already active.
 // Main thread only, needs a running AppKit loop.

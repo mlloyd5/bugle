@@ -4,9 +4,9 @@
 // (global points, top-left origin) through a C callback. The host decides
 // which window is under the pointer and calls `bugle_pick_highlight` to draw
 // it; this file knows nothing about windows. A left click, a right click,
-// Esc, `bugle_pick_cancel` or the timeout ends the session: the overlay is
-// removed first and the final callback is delivered on a later main-queue
-// turn, so it never re-enters the caller.
+// Esc, switching apps, `bugle_pick_cancel` or the timeout ends the session:
+// the overlay is removed first and the final callback is delivered on a later
+// main-queue turn, so it never re-enters the caller.
 
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
@@ -28,6 +28,7 @@
 @property(nonatomic) CGRect highlight;  // global, top-left origin; empty = none
 @property(nonatomic, copy) NSString *label;
 @property(nonatomic, strong) NSTimer *timer;
+@property(nonatomic, strong) id resignObserver;
 @property(nonatomic) BOOL finished;
 - (void)moved;
 - (void)finish:(int32_t)kind;
@@ -112,19 +113,24 @@ static CGPoint pick_mouse(void) {
 }
 - (void)finish:(int32_t)kind {
     if (self.finished) return;
+    // The global may be the only strong reference. Hold one for the whole
+    // method, and touch nothing but locals after the global is cleared.
+    __attribute__((objc_precise_lifetime)) BuglePickSession *keep = self;
     self.finished = YES;
     [self.timer invalidate];
     self.timer = nil;
+    if (self.resignObserver) [[NSNotificationCenter defaultCenter] removeObserver:self.resignObserver];
+    self.resignObserver = nil;
     for (NSWindow *win in self.windows) [win orderOut:nil];
     [self.windows removeAllObjects];
-    if (g_pick_session == self) g_pick_session = nil;
-    // Give keyboard focus back to whatever the user was working in.
-    [NSApp deactivate];
     CGPoint p = pick_mouse();
     bugle_pick_callback_t cb = self.cb;
     void *ctx = self.ctx;
     self.cb = NULL;
     self.ctx = NULL;
+    if (g_pick_session == keep) g_pick_session = nil;
+    // Give keyboard focus back to whatever the user was working in.
+    [NSApp deactivate];
     dispatch_async(dispatch_get_main_queue(), ^{
         cb(ctx, kind, p.x, p.y);
     });
@@ -174,6 +180,17 @@ int32_t bugle_pick_begin(bugle_pick_callback_t cb, void *ctx, double timeout_sec
         [[NSRunLoop mainRunLoop] addTimer:session.timer forMode:NSRunLoopCommonModes];
         g_pick_session = session;
         [app activateIgnoringOtherApps:YES];
+        // Esc only reaches the overlay while Bugle is active. Switching to
+        // another app (Cmd-Tab) therefore cancels, so the overlay is never
+        // left up with a dead Esc key; click, right click and the timeout
+        // work regardless.
+        session.resignObserver = [[NSNotificationCenter defaultCenter]
+            addObserverForName:NSApplicationDidResignActiveNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+                        [weak finish:2];
+                    }];
         // Highlight whatever is under the pointer before it moves.
         dispatch_async(dispatch_get_main_queue(), ^{
             [weak moved];
@@ -196,6 +213,7 @@ int32_t bugle_pick_active(void) { return g_pick_session ? 1 : 0; }
 
 void bugle_pick_cancel(void) {
     @autoreleasepool {
-        [g_pick_session finish:2];
+        __attribute__((objc_precise_lifetime)) BuglePickSession *s = g_pick_session;  // strong across the call
+        [s finish:2];
     }
 }

@@ -35,6 +35,7 @@ pub struct bugle_window_t {
     pub on_screen: i32,
     pub owner: [c_char; 256],
     pub title: [c_char; 512],
+    pub alpha: f64,
 }
 
 #[repr(C)]

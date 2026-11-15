@@ -28,7 +28,8 @@ pub enum PickEvent {
     Moved(Point),
     /// The user clicked here; the overlay is already gone.
     Clicked(Point),
-    /// Esc, right click, timeout or [`window_pick_cancel`].
+    /// Esc, right click, timeout, switching to another app, or
+    /// [`window_pick_cancel`].
     Cancelled,
 }
 
