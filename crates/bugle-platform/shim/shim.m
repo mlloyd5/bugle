@@ -196,6 +196,8 @@ int32_t bugle_list_windows(bugle_window_t *out, int32_t max, int32_t on_screen_o
         win.pid = [w[(__bridge NSString *)kCGWindowOwnerPID] intValue];
         win.layer = [w[(__bridge NSString *)kCGWindowLayer] intValue];
         win.on_screen = [w[(__bridge NSString *)kCGWindowIsOnscreen] boolValue] ? 1 : 0;
+        NSNumber *alpha = w[(__bridge NSString *)kCGWindowAlpha];
+        win.alpha = alpha ? alpha.doubleValue : 1.0;
         CGRect b = CGRectZero;
         CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)w[(__bridge NSString *)kCGWindowBounds], &b);
         win.x = b.origin.x; win.y = b.origin.y; win.w = b.size.width; win.h = b.size.height;
@@ -692,7 +694,7 @@ static BugleSelectSession *g_select_session = nil;
 /// Show the overlay on every screen. Returns NO when a selection is already
 /// in progress (the completion is then never called).
 static BOOL select_begin(BugleSelectCompletion completion) {
-    if (g_select_session) return NO;
+    if (g_select_session || bugle_pick_active()) return NO;
     NSApplication *app = [NSApplication sharedApplication];
     [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
     BugleSelectSession *session = [[BugleSelectSession alloc] init];

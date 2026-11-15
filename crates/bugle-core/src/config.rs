@@ -49,6 +49,10 @@ pub struct ScreenshotConfig {
     pub window_shadow: bool,
     /// Scale captures down to 1x (points) instead of keeping Retina pixels.
     pub downscale_retina: bool,
+    /// `bugle-app` *Capture Window*: hover to highlight a window and click it.
+    /// `false` captures the front-most window at once (the CLI and API always
+    /// do, unless given an id, title or owner).
+    pub window_picker: bool,
 }
 
 /// Which recorder produces video (mp4/mov) recordings.
@@ -204,6 +208,7 @@ impl Default for ScreenshotConfig {
             jpeg_quality: 90,
             window_shadow: true,
             downscale_retina: false,
+            window_picker: true,
         }
     }
 }
@@ -251,26 +256,42 @@ impl Default for ApiConfig {
 /// `modifier+modifier+key` string: modifiers `cmd`, `shift`, `alt`/`option`,
 /// `ctrl`; keys are letters, digits, `F1`..`F24`, `space`, `enter`, … (the
 /// W3C `KeyboardEvent.code` names also work). An empty string or a missing
-/// key leaves that action without a hotkey.
+/// key leaves that action without a hotkey (a missing named key keeps its
+/// default). Loading never fails on this section: a non-string value, even
+/// for a named key, lands in `extra` for `bugle-app` to warn about and skip.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "BTreeMap<String, toml::Value>")]
 pub struct HotkeyConfig {
     /// Drag an area with the crosshair overlay.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub capture_area: Option<String>,
     /// Capture the main display.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub capture_screen: Option<String>,
     /// Capture the front-most window.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub capture_window: Option<String>,
     /// Drag an area, then scroll-and-stitch it (needs Accessibility).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub scroll_capture: Option<String>,
     /// Start an MP4 recording of a dragged area, or stop the active recording.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub record: Option<String>,
     /// Start a GIF recording of a dragged area, or stop the active recording.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub record_gif: Option<String>,
     /// OCR the latest capture and copy the text.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ocr_latest: Option<String>,
     /// Pin the latest capture to the screen.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pin_latest: Option<String>,
+    /// Bindings for the other menu items (`stop_recording`, `sync_latest`,
+    /// `open_folder`, `toggle_api`, `preferences`, `quit`), plus any value
+    /// that is not a string. `bugle-app` owns the list of valid names and
+    /// warns about unknown keys and non-string values.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, toml::Value>,
 }
 
 impl Default for HotkeyConfig {
@@ -284,7 +305,38 @@ impl Default for HotkeyConfig {
             record_gif: None,
             ocr_latest: Some("cmd+shift+2".into()),
             pin_latest: Some("cmd+shift+p".into()),
+            extra: BTreeMap::new(),
         }
+    }
+}
+
+impl From<BTreeMap<String, toml::Value>> for HotkeyConfig {
+    fn from(table: BTreeMap<String, toml::Value>) -> Self {
+        let mut h = HotkeyConfig::default();
+        for (name, value) in table {
+            let field = match name.as_str() {
+                "capture_area" => &mut h.capture_area,
+                "capture_screen" => &mut h.capture_screen,
+                "capture_window" => &mut h.capture_window,
+                "scroll_capture" => &mut h.scroll_capture,
+                "record" => &mut h.record,
+                "record_gif" => &mut h.record_gif,
+                "ocr_latest" => &mut h.ocr_latest,
+                "pin_latest" => &mut h.pin_latest,
+                _ => {
+                    h.extra.insert(name, value);
+                    continue;
+                }
+            };
+            match value {
+                toml::Value::String(s) => *field = Some(s),
+                other => {
+                    *field = None;
+                    h.extra.insert(name, other);
+                }
+            }
+        }
+        h
     }
 }
 

@@ -16,6 +16,9 @@ format = "png"            # png | jpeg | webp | tiff
 jpeg_quality = 90
 window_shadow = true      # keep the window drop shadow in window captures
 downscale_retina = false  # save at 1x points instead of 2x pixels
+# bugle-app Capture Window: hover to highlight a window, click to capture it.
+# false = capture the front-most window at once (the CLI and API always do).
+window_picker = true
 
 [recordings]
 gif_frame_rate = 12
@@ -53,7 +56,9 @@ cors = false
 
 # Global hotkeys for the menu-bar app (`bugle-app`). "mod+mod+key"; modifiers
 # cmd, shift, alt/option, ctrl; keys: letters, digits, F1..F24, space, enter…
-# An empty string unbinds the action.
+# An empty string unbinds the action. Every menu item can be bound; unknown
+# keys, non-string values and clashing or unparsable bindings are skipped with
+# a warning (the config still loads).
 [hotkeys]
 capture_area = "cmd+shift+4"
 capture_screen = "cmd+shift+3"
@@ -63,6 +68,12 @@ record = "cmd+shift+5"        # starts an MP4 recording, or stops the active one
 # record_gif = "cmd+shift+g"
 ocr_latest = "cmd+shift+2"
 pin_latest = "cmd+shift+p"
+# stop_recording = "cmd+shift+."
+# sync_latest = "ctrl+alt+s"
+# open_folder = "ctrl+alt+o"
+# toggle_api = "ctrl+alt+a"
+# preferences = "ctrl+alt+,"
+# quit = "ctrl+alt+q"
 
 # ---------------------------------------------------------------------------
 # Sync every new capture to storage you own. There is no hosted service: pick

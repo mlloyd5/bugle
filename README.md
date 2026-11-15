@@ -141,13 +141,24 @@ menu bar and listens for global hotkeys. Everything it does goes through the sam
 `Engine` as the CLI, so captures land in the configured `save_dir`, appear in
 history, and play the shutter sound when `general.shutter_sound` is on.
 
-Menu: Capture Area · Capture Window (front-most window) · Capture Screen ·
+Menu: Capture Area · Capture Window · Capture Screen ·
 Scrolling Capture · Record Video · Record GIF · Stop Recording · OCR Latest
 (copies the text) · Pin Latest · Recent Captures (last five, click to open) ·
 Open History Folder · Start/Stop Agent API · Preferences… (opens the config
 file) · Quit. While recording, the status item shows `● m:ss`. After each
 action a small toast in the top-right corner shows a thumbnail and the file
 name; clicking it opens the file.
+
+*Capture Window* dims the screen slightly and highlights the window under the
+pointer with its app, title and size; click to capture it. Esc, a right click
+or switching to another app cancels, and the picker closes itself after 30
+seconds. Esc only reaches the picker while Bugle is the active app; if it ever
+seems ignored, a right click always works. Only ordinary windows are pickable:
+invisible windows are skipped, and floating panels or always-on-top windows
+above the normal window layer are neither picked nor block the window under
+them. Set
+`[screenshots] window_picker = false` to capture the front-most window at once
+instead, as `bugle capture window` and the API do.
 
 Hotkeys live in the `[hotkeys]` section of the config file and are parsed as
 `modifier+modifier+key` (`cmd`, `shift`, `alt`/`option`, `ctrl`; letters,
@@ -161,8 +172,14 @@ digits, `F1`…`F24`, `space`, …). Defaults:
 | `ocr_latest` | ⌘⇧2 | OCR the latest capture to the clipboard |
 | `pin_latest` | ⌘⇧P | pin the latest capture |
 | `capture_window`, `scroll_capture`, `record_gif` | — | unbound until set |
+| `stop_recording`, `sync_latest`, `open_folder`, `toggle_api`, `preferences`, `quit` | — | unbound until set |
 
-An empty string unbinds an action. ⌘⇧3/4/5 are also the system screenshot
+Every menu item except *Recent Captures* can be bound; the keys are the names
+above. An empty string unbinds an action. Unknown keys, values that are not
+strings (for any key, including the defaults above, which are then left
+unbound), bindings that do not parse, a combination already used by another
+item, and bindings macOS refuses are skipped with a warning in the log and one
+toast at launch; the config still loads. ⌘⇧3/4/5 are also the system screenshot
 shortcuts; disable those in System Settings → Keyboard → Keyboard Shortcuts →
 Screenshots (or pick other keys) so they do not fire twice. The agent API started
 from the menu uses `[api]` from the config and serves the in-app overlay for

@@ -24,6 +24,13 @@ pub struct WindowInfo {
     pub frame: Rect,
     pub layer: i32,
     pub on_screen: bool,
+    /// Window opacity, 0.0 (invisible) to 1.0.
+    #[serde(default = "opaque")]
+    pub alpha: f64,
+}
+
+fn opaque() -> f64 {
+    1.0
 }
 
 /// What to capture.
