@@ -150,18 +150,23 @@ report through a small toast in the top-right corner (thumbnail and file name;
 click to open).
 
 After a capture or recording, the **quick-access panel** takes the toast's
-place: the thumbnail (click to open) with **Copy**, **Annotate** (opens the file
-in Preview's Markup tools, or the app set in `annotate_app`), **Pin**, **Sync**
-(only when a `[sync]` destination is set and the automatic sync did not already
-send the file) and **Reveal** in Finder, plus a close button. It never takes
-keyboard focus, closes after `timeout_seconds` (paused while the pointer is
-over it) and goes away after any button. Configure it in `[quick_access]`:
+place, in the bottom-right corner by default: the thumbnail (click to open)
+with **Copy**, **Annotate**, **Pin**, **Sync** and **Reveal** in Finder, plus a
+close (×) button. **Annotate** opens the file in Preview (or the app named by
+`annotate_app`); edits made there change the saved capture in place. **Sync**
+appears when a `[sync]` destination is set and the file is not there yet — so
+it is also the retry when the automatic sync failed. The panel never takes
+keyboard focus, so it has no keyboard shortcut: it goes away after any button,
+the × button, or `timeout_seconds`. It does not time out while the pointer is
+over it, and stays up to 2 s after the pointer leaves. Starting another capture
+or recording from the menu or a hotkey closes it first so it is not captured.
+Configure it in `[quick_access]`:
 
 ```toml
 [quick_access]
 enabled = true            # false: plain toast instead
 timeout_seconds = 8.0     # 0: stays until a button or × is clicked
-position = "top-right"    # top-left | bottom-right | bottom-left
+position = "bottom-right" # bottom-left | top-right | top-left
 annotate_app = "com.apple.Preview"
 ```
 

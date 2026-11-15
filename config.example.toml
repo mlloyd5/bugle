@@ -65,12 +65,16 @@ ocr_latest = "cmd+shift+2"
 pin_latest = "cmd+shift+p"
 
 # Quick-access panel shown by `bugle-app` after a capture: thumbnail plus
-# Copy · Annotate · Pin · Sync · Reveal. `enabled = false` keeps the plain toast.
+# Copy · Annotate · Pin · Sync · Reveal and a close (×) button. `enabled = false`
+# keeps the plain toast.
 [quick_access]
 enabled = true
-timeout_seconds = 8.0     # closes by itself (paused while hovered); 0 = stay open
-position = "top-right"    # top-right | top-left | bottom-right | bottom-left
-annotate_app = "com.apple.Preview"   # bundle id Annotate opens the file in (Markup toolbar)
+# Closes by itself after this many seconds, but never while the pointer is over
+# it (and up to 2 s after the pointer leaves). 0 = stay open until a button or ×.
+timeout_seconds = 8.0
+position = "bottom-right" # bottom-right | bottom-left | top-right | top-left
+# Bundle id Annotate opens the file in; edits there change the saved file in place.
+annotate_app = "com.apple.Preview"
 
 # ---------------------------------------------------------------------------
 # Sync every new capture to storage you own. There is no hosted service: pick
