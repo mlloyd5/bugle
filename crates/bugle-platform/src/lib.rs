@@ -7,6 +7,8 @@
 
 #[cfg(target_os = "macos")]
 mod ffi;
+#[cfg(target_os = "macos")]
+pub mod login_item;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bugle_core::{BugleError, DisplayInfo, OcrLine, Point, Rect, WindowInfo};
