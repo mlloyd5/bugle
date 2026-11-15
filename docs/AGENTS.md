@@ -47,7 +47,7 @@ bugle serve --bind 127.0.0.1:4848 --token secret     # alias: bugle jameson
 
 * All actions: `POST /v1/actions/{name}` with the tool's JSON arguments.
 * Aliases: `POST /v1/capture`, `/v1/ocr`, `/v1/describe`, `/v1/annotate`,
-  `/v1/scroll`, `/v1/transcribe`, `/v1/subtitles`, `/v1/complete`,
+  `/v1/scroll`, `/v1/transcribe`, `/v1/subtitles`, `/v1/edit`, `/v1/complete`,
   `/v1/record/start|stop`, `/v1/pin`, `/v1/copy`, `/v1/sync`, `/v1/select`;
   `GET /v1/displays`, `/v1/windows?all=1`, `/v1/history?limit=20`,
   `/v1/record/status`, `/v1/providers`, `/v1/permissions`, `/v1/tools`,
@@ -94,6 +94,7 @@ curl -s -H "$H" -H 'content-type: application/json' \
 | `record_status` | – | status |
 | `transcribe` | `source`, `provider`, `language` | `transcript`, `srt` |
 | `subtitles` | `source`, `format` (srt/vtt), `provider`, `language`, `output` | `path`, `segments`, `text` |
+| `edit_video` | `source`, `start`, `end` (seconds, negative = from the end), `preset` (original/high/hevc/1080p/720p/540p/gif/gif-small), `fps`, `max_size`, `output`, `label` | `media` (parent = source) |
 | `complete` | `prompt`, `provider`, `system` | `text` |
 | `history` | `limit` | media list |
 | `get_media` | `source`, `inline_image`, `max_edge` | media (+ image) |

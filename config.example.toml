@@ -18,8 +18,8 @@ window_shadow = true      # keep the window drop shadow in window captures
 downscale_retina = false  # save at 1x points instead of 2x pixels
 
 [recordings]
-gif_frame_rate = 12
-gif_max_size = 1200       # long edge, pixels
+gif_frame_rate = 12       # also the `gif` preset of `bugle edit`
+gif_max_size = 1200       # long edge, pixels (also the `gif` preset)
 video_fps = 30
 microphone = false
 system_audio = false      # needs the ScreenCaptureKit backend (macOS 14+)

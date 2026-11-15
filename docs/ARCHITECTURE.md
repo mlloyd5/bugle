@@ -48,6 +48,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
 | `export_audio_m4a`, `export_mp4`, `export_mov`, `video_frame`, `media_duration` | `AVAssetExportSession`, `AVAssetImageGenerator` |
+| `export_video`, `video_size`, `VideoFrameReader`, `VideoFrameWriter` | `AVAssetExportSession` with `timeRange`/preset/`AVMutableVideoComposition` frame rate, one reusable `AVAssetImageGenerator`, `AVAssetWriter` + pixel-buffer adaptor (H.264) |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
 
 Window shadows: ScreenCaptureKit clips single-window screenshots to the window
@@ -104,6 +105,18 @@ recorder state machine, and exposes one method per user-facing action:
   recorder comment: the writer session opens before the stream starts, a static
   screen's stale first-frame timestamp is clamped, and the last frame is
   re-appended at the stop time so the video track covers the whole recording.
+* `edit` (`edit.rs`) — trims a recording (`start`/`end` seconds, negative from
+  the end) and exports it with a preset. Video → video is one
+  `AVAssetExportSession` over the time range: `original` is passthrough (a
+  lossless trim, audio kept), `high`/`hevc` re-encode at the source size,
+  `1080p`/`720p`/`540p` fit a box (never upscaling), and an `fps` override
+  re-encodes through a video composition. Video → GIF decodes frames exactly
+  (zero tolerance, so the cut never bleeds to a keyframe outside it) at the
+  middle of each output frame interval and streams them into the GIF encoder.
+  GIF → GIF is a frame-exact cut (edge delays shortened) unless a rate is given;
+  GIF → video resamples to a constant rate for `AVAssetWriter`. Output is written
+  to a temp file beside the target and renamed, then added to history with the
+  source as `parent`.
 * `ocr` (Apple Vision or an AI provider, per request or `[ocr] engine`), `describe` (images or sampled video frames), `transcribe`
   (extracts the audio track first), `subtitles`, `annotate`, `pin`, `select_area`.
 * `sync` (`sync.rs`) — runs after every successful save (`save_image`, so
@@ -147,8 +160,10 @@ plus the shutter sound; the status item title shows `● m:ss` while recording.
 Bugle is a standalone app; this is the backlog, roughly in the order it would
 earn its keep.
 
-* **Post-capture video editor** — trim, auto-zoom on clicks, cursor smoothing,
-  export presets.
+* **Video editor extras** — auto-zoom on clicks and cursor smoothing (the
+  recorders bake the cursor into the frames and log no click or cursor
+  positions, so these first need a click/cursor event track recorded alongside
+  the video), and an editing window on top of the headless `edit` pipeline.
 * **Audio mixing** — fold the microphone and system-audio tracks into one when
   asked; click highlighting on the ScreenCaptureKit recorder.
 * **Quick-access panel** after a capture (the toast with a thumbnail is the
