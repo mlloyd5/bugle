@@ -116,6 +116,9 @@ extern "C" {
     pub fn bugle_export_audio_m4a(in_path: *const c_char, out_path: *const c_char) -> i32;
     pub fn bugle_export_mp4(in_path: *const c_char, out_path: *const c_char) -> i32;
     pub fn bugle_export_mov(in_path: *const c_char, out_path: *const c_char) -> i32;
+    pub fn bugle_audio_track_count(path: *const c_char) -> i32;
+    pub fn bugle_mix_audio_tracks(in_path: *const c_char, out_path: *const c_char) -> i32;
+    pub fn bugle_write_tone_tracks(out_path: *const c_char, tracks: i32, seconds: f64) -> i32;
     pub fn bugle_media_duration(path: *const c_char) -> f64;
     pub fn bugle_video_frame(path: *const c_char, seconds: f64) -> bugle_image_t;
     pub fn bugle_play_sound(name: *const c_char);

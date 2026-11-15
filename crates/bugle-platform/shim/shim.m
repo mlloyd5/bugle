@@ -1033,6 +1033,237 @@ int32_t bugle_export_mov(const char *in_path, const char *out_path) {
     return remux(in_path, out_path, AVFileTypeQuickTimeMovie);
 }
 
+int32_t bugle_audio_track_count(const char *path) {
+    @autoreleasepool {
+        NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
+        return (int32_t)[asset tracksWithMediaType:AVMediaTypeAudio].count;
+    }
+}
+
+// Fold every audio track of a movie into one AAC track. A post-pass on the
+// finished file: AVAssetReaderAudioMixOutput sums the tracks (each on its
+// own edit timeline, so their offsets are kept) into float PCM, which is
+// encoded once; video tracks are copied sample for sample without
+// re-encoding. Returns 1 and writes nothing when there are fewer than two
+// audio tracks.
+int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path) {
+    @autoreleasepool {
+        clear_error();
+        NSURL *in = [NSURL fileURLWithPath:[NSString stringWithUTF8String:in_path]];
+        NSURL *out = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:in options:nil];
+        NSArray<AVAssetTrack *> *audio = [asset tracksWithMediaType:AVMediaTypeAudio];
+        if (audio.count < 2) return 1;
+        NSArray<AVAssetTrack *> *video = [asset tracksWithMediaType:AVMediaTypeVideo];
+        NSError *err = nil;
+        AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&err];
+        if (!reader) { set_error(@"could not read %s: %@", in_path, err.localizedDescription); return -1; }
+        [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+        AVFileType type = [out.pathExtension.lowercaseString isEqualToString:@"mov"] ? AVFileTypeQuickTimeMovie : AVFileTypeMPEG4;
+        AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:out fileType:type error:&err];
+        if (!writer) { set_error(@"AVAssetWriter: %@", err.localizedDescription); return -1; }
+        writer.shouldOptimizeForNetworkUse = YES;
+
+        NSMutableArray<AVAssetReaderOutput *> *outputs = [NSMutableArray array];
+        NSMutableArray<AVAssetWriterInput *> *inputs = [NSMutableArray array];
+        for (AVAssetTrack *t in video) {
+            AVAssetReaderTrackOutput *ro = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:t outputSettings:nil];
+            ro.alwaysCopiesSampleData = NO;
+            CMFormatDescriptionRef hint = (__bridge CMFormatDescriptionRef)t.formatDescriptions.firstObject;
+            AVAssetWriterInput *wi = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
+                                                                        outputSettings:nil
+                                                                      sourceFormatHint:hint];
+            wi.transform = t.preferredTransform;
+            if (![reader canAddOutput:ro] || ![writer canAddInput:wi]) { set_error(@"could not copy the video track"); return -1; }
+            [reader addOutput:ro];
+            [writer addInput:wi];
+            [outputs addObject:ro];
+            [inputs addObject:wi];
+        }
+        NSDictionary *pcm = @{
+            AVFormatIDKey: @(kAudioFormatLinearPCM),
+            AVSampleRateKey: @48000,
+            AVNumberOfChannelsKey: @2,
+            AVLinearPCMBitDepthKey: @32,
+            AVLinearPCMIsFloatKey: @YES,
+            AVLinearPCMIsBigEndianKey: @NO,
+            AVLinearPCMIsNonInterleaved: @NO,
+        };
+        AVAssetReaderAudioMixOutput *mix = [AVAssetReaderAudioMixOutput assetReaderAudioMixOutputWithAudioTracks:audio
+                                                                                                   audioSettings:pcm];
+        NSDictionary *aac = @{
+            AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: @48000,
+            AVNumberOfChannelsKey: @2,
+            AVEncoderBitRateKey: @160000,
+        };
+        AVAssetWriterInput *ai = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:aac];
+        if (![reader canAddOutput:mix] || ![writer canAddInput:ai]) { set_error(@"could not set up the audio mix"); return -1; }
+        [reader addOutput:mix];
+        [writer addInput:ai];
+        [outputs addObject:mix];
+        [inputs addObject:ai];
+
+        if (![writer startWriting]) {
+            set_error(@"could not start writing %s: %@", out_path, writer.error.localizedDescription);
+            return -1;
+        }
+        if (![reader startReading]) {
+            [writer cancelWriting];
+            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+            set_error(@"could not read %s: %@", in_path, reader.error.localizedDescription);
+            return -1;
+        }
+        [writer startSessionAtSourceTime:kCMTimeZero];
+        // One pump per track, each on its own queue: the writer interleaves
+        // tracks and holds one back until the others catch up.
+        dispatch_group_t group = dispatch_group_create();
+        for (NSUInteger i = 0; i < inputs.count; i++) {
+            AVAssetReaderOutput *ro = outputs[i];
+            AVAssetWriterInput *wi = inputs[i];
+            __block BOOL done = NO;
+            dispatch_group_enter(group);
+            [wi requestMediaDataWhenReadyOnQueue:dispatch_queue_create("bugle.mix", DISPATCH_QUEUE_SERIAL)
+                                      usingBlock:^{
+                                          while (!done && wi.readyForMoreMediaData) {
+                                              CMSampleBufferRef sb = [ro copyNextSampleBuffer];
+                                              BOOL ok = sb && [wi appendSampleBuffer:sb];
+                                              if (sb) CFRelease(sb);
+                                              if (!ok) {
+                                                  done = YES;
+                                                  [wi markAsFinished];
+                                                  dispatch_group_leave(group);
+                                              }
+                                          }
+                                      }];
+        }
+        // A failed writer stops asking for data, so bound the wait by the
+        // media length (decoding runs many times faster than real time).
+        double secs = CMTimeGetSeconds(asset.duration);
+        double limit = 60.0 + (isfinite(secs) && secs > 0 ? secs * 2.0 : 0.0);
+        if (dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(limit * NSEC_PER_SEC))) != 0) {
+            [reader cancelReading];
+            [writer cancelWriting];
+            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+            set_error(@"timed out mixing the audio tracks%@",
+                      writer.error ? [NSString stringWithFormat:@" (%@)", writer.error.localizedDescription] : @"");
+            return -1;
+        }
+        if (reader.status == AVAssetReaderStatusFailed || writer.status == AVAssetWriterStatusFailed) {
+            NSString *why = (reader.error ?: writer.error).localizedDescription ?: @"unknown error";
+            [reader cancelReading];
+            [writer cancelWriting];
+            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+            set_error(@"mixing the audio tracks failed: %@", why);
+            return -1;
+        }
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        [writer finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
+        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        if (writer.status != AVAssetWriterStatusCompleted) {
+            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+            set_error(@"writing the mixed file failed: %@", writer.error.localizedDescription);
+            return -1;
+        }
+        return 0;
+    }
+}
+
+// Test fixture: an .mp4 with `tracks` AAC tracks (48 kHz stereo) lasting
+// `seconds`. Track i plays a sine tone during the i-th equal slice of the
+// duration and is silent elsewhere, so a mix is audible in every slice.
+int32_t bugle_write_tone_tracks(const char *out_path, int32_t tracks, double seconds) {
+    @autoreleasepool {
+        clear_error();
+        if (tracks < 1 || tracks > 8 || !(seconds > 0 && seconds <= 60)) { set_error(@"bad tone fixture parameters"); return -1; }
+        NSURL *out = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
+        [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+        NSError *err = nil;
+        AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:out fileType:AVFileTypeMPEG4 error:&err];
+        if (!writer) { set_error(@"AVAssetWriter: %@", err.localizedDescription); return -1; }
+        NSDictionary *aac = @{
+            AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: @48000,
+            AVNumberOfChannelsKey: @2,
+            AVEncoderBitRateKey: @128000,
+        };
+        NSMutableArray<AVAssetWriterInput *> *inputs = [NSMutableArray array];
+        for (int32_t i = 0; i < tracks; i++) {
+            AVAssetWriterInput *in = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:aac];
+            if (![writer canAddInput:in]) { set_error(@"writer refused audio track %d", i); return -1; }
+            [writer addInput:in];
+            [inputs addObject:in];
+        }
+        AudioStreamBasicDescription asbd = {0};
+        asbd.mSampleRate = 48000;
+        asbd.mFormatID = kAudioFormatLinearPCM;
+        asbd.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+        asbd.mChannelsPerFrame = 2;
+        asbd.mBitsPerChannel = 32;
+        asbd.mBytesPerFrame = 8;
+        asbd.mFramesPerPacket = 1;
+        asbd.mBytesPerPacket = 8;
+        CMAudioFormatDescriptionRef fmt = NULL;
+        if (CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &asbd, 0, NULL, 0, NULL, NULL, &fmt) != noErr) {
+            set_error(@"could not describe the PCM format");
+            return -1;
+        }
+        if (![writer startWriting]) {
+            CFRelease(fmt);
+            set_error(@"could not start writing: %@", writer.error.localizedDescription);
+            return -1;
+        }
+        [writer startSessionAtSourceTime:kCMTimeZero];
+        const int64_t total = (int64_t)(seconds * 48000);
+        const int64_t slice = total / tracks;
+        enum { chunk = 1024 };
+        float buf[chunk * 2];
+        BOOL ok = YES;
+        for (int64_t start = 0; start < total && ok; start += chunk) {
+            int n = (int)MIN((int64_t)chunk, total - start);
+            for (int32_t t = 0; t < tracks && ok; t++) {
+                double freq = 440.0 * (t + 1);
+                for (int k = 0; k < n; k++) {
+                    int64_t f = start + k;
+                    BOOL on = f >= t * slice && f < (t + 1) * slice;
+                    float v = on ? (float)(0.5 * sin(2 * M_PI * freq * (double)f / 48000.0)) : 0.0f;
+                    buf[2 * k] = buf[2 * k + 1] = v;
+                }
+                size_t bytes = (size_t)n * 8;
+                CMBlockBufferRef bb = NULL;
+                CMSampleBufferRef sb = NULL;
+                ok = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, bytes, kCFAllocatorDefault, NULL, 0,
+                                                        bytes, kCMBlockBufferAssureMemoryNowFlag, &bb) == noErr &&
+                     CMBlockBufferReplaceDataBytes(buf, bb, 0, bytes) == noErr &&
+                     CMAudioSampleBufferCreateReadyWithPacketDescriptions(kCFAllocatorDefault, bb, fmt, n,
+                                                                          CMTimeMake(start, 48000), NULL, &sb) == noErr;
+                if (bb) CFRelease(bb);
+                AVAssetWriterInput *in = inputs[t];
+                for (int w = 0; ok && w < 5000 && !in.readyForMoreMediaData; w++) usleep(1000);
+                ok = ok && in.readyForMoreMediaData && [in appendSampleBuffer:sb];
+                if (sb) CFRelease(sb);
+            }
+        }
+        CFRelease(fmt);
+        if (!ok) {
+            NSString *why = writer.error.localizedDescription ?: @"append failed";
+            [writer cancelWriting];
+            set_error(@"writing the tone fixture failed: %@", why);
+            return -1;
+        }
+        for (AVAssetWriterInput *in in inputs) [in markAsFinished];
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        [writer finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
+        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        if (writer.status != AVAssetWriterStatusCompleted) {
+            set_error(@"finalising the tone fixture failed: %@", writer.error.localizedDescription);
+            return -1;
+        }
+        return 0;
+    }
+}
+
 double bugle_media_duration(const char *path) {
     @autoreleasepool {
         NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];

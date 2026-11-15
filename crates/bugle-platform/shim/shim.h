@@ -86,6 +86,12 @@ void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const c
 int32_t bugle_export_audio_m4a(const char *in_path, const char *out_path);
 int32_t bugle_export_mp4(const char *in_path, const char *out_path);
 int32_t bugle_export_mov(const char *in_path, const char *out_path);
+int32_t bugle_audio_track_count(const char *path);
+// Fold all audio tracks into one AAC track (video copied as is). 0 on
+// success, 1 (nothing written) with fewer than two audio tracks.
+int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path);
+// Test fixture: `tracks` AAC tracks, track i sounding only in slice i.
+int32_t bugle_write_tone_tracks(const char *out_path, int32_t tracks, double seconds);
 double bugle_media_duration(const char *path);
 bugle_image_t bugle_video_frame(const char *path, double seconds);
 void bugle_play_sound(const char *name);

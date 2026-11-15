@@ -453,6 +453,37 @@ pub fn export_mov(input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Number of audio tracks in a movie (0 for a file AVFoundation cannot read).
+pub fn audio_track_count(path: &Path) -> Result<usize> {
+    let p = path_cstr(path)?;
+    Ok(unsafe { ffi::bugle_audio_track_count(p.as_ptr()) }.max(0) as usize)
+}
+
+/// Fold every audio track of `input` into one AAC track in `output` (a
+/// `.mov` extension writes QuickTime, anything else MP4); video is copied
+/// without re-encoding. Returns `false`, writing nothing, when the input has
+/// fewer than two audio tracks.
+pub fn mix_audio_tracks(input: &Path, output: &Path) -> Result<bool> {
+    let i = path_cstr(input)?;
+    let o = path_cstr(output)?;
+    match unsafe { ffi::bugle_mix_audio_tracks(i.as_ptr(), o.as_ptr()) } {
+        0 => Ok(true),
+        1 => Ok(false),
+        _ => bail!("{}", last_error()),
+    }
+}
+
+/// Test fixture: an `.mp4` with `tracks` AAC tracks lasting `seconds`;
+/// track `i` plays a tone only during the `i`-th equal slice.
+#[doc(hidden)]
+pub fn write_tone_tracks(output: &Path, tracks: u32, seconds: f64) -> Result<()> {
+    let o = path_cstr(output)?;
+    if unsafe { ffi::bugle_write_tone_tracks(o.as_ptr(), tracks.min(i32::MAX as u32) as i32, seconds) } != 0 {
+        bail!("{}", last_error());
+    }
+    Ok(())
+}
+
 pub fn media_duration(path: &Path) -> Result<f64> {
     let p = path_cstr(path)?;
     let d = unsafe { ffi::bugle_media_duration(p.as_ptr()) };
@@ -748,6 +779,83 @@ mod tests {
         for th in threads {
             th.join().expect("worker thread panicked");
         }
+    }
+
+    /// RMS of each `parts`-th slice of the first audio track of `path`,
+    /// decoded to 16-bit mono PCM with the system `afconvert`.
+    fn slice_rms(path: &Path, parts: usize) -> Vec<f64> {
+        let wav = path.with_extension("wav");
+        let st = std::process::Command::new("/usr/bin/afconvert")
+            .args(["-f", "WAVE", "-d", "LEI16@48000", "-c", "1"])
+            .arg(path)
+            .arg(&wav)
+            .status()
+            .expect("afconvert");
+        assert!(st.success(), "afconvert failed on {}", path.display());
+        let bytes = std::fs::read(&wav).unwrap();
+        // Walk the RIFF chunks to "data".
+        let mut i = 12;
+        let data = loop {
+            let id = &bytes[i..i + 4];
+            let len = u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap()) as usize;
+            if id == b"data" {
+                break &bytes[i + 8..(i + 8 + len).min(bytes.len())];
+            }
+            i += 8 + len + (len & 1);
+        };
+        let samples: Vec<f64> = data.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f64 / 32768.0).collect();
+        let n = samples.len() / parts;
+        (0..parts)
+            .map(|p| {
+                // Skip the edges of each slice: AAC priming and the tone's
+                // on/off transitions smear across them.
+                let s = &samples[p * n + n / 5..(p + 1) * n - n / 5];
+                (s.iter().map(|v| v * v).sum::<f64>() / s.len() as f64).sqrt()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mixes_audio_tracks_into_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let two = tmp.path().join("two.mp4");
+        write_tone_tracks(&two, 2, 2.0).unwrap();
+        assert_eq!(audio_track_count(&two).unwrap(), 2);
+        // Decoding picks the first track only: tone in the first half.
+        let rms = slice_rms(&two, 2);
+        assert!(rms[0] > 0.1 && rms[1] < 0.01, "fixture track 0 levels {rms:?}");
+
+        let mixed = tmp.path().join("mixed.mp4");
+        assert!(mix_audio_tracks(&two, &mixed).unwrap());
+        assert_eq!(audio_track_count(&mixed).unwrap(), 1);
+        let d = media_duration(&mixed).unwrap();
+        assert!((d - 2.0).abs() < 0.15, "mixed duration {d}");
+        // Both tracks are in the one track: tone in both halves.
+        let rms = slice_rms(&mixed, 2);
+        assert!(rms[0] > 0.1 && rms[1] > 0.1, "mixed levels {rms:?}");
+
+        // A .mov output is QuickTime.
+        let mov = tmp.path().join("mixed.mov");
+        assert!(mix_audio_tracks(&two, &mov).unwrap());
+        let head = std::fs::read(&mov).unwrap();
+        assert_eq!(&head[4..12], b"ftypqt  ");
+        assert_eq!(audio_track_count(&mov).unwrap(), 1);
+    }
+
+    #[test]
+    fn mixing_one_track_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let one = tmp.path().join("one.mp4");
+        write_tone_tracks(&one, 1, 0.5).unwrap();
+        let out = tmp.path().join("out.mp4");
+        assert!(!mix_audio_tracks(&one, &out).unwrap());
+        assert!(!out.exists());
+        // Not a movie: no audio tracks, nothing to do.
+        let junk = tmp.path().join("junk.mp4");
+        std::fs::write(&junk, b"not a movie").unwrap();
+        assert_eq!(audio_track_count(&junk).unwrap(), 0);
+        assert!(!mix_audio_tracks(&junk, &out).unwrap());
+        assert!(!out.exists());
     }
 
     #[test]
