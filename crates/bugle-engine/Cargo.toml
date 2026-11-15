@@ -22,3 +22,7 @@ tempfile.workspace = true
 reqwest.workspace = true
 ring.workspace = true
 dirs.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+axum.workspace = true

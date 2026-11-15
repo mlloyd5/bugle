@@ -310,7 +310,7 @@ fn saved_subtitle(engine: &Engine, item: &bugle_core::MediaItem) -> String {
     }
     let name = file_name(&item.path);
     if engine.config.sync.applies_to(item.kind) {
-        if let Some(label) = engine.sync_destination_label() {
+        if let Some(label) = engine.sync_destination_label_for(item.kind) {
             return format!("{name} → {label}");
         }
     }
@@ -389,7 +389,7 @@ fn build_menu(config: &Config) -> Result<MenuItems> {
     let stop = MenuItem::with_id("stop_recording", "Stop Recording", false, None);
     let ocr = item("ocr_latest", "OCR Latest", Some("ocr_latest"));
     let pin = item("pin_latest", "Pin Latest", Some("pin_latest"));
-    let sync_enabled = matches!(config.sync.destination(), Ok(Some(_)));
+    let sync_enabled = config.sync.has_destination();
     let sync = MenuItem::with_id("sync_latest", "Sync Latest", sync_enabled, None);
     let recent = Submenu::with_id("recent", "Recent Captures", true);
     let open_folder = MenuItem::with_id("open_folder", "Open History Folder", true, None);

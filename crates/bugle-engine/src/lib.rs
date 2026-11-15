@@ -57,7 +57,7 @@ impl Engine {
         let history = History::open(config.history_path())?;
         let ai = Registry::from_config(&config.ai);
         std::fs::create_dir_all(config.save_dir()).ok();
-        if let Err(e) = config.sync.destination() {
+        if let Err(e) = config.sync.validate() {
             tracing::warn!("{e:#}; sync is off until the config is fixed");
         }
         Ok(Self { config, history, ai, recorder_state: RecorderState::default(), main_thread_ui, ui_host: None, renderer: Mutex::new(None) })
@@ -394,6 +394,7 @@ impl Engine {
         let mut m = MediaItem::new(MediaKind::Subtitle, &path);
         m.parent = Some(media.id.clone());
         m.source = Some(format!("subtitles via {}", transcript.provider));
+        self.sync_new_sidecar(&media, &mut m);
         self.history.push(&m)?;
         Ok((media, transcript, path))
     }
