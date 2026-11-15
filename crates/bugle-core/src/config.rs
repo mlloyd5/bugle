@@ -325,6 +325,26 @@ pub struct SyncConfig {
     pub folder: Option<String>,
     /// S3-compatible destination. Mutually exclusive with `folder`.
     pub s3: Option<S3Config>,
+    /// Sync `.srt` / `.vtt` sidecars together with their video, to the
+    /// video's destination and under the video's synced name.
+    pub sidecars: bool,
+    /// Per-kind destinations (`[sync.destinations.video]`, …). Kinds without
+    /// an entry use `folder` / `s3` above; a kind with an entry is synced
+    /// automatically even when it is not listed in `kinds`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub destinations: BTreeMap<MediaKind, SyncTarget>,
+}
+
+/// One per-kind destination: its own `folder` or `[s3]`, or just a `prefix`
+/// (a sub-folder / key prefix under the default destination). `mode`
+/// overrides `[sync] mode` for this kind.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncTarget {
+    pub folder: Option<String>,
+    pub s3: Option<S3Config>,
+    pub prefix: Option<String>,
+    pub mode: Option<SyncMode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -356,6 +376,11 @@ pub struct S3Config {
     /// are served from somewhere else than the API endpoint (a CDN, a custom
     /// domain). Defaults to `{endpoint}/{bucket}`.
     pub public_url: Option<String>,
+    /// Files at least this large (MiB) are sent as a multipart upload that
+    /// streams from disk part by part instead of one `PUT`.
+    pub multipart_threshold_mb: u64,
+    /// Multipart part size in MiB (at least 5, the S3 minimum).
+    pub part_size_mb: u64,
 }
 
 impl Default for SyncConfig {
@@ -366,6 +391,8 @@ impl Default for SyncConfig {
             kinds: vec![MediaKind::Screenshot, MediaKind::ScrollCapture, MediaKind::Annotated, MediaKind::Video, MediaKind::Gif],
             folder: None,
             s3: None,
+            sidecars: true,
+            destinations: BTreeMap::new(),
         }
     }
 }
@@ -380,6 +407,8 @@ impl Default for S3Config {
             access_key_env: "AWS_ACCESS_KEY_ID".into(),
             secret_key_env: "AWS_SECRET_ACCESS_KEY".into(),
             public_url: None,
+            multipart_threshold_mb: 64,
+            part_size_mb: 16,
         }
     }
 }
@@ -392,29 +421,83 @@ pub enum SyncDestination {
 }
 
 impl SyncConfig {
-    /// The configured destination; `None` when neither `folder` nor `s3` is
+    /// The default destination; `None` when neither `folder` nor `s3` is
     /// set, an error when both are.
     pub fn destination(&self) -> Result<Option<SyncDestination>> {
-        let folder = self.folder.as_deref().map(str::trim).filter(|f| !f.is_empty());
-        match (folder, &self.s3) {
-            (Some(_), Some(_)) => anyhow::bail!("[sync] sets both `folder` and `s3`; pick one"),
-            (Some(f), None) => Ok(Some(SyncDestination::Folder(expand_tilde(f)))),
-            (None, Some(s3)) => {
-                if s3.bucket.trim().is_empty() {
-                    anyhow::bail!("[sync.s3] needs a `bucket`");
-                }
-                if s3.endpoint.trim().is_empty() {
-                    anyhow::bail!("[sync.s3] needs an `endpoint`");
-                }
-                Ok(Some(SyncDestination::S3(s3.clone())))
-            }
-            (None, None) => Ok(None),
+        resolve_target(self.folder.as_deref(), self.s3.as_ref(), "[sync]")
+    }
+
+    /// Where `kind` goes: its `[sync.destinations.<kind>]` entry, else the
+    /// default destination.
+    pub fn destination_for(&self, kind: MediaKind) -> Result<Option<SyncDestination>> {
+        let Some(t) = self.destinations.get(&kind) else { return self.destination() };
+        let section = format!("[sync.destinations.{}]", kind_key(kind));
+        if let Some(dest) = resolve_target(t.folder.as_deref(), t.s3.as_ref(), &section)? {
+            return Ok(Some(with_prefix(dest, t.prefix.as_deref())));
         }
+        match self.destination()? {
+            Some(base) => Ok(Some(with_prefix(base, t.prefix.as_deref()))),
+            None => anyhow::bail!("{section} sets no `folder` or `s3` and there is no default [sync] destination"),
+        }
+    }
+
+    /// `[sync] mode`, unless the kind's entry overrides it.
+    pub fn mode_for(&self, kind: MediaKind) -> SyncMode {
+        self.destinations.get(&kind).and_then(|t| t.mode).unwrap_or(self.mode)
+    }
+
+    /// Whether any destination (default or per kind) is configured.
+    pub fn has_destination(&self) -> bool {
+        matches!(self.destination(), Ok(Some(_))) || !self.destinations.is_empty()
+    }
+
+    /// Check the default and every per-kind destination.
+    pub fn validate(&self) -> Result<()> {
+        self.destination()?;
+        for kind in self.destinations.keys() {
+            self.destination_for(*kind)?;
+        }
+        Ok(())
     }
 
     /// Whether the automatic step applies to `kind`.
     pub fn applies_to(&self, kind: MediaKind) -> bool {
-        self.enabled && self.kinds.contains(&kind)
+        self.enabled && (self.kinds.contains(&kind) || self.destinations.contains_key(&kind))
+    }
+}
+
+fn kind_key(kind: MediaKind) -> String {
+    serde_json::to_value(kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| format!("{kind:?}"))
+}
+
+fn resolve_target(folder: Option<&str>, s3: Option<&S3Config>, section: &str) -> Result<Option<SyncDestination>> {
+    let folder = folder.map(str::trim).filter(|f| !f.is_empty());
+    match (folder, s3) {
+        (Some(_), Some(_)) => anyhow::bail!("{section} sets both `folder` and `s3`; pick one"),
+        (Some(f), None) => Ok(Some(SyncDestination::Folder(expand_tilde(f)))),
+        (None, Some(s3)) => {
+            if s3.bucket.trim().is_empty() {
+                anyhow::bail!("{section} s3 needs a `bucket`");
+            }
+            if s3.endpoint.trim().is_empty() {
+                anyhow::bail!("{section} s3 needs an `endpoint`");
+            }
+            Ok(Some(SyncDestination::S3(s3.clone())))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// A sub-folder of a folder destination, or a longer key prefix in a bucket.
+fn with_prefix(dest: SyncDestination, prefix: Option<&str>) -> SyncDestination {
+    let Some(p) = prefix.map(|p| p.trim().trim_matches('/')).filter(|p| !p.is_empty()) else { return dest };
+    match dest {
+        SyncDestination::Folder(dir) => SyncDestination::Folder(dir.join(p)),
+        SyncDestination::S3(mut s3) => {
+            let base = s3.prefix.trim().trim_matches('/');
+            s3.prefix = if base.is_empty() { p.to_string() } else { format!("{base}/{p}") };
+            SyncDestination::S3(s3)
+        }
     }
 }
 
@@ -581,6 +664,51 @@ mod tests {
         assert_eq!(cfg.sync.mode, SyncMode::Move);
         assert_eq!(cfg.sync.kinds, vec![MediaKind::Screenshot]);
         assert!(cfg.sync.destination().is_err());
+    }
+
+    #[test]
+    fn per_kind_destinations_fall_back_to_the_default() {
+        let cfg: Config = toml::from_str(
+            "[sync]\nenabled = true\nkinds = [\"screenshot\"]\nfolder = \"/sync\"\n\
+             [sync.destinations.video]\nprefix = \"videos\"\nmode = \"move\"\n\
+             [sync.destinations.gif]\nfolder = \"/gifs\"\n\
+             [sync.destinations.scroll_capture.s3]\nbucket = \"b\"\nendpoint = \"http://127.0.0.1:9000\"\nprefix = \"p\"\n\
+             [sync.destinations.annotated]\ns3 = { bucket = \"b\", endpoint = \"http://h\" }\nprefix = \"marked\"\n",
+        )
+        .unwrap();
+        let folder = |k| match cfg.sync.destination_for(k).unwrap() {
+            Some(SyncDestination::Folder(p)) => p,
+            other => panic!("unexpected {other:?}"),
+        };
+        let prefix = |k| match cfg.sync.destination_for(k).unwrap() {
+            Some(SyncDestination::S3(s3)) => s3.prefix,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(folder(MediaKind::Screenshot), PathBuf::from("/sync"));
+        assert_eq!(folder(MediaKind::Video), PathBuf::from("/sync/videos"));
+        assert_eq!(folder(MediaKind::Gif), PathBuf::from("/gifs"));
+        assert_eq!(prefix(MediaKind::ScrollCapture), "p");
+        assert_eq!(prefix(MediaKind::Annotated), "marked");
+        assert_eq!(cfg.sync.mode_for(MediaKind::Video), SyncMode::Move);
+        assert_eq!(cfg.sync.mode_for(MediaKind::Gif), SyncMode::Copy);
+        // A kind with its own destination is synced even when not in `kinds`.
+        assert!(cfg.sync.applies_to(MediaKind::Gif));
+        assert!(!cfg.sync.applies_to(MediaKind::Audio));
+        assert!(cfg.sync.sidecars);
+        cfg.sync.validate().unwrap();
+        // Serialises back to the same shape.
+        let again: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(again.sync.destinations.len(), 4);
+
+        // A prefix-only entry needs a default destination.
+        let cfg: Config = toml::from_str("[sync.destinations.video]\nprefix = \"v\"\n").unwrap();
+        assert!(cfg.sync.destination_for(MediaKind::Video).is_err());
+        assert!(cfg.sync.validate().is_err());
+        assert!(cfg.sync.destination_for(MediaKind::Screenshot).unwrap().is_none());
+        let cfg: Config =
+            toml::from_str("[sync.destinations.video]\nfolder = \"/a\"\ns3 = { bucket = \"b\", endpoint = \"http://h\" }\n").unwrap();
+        assert!(cfg.sync.validate().is_err());
+        assert!(toml::from_str::<Config>("[sync.destinations.movie]\nfolder = \"/a\"\n").is_err(), "unknown kinds are rejected");
     }
 
     #[test]
