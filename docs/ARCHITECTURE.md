@@ -1,6 +1,6 @@
 # Architecture
 
-Bugle is a Rust workspace of eight crates, split by subsystem so every feature has
+Bugle is a Rust workspace of eight crates (plus `xtask` for packaging), split by subsystem so every feature has
 an obvious home.
 
 ```
@@ -49,6 +49,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
 | `export_audio_m4a`, `export_mp4`, `export_mov`, `video_frame`, `media_duration` | `AVAssetExportSession`, `AVAssetImageGenerator` |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
+| `login_item::{in_app_bundle, status, set_enabled}` | `SMAppService.mainAppService` (`shim/login_item.m`, ServiceManagement) |
 
 Window shadows: ScreenCaptureKit clips single-window screenshots to the window
 bounds, so the shadow path uses `CGWindowListCreateImage` (deprecated but
@@ -141,6 +142,37 @@ the overlay calls back. The agent API can be started from the menu on a tokio
 runtime thread (`http::serve_with_shutdown`) and shares the same `Engine`, so API
 callers get the in-app overlay too. Feedback is a transient toast (`toast_show`)
 plus the shutter sound; the status item title shows `● m:ss` while recording.
+When the process runs from `Bugle.app`, an *Open at Login* check item
+(`login.rs`) registers the bundle with `SMAppService`.
+
+The status-bar glyph is a signed distance field (`icon/glyph.rs`) that scales
+its stroke widths with the render size, so the same drawing serves the 36 px
+template image and the application icon.
+
+### `xtask` (packaging)
+`cargo xtask bundle` (alias in `.cargo/config.toml`) builds `bugle-app` and
+`bugle` in release mode and assembles `dist/Bugle.app`:
+
+```
+Bugle.app/Contents/
+  Info.plist          generated (plist.rs): bundle id, workspace version, LSUIElement,
+                      NSScreenCaptureUsageDescription, NSMicrophoneUsageDescription
+  PkgInfo
+  MacOS/bugle-app     CFBundleExecutable
+  MacOS/bugle         the CLI, signed as <bundle id>.cli
+  Resources/Bugle.icns  icns.rs: glyph.rs (included by path) on a gradient square,
+                        rendered per size and written as PNG elements, reproducibly
+```
+
+Signing is inside-out (CLI, then the bundle) with `--options runtime` and
+`packaging/Bugle.entitlements` (`device.audio-input`, which the hardened runtime
+requires for the microphone); ad-hoc by default, a Developer ID identity from
+`--sign`/`BUGLE_SIGN_IDENTITY` adds a secure timestamp. Verification runs
+`plutil -lint`, `codesign --verify --deep --strict`, checks the runtime flag and
+entitlements, round-trips the icon through `iconutil` and runs both binaries
+with `--version`. `--notarize` submits a `ditto` zip to `notarytool`, staples and
+re-zips, and is skipped (with a message) without a Developer ID identity or
+credentials.
 
 ## Feature ideas
 
@@ -155,7 +187,8 @@ earn its keep.
   minimal version): annotate, copy, pin or send from one place.
 * **Window-picking mode** for *Capture Window* (hover to highlight) instead of
   taking the front-most window; a hotkey for every menu item.
-* **Packaging** — a signed `.app` bundle so notifications, Login Items and the
-  permission prompts carry Bugle's own name.
+* **Packaging extras** — a universal (arm64 + x86_64) build, a DMG, and system
+  notifications (`UNUserNotificationCenter`) alongside the toast now that the
+  bundle gives them Bugle's name.
 * **Sync extras** — a destination per media kind, streaming multipart uploads
   for long recordings, and syncing sidecar subtitles next to their video.
