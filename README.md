@@ -228,15 +228,25 @@ secret_key_env = "AWS_SECRET_ACCESS_KEY"
 ```
 
 Uploads are SigV4-signed (path-style, no SDK) and stream from disk; files of
-`multipart_threshold_mb` (64) or more go up as a multipart upload in
-`part_size_mb` (16) parts, each retried on its own, and the upload is aborted if
-it cannot finish. The object URL is stored
+`multipart_threshold_mb` (64, at most 5120) or more go up as a multipart upload
+in `part_size_mb` (16, 5..=5120) parts. Each request is retried up to six times
+with a capped, jittered backoff (and the server's `Retry-After`), and the upload
+is aborted if it cannot finish or the file changes meanwhile. An upload cut
+short by a crash, or a create request whose response was lost, can leave an
+incomplete upload behind: add a lifecycle rule to the bucket that aborts
+incomplete multipart uploads after a day. The sync runs right after the save,
+on the same thread: the capture is in history at once, but `record_stop` (and
+the menu-bar action) returns when the upload has finished. The object URL is stored
 in the history item (`url`) and copied to the clipboard unless
 `general.copy_to_clipboard` already puts the image there. `bugle sync latest`,
 the `sync` agent action and *Sync Latest* in the menu bar do the same on demand,
 even with `enabled = false`.
 
-Each media kind can have its own destination; kinds without one use the default:
+Automatic sync covers what Bugle saves: screenshots, scrolling captures,
+annotations, recordings and GIFs (as listed in `kinds`), and subtitles written by
+`bugle subtitles`. Audio and text files are synced on demand with `bugle sync`.
+Each media kind can have its own destination; kinds without one use the default,
+and a kind with its own entry syncs automatically when it is saved:
 
 ```toml
 [sync.destinations.video]
@@ -247,8 +257,12 @@ mode = "move"
 ```
 
 With `sidecars = true` (the default), a video's `.srt` / `.vtt` subtitles are
-synced to the video's destination under the video's synced name (`clip 2.mp4` →
-`clip 2.srt`), including subtitles generated after the video was synced.
+synced to the video's destination (or to `[sync.destinations.subtitle]` when
+that is set) under the video's synced name (`clip 2.mp4` → `clip 2.srt`),
+including subtitles generated after the video was synced. A file there that
+Bugle did not write for that video is never replaced: the subtitle gets a unique
+name instead. A subtitle written to an explicit `--output` is copied even in
+move mode. `prefix` must be relative and free of `.` / `..` segments.
 
 ## Agents
 
