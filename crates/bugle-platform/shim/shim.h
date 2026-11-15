@@ -102,3 +102,16 @@ void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t wi
 int64_t bugle_sck_record_frames(void *handle);
 char *bugle_sck_record_warnings(void *handle);   // malloc'd, NULL when none
 int32_t bugle_sck_record_stop(void *handle);
+
+// Window picker overlay (picker.m). `cb` gets kind 0 for every pointer move
+// (global top-left points), then exactly one final call: 1 = clicked at
+// (x, y), 2 = cancelled (Esc, right click, timeout, bugle_pick_cancel). The
+// final call arrives on a later main-queue turn, after the overlay is gone.
+// Returns 0 (cb never called) when a picker or selection is already active.
+// Main thread only, needs a running AppKit loop.
+typedef void (*bugle_pick_callback_t)(void *ctx, int32_t kind, double x, double y);
+int32_t bugle_pick_begin(bugle_pick_callback_t cb, void *ctx, double timeout_seconds);
+// Highlight a global top-left rect with a centred label; w or h <= 0 clears.
+void bugle_pick_highlight(double x, double y, double w, double h, const char *label);
+int32_t bugle_pick_active(void);
+void bugle_pick_cancel(void);

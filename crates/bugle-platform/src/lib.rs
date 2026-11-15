@@ -7,6 +7,10 @@
 
 #[cfg(target_os = "macos")]
 mod ffi;
+#[cfg(target_os = "macos")]
+mod picker;
+#[cfg(target_os = "macos")]
+pub use picker::{window_pick_active, window_pick_begin, window_pick_cancel, window_pick_highlight, PickEvent};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bugle_core::{BugleError, DisplayInfo, OcrLine, Point, Rect, WindowInfo};
