@@ -1,11 +1,15 @@
 fn main() {
     println!("cargo:rerun-if-changed=shim/shim.m");
+    println!("cargo:rerun-if-changed=shim/fixtures.m");
     println!("cargo:rerun-if-changed=shim/shim.h");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
     cc::Build::new()
         .file("shim/shim.m")
+        // Separate object: only tests reference it, so shipped binaries
+        // leave it out.
+        .file("shim/fixtures.m")
         .flag("-fobjc-arc")
         .flag("-mmacosx-version-min=13.0")
         .flag("-Wno-deprecated-declarations")

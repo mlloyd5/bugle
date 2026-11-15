@@ -90,8 +90,18 @@ int32_t bugle_audio_track_count(const char *path);
 // Fold all audio tracks into one AAC track (video copied as is). 0 on
 // success, 1 (nothing written) with fewer than two audio tracks.
 int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path);
-// Test fixture: `tracks` AAC tracks, track i sounding only in slice i.
-int32_t bugle_write_tone_tracks(const char *out_path, int32_t tracks, double seconds);
+int32_t bugle_video_track_count(const char *path);
+
+// Test fixtures (shim/fixtures.m, its own object file: nothing in the app
+// references it, so the linker leaves it out of shipped binaries). Writes an
+// .mp4 of `tracks` AAC tracks lasting `seconds`; tracks after the first start
+// `delay` seconds in. Each track plays a sine of `amplitude`: with `overlap`
+// all tracks play the same 440 Hz tone throughout, otherwise track i plays
+// 440*(i+1) Hz during the i-th equal slice only. `video` adds a 64x64 H.264
+// track at 10 fps. Returns a malloc'd error (free with bugle_free), NULL on
+// success.
+char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double seconds, double amplitude, int32_t overlap,
+                                double delay, int32_t video);
 double bugle_media_duration(const char *path);
 bugle_image_t bugle_video_frame(const char *path, double seconds);
 void bugle_play_sound(const char *name);

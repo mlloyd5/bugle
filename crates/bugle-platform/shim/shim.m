@@ -1041,19 +1041,35 @@ int32_t bugle_audio_track_count(const char *path) {
     }
 }
 
-// Fold every audio track of a movie into one AAC track. A post-pass on the
-// finished file: AVAssetReaderAudioMixOutput sums the tracks (each on its
-// own edit timeline, so their offsets are kept) into float PCM, which is
+int32_t bugle_video_track_count(const char *path) {
+    @autoreleasepool {
+        NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
+        return (int32_t)[asset tracksWithMediaType:AVMediaTypeVideo].count;
+    }
+}
+
+// Fold every enabled audio track of a movie into one AAC track. A post-pass
+// on the finished file: AVAssetReaderAudioMixOutput sums the tracks (each on
+// its own edit timeline, so their offsets are kept) into float PCM, which is
 // encoded once; video tracks are copied sample for sample without
-// re-encoding. Returns 1 and writes nothing when there are fewer than two
-// audio tracks.
+// re-encoding, on their own timescale. Each of the n tracks is scaled by 1/n
+// so the sum can never exceed full scale. Returns 1 and writes nothing when
+// there are fewer than two audio tracks; refuses to write over its input.
 int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path) {
     @autoreleasepool {
         clear_error();
         NSURL *in = [NSURL fileURLWithPath:[NSString stringWithUTF8String:in_path]];
         NSURL *out = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
+        if ([in.URLByResolvingSymlinksInPath.path isEqualToString:out.URLByResolvingSymlinksInPath.path]) {
+            set_error(@"mixing %s: input and output are the same file", in_path);
+            return -1;
+        }
         AVURLAsset *asset = [AVURLAsset URLAssetWithURL:in options:nil];
-        NSArray<AVAssetTrack *> *audio = [asset tracksWithMediaType:AVMediaTypeAudio];
+        NSMutableArray<AVAssetTrack *> *audio = [NSMutableArray array];
+        for (AVAssetTrack *t in [asset tracksWithMediaType:AVMediaTypeAudio]) {
+            if (t.enabled) [audio addObject:t];
+        }
         if (audio.count < 2) return 1;
         NSArray<AVAssetTrack *> *video = [asset tracksWithMediaType:AVMediaTypeVideo];
         NSError *err = nil;
@@ -1075,6 +1091,8 @@ int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path) {
                                                                         outputSettings:nil
                                                                       sourceFormatHint:hint];
             wi.transform = t.preferredTransform;
+            // Keep the source's frame times exactly (the default is 1/600 s).
+            if (t.naturalTimeScale > 0) wi.mediaTimeScale = t.naturalTimeScale;
             if (![reader canAddOutput:ro] || ![writer canAddInput:wi]) { set_error(@"could not copy the video track"); return -1; }
             [reader addOutput:ro];
             [writer addInput:wi];
@@ -1092,6 +1110,16 @@ int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path) {
         };
         AVAssetReaderAudioMixOutput *mix = [AVAssetReaderAudioMixOutput assetReaderAudioMixOutputWithAudioTracks:audio
                                                                                                    audioSettings:pcm];
+        // Headroom: n sources at 1/n each cannot clip, however loud they are.
+        AVMutableAudioMix *levels = [AVMutableAudioMix audioMix];
+        NSMutableArray<AVAudioMixInputParameters *> *params = [NSMutableArray array];
+        for (AVAssetTrack *t in audio) {
+            AVMutableAudioMixInputParameters *pm = [AVMutableAudioMixInputParameters audioMixInputParametersWithTrack:t];
+            [pm setVolume:1.0f / (float)audio.count atTime:kCMTimeZero];
+            [params addObject:pm];
+        }
+        levels.inputParameters = params;
+        mix.audioMix = levels;
         NSDictionary *aac = @{
             AVFormatIDKey: @(kAudioFormatMPEG4AAC),
             AVSampleRateKey: @48000,
@@ -1164,100 +1192,6 @@ int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path) {
         if (writer.status != AVAssetWriterStatusCompleted) {
             [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
             set_error(@"writing the mixed file failed: %@", writer.error.localizedDescription);
-            return -1;
-        }
-        return 0;
-    }
-}
-
-// Test fixture: an .mp4 with `tracks` AAC tracks (48 kHz stereo) lasting
-// `seconds`. Track i plays a sine tone during the i-th equal slice of the
-// duration and is silent elsewhere, so a mix is audible in every slice.
-int32_t bugle_write_tone_tracks(const char *out_path, int32_t tracks, double seconds) {
-    @autoreleasepool {
-        clear_error();
-        if (tracks < 1 || tracks > 8 || !(seconds > 0 && seconds <= 60)) { set_error(@"bad tone fixture parameters"); return -1; }
-        NSURL *out = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
-        [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
-        NSError *err = nil;
-        AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:out fileType:AVFileTypeMPEG4 error:&err];
-        if (!writer) { set_error(@"AVAssetWriter: %@", err.localizedDescription); return -1; }
-        NSDictionary *aac = @{
-            AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: @48000,
-            AVNumberOfChannelsKey: @2,
-            AVEncoderBitRateKey: @128000,
-        };
-        NSMutableArray<AVAssetWriterInput *> *inputs = [NSMutableArray array];
-        for (int32_t i = 0; i < tracks; i++) {
-            AVAssetWriterInput *in = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:aac];
-            if (![writer canAddInput:in]) { set_error(@"writer refused audio track %d", i); return -1; }
-            [writer addInput:in];
-            [inputs addObject:in];
-        }
-        AudioStreamBasicDescription asbd = {0};
-        asbd.mSampleRate = 48000;
-        asbd.mFormatID = kAudioFormatLinearPCM;
-        asbd.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
-        asbd.mChannelsPerFrame = 2;
-        asbd.mBitsPerChannel = 32;
-        asbd.mBytesPerFrame = 8;
-        asbd.mFramesPerPacket = 1;
-        asbd.mBytesPerPacket = 8;
-        CMAudioFormatDescriptionRef fmt = NULL;
-        if (CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &asbd, 0, NULL, 0, NULL, NULL, &fmt) != noErr) {
-            set_error(@"could not describe the PCM format");
-            return -1;
-        }
-        if (![writer startWriting]) {
-            CFRelease(fmt);
-            set_error(@"could not start writing: %@", writer.error.localizedDescription);
-            return -1;
-        }
-        [writer startSessionAtSourceTime:kCMTimeZero];
-        const int64_t total = (int64_t)(seconds * 48000);
-        const int64_t slice = total / tracks;
-        enum { chunk = 1024 };
-        float buf[chunk * 2];
-        BOOL ok = YES;
-        for (int64_t start = 0; start < total && ok; start += chunk) {
-            int n = (int)MIN((int64_t)chunk, total - start);
-            for (int32_t t = 0; t < tracks && ok; t++) {
-                double freq = 440.0 * (t + 1);
-                for (int k = 0; k < n; k++) {
-                    int64_t f = start + k;
-                    BOOL on = f >= t * slice && f < (t + 1) * slice;
-                    float v = on ? (float)(0.5 * sin(2 * M_PI * freq * (double)f / 48000.0)) : 0.0f;
-                    buf[2 * k] = buf[2 * k + 1] = v;
-                }
-                size_t bytes = (size_t)n * 8;
-                CMBlockBufferRef bb = NULL;
-                CMSampleBufferRef sb = NULL;
-                ok = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, bytes, kCFAllocatorDefault, NULL, 0,
-                                                        bytes, kCMBlockBufferAssureMemoryNowFlag, &bb) == noErr &&
-                     CMBlockBufferReplaceDataBytes(buf, bb, 0, bytes) == noErr &&
-                     CMAudioSampleBufferCreateReadyWithPacketDescriptions(kCFAllocatorDefault, bb, fmt, n,
-                                                                          CMTimeMake(start, 48000), NULL, &sb) == noErr;
-                if (bb) CFRelease(bb);
-                AVAssetWriterInput *in = inputs[t];
-                for (int w = 0; ok && w < 5000 && !in.readyForMoreMediaData; w++) usleep(1000);
-                ok = ok && in.readyForMoreMediaData && [in appendSampleBuffer:sb];
-                if (sb) CFRelease(sb);
-            }
-        }
-        CFRelease(fmt);
-        if (!ok) {
-            NSString *why = writer.error.localizedDescription ?: @"append failed";
-            [writer cancelWriting];
-            set_error(@"writing the tone fixture failed: %@", why);
-            return -1;
-        }
-        for (AVAssetWriterInput *in in inputs) [in markAsFinished];
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [writer finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
-        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-        if (writer.status != AVAssetWriterStatusCompleted) {
-            set_error(@"finalising the tone fixture failed: %@", writer.error.localizedDescription);
             return -1;
         }
         return 0;
@@ -1737,7 +1671,8 @@ void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t wi
         cfg.showsCursor = show_cursor != 0;
         BOOL clicksUnsupported = NO;
         if (show_clicks) {
-            if (@available(macOS 15.0, *)) {
+            // A selector check rather than `@available` (see sck_available).
+            if ([cfg respondsToSelector:@selector(setShowMouseClicks:)]) {
                 cfg.showMouseClicks = YES;
             } else {
                 clicksUnsupported = YES;
