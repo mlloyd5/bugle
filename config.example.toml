@@ -24,6 +24,8 @@ video_fps = 30
 microphone = false
 system_audio = false      # needs the ScreenCaptureKit backend (macOS 14+)
 mix_audio = false         # one audio track instead of microphone + system audio
+                          # (re-encodes the audio after stop; each source at 1/2;
+                          # needs free space equal to the recording)
 highlight_clicks = false  # stream backend: macOS 15+
 retina = true
 # auto: ScreenCaptureKit (SCStream + AVAssetWriter, H.264 + AAC .mp4) when system

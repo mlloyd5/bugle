@@ -31,6 +31,8 @@ char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double sec
         NSError *err = nil;
         AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:out fileType:AVFileTypeMPEG4 error:&err];
         if (!writer) return fixture_error(@"AVAssetWriter: %@", err.localizedDescription);
+        // Header first, like the recorder's own files.
+        writer.shouldOptimizeForNetworkUse = YES;
         NSDictionary *aac = @{
             AVFormatIDKey: @(kAudioFormatMPEG4AAC),
             AVSampleRateKey: @48000,

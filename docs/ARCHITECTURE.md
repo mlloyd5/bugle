@@ -48,7 +48,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
 | `export_audio_m4a`, `export_mp4`, `export_mov`, `video_frame`, `media_duration` | `AVAssetExportSession`, `AVAssetImageGenerator` |
-| `mix_audio_tracks`, `audio_track_count` | `AVAssetReaderAudioMixOutput` → `AVAssetWriter` (AAC), video samples copied as is |
+| `mix_audio_tracks`, `audio_track_count`, `video_track_count` | `AVAssetReaderAudioMixOutput` (+ `AVMutableAudioMix` levels) → `AVAssetWriter` (AAC), video samples copied on their own timescale |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
 
 Window shadows: ScreenCaptureKit clips single-window screenshots to the window
@@ -102,10 +102,16 @@ recorder state machine, and exposes one method per user-facing action:
   `AVCaptureSession` audio tap written as a second AAC track, retimed to the host
   clock; `export_audio_m4a` mixes both tracks when transcribing. With
   `mix_audio` (`[recordings]`, `--mix-audio`, action argument) a post-pass on the
-  finished file folds all audio tracks into one AAC track before any `.mov`
-  remux; mixing after capture keeps the real-time path unchanged (no
-  cross-clock resampling or buffering between two live sources), and a failed
-  mix only logs a warning and keeps the two tracks. Click highlighting
+  finished file folds all audio tracks into one AAC track (a `.mov` request is
+  mixed straight to QuickTime); mixing after capture keeps the real-time path
+  unchanged (no cross-clock resampling or buffering between two live sources).
+  Each of the n sources is scaled by 1/n so the sum cannot clip; the audio is
+  re-encoded (a second AAC generation) while video samples and frame times are
+  copied. The mix runs during stop, writes a uniquely named hidden copy next to
+  the recording (so it needs free space equal to the recording) and replaces the
+  file only after checking the copy's tracks and duration; a failed mix logs a
+  warning and keeps the two tracks. Asking for it without both sources on the
+  stream recorder warns at start. Click highlighting
   uses `screencapture -k` or, on the stream recorder, `SCStreamConfiguration.showMouseClicks`
   (macOS 15+). Timing details live in the shim's
   recorder comment: the writer session opens before the stream starts, a static
