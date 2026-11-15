@@ -58,7 +58,10 @@ impl Engine {
         let ai = Registry::from_config(&config.ai);
         std::fs::create_dir_all(config.save_dir()).ok();
         if let Err(e) = config.sync.validate() {
-            tracing::warn!("{e:#}; sync is off until the config is fixed");
+            tracing::warn!("{e:#}; media that would sync there is not synced until the config is fixed");
+        }
+        for w in config.sync.warnings() {
+            tracing::warn!("{w}");
         }
         Ok(Self { config, history, ai, recorder_state: RecorderState::default(), main_thread_ui, ui_host: None, renderer: Mutex::new(None) })
     }
@@ -152,8 +155,8 @@ impl Engine {
         m.label = label;
         m.source = source;
         m.parent = parent;
-        self.sync_after_save(&mut m);
         self.history.push(&m)?;
+        self.sync_after_save(&mut m);
         Ok(m)
     }
 
@@ -391,12 +394,10 @@ impl Engine {
             None => media.path.with_extension(ext),
         };
         std::fs::write(&path, transcript.render(format)).with_context(|| format!("writing {}", path.display()))?;
-        let mut m = MediaItem::new(MediaKind::Subtitle, &path);
-        m.parent = Some(media.id.clone());
-        m.source = Some(format!("subtitles via {}", transcript.provider));
-        self.sync_new_sidecar(&media, &mut m);
-        self.history.push(&m)?;
-        Ok((media, transcript, path))
+        let source = format!("subtitles via {}", transcript.provider);
+        // The sync may move the file; report where it is now.
+        let m = self.save_subtitle_item(&media, &path, source, output.is_some())?;
+        Ok((media, transcript, m.path))
     }
 
     // -----------------------------------------------------------------------
