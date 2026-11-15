@@ -17,15 +17,10 @@ enum Value<'a> {
 }
 
 /// Usage strings for the privacy prompts the app (or the embedded CLI) can
-/// trigger. Screen Recording's system prompt currently shows fixed text; the
-/// key is set so the string is there wherever macOS does show it.
-pub const USAGE_DESCRIPTIONS: &[(&str, &str)] = &[
-    (
-        "NSScreenCaptureUsageDescription",
-        "Bugle captures the screen for screenshots, scrolling captures and recordings.",
-    ),
-    ("NSMicrophoneUsageDescription", "Bugle records your microphone when you include it in a screen recording."),
-];
+/// trigger. Screen Recording and Accessibility have no Info.plist usage key;
+/// their prompts show fixed system text with the bundle's name.
+pub const USAGE_DESCRIPTIONS: &[(&str, &str)] =
+    &[("NSMicrophoneUsageDescription", "Bugle records your microphone when you include it in a screen recording.")];
 
 pub fn info_plist(info: &BundleInfo) -> String {
     let mut entries: Vec<(&str, Value)> = vec![
@@ -41,7 +36,6 @@ pub fn info_plist(info: &BundleInfo) -> String {
         ("CFBundleVersion", Value::Str(info.build_number)),
         ("LSApplicationCategoryType", Value::Str("public.app-category.productivity")),
         ("LSMinimumSystemVersion", Value::Str(info.min_macos)),
-        ("LSMultipleInstancesProhibited", Value::Bool(true)),
         // Menu-bar app: no Dock icon, no main menu.
         ("LSUIElement", Value::Bool(true)),
         ("NSHighResolutionCapable", Value::Bool(true)),
@@ -96,7 +90,7 @@ mod tests {
         assert!(p.contains("<key>CFBundleExecutable</key>\n\t<string>bugle-app</string>"));
         assert!(p.contains("<key>LSUIElement</key>\n\t<true/>"));
         assert!(p.contains("<key>NSMicrophoneUsageDescription</key>"));
-        assert!(p.contains("<key>NSScreenCaptureUsageDescription</key>"));
+        assert!(!p.contains("NSScreenCaptureUsageDescription"));
         assert!(p.ends_with("</dict>\n</plist>\n"));
     }
 
