@@ -45,6 +45,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `select_rect_blocking`, `select_rect_begin`/`_cancel` | borderless `NSWindow` per screen, dim fill, crosshair, size label; blocking (`[NSApp run]`) or callback-based for a host with its own run loop |
 | `pin_image_blocking`, `pin_image_show` | floating borderless window, drag/resize/close; blocking or fire-and-forget |
 | `toast_show` | non-activating `NSPanel` with `NSVisualEffectView`, thumbnail + two lines, fades out |
+| `panel_show` (`shim/panel.m`) | quick-access panel: non-activating, never-key `NSPanel`, thumbnail, buttons, close; reports clicks through a callback |
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
 | `export_audio_m4a`, `export_mp4`, `export_mov`, `video_frame`, `media_duration` | `AVAssetExportSession`, `AVAssetImageGenerator` |
@@ -142,6 +143,18 @@ runtime thread (`http::serve_with_shutdown`) and shares the same `Engine`, so AP
 callers get the in-app overlay too. Feedback is a transient toast (`toast_show`)
 plus the shutter sound; the status item title shows `● m:ss` while recording.
 
+After a capture the app shows the quick-access panel instead of the toast
+(`[quick_access]`, on by default). `quick_access.rs` is the platform-free part:
+which buttons a media kind gets, the current panel generation (stale clicks are
+ignored), the timeout (paused while hovered, checked on the loop tick) and
+`perform`, which maps each button onto the engine through a `Backend` trait —
+Copy → `Engine::copy_media`, Pin → `Engine::pin`, Sync → `Engine::sync_media`,
+Annotate → open in `annotate_app`, Reveal → Finder. `quick_panel.rs` is the glue:
+it shows the panel, turns clicks into `AppEvent::QuickAccess`, runs blocking
+actions on a short-lived thread (Pin must, since its `UiHost` request
+round-trips through the main thread) and swaps in a sharper thumbnail rendered
+off the main thread.
+
 ## Feature ideas
 
 Bugle is a standalone app; this is the backlog, roughly in the order it would
@@ -151,8 +164,10 @@ earn its keep.
   export presets.
 * **Audio mixing** — fold the microphone and system-audio tracks into one when
   asked; click highlighting on the ScreenCaptureKit recorder.
-* **Quick-access panel** after a capture (the toast with a thumbnail is the
-  minimal version): annotate, copy, pin or send from one place.
+* **Built-in markup editor** — draw arrows, boxes and text on a capture inside
+  Bugle (the quick-access panel's *Annotate* opens the file in `annotate_app`
+  for now), and keep the quick-access panel's thumbnails stacked when several
+  captures arrive in a row.
 * **Window-picking mode** for *Capture Window* (hover to highlight) instead of
   taking the front-most window; a hotkey for every menu item.
 * **Packaging** — a signed `.app` bundle so notifications, Login Items and the

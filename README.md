@@ -145,9 +145,25 @@ Menu: Capture Area · Capture Window (front-most window) · Capture Screen ·
 Scrolling Capture · Record Video · Record GIF · Stop Recording · OCR Latest
 (copies the text) · Pin Latest · Recent Captures (last five, click to open) ·
 Open History Folder · Start/Stop Agent API · Preferences… (opens the config
-file) · Quit. While recording, the status item shows `● m:ss`. After each
-action a small toast in the top-right corner shows a thumbnail and the file
-name; clicking it opens the file.
+file) · Quit. While recording, the status item shows `● m:ss`. Other actions
+report through a small toast in the top-right corner (thumbnail and file name;
+click to open).
+
+After a capture or recording, the **quick-access panel** takes the toast's
+place: the thumbnail (click to open) with **Copy**, **Annotate** (opens the file
+in Preview's Markup tools, or the app set in `annotate_app`), **Pin**, **Sync**
+(only when a `[sync]` destination is set and the automatic sync did not already
+send the file) and **Reveal** in Finder, plus a close button. It never takes
+keyboard focus, closes after `timeout_seconds` (paused while the pointer is
+over it) and goes away after any button. Configure it in `[quick_access]`:
+
+```toml
+[quick_access]
+enabled = true            # false: plain toast instead
+timeout_seconds = 8.0     # 0: stays until a button or × is clicked
+position = "top-right"    # top-left | bottom-right | bottom-left
+annotate_app = "com.apple.Preview"
+```
 
 Hotkeys live in the `[hotkeys]` section of the config file and are parsed as
 `modifier+modifier+key` (`cmd`, `shift`, `alt`/`option`, `ctrl`; letters,
@@ -190,8 +206,8 @@ OpenRouter, Groq…). `kind = "command"` wraps a local executable, e.g. `whisper
 
 The other sections: `[general]` (save folder, filename template, clipboard),
 `[screenshots]`, `[recordings]` (backend, audio), `[ocr]`, `[markup]` defaults,
-`[api]` (bind address, token, CORS), `[hotkeys]` for the menu-bar app and `[sync]`
-below.
+`[api]` (bind address, token, CORS), `[hotkeys]` and `[quick_access]` for the
+menu-bar app and `[sync]` below.
 
 The HTTP API is meant for local agents. Setting a token is recommended; without
 one any local process can call it. Binding to a non-loopback address (e.g.
