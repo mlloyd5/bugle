@@ -65,6 +65,7 @@ pub fn router_for_bind(engine: Arc<Engine>, token: Option<String>, cors: bool, l
         .route("/v1/transcribe", post(|s, j| action_post(s, Path("transcribe".into()), j)))
         .route("/v1/subtitles", post(|s, j| action_post(s, Path("subtitles".into()), j)))
         .route("/v1/complete", post(|s, j| action_post(s, Path("complete".into()), j)))
+        .route("/v1/edit", post(|s, j| action_post(s, Path("edit_video".into()), j)))
         .route("/v1/record/start", post(|s, j| action_post(s, Path("record_start".into()), j)))
         .route("/v1/record/stop", post(|s| action_post(s, Path("record_stop".into()), Ok(Json(json!({}))))))
         .route("/v1/record/status", get(|s| action_get(s, "record_status")))

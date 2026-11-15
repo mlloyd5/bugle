@@ -195,6 +195,23 @@ pub fn catalog() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "edit_video",
+            description: "Trim a recording (video or GIF) and export it with a preset: original (lossless trim), high, hevc, 1080p, 720p, 540p, gif, gif-small. Times are seconds; negative counts from the end. Saves a new media item whose parent is the source.",
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "source":{"type":"string","default":"latest"},
+                    "start":{"type":"number","description":"seconds; negative = from the end"},
+                    "end":{"type":"number","description":"seconds; negative = from the end (-2 drops the last two seconds)"},
+                    "preset":{"type":"string","enum":bugle_engine::ExportPreset::ALL.iter().map(|p| p.name()).collect::<Vec<_>>(),"default":"original"},
+                    "fps":{"type":"integer","description":"output frame rate (re-encodes video, resamples GIF)"},
+                    "max_size":{"type":"integer","description":"long edge of GIF output in pixels"},
+                    "output":{"type":"string"},
+                    "label":{"type":"string"}
+                }
+            }),
+        },
+        ToolSpec {
             name: "complete",
             description: "Plain text completion with the configured text provider (e.g. summarise OCR output).",
             input_schema: json!({"type":"object","properties":{"prompt":{"type":"string"},"provider":{"type":"string"},"system":{"type":"string"}},"required":["prompt"]}),
@@ -343,6 +360,14 @@ pub async fn run(engine: &Arc<Engine>, name: &str, args: Value) -> Result<Action
             let (media, t, path) = e.subtitles(&source, format, provider.as_deref(), language.as_deref(), output.as_deref()).await?;
             Ok(ActionOutput::json(json!({"media_id": media.id, "path": path, "segments": t.segments.len(), "text": t.text})))
         }
+        "edit_video" => {
+            let mut req: bugle_engine::EditRequest = serde_json::from_value(args)?;
+            if req.source.is_empty() {
+                req.source = "latest".into();
+            }
+            let media = tokio::task::spawn_blocking(move || e.edit(&req)).await??;
+            Ok(ActionOutput::json(json!({"media": media})))
+        }
         "complete" => {
             let prompt = args.get("prompt").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("prompt is required"))?;
             let provider = args.get("provider").and_then(|v| v.as_str());
@@ -459,6 +484,16 @@ mod tests {
     fn invalid_as_source_is_400() {
         let e = anyhow::Error::new(Outer(BugleError::Invalid("x".into())));
         assert_eq!(status_for(&e), 400);
+    }
+
+    #[test]
+    fn edit_video_is_catalogued_with_every_preset() {
+        let spec = catalog().into_iter().find(|t| t.name == "edit_video").expect("edit_video in catalog");
+        let names = spec.input_schema["properties"]["preset"]["enum"].as_array().unwrap().len();
+        assert_eq!(names, bugle_engine::ExportPreset::ALL.len());
+        // A bad preset is a 400, not a 500.
+        let err = serde_json::from_value::<bugle_engine::EditRequest>(json!({"preset":"4k"})).map_err(anyhow::Error::from).unwrap_err();
+        assert_eq!(status_for(&err), 400);
     }
 
     #[test]

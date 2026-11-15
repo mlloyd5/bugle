@@ -46,6 +46,8 @@ pub enum Cmd {
     Transcribe(TranscribeArgs),
     /// Transcribe a recording and write SRT/VTT subtitles next to it.
     Subtitles(SubtitlesArgs),
+    /// Trim a recording and export it with a preset (video or GIF).
+    Edit(EditArgs),
     /// Draw annotations onto an image.
     #[command(name = "annotate")]
     Markup(MarkupArgs),
@@ -351,6 +353,38 @@ pub struct SubtitlesArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct EditArgs {
+    /// Recording to edit: media id, `latest`, or a .mp4/.mov/.m4v/.gif path.
+    #[arg(default_value = "latest")]
+    pub source: String,
+    /// Start time: seconds (`12.5`), `m:ss`, or negative to count from the end.
+    #[arg(long, short = 's', allow_hyphen_values = true)]
+    pub start: Option<String>,
+    /// End time, same forms as --start (`-2` drops the last two seconds).
+    #[arg(long, short = 'e', allow_hyphen_values = true)]
+    pub end: Option<String>,
+    /// Export preset (see --list-presets).
+    #[arg(long, short = 'p', default_value = "original")]
+    pub preset: String,
+    /// Output frame rate (re-encodes video, resamples GIF).
+    #[arg(long)]
+    pub fps: Option<u32>,
+    /// Long edge of GIF output, in pixels.
+    #[arg(long)]
+    pub max_size: Option<u32>,
+    #[arg(long, short = 'o')]
+    pub output: Option<String>,
+    #[arg(long)]
+    pub label: Option<String>,
+    /// Open the result when done.
+    #[arg(long)]
+    pub open: bool,
+    /// List the export presets and exit.
+    #[arg(long)]
+    pub list_presets: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct MarkupArgs {
     #[arg(default_value = "latest")]
     pub source: String,
@@ -653,6 +687,41 @@ pub async fn run(cli: Cli) -> Result<()> {
                 println!("{}  ({} segments via {})", path.display(), t.segments.len(), t.provider);
             }
         }
+        Cmd::Edit(a) => {
+            if a.list_presets {
+                for p in bugle_engine::ExportPreset::ALL {
+                    if json {
+                        println!("{}", json!({"name": p.name(), "description": p.description()}));
+                    } else {
+                        println!("{:<10} {}", p.name(), p.description());
+                    }
+                }
+                return Ok(());
+            }
+            let req = bugle_engine::EditRequest {
+                source: a.source,
+                start: a.start.as_deref().map(bugle_engine::edit::parse_time).transpose()?,
+                end: a.end.as_deref().map(bugle_engine::edit::parse_time).transpose()?,
+                preset: a.preset.parse()?,
+                fps: a.fps,
+                max_size: a.max_size,
+                output: a.output,
+                label: a.label,
+            };
+            let media = tokio::task::spawn_blocking({
+                let e = engine.clone();
+                move || e.edit(&req)
+            })
+            .await??;
+            if a.open {
+                bugle_platform::open_path(&media.path);
+            }
+            if json {
+                println!("{}", json!({"media": media}));
+            } else {
+                println!("{}  [{}]  {:.1}s", media.path.display(), media.id, media.duration_seconds.unwrap_or(0.0));
+            }
+        }
         Cmd::Markup(a) => {
             if a.schema {
                 println!("{}", serde_json::to_string_pretty(&bugle_markup::schema_description())?);
@@ -929,6 +998,20 @@ mod tests {
             Cmd::Scroll(a) => assert_eq!(a.step, -8),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn edit_args_accept_negative_times() {
+        let cli = Cli::try_parse_from(["bugle", "edit", "abc", "--start", "1:05", "--end", "-2", "-p", "gif-small"]).unwrap();
+        match cli.cmd {
+            Cmd::Edit(a) => {
+                assert_eq!((a.source.as_str(), a.start.as_deref(), a.end.as_deref()), ("abc", Some("1:05"), Some("-2")));
+                assert_eq!(a.preset, "gif-small");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["bugle", "edit", "--list-presets"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Edit(EditArgs { list_presets: true, .. })));
     }
 
     #[test]
