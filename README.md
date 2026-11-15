@@ -41,7 +41,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | MCP server (stdio) | JSON-RPC 2.0, image content | ✅ |
 | Menu-bar app, global hotkeys | `bugle-app`: `NSStatusItem` via `tray-icon`, Carbon hotkeys via `global-hotkey`, in-app overlays | ✅ |
 | Sync to your own storage | folder copy/move, or SigV4 `PUT` to any S3-compatible bucket | ✅ |
-| Trim and export recordings (presets: lossless trim, H.264/HEVC, 1080p/720p/540p, GIF) | `AVAssetExportSession`, `AVAssetImageGenerator` → GIF, `AVAssetWriter` for GIF → MP4 | ✅ (headless: CLI/API) |
+| Trim and export recordings (presets: trim, H.264/HEVC, 1080p/720p/540p, frame rate, GIF) | `AVAssetExportSession` + video composition, `AVAssetImageGenerator` → GIF, `AVAssetWriter` for GIF → MP4 | ✅ (headless: CLI/API) |
 
 ## Build
 
@@ -86,10 +86,11 @@ bugle describe <video-id>          # samples 4 frames and describes the recordin
 bugle transcribe latest
 bugle subtitles latest -f vtt --provider whisper
 
-bugle edit latest --start 2.5 --end -1        # trim (lossless, audio kept)
+bugle edit latest --start 2.5 --end -1        # trim, audio kept (see note below)
 bugle edit latest -s 0:05 -e 0:12 -p 720p -o ~/Desktop/clip.mp4
+bugle edit latest -p high --fps 15            # re-encode at 15 fps
 bugle edit latest -p gif-small                # recording → chat-sized GIF
-bugle edit demo.gif -p high                   # GIF → H.264 .mp4
+bugle edit demo.gif -p hevc                   # GIF → HEVC .mp4
 bugle edit --list-presets
 
 bugle annotate latest --arrow 200,300,500,150 --box 100,100,400,200 \
@@ -108,6 +109,13 @@ bugle mcp                          # MCP over stdio                (alias: parke
 ```
 
 `latest` (or a media id prefix, or a file path) is accepted anywhere a source is.
+
+Trimming and privacy: `bugle edit` (preset `original`) copies the video without
+re-encoding only when the cut starts on a keyframe; otherwise it re-encodes, so
+nothing you trimmed off stays in the file. `-p lossless` always copies (faster,
+no quality loss) but keeps up to one keyframe interval of footage before the
+cut inside the file, hidden from players and recoverable with other tools; do
+not use it to remove something sensitive.
 Every command takes `--json`.
 
 ### Annotation documents

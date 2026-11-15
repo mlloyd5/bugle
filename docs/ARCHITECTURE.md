@@ -48,7 +48,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
 | `export_audio_m4a`, `export_mp4`, `export_mov`, `video_frame`, `media_duration` | `AVAssetExportSession`, `AVAssetImageGenerator` |
-| `export_video`, `video_size`, `VideoFrameReader`, `VideoFrameWriter` | `AVAssetExportSession` with `timeRange`/preset/`AVMutableVideoComposition` frame rate, one reusable `AVAssetImageGenerator`, `AVAssetWriter` + pixel-buffer adaptor (H.264) |
+| `export_video`, `video_info`, `video_sync_at`, `VideoFrameReader`, `VideoFrameWriter` | `AVAssetExportSession` with `timeRange`/preset, an `AVMutableVideoComposition` on every re-encode (`frameDuration` + `sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid` for a new frame rate), bounded wait + `cancelExport`; `AVSampleCursor` (stored samples, sync sample at a cut); one reusable `AVAssetImageGenerator`; `AVAssetWriter` + pixel-buffer adaptor (H.264 or HEVC) |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
 
 Window shadows: ScreenCaptureKit clips single-window screenshots to the window
@@ -106,17 +106,29 @@ recorder state machine, and exposes one method per user-facing action:
   screen's stale first-frame timestamp is clamped, and the last frame is
   re-appended at the stop time so the video track covers the whole recording.
 * `edit` (`edit.rs`) — trims a recording (`start`/`end` seconds, negative from
-  the end) and exports it with a preset. Video → video is one
-  `AVAssetExportSession` over the time range: `original` is passthrough (a
-  lossless trim, audio kept), `high`/`hevc` re-encode at the source size,
-  `1080p`/`720p`/`540p` fit a box (never upscaling), and an `fps` override
-  re-encodes through a video composition. Video → GIF decodes frames exactly
-  (zero tolerance, so the cut never bleeds to a keyframe outside it) at the
-  middle of each output frame interval and streams them into the GIF encoder.
-  GIF → GIF is a frame-exact cut (edge delays shortened) unless a rate is given;
-  GIF → video resamples to a constant rate for `AVAssetWriter`. Output is written
-  to a temp file beside the target and renamed, then added to history with the
-  source as `parent`.
+  the end, measured on the video track) and exports it with a preset. Video →
+  video is one `AVAssetExportSession` over the time range, audio kept.
+  `original` copies samples only when the cut starts on a sync sample (checked
+  with an `AVSampleCursor`); otherwise it re-encodes, because a copied cut
+  between keyframes keeps the frames back to the previous keyframe in the file
+  behind an edit list. `lossless` always copies and says so. Every re-encode
+  renders through a video composition, which stores only frames inside the
+  range (an export without one also starts at the earlier keyframe) and is how
+  `fps` resamples. `high`/`hevc` keep the source size, `1080p`/`720p`/`540p`
+  fit a box (never upscaling). Exports are cancelled after 120 s + 10 s per
+  second of output, and an engine runs at most two edits at once. Video → GIF
+  decodes frames exactly (zero tolerance, so the cut never bleeds to a keyframe
+  outside it) in the middle of each output frame interval, holding the last
+  frame if the track ends early. GIF sources are streamed twice (timeline, then
+  frames) under decoder size/allocation limits, never held whole: GIF → GIF is
+  a frame-exact cut (edge delays shortened) unless a rate is given; GIF → video
+  resamples to a constant rate for `AVAssetWriter` (HEVC for `hevc`). GIF delays
+  are written in centiseconds with the rounding error carried forward (minimum
+  2 cs), and the recorded duration is what was written. The `gif` preset uses
+  `recordings.gif_frame_rate` for video sources and keeps a GIF source's timing;
+  both are scaled to `gif_max_size`. Output is written to a temp file beside the
+  target (extension corrected to the container) and renamed, then added to
+  history, with the source as `parent` when it is a history item.
 * `ocr` (Apple Vision or an AI provider, per request or `[ocr] engine`), `describe` (images or sampled video frames), `transcribe`
   (extracts the audio track first), `subtitles`, `annotate`, `pin`, `select_area`.
 * `sync` (`sync.rs`) — runs after every successful save (`save_image`, so
