@@ -42,6 +42,8 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | Menu-bar app, global hotkeys | `bugle-app`: `NSStatusItem` via `tray-icon`, Carbon hotkeys via `global-hotkey`, in-app overlays | ✅ |
 | Sync to your own storage | folder copy/move, or SigV4 uploads (multipart for large files) to any S3-compatible bucket; a destination per media kind; subtitles follow their video | ✅ |
 | Trim and export recordings (presets: trim, H.264/HEVC, 1080p/720p/540p, frame rate, GIF) | `AVAssetExportSession` + video composition, `AVAssetImageGenerator` → GIF, `AVAssetWriter` for GIF → MP4 | ✅ (headless: CLI/API) |
+| `Bugle.app` bundle | `cargo xtask bundle` (hardened runtime, ad-hoc or Developer ID) | ✅ ad-hoc; Developer ID signing and notarization not yet exercised |
+| Open at Login | `SMAppService.mainAppService` | built, status read verified; registering not yet exercised |
 
 ## Build
 
@@ -53,6 +55,89 @@ The binaries are `target/release/bugle` (CLI + servers) and `target/release/bugl
 (menu-bar app). The platform crate compiles a small
 Objective-C shim (`crates/bugle-platform/shim/shim.m`) with the Xcode command
 line tools; no Xcode project is needed.
+
+### App bundle
+
+```bash
+cargo xtask bundle                 # → dist/Bugle.app, ad-hoc signed
+cargo xtask bundle --zip           # also dist/Bugle-<version>.zip
+cargo xtask verify --smoke-test    # re-check a bundle and launch it briefly
+```
+
+`bundle` builds the release binaries (taking their paths from cargo, so a custom
+target directory works) and assembles the bundle in `dist/.staging`: an
+`Info.plist` with the workspace version, `LSUIElement` (menu-bar only, no Dock
+icon) and the microphone usage string; `Bugle.icns`, rendered from the menu-bar
+glyph; `Contents/MacOS/bugle-app` and the `bugle` CLI next to it. Both
+executables are signed with the hardened runtime and
+[`packaging/Bugle.entitlements`](packaging/Bugle.entitlements) (microphone only;
+the app is not sandboxed), then checked with `plutil -lint` (Info.plist and the
+entitlements embedded in each signature), `codesign --verify --deep --strict`,
+`iconutil` and `--version`. Only a bundle that passes replaces `dist/Bugle.app`.
+
+The binaries are built for the host architecture only (arm64 on Apple silicon,
+x86_64 on Intel); the bundle does not launch on the other kind of Mac.
+
+When Bugle.app is launched from Finder, the Dock, `open` or as a login item,
+the Screen Recording, Microphone and Accessibility prompts and System Settings
+name **Bugle** rather than the terminal (running
+`Bugle.app/Contents/MacOS/bugle-app` from a shell still attributes permissions
+to the terminal). The menu also gains **Open at Login**. Register it from the
+installed copy (for example in `/Applications`), not from `dist/`: the login
+item points at the bundle's location, so moving the bundle or rebuilding it in
+`dist/` leaves a stale entry; turn it off first, or remove the entry in System
+Settings → General → Login Items.
+
+To use the CLI from the bundle, link it into a directory on your `PATH` (no
+`sudo`; add `~/.local/bin` to `PATH` in your shell profile if it is not there):
+
+```bash
+mkdir -p ~/.local/bin
+ln -sf /Applications/Bugle.app/Contents/MacOS/bugle ~/.local/bin/bugle
+```
+
+| Option | Environment | Default |
+|---|---|---|
+| `--sign IDENTITY` | `BUGLE_SIGN_IDENTITY` | `-` (ad-hoc) |
+| `--bundle-id ID` | `BUGLE_BUNDLE_ID` | `bundle_id` under `[workspace.metadata.bugle]` in the root `Cargo.toml` (the CLI is signed as `<id>.cli`) |
+| `--build-number N` | `BUGLE_BUILD_NUMBER` | the workspace version |
+| `--out DIR` | — | `dist/` |
+
+The default bundle id is provisional until the project's final domain is
+chosen; it is defined only in `Cargo.toml`. macOS keys permission grants and the
+login item to the bundle id, so changing it after installing a build resets
+those: grant the permissions again and re-enable Open at Login.
+
+An ad-hoc signature is enough to run the bundle on the machine that built it.
+macOS identifies an ad-hoc signed app by the hash of its code, so after a
+rebuild the old grant may still be listed (even switched on) in System Settings
+while capture is denied. Reset the entries and grant them again:
+
+```bash
+tccutil reset ScreenCapture <bundle id>
+tccutil reset Microphone <bundle id>
+tccutil reset Accessibility <bundle id>
+```
+
+To distribute the bundle, sign it with a Developer ID Application identity from
+your keychain (`security find-identity -v -p codesigning` lists them) and
+notarize it:
+
+```bash
+# once: store notary credentials in the keychain (prompts for the password)
+xcrun notarytool store-credentials bugle-notary --apple-id you@example.com --team-id TEAMID
+BUGLE_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
+BUGLE_NOTARY_PROFILE=bugle-notary cargo xtask bundle --notarize
+```
+
+`--notarize` zips the staged bundle under a temporary name, submits it with
+`xcrun notarytool submit --wait`, staples the ticket, checks it with
+`spctl --assess` and only then writes `dist/Bugle-<version>.zip`. Instead of a
+keychain profile it accepts an App Store Connect API key: `BUGLE_NOTARY_KEY`
+(path to the `.p8` file), `BUGLE_NOTARY_KEY_ID` and `BUGLE_NOTARY_ISSUER`. No
+secret is passed on the command line, and identifiers are masked in the log.
+`--notarize` fails before building when the identity is ad-hoc or the
+credentials are missing or incomplete; any failing step fails the run.
 
 ## Permissions
 
@@ -160,7 +245,7 @@ Menu: Capture Area · Capture Window · Capture Screen ·
 Scrolling Capture · Record Video · Record GIF · Stop Recording · OCR Latest
 (copies the text) · Pin Latest · Recent Captures (last five, click to open) ·
 Open History Folder · Start/Stop Agent API · Preferences… (opens the config
-file) · Quit. While recording, the status item shows `● m:ss`. Other actions
+file) · Open at Login (only when running from `Bugle.app`) · Quit. While recording, the status item shows `● m:ss`. Other actions
 report through a small toast in the top-right corner (thumbnail and file name;
 click to open).
 
@@ -222,7 +307,8 @@ from the menu uses `[api]` from the config and serves the in-app overlay for
 `select_area`, `pin` and interactive captures — no helper processes.
 
 Screen Recording permission is requested on first launch (granted to the
-terminal or app that launched `bugle-app` when run from a shell).
+terminal or app that launched `bugle-app` when run from a shell, or to Bugle
+itself when run from [the app bundle](#app-bundle)).
 
 ## Configuration
 
@@ -338,7 +424,7 @@ look at what it took.
 
 ## Architecture
 
-Eight crates; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the details.
+Eight crates plus an `xtask` for packaging; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the details.
 
 ```
 bugle-core      types, config, naming, history (no OS calls)
@@ -350,6 +436,7 @@ bugle-engine    Engine: capture, scroll stitch, record, annotate, OCR, AI action
 bugle-api       action catalog → HTTP (axum) and MCP (stdio)
 bugle-cli       the `bugle` binary
 bugle-app       the `bugle-app` menu-bar binary: status item, hotkeys, toasts
+xtask           `cargo xtask bundle`: assemble, sign and verify Bugle.app
 ```
 
 ## Why "Bugle"?

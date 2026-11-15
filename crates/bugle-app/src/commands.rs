@@ -37,6 +37,10 @@ pub enum Slot {
     Separator,
     /// The *Recent Captures* submenu, filled at run time; not bindable.
     Recent,
+    /// The *Open at Login* check item (`login::LoginMenu`): present only
+    /// when running from Bugle.app, with its state read from macOS; not
+    /// bindable.
+    OpenAtLogin,
 }
 
 const fn item(name: &'static str, label: &'static str, command: Command) -> Slot {
@@ -62,6 +66,7 @@ pub const MENU: &[Slot] = &[
     Slot::Separator,
     item("toggle_api", "Start Agent API", Command::ToggleApi),
     item("preferences", "Preferences…", Command::Preferences),
+    Slot::OpenAtLogin,
     Slot::Separator,
     Slot::Item(Entry { name: "quit", label: "Quit Bugle", command: Command::Quit, menu_key: Some("cmd+q") }),
 ];

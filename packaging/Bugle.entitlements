@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for Bugle.app and the embedded `bugle` CLI, both signed with the
+  hardened runtime. The app is not sandboxed: it writes to any configured
+  save/sync folder, spawns /usr/sbin/screencapture and posts scroll events.
+
+  * audio-input: the hardened runtime blocks microphone access without it
+    (recordings with `microphone = true`).
+
+  Screen Recording and Accessibility are TCC permissions granted by the user;
+  they need no entitlement.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>

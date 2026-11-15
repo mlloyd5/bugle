@@ -9,14 +9,21 @@ members = [
     "crates/bugle-api",
     "crates/bugle-cli",
     "crates/bugle-app",
+    "xtask",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/mlloyd/bugle"
+repository = "https://github.com/mlloyd5/bugle"
 authors = ["Max Lloyd"]
+
+# Bugle.app's CFBundleIdentifier, read by `cargo xtask bundle` (the embedded
+# CLI is signed as "<bundle_id>.cli"). Provisional: changing it after people
+# have installed a build resets their macOS permission grants and login item.
+[workspace.metadata.bugle]
+bundle_id = "io.github.mlloyd5.bugle"
 
 [workspace.dependencies]
 bugle-core = { path = "crates/bugle-core" }

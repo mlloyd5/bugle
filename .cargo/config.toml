@@ -1,0 +1,3 @@
+[alias]
+# Build tasks live in the `xtask` crate: `cargo xtask bundle --help`.
+xtask = "run --quiet --package xtask --"

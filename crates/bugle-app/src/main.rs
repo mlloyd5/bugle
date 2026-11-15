@@ -8,6 +8,7 @@
 
 mod commands;
 mod icon;
+mod login;
 mod picker;
 mod quick_access;
 mod quick_panel;
@@ -364,6 +365,7 @@ struct MenuItems {
     stop: MenuItem,
     recent: Submenu,
     api: MenuItem,
+    login: Option<login::LoginMenu>,
 }
 
 /// Build the status menu from [`commands::MENU`]. `keys` maps entry names to
@@ -371,11 +373,17 @@ struct MenuItems {
 fn build_menu(config: &Config, keys: &HashMap<&'static str, String>) -> Result<MenuItems> {
     let menu = Menu::new();
     let recent = Submenu::with_id("recent", "Recent Captures", true);
+    let login = login::LoginMenu::new();
     let mut by_name: HashMap<&'static str, MenuItem> = HashMap::new();
     for slot in commands::MENU {
         match slot {
             Slot::Separator => menu.append(&PredefinedMenuItem::separator())?,
             Slot::Recent => menu.append(&recent)?,
+            Slot::OpenAtLogin => {
+                if let Some(l) = &login {
+                    menu.append(&l.item)?;
+                }
+            }
             Slot::Item(e) => {
                 let key = keys.get(e.name).map(String::as_str).or(e.menu_key);
                 let item = MenuItem::with_id(e.name, e.label, true, key.and_then(|k| k.parse::<Accelerator>().ok()));
@@ -392,6 +400,7 @@ fn build_menu(config: &Config, keys: &HashMap<&'static str, String>) -> Result<M
         api: take("toggle_api")?,
         menu,
         recent,
+        login,
     };
     take("sync_latest")?.set_enabled(config.sync.has_destination());
     items.stop.set_enabled(false);
@@ -459,9 +468,21 @@ impl App {
             bugle_platform::open_path(std::path::Path::new(path));
             return;
         }
+        if id == login::MENU_ID {
+            return self.toggle_login();
+        }
         match commands::find(id) {
             Some(e) => self.run_command(e.command, control_flow),
             None => tracing::warn!("unknown menu item {id}"),
+        }
+    }
+
+    /// *Open at Login* was clicked (not a [`Command`]: it has no hotkey).
+    fn toggle_login(&mut self) {
+        match self.items.login.as_mut().map(login::LoginMenu::toggle) {
+            Some(Ok(Some(msg))) => self.toast_error(&msg),
+            Some(Err(e)) => self.toast_error(&format!("Open at Login: {e:#}")),
+            _ => {}
         }
     }
 
@@ -623,6 +644,9 @@ impl App {
         self.last_tick = Instant::now();
         self.update_recording_ui();
         self.refresh_recent();
+        if let Some(l) = self.items.login.as_mut() {
+            l.refresh();
+        }
     }
 }
 

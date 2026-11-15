@@ -1,6 +1,6 @@
 # Architecture
 
-Bugle is a Rust workspace of eight crates, split by subsystem so every feature has
+Bugle is a Rust workspace of eight crates (plus `xtask` for packaging), split by subsystem so every feature has
 an obvious home.
 
 ```
@@ -54,6 +54,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `mix_audio_tracks`, `audio_track_count`, `video_track_count` | `AVAssetReaderAudioMixOutput` (+ `AVMutableAudioMix` levels) → `AVAssetWriter` (AAC), video samples copied on their own timescale |
 | `export_video`, `video_info`, `video_sync_at`, `VideoFrameReader`, `VideoFrameWriter` | `AVAssetExportSession` with `timeRange`/preset, an `AVMutableVideoComposition` on every re-encode (`frameDuration` + `sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid` for a new frame rate), bounded wait + `cancelExport`; `AVSampleCursor` (stored samples, sync sample at a cut); one reusable `AVAssetImageGenerator`; `AVAssetWriter` + pixel-buffer adaptor (H.264 or HEVC) |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
+| `login_item::{in_app_bundle, status, set_enabled}` | `SMAppService.mainAppService` (`shim/login_item.m`, ServiceManagement) |
 
 Window shadows: ScreenCaptureKit clips single-window screenshots to the window
 bounds, so the shadow path uses `CGWindowListCreateImage` (deprecated but
@@ -213,6 +214,48 @@ the overlay calls back. The agent API can be started from the menu on a tokio
 runtime thread (`http::serve_with_shutdown`) and shares the same `Engine`, so API
 callers get the in-app overlay too. Feedback is a transient toast (`toast_show`)
 plus the shutter sound; the status item title shows `● m:ss` while recording.
+When the process runs from `Bugle.app`, an *Open at Login* check item
+(`login.rs`) registers the bundle with `SMAppService`. Its check mark is
+re-read on the periodic tick (every 5 s) and set only for an enabled item; a
+pending approval is shown in the title, and clicking it then opens System
+Settings → Login Items.
+
+The status-bar glyph is a signed distance field (`icon/glyph.rs`) that scales
+its stroke widths with the render size, so the same drawing serves the 36 px
+template image and the application icon.
+
+### `xtask` (packaging)
+`cargo xtask bundle` (alias in `.cargo/config.toml`) builds `bugle-app` and
+`bugle` in release mode, taking the executable paths from
+`cargo build --message-format=json` and the target directory from
+`cargo metadata`, and assembles the bundle in `dist/.staging`. The bundle id
+is read from `[workspace.metadata.bugle] bundle_id` in the root `Cargo.toml`
+(its only definition; `--bundle-id` overrides it and is validated):
+
+```
+Bugle.app/Contents/
+  Info.plist          generated (plist.rs): bundle id, workspace version, LSUIElement,
+                      NSMicrophoneUsageDescription (Screen Recording and
+                      Accessibility have no usage key)
+  PkgInfo
+  MacOS/bugle-app     CFBundleExecutable
+  MacOS/bugle         the CLI, signed as <bundle id>.cli
+  Resources/Bugle.icns  icns.rs: glyph.rs (included by path) on a gradient square,
+                        rendered per size and written as PNG elements, reproducibly
+```
+
+Signing is inside-out (CLI, then the bundle) with `--options runtime` and
+`packaging/Bugle.entitlements` (`device.audio-input`, which the hardened runtime
+requires for the microphone); ad-hoc by default, a Developer ID identity from
+`--sign`/`BUGLE_SIGN_IDENTITY` adds a secure timestamp. Verification runs
+`plutil -lint` on Info.plist, `codesign --verify --deep --strict`, checks the
+runtime flag and lints the entitlements embedded in both signatures (app and
+CLI), round-trips the icon through `iconutil` and runs both binaries with
+`--version`. `--notarize` needs a Developer ID identity and a keychain profile
+or an App Store Connect API key file (never a password in argv) and fails up
+front without them; it submits a temporary `ditto` zip to `notarytool`,
+staples, and requires `spctl --assess` to pass. Only then is the staged bundle
+renamed over `dist/Bugle.app` and the final zip written.
 
 After a capture the app shows the quick-access panel instead of the toast
 (`[quick_access]`, on by default). `quick_access.rs` is the platform-free part:
@@ -243,5 +286,7 @@ earn its keep.
   captures arrive in a row.
 * **Window picker extras** — Space to switch to area selection, a picker for
   window recordings, and offering the picker to API callers through `UiHost`.
-* **Packaging** — a signed `.app` bundle so notifications, Login Items and the
-  permission prompts carry Bugle's own name.
+* **Packaging extras** — a universal (arm64 + x86_64) build (bundles are
+  host-architecture only today), a DMG, the final bundle id, and system
+  notifications (`UNUserNotificationCenter`) alongside the toast now that the
+  bundle gives them Bugle's name.
