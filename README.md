@@ -150,8 +150,13 @@ action a small toast in the top-right corner shows a thumbnail and the file
 name; clicking it opens the file.
 
 *Capture Window* dims the screen slightly and highlights the window under the
-pointer with its app, title and size; click to capture it, Esc or a right click
-to cancel (the picker also closes itself after 30 seconds). Set
+pointer with its app, title and size; click to capture it. Esc, a right click
+or switching to another app cancels, and the picker closes itself after 30
+seconds. Esc only reaches the picker while Bugle is the active app; if it ever
+seems ignored, a right click always works. Only ordinary windows are pickable:
+invisible windows are skipped, and floating panels or always-on-top windows
+above the normal window layer are neither picked nor block the window under
+them. Set
 `[screenshots] window_picker = false` to capture the front-most window at once
 instead, as `bugle capture window` and the API do.
 
@@ -170,9 +175,11 @@ digits, `F1`…`F24`, `space`, …). Defaults:
 | `stop_recording`, `sync_latest`, `open_folder`, `toggle_api`, `preferences`, `quit` | — | unbound until set |
 
 Every menu item except *Recent Captures* can be bound; the keys are the names
-above. An empty string unbinds an action. Unknown keys, bindings that do not
-parse, a combination already used by another item, and bindings macOS refuses
-are skipped with a warning in the log and one toast at launch. ⌘⇧3/4/5 are also the system screenshot
+above. An empty string unbinds an action. Unknown keys, values that are not
+strings (for any key, including the defaults above, which are then left
+unbound), bindings that do not parse, a combination already used by another
+item, and bindings macOS refuses are skipped with a warning in the log and one
+toast at launch; the config still loads. ⌘⇧3/4/5 are also the system screenshot
 shortcuts; disable those in System Settings → Keyboard → Keyboard Shortcuts →
 Screenshots (or pick other keys) so they do not fire twice. The agent API started
 from the menu uses `[api]` from the config and serves the in-app overlay for

@@ -103,9 +103,9 @@ pub struct Binding {
 }
 
 /// Resolve `(name, binding)` pairs against [`MENU`]. Unknown names, bindings
-/// that do not parse, a second binding for the same item, and a key
-/// combination already taken by an earlier item are skipped with a warning;
-/// the first one wins.
+/// that do not parse, and a key combination already taken by an earlier item
+/// are skipped with a warning; the first one wins. (A name cannot appear
+/// twice: TOML rejects duplicate keys.)
 pub fn plan(pairs: &[(String, String)]) -> (Vec<Binding>, Vec<String>) {
     let mut out: Vec<Binding> = Vec::new();
     let mut warnings = Vec::new();
@@ -116,10 +116,6 @@ pub fn plan(pairs: &[(String, String)]) -> (Vec<Binding>, Vec<String>) {
             warnings.push(format!("[hotkeys] unknown key `{name}` (known: {})", known.join(", ")));
             continue;
         };
-        if out.iter().any(|b| std::ptr::eq(b.entry, entry)) {
-            warnings.push(format!("[hotkeys] {name} is bound more than once; keeping the first"));
-            continue;
-        }
         let hotkey = match combo.parse::<HotKey>() {
             Ok(h) => h,
             Err(e) => {
@@ -209,17 +205,34 @@ mod tests {
             ("capture_everything", "cmd+shift+9"), // unknown name
             ("ocr_latest", "cmd+shift+nope"),      // does not parse
             ("pin_latest", "shift+cmd+4"),         // same combo as capture_area
-            ("capture_area", "cmd+shift+7"),       // second binding for an item
             ("quit", "ctrl+alt+q"),
         ]));
         let names: Vec<&str> = b.iter().map(|b| b.entry.name).collect();
         assert_eq!(names, ["capture_area", "quit"]);
         assert_eq!(b[0].combo, "cmd+shift+4");
-        assert_eq!(w.len(), 4, "{w:#?}");
+        assert_eq!(w.len(), 3, "{w:#?}");
         assert!(w[0].contains("unknown key `capture_everything`"));
         assert!(w[1].contains("ocr_latest"));
         assert!(w[2].contains("already bound to capture_area"));
-        assert!(w[3].contains("more than once"));
+    }
+
+    #[test]
+    fn non_string_named_keys_warn_instead_of_failing_the_load() {
+        let toml = "[hotkeys]\ncapture_area = 5\nrecord = [\"cmd+shift+5\"]\nocr_latest = \"ctrl+alt+o\"\n";
+        let cfg: Config = toml::from_str(toml).expect("config still loads");
+        let h = &cfg.hotkeys;
+        assert_eq!(h.capture_area, None, "a bad value unbinds rather than keeping the default");
+        assert_eq!(h.record, None);
+        assert_eq!(h.ocr_latest.as_deref(), Some("ctrl+alt+o"));
+        assert_eq!(h.capture_screen.as_deref(), Some("cmd+shift+3"), "missing keys keep defaults");
+        let (pairs, w) = config_pairs(h);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w.iter().any(|w| w.contains("capture_area")) && w.iter().any(|w| w.contains("record")));
+        assert!(!pairs.iter().any(|(n, _)| n == "capture_area" || n == "record"));
+        // Saving and reloading keeps the bad value where the user put it.
+        let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.hotkeys.extra.get("capture_area").and_then(|v| v.as_integer()), Some(5));
+        assert_eq!(back.hotkeys.capture_area, None);
     }
 
     #[test]

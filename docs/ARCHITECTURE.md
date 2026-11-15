@@ -142,10 +142,14 @@ skipped. Menu and hotkey events are forwarded to the loop as user events.
 *Capture Window* opens the window picker (`picker.rs`): the main thread snapshots
 the on-screen window list, shows the shim's overlay and, on every pointer move,
 asks `window_at` — a pure function over the z-ordered list that skips Bugle's
-own windows, non-zero layers, off-screen and sub-50-point windows — which window
-to highlight. A click captures that window by id; Esc, a right click or the
-30-second timeout cancel. `[screenshots] window_picker = false` restores the
-immediate front-most capture, which the CLI and API always use.
+own windows, non-zero layers, fully transparent (alpha 0), off-screen and
+sub-50-point windows — which window to highlight. A click captures that window
+by id after a 150 ms settle; Esc, a right click, Bugle losing active status (Esc
+only arrives while it is active) or the 30-second timeout cancel. A request the
+main thread reaches more than 3 s late is refused, and every refusal reaches
+the worker with its reason. The picker and the area selection refuse to open
+over each other. `[screenshots] window_picker = false` restores the immediate
+front-most capture, which the CLI and API always use.
 Engine actions run on one worker thread so the menu never blocks; when an action
 needs the crosshair overlay or a pin window, the engine's `UiHost` (implemented
 here) sends a request to the main thread and blocks the worker on a channel until

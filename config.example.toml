@@ -57,7 +57,8 @@ cors = false
 # Global hotkeys for the menu-bar app (`bugle-app`). "mod+mod+key"; modifiers
 # cmd, shift, alt/option, ctrl; keys: letters, digits, F1..F24, space, enter…
 # An empty string unbinds the action. Every menu item can be bound; unknown
-# keys and clashing or unparsable bindings are skipped with a warning.
+# keys, non-string values and clashing or unparsable bindings are skipped with
+# a warning (the config still loads).
 [hotkeys]
 capture_area = "cmd+shift+4"
 capture_screen = "cmd+shift+3"
