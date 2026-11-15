@@ -49,6 +49,10 @@ pub struct ScreenshotConfig {
     pub window_shadow: bool,
     /// Scale captures down to 1x (points) instead of keeping Retina pixels.
     pub downscale_retina: bool,
+    /// `bugle-app` *Capture Window*: hover to highlight a window and click it.
+    /// `false` captures the front-most window at once (the CLI and API always
+    /// do, unless given an id, title or owner).
+    pub window_picker: bool,
 }
 
 /// Which recorder produces video (mp4/mov) recordings.
@@ -204,6 +208,7 @@ impl Default for ScreenshotConfig {
             jpeg_quality: 90,
             window_shadow: true,
             downscale_retina: false,
+            window_picker: true,
         }
     }
 }
@@ -271,6 +276,12 @@ pub struct HotkeyConfig {
     pub ocr_latest: Option<String>,
     /// Pin the latest capture to the screen.
     pub pin_latest: Option<String>,
+    /// Bindings for the other menu items (`stop_recording`, `sync_latest`,
+    /// `open_folder`, `toggle_api`, `preferences`, `quit`). `bugle-app` owns
+    /// the list of valid names and warns about unknown keys and non-string
+    /// values instead of failing to load.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, toml::Value>,
 }
 
 impl Default for HotkeyConfig {
@@ -284,6 +295,7 @@ impl Default for HotkeyConfig {
             record_gif: None,
             ocr_latest: Some("cmd+shift+2".into()),
             pin_latest: Some("cmd+shift+p".into()),
+            extra: BTreeMap::new(),
         }
     }
 }
