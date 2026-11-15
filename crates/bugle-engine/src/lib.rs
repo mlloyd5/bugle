@@ -5,6 +5,7 @@
 //! milliseconds; async front ends wrap them in `spawn_blocking`.
 
 pub mod capture;
+pub mod edit;
 pub mod record;
 pub mod scroll;
 pub mod stitch;
@@ -24,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub use capture::CaptureOutcome;
+pub use edit::{EditRequest, ExportPreset};
 pub use record::RecorderState;
 pub use sync::SyncReport;
 
@@ -50,6 +52,7 @@ pub struct Engine {
     /// helper-process fallback when `main_thread_ui` is false.
     pub ui_host: Option<Arc<dyn UiHost>>,
     renderer: Mutex<Option<Renderer>>,
+    edit_slots: edit::EditSlots,
 }
 
 impl Engine {
@@ -63,7 +66,7 @@ impl Engine {
         for w in config.sync.warnings() {
             tracing::warn!("{w}");
         }
-        Ok(Self { config, history, ai, recorder_state: RecorderState::default(), main_thread_ui, ui_host: None, renderer: Mutex::new(None) })
+        Ok(Self { config, history, ai, recorder_state: RecorderState::default(), main_thread_ui, ui_host: None, renderer: Mutex::new(None), edit_slots: Default::default() })
     }
 
     pub fn from_default_config(main_thread_ui: bool) -> Result<Self> {

@@ -105,6 +105,32 @@ char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double sec
                                 double delay, int32_t video);
 double bugle_media_duration(const char *path);
 bugle_image_t bugle_video_frame(const char *path, double seconds);
+
+// Editing. `bugle_export_video` exports [start, end) seconds of a movie with an
+// AVAssetExportSession preset (0 passthrough, 1 highest quality H.264, 2 HEVC,
+// 3 1920x1080, 4 1280x720, 5 960x540) to .mp4 (`mp4` != 0) or .mov; `fps` > 0
+// resamples through a video composition (refused with passthrough). Waits at
+// most `timeout` seconds (<= 0: no limit), then cancels the export. The frame
+// reader decodes frames at arbitrary times (`tolerance` seconds either side);
+// the frame writer encodes RGBA frames (even sizes) to H.264 or HEVC at a
+// fixed rate.
+typedef struct {
+    int32_t width, height;      // display size (pixels, after rotation)
+    double nominal_fps;
+    double start, duration;     // video track's time range, seconds
+    int64_t stored_samples;     // samples in the media (incl. edit-list-hidden ones); -1 unknown
+} bugle_video_info_t;
+int32_t bugle_video_info(const char *path, bugle_video_info_t *out);
+int32_t bugle_video_sync_at(const char *path, double seconds);   // 1 when a cut there needs no re-encode
+int32_t bugle_export_video(const char *in_path, const char *out_path, double start, double end, int32_t preset,
+                           int32_t mp4, int32_t fps, double timeout);
+void *bugle_frames_open(const char *path, double tolerance);
+bugle_image_t bugle_frames_at(void *handle, double seconds);
+void bugle_frames_close(void *handle);
+void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int32_t mp4, int32_t hevc);
+int32_t bugle_writer_append(void *handle, const uint8_t *rgba, size_t len, int32_t w, int32_t h);
+int32_t bugle_writer_finish(void *handle, double timeout);   // finalises and releases the handle
+void bugle_writer_cancel(void *handle);      // discards the file and releases the handle
 void bugle_play_sound(const char *name);
 void bugle_open_path(const char *path);
 

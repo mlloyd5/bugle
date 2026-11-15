@@ -41,7 +41,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | MCP server (stdio) | JSON-RPC 2.0, image content | ✅ |
 | Menu-bar app, global hotkeys | `bugle-app`: `NSStatusItem` via `tray-icon`, Carbon hotkeys via `global-hotkey`, in-app overlays | ✅ |
 | Sync to your own storage | folder copy/move, or SigV4 uploads (multipart for large files) to any S3-compatible bucket; a destination per media kind; subtitles follow their video | ✅ |
-| Post-capture video editor | — | see [feature ideas](docs/ARCHITECTURE.md#feature-ideas) |
+| Trim and export recordings (presets: trim, H.264/HEVC, 1080p/720p/540p, frame rate, GIF) | `AVAssetExportSession` + video composition, `AVAssetImageGenerator` → GIF, `AVAssetWriter` for GIF → MP4 | ✅ (headless: CLI/API) |
 
 ## Build
 
@@ -87,6 +87,13 @@ bugle describe <video-id>          # samples 4 frames and describes the recordin
 bugle transcribe latest
 bugle subtitles latest -f vtt --provider whisper
 
+bugle edit latest --start 2.5 --end -1        # trim, audio kept (see note below)
+bugle edit latest -s 0:05 -e 0:12 -p 720p -o ~/Desktop/clip.mp4
+bugle edit latest -p high --fps 15            # re-encode at 15 fps
+bugle edit latest -p gif-small                # recording → chat-sized GIF
+bugle edit demo.gif -p hevc                   # GIF → HEVC .mp4
+bugle edit --list-presets
+
 bugle annotate latest --arrow 200,300,500,150 --box 100,100,400,200 \
     --text "120,60:Look here" --counter 150,400 --redact 600,500,300,100 \
     --canvas sunset --padding 60 --open
@@ -103,6 +110,13 @@ bugle mcp                          # MCP over stdio                (alias: parke
 ```
 
 `latest` (or a media id prefix, or a file path) is accepted anywhere a source is.
+
+Trimming and privacy: `bugle edit` (preset `original`) copies the video without
+re-encoding only when the cut starts on a keyframe; otherwise it re-encodes, so
+nothing you trimmed off stays in the file. `-p lossless` always copies (faster,
+no quality loss) but keeps up to one keyframe interval of footage before the
+cut inside the file, hidden from players and recoverable with other tools; do
+not use it to remove something sensitive.
 Every command takes `--json`.
 
 ### Annotation documents
@@ -296,9 +310,9 @@ curl -H 'Authorization: Bearer secret' -H 'content-type: application/json' \
      -d '{"target":{"kind":"window","owner":"Safari"}}' http://127.0.0.1:4848/v1/capture
 ```
 
-Both transports expose the same 23 tools (`capture`, `list_windows`, `ocr`,
+Both transports expose the same 24 tools (`capture`, `list_windows`, `ocr`,
 `describe`, `annotate`, `scroll_capture`, `record_start/stop/status`, `transcribe`,
-`subtitles`, `history`, `pin`, `sync`, …). `capture` returns the PNG inline so an agent can
+`subtitles`, `edit_video`, `history`, `pin`, `sync`, …). `capture` returns the PNG inline so an agent can
 look at what it took.
 
 ## Architecture

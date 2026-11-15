@@ -65,6 +65,7 @@ pub fn router_for_bind(engine: Arc<Engine>, token: Option<String>, cors: bool, l
         .route("/v1/transcribe", post(|s, j| action_post(s, Path("transcribe".into()), j)))
         .route("/v1/subtitles", post(|s, j| action_post(s, Path("subtitles".into()), j)))
         .route("/v1/complete", post(|s, j| action_post(s, Path("complete".into()), j)))
+        .route("/v1/edit", post(|s, j| action_post(s, Path("edit_video".into()), j)))
         .route("/v1/record/start", post(|s, j| action_post(s, Path("record_start".into()), j)))
         .route("/v1/record/stop", post(|s| action_post(s, Path("record_stop".into()), Ok(Json(json!({}))))))
         .route("/v1/record/status", get(|s| action_get(s, "record_status")))
@@ -477,6 +478,33 @@ mod tests {
             assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{uri}");
             envelope(&body);
         }
+    }
+
+    #[tokio::test]
+    async fn edit_alias_trims_a_recording() {
+        let f = fixture();
+        let app = router(f.engine.clone(), None, false);
+        let src = f.tmp.path().join("in.gif");
+        crate::actions::tests::fixture_gif(&src);
+        let post = |body: Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/edit")
+                .header(header::HOST, "127.0.0.1")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let (status, _, body) = send(&app, post(json!({"source": src, "end": 0.3, "preset": "gif-small"}))).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["media"]["kind"], "gif");
+        assert_eq!(v["media"]["duration_seconds"], 0.3);
+        assert!(std::path::Path::new(v["media"]["path"].as_str().unwrap()).exists());
+        let (status, _, body) = send(&app, post(json!({"source": src, "preset": "4k"}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        envelope(&body);
     }
 
     #[tokio::test]

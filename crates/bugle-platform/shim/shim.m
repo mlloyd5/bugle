@@ -1226,6 +1226,353 @@ bugle_image_t bugle_video_frame(const char *path, double seconds) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Editing: trimmed / re-encoded export, frame reader, frame writer
+// ---------------------------------------------------------------------------
+
+static AVAssetTrack *first_video_track(AVAsset *asset) {
+    return [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+}
+
+static AVURLAsset *precise_asset(const char *path) {
+    return [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:path]]
+                               options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
+}
+
+/// Wait for `sem` at most `timeout` seconds (<= 0: forever). YES when signalled.
+static BOOL wait_bounded(dispatch_semaphore_t sem, double timeout) {
+    dispatch_time_t t = timeout > 0 ? dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)) : DISPATCH_TIME_FOREVER;
+    return dispatch_semaphore_wait(sem, t) == 0;
+}
+
+/// Media time of the sample shown at track time `t` (edit lists map the
+/// track timeline onto the media; plain files map 1:1).
+static CMTime media_time_for(AVAssetTrack *track, CMTime t) {
+    AVAssetTrackSegment *seg = [track segmentForTrackTime:t];
+    if (!seg || seg.isEmpty) return t;
+    CMTimeMapping m = seg.timeMapping;
+    return CMTimeAdd(m.source.start, CMTimeSubtract(t, m.target.start));
+}
+
+int32_t bugle_video_info(const char *path, bugle_video_info_t *out) {
+    @autoreleasepool {
+        clear_error();
+        if (!path || !out) { set_error(@"video info: NULL argument"); return -1; }
+        memset(out, 0, sizeof(*out));
+        AVURLAsset *asset = precise_asset(path);
+        AVAssetTrack *track = first_video_track(asset);
+        if (!track) { set_error(@"%s has no video track", path); return -1; }
+        CGSize s = CGSizeApplyAffineTransform(track.naturalSize, track.preferredTransform);
+        out->width = (int32_t)llround(fabs(s.width));
+        out->height = (int32_t)llround(fabs(s.height));
+        out->nominal_fps = track.nominalFrameRate;
+        out->start = CMTimeGetSeconds(track.timeRange.start);
+        out->duration = CMTimeGetSeconds(track.timeRange.duration);
+        // Every sample stored in the media, including any an edit list hides.
+        out->stored_samples = -1;
+        if (track.canProvideSampleCursors) {
+            AVSampleCursor *c = [track makeSampleCursorAtFirstSampleInDecodeOrder];
+            if (c) {
+                int64_t n = 1;
+                while ([c stepInDecodeOrderByCount:1] == 1) n++;
+                out->stored_samples = n;
+            }
+        }
+        return 0;
+    }
+}
+
+int32_t bugle_video_sync_at(const char *path, double seconds) {
+    @autoreleasepool {
+        clear_error();
+        if (!path || !isfinite(seconds)) { set_error(@"sync check: invalid argument"); return -1; }
+        AVURLAsset *asset = precise_asset(path);
+        AVAssetTrack *track = first_video_track(asset);
+        if (!track) { set_error(@"%s has no video track", path); return -1; }
+        if (!track.canProvideSampleCursors) return 0;
+        CMTime t = CMTimeMakeWithSeconds(seconds, 60000);
+        CMTime mt = media_time_for(track, t);
+        AVSampleCursor *c = [track makeSampleCursorWithPresentationTimeStamp:mt];
+        if (!c) return 0;
+        // The cursor lands on the sample shown at `mt`; a cut is clean when
+        // that sample is a full sync sample starting (within 1 ms) at the cut.
+        double delta = fabs(CMTimeGetSeconds(CMTimeSubtract(c.presentationTimeStamp, mt)));
+        return (c.currentSampleSyncInfo.sampleIsFullSync && delta < 0.001) ? 1 : 0;
+    }
+}
+
+static NSString *edit_preset_name(int32_t preset) {
+    switch (preset) {
+        case 0: return AVAssetExportPresetPassthrough;
+        case 1: return AVAssetExportPresetHighestQuality;
+        case 2: return AVAssetExportPresetHEVCHighestQuality;
+        case 3: return AVAssetExportPreset1920x1080;
+        case 4: return AVAssetExportPreset1280x720;
+        case 5: return AVAssetExportPreset960x540;
+        default: return nil;
+    }
+}
+
+int32_t bugle_export_video(const char *in_path, const char *out_path, double start, double end, int32_t preset,
+                           int32_t mp4, int32_t fps, double timeout) {
+    @autoreleasepool {
+        clear_error();
+        NSString *name = edit_preset_name(preset);
+        if (!name) { set_error(@"unknown export preset %d", preset); return -1; }
+        if (!in_path || !out_path) { set_error(@"export: NULL path"); return -1; }
+        if (!isfinite(start) || !isfinite(end) || start < 0 || end <= start) {
+            set_error(@"invalid time range %g..%g s", start, end);
+            return -1;
+        }
+        if (fps < 0 || fps > 240) { set_error(@"invalid frame rate %d", fps); return -1; }
+        if (fps > 0 && preset == 0) { set_error(@"a frame rate needs a re-encoding preset"); return -1; }
+        NSURL *out = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
+        AVURLAsset *asset = precise_asset(in_path);
+        if (!first_video_track(asset)) { set_error(@"the source has no video track"); return -1; }
+        // Passthrough is never listed as "compatible" but always works.
+        if (preset != 0 && ![[AVAssetExportSession exportPresetsCompatibleWithAsset:asset] containsObject:name]) {
+            set_error(@"export preset %@ is not available for this source", name);
+            return -1;
+        }
+        AVAssetExportSession *s = [[AVAssetExportSession alloc] initWithAsset:asset presetName:name];
+        if (!s) { set_error(@"could not create export session"); return -1; }
+        AVFileType type = mp4 ? AVFileTypeMPEG4 : AVFileTypeQuickTimeMovie;
+        if (![s.supportedFileTypes containsObject:type]) {
+            set_error(@"export preset %@ cannot write %@", name, type);
+            return -1;
+        }
+        [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+        s.outputURL = out;
+        s.outputFileType = type;
+        s.shouldOptimizeForNetworkUse = YES;
+        s.timeRange = CMTimeRangeFromTimeToTime(CMTimeMakeWithSeconds(start, 60000), CMTimeMakeWithSeconds(end, 60000));
+        if (preset != 0) {
+            // Re-encodes always render through a video composition: without
+            // one the encoder starts at the keyframe before the cut and hides
+            // the extra frames with an edit list, leaving cut footage in the
+            // file. The composition renders only frames inside the range.
+            AVMutableVideoComposition *vc = [AVMutableVideoComposition videoCompositionWithPropertiesOfAsset:asset];
+            if (fps > 0) {
+                vc.frameDuration = CMTimeMake(1, fps);
+                // Without this the source track's own frame timing wins and
+                // frameDuration is ignored.
+                vc.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid;
+            }
+            s.videoComposition = vc;
+        }
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        [s exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
+        if (!wait_bounded(sem, timeout)) {
+            [s cancelExport];
+            wait_bounded(sem, 10);
+            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+            set_error(@"export timed out after %.0f s and was cancelled", timeout);
+            return -1;
+        }
+        if (s.status != AVAssetExportSessionStatusCompleted) {
+            set_error(@"export failed: %@", s.error.localizedDescription ?: @"unknown error");
+            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+            return -1;
+        }
+        return 0;
+    }
+}
+
+void *bugle_frames_open(const char *path, double tolerance) {
+    @autoreleasepool {
+        clear_error();
+        if (!path) { set_error(@"frames: NULL path"); return NULL; }
+        AVURLAsset *asset = precise_asset(path);
+        if (!first_video_track(asset)) { set_error(@"the source has no video track"); return NULL; }
+        AVAssetImageGenerator *gen = [[AVAssetImageGenerator alloc] initWithAsset:asset];
+        gen.appliesPreferredTrackTransform = YES;
+        CMTime tol = (isfinite(tolerance) && tolerance > 0) ? CMTimeMakeWithSeconds(tolerance, 60000) : kCMTimeZero;
+        gen.requestedTimeToleranceBefore = tol;
+        gen.requestedTimeToleranceAfter = tol;
+        return (__bridge_retained void *)gen;
+    }
+}
+
+bugle_image_t bugle_frames_at(void *handle, double seconds) {
+    @autoreleasepool {
+        clear_error();
+        if (!handle || !isfinite(seconds)) { set_error(@"frames: invalid handle or time"); return (bugle_image_t){0}; }
+        AVAssetImageGenerator *gen = (__bridge AVAssetImageGenerator *)handle;
+        NSError *err = nil;
+        CGImageRef img = [gen copyCGImageAtTime:CMTimeMakeWithSeconds(fmax(0, seconds), 60000) actualTime:NULL error:&err];
+        if (!img) { set_error(@"frame extraction at %.3fs failed: %@", seconds, err.localizedDescription); return (bugle_image_t){0}; }
+        bugle_image_t out = cg_to_rgba(img);
+        CGImageRelease(img);
+        return out;
+    }
+}
+
+void bugle_frames_close(void *handle) {
+    if (!handle) return;
+    @autoreleasepool {
+        AVAssetImageGenerator *gen = (__bridge_transfer AVAssetImageGenerator *)handle;
+        (void)gen;
+    }
+}
+
+@interface BugleFrameWriter : NSObject
+@property(strong) AVAssetWriter *writer;
+@property(strong) AVAssetWriterInput *input;
+@property(strong) AVAssetWriterInputPixelBufferAdaptor *adaptor;
+@property(strong) NSURL *url;
+@property int32_t width, height, fps;
+@property int64_t frames;
+@end
+@implementation BugleFrameWriter
+@end
+
+void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int32_t mp4, int32_t hevc) {
+    @autoreleasepool {
+        clear_error();
+        if (!path) { set_error(@"writer: NULL path"); return NULL; }
+        if (w < 2 || h < 2 || w > BUGLE_MAX_PX || h > BUGLE_MAX_PX || (w & 1) || (h & 1)) {
+            set_error(@"writer: frame size %dx%d must be even and within 2...%d", w, h, BUGLE_MAX_PX);
+            return NULL;
+        }
+        if (fps < 1 || fps > 120) { set_error(@"writer: invalid frame rate %d", fps); return NULL; }
+        NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+        [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+        NSError *err = nil;
+        AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:url
+                                                          fileType:(mp4 ? AVFileTypeMPEG4 : AVFileTypeQuickTimeMovie)
+                                                             error:&err];
+        if (!writer) { set_error(@"AVAssetWriter: %@", err.localizedDescription); return NULL; }
+        writer.shouldOptimizeForNetworkUse = YES;
+        // Same budget as the recorder: ~0.1 bit per pixel per frame.
+        double bitrate = fmax(1.0e6, fmin(40.0e6, (double)w * (double)h * (double)fps * 0.1));
+        NSMutableDictionary *compression = [@{
+            AVVideoAverageBitRateKey: @((int64_t)bitrate),
+            AVVideoExpectedSourceFrameRateKey: @(fps),
+            AVVideoMaxKeyFrameIntervalKey: @(fps),
+            AVVideoAllowFrameReorderingKey: @NO,
+        } mutableCopy];
+        if (!hevc) compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel;
+        NSDictionary *video = @{
+            AVVideoCodecKey: hevc ? AVVideoCodecTypeHEVC : AVVideoCodecTypeH264,
+            AVVideoWidthKey: @(w),
+            AVVideoHeightKey: @(h),
+            AVVideoCompressionPropertiesKey: compression,
+        };
+        AVAssetWriterInput *input = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:video];
+        input.expectsMediaDataInRealTime = NO;
+        NSDictionary *attrs = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+            (id)kCVPixelBufferWidthKey: @(w),
+            (id)kCVPixelBufferHeightKey: @(h),
+        };
+        AVAssetWriterInputPixelBufferAdaptor *adaptor =
+            [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:input
+                                                                             sourcePixelBufferAttributes:attrs];
+        if (![writer canAddInput:input]) { set_error(@"writer refused the %@ video track", hevc ? @"HEVC" : @"H.264"); return NULL; }
+        [writer addInput:input];
+        if (![writer startWriting]) {
+            set_error(@"could not start writing the movie: %@", writer.error.localizedDescription);
+            [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+            return NULL;
+        }
+        [writer startSessionAtSourceTime:kCMTimeZero];
+        BugleFrameWriter *fw = [[BugleFrameWriter alloc] init];
+        fw.writer = writer;
+        fw.input = input;
+        fw.adaptor = adaptor;
+        fw.url = url;
+        fw.width = w;
+        fw.height = h;
+        fw.fps = fps;
+        return (__bridge_retained void *)fw;
+    }
+}
+
+int32_t bugle_writer_append(void *handle, const uint8_t *rgba, size_t len, int32_t w, int32_t h) {
+    @autoreleasepool {
+        clear_error();
+        if (!handle) { set_error(@"writer: NULL handle"); return -1; }
+        BugleFrameWriter *fw = (__bridge BugleFrameWriter *)handle;
+        if (!rgba || w != fw.width || h != fw.height || len < rgba_len(w, h)) {
+            set_error(@"writer: frame %dx%d (%zu bytes) does not match %dx%d", w, h, len, fw.width, fw.height);
+            return -1;
+        }
+        // Not real time: wait (bounded) for the encoder to drain.
+        for (int i = 0; !fw.input.readyForMoreMediaData; i++) {
+            if (fw.writer.status != AVAssetWriterStatusWriting || i > 2000) {
+                set_error(@"writer stalled: %@", fw.writer.error.localizedDescription ?: @"encoder not ready");
+                return -1;
+            }
+            usleep(5000);
+        }
+        CVPixelBufferRef pb = NULL;
+        CVReturn rc = fw.adaptor.pixelBufferPool
+                          ? CVPixelBufferPoolCreatePixelBuffer(NULL, fw.adaptor.pixelBufferPool, &pb)
+                          : CVPixelBufferCreate(NULL, w, h, kCVPixelFormatType_32BGRA, NULL, &pb);
+        if (rc != kCVReturnSuccess || !pb) { set_error(@"writer: could not allocate a pixel buffer (%d)", rc); return -1; }
+        CVPixelBufferLockBaseAddress(pb, 0);
+        uint8_t *base = CVPixelBufferGetBaseAddress(pb);
+        size_t stride = CVPixelBufferGetBytesPerRow(pb);
+        for (int32_t y = 0; y < h; y++) {
+            const uint8_t *src = rgba + (size_t)y * (size_t)w * 4;
+            uint8_t *dst = base + (size_t)y * stride;
+            for (int32_t x = 0; x < w; x++) {
+                dst[x * 4 + 0] = src[x * 4 + 2];
+                dst[x * 4 + 1] = src[x * 4 + 1];
+                dst[x * 4 + 2] = src[x * 4 + 0];
+                dst[x * 4 + 3] = 255;
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+        BOOL ok = [fw.adaptor appendPixelBuffer:pb withPresentationTime:CMTimeMake(fw.frames, fw.fps)];
+        CVPixelBufferRelease(pb);
+        if (!ok) { set_error(@"writer: appending frame %lld failed: %@", fw.frames, fw.writer.error.localizedDescription); return -1; }
+        fw.frames += 1;
+        return 0;
+    }
+}
+
+int32_t bugle_writer_finish(void *handle, double timeout) {
+    @autoreleasepool {
+        clear_error();
+        if (!handle) { set_error(@"writer: NULL handle"); return -1; }
+        BugleFrameWriter *fw = (__bridge_transfer BugleFrameWriter *)handle;
+        if (fw.frames == 0) {
+            [fw.writer cancelWriting];
+            [[NSFileManager defaultManager] removeItemAtURL:fw.url error:nil];
+            set_error(@"writer: no frames were written");
+            return -1;
+        }
+        [fw.input markAsFinished];
+        // The last frame lasts a full frame interval.
+        [fw.writer endSessionAtSourceTime:CMTimeMake(fw.frames, fw.fps)];
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        [fw.writer finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
+        if (!wait_bounded(sem, timeout)) {
+            [fw.writer cancelWriting];
+            wait_bounded(sem, 10);
+            [[NSFileManager defaultManager] removeItemAtURL:fw.url error:nil];
+            set_error(@"finalising the movie timed out after %.0f s", timeout);
+            return -1;
+        }
+        if (fw.writer.status != AVAssetWriterStatusCompleted) {
+            set_error(@"finalising the movie failed: %@", fw.writer.error.localizedDescription);
+            [[NSFileManager defaultManager] removeItemAtURL:fw.url error:nil];
+            return -1;
+        }
+        return 0;
+    }
+}
+
+void bugle_writer_cancel(void *handle) {
+    if (!handle) return;
+    @autoreleasepool {
+        BugleFrameWriter *fw = (__bridge_transfer BugleFrameWriter *)handle;
+        [fw.writer cancelWriting];
+        [[NSFileManager defaultManager] removeItemAtURL:fw.url error:nil];
+    }
+}
+
 void bugle_play_sound(const char *name) {
     @autoreleasepool {
         NSSound *s = [NSSound soundNamed:[NSString stringWithUTF8String:name]];

@@ -563,6 +563,229 @@ pub fn video_frame(path: &Path, seconds: f64) -> Result<RgbaImage> {
 }
 
 // ---------------------------------------------------------------------------
+// Editing
+// ---------------------------------------------------------------------------
+
+/// Display size (pixels, after the track's rotation) of a movie's first
+/// video track.
+pub fn video_size(path: &Path) -> Result<(u32, u32)> {
+    let i = video_info(path)?;
+    Ok((i.width, i.height))
+}
+
+/// Facts about a movie's first video track.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VideoInfo {
+    /// Display size in pixels (after the track's rotation).
+    pub width: u32,
+    pub height: u32,
+    pub nominal_fps: f64,
+    /// The video track's time range in seconds (an audio track may run
+    /// longer than this).
+    pub start: f64,
+    pub duration: f64,
+    /// Samples stored in the media, including any an edit list hides from
+    /// playback; `None` when the file cannot say.
+    pub stored_samples: Option<u64>,
+}
+
+impl VideoInfo {
+    pub fn end(&self) -> f64 {
+        self.start + self.duration
+    }
+}
+
+pub fn video_info(path: &Path) -> Result<VideoInfo> {
+    let p = path_cstr(path)?;
+    let mut i = ffi::bugle_video_info_t::default();
+    if unsafe { ffi::bugle_video_info(p.as_ptr(), &mut i) } != 0 {
+        bail!("{}", last_error());
+    }
+    Ok(VideoInfo {
+        width: i.width.max(0) as u32,
+        height: i.height.max(0) as u32,
+        nominal_fps: i.nominal_fps,
+        start: i.start,
+        duration: i.duration,
+        stored_samples: u64::try_from(i.stored_samples).ok(),
+    })
+}
+
+/// Whether the frame shown at `seconds` is a full sync (key) frame starting
+/// exactly there, i.e. whether a passthrough cut at that time copies nothing
+/// from before it.
+pub fn video_sync_at(path: &Path, seconds: f64) -> Result<bool> {
+    let p = path_cstr(path)?;
+    match unsafe { ffi::bugle_video_sync_at(p.as_ptr(), seconds) } {
+        1 => Ok(true),
+        0 => Ok(false),
+        _ => bail!("{}", last_error()),
+    }
+}
+
+/// The `AVAssetExportSession` preset a video export runs with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoExportPreset {
+    /// No re-encode: samples are copied (trim and container change only).
+    Passthrough,
+    /// H.264 at the source size.
+    Highest,
+    /// HEVC at the source size.
+    HevcHighest,
+    /// H.264 scaled to fit 1920x1080.
+    Fit1920x1080,
+    /// H.264 scaled to fit 1280x720.
+    Fit1280x720,
+    /// H.264 scaled to fit 960x540.
+    Fit960x540,
+}
+
+impl VideoExportPreset {
+    fn code(self) -> i32 {
+        match self {
+            Self::Passthrough => 0,
+            Self::Highest => 1,
+            Self::HevcHighest => 2,
+            Self::Fit1920x1080 => 3,
+            Self::Fit1280x720 => 4,
+            Self::Fit960x540 => 5,
+        }
+    }
+}
+
+/// Export `start..end` seconds of `input` to `output` (MP4 when `mp4`,
+/// QuickTime otherwise) with `preset`; audio tracks are kept. `fps`
+/// resamples the video (an error with `Passthrough`). The export is cancelled
+/// after `timeout` seconds (`None`: no limit). A failed export leaves no file
+/// at `output`.
+#[allow(clippy::too_many_arguments)]
+pub fn export_video(
+    input: &Path,
+    output: &Path,
+    start: f64,
+    end: f64,
+    preset: VideoExportPreset,
+    mp4: bool,
+    fps: Option<u32>,
+    timeout: Option<f64>,
+) -> Result<()> {
+    let i = path_cstr(input)?;
+    let o = path_cstr(output)?;
+    let fps = fps.map(|f| f.min(240) as i32).unwrap_or(0);
+    let timeout = timeout.filter(|t| t.is_finite() && *t > 0.0).unwrap_or(0.0);
+    if unsafe { ffi::bugle_export_video(i.as_ptr(), o.as_ptr(), start, end, preset.code(), mp4 as i32, fps, timeout) } != 0 {
+        bail!("{}", last_error());
+    }
+    Ok(())
+}
+
+/// Decodes frames of one movie at arbitrary times, reusing one
+/// `AVAssetImageGenerator` (much cheaper than [`video_frame`] per frame).
+pub struct VideoFrameReader {
+    handle: *mut libc::c_void,
+}
+
+// The generator is used from one thread at a time (`&mut self`).
+unsafe impl Send for VideoFrameReader {}
+
+impl VideoFrameReader {
+    /// `tolerance` is how far (seconds, either side) a returned frame may be
+    /// from the requested time; 0 decodes exactly.
+    pub fn open(path: &Path, tolerance: f64) -> Result<Self> {
+        let p = path_cstr(path)?;
+        let handle = unsafe { ffi::bugle_frames_open(p.as_ptr(), tolerance) };
+        if handle.is_null() {
+            bail!("{}", last_error());
+        }
+        Ok(Self { handle })
+    }
+
+    pub fn frame_at(&mut self, seconds: f64) -> Result<RgbaImage> {
+        let img = unsafe { ffi::bugle_frames_at(self.handle, seconds) };
+        if img.data.is_null() {
+            bail!("{}", last_error());
+        }
+        take_image(img)
+    }
+}
+
+impl Drop for VideoFrameReader {
+    fn drop(&mut self) {
+        unsafe { ffi::bugle_frames_close(self.handle) }
+    }
+}
+
+/// Encodes RGBA frames of one fixed, even size to an H.264 (or HEVC) movie at
+/// a constant frame rate. Dropping an unfinished writer discards the file.
+pub struct VideoFrameWriter {
+    handle: *mut libc::c_void,
+    width: u32,
+    height: u32,
+}
+
+unsafe impl Send for VideoFrameWriter {}
+
+impl VideoFrameWriter {
+    pub fn create(path: &Path, width: u32, height: u32, fps: u32, mp4: bool) -> Result<Self> {
+        Self::create_with_codec(path, width, height, fps, mp4, false)
+    }
+
+    pub fn create_with_codec(path: &Path, width: u32, height: u32, fps: u32, mp4: bool, hevc: bool) -> Result<Self> {
+        let p = path_cstr(path)?;
+        let (Ok(w), Ok(h)) = (i32::try_from(width), i32::try_from(height)) else {
+            return Err(BugleError::Invalid(format!("frame size {width}x{height} is too large")).into());
+        };
+        let fps = i32::try_from(fps).unwrap_or(i32::MAX);
+        let handle = unsafe { ffi::bugle_writer_open(p.as_ptr(), w, h, fps, mp4 as i32, hevc as i32) };
+        if handle.is_null() {
+            bail!("{}", last_error());
+        }
+        Ok(Self { handle, width, height })
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Append the next frame; it must be exactly [`Self::size`].
+    pub fn append(&mut self, frame: &RgbaImage) -> Result<()> {
+        if frame.dimensions() != (self.width, self.height) {
+            return Err(BugleError::Invalid(format!(
+                "frame is {}x{}, the writer expects {}x{}",
+                frame.width(),
+                frame.height(),
+                self.width,
+                self.height
+            ))
+            .into());
+        }
+        let (w, h) = ffi_dims(frame.width(), frame.height(), frame.as_raw().len())?;
+        let raw = frame.as_raw();
+        if unsafe { ffi::bugle_writer_append(self.handle, raw.as_ptr(), raw.len(), w, h) } != 0 {
+            bail!("{}", last_error());
+        }
+        Ok(())
+    }
+
+    /// Finalise the movie (waits at most two minutes).
+    pub fn finish(mut self) -> Result<()> {
+        let h = std::mem::replace(&mut self.handle, std::ptr::null_mut());
+        if unsafe { ffi::bugle_writer_finish(h, 120.0) } != 0 {
+            bail!("{}", last_error());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for VideoFrameWriter {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { ffi::bugle_writer_cancel(self.handle) }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ScreenCaptureKit recording
 // ---------------------------------------------------------------------------
 
@@ -985,6 +1208,97 @@ mod tests {
             assert!(e.to_string().contains("same file"), "{e}");
         }
         assert_eq!(std::fs::read(&two).unwrap(), before);
+    }
+
+    fn solid(w: u32, h: u32, rgb: [u8; 3]) -> RgbaImage {
+        RgbaImage::from_pixel(w, h, image::Rgba([rgb[0], rgb[1], rgb[2], 255]))
+    }
+
+    fn close(a: &image::Rgba<u8>, rgb: [u8; 3]) -> bool {
+        (0..3).all(|i| (a[i] as i32 - rgb[i] as i32).abs() < 40)
+    }
+
+    #[test]
+    fn frame_writer_reader_and_export_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let movie = dir.path().join("fixture.mp4");
+        // 2 s at 10 fps: red for the first second, blue for the second.
+        let mut w = VideoFrameWriter::create(&movie, 64, 48, 10, true).unwrap();
+        for i in 0..20 {
+            w.append(&solid(64, 48, if i < 10 { [255, 0, 0] } else { [0, 0, 255] })).unwrap();
+        }
+        assert!(w.append(&solid(62, 48, [0, 0, 0])).is_err(), "size mismatch is refused");
+        w.finish().unwrap();
+        assert_eq!(video_size(&movie).unwrap(), (64, 48));
+        assert!((media_duration(&movie).unwrap() - 2.0).abs() < 0.05);
+
+        let mut r = VideoFrameReader::open(&movie, 0.0).unwrap();
+        assert!(close(r.frame_at(0.45).unwrap().get_pixel(32, 24), [255, 0, 0]));
+        assert!(close(r.frame_at(1.55).unwrap().get_pixel(32, 24), [0, 0, 255]));
+
+        let cut = dir.path().join("cut.mov");
+        export_video(&movie, &cut, 1.0, 2.0, VideoExportPreset::Highest, false, Some(5), Some(60.0)).unwrap();
+        assert!((media_duration(&cut).unwrap() - 1.0).abs() < 0.1);
+        let mut r = VideoFrameReader::open(&cut, 0.0).unwrap();
+        assert!(close(r.frame_at(0.1).unwrap().get_pixel(32, 24), [0, 0, 255]));
+        // The frame rate really changed: 1 s at 5 fps is 5 stored frames.
+        let info = video_info(&cut).unwrap();
+        assert_eq!(info.stored_samples, Some(5), "{info:?}");
+        assert!((info.nominal_fps - 5.0).abs() < 0.5, "{info:?}");
+        let src = video_info(&movie).unwrap();
+        assert_eq!(src.stored_samples, Some(20));
+        assert!((src.end() - 2.0).abs() < 0.01, "{src:?}");
+
+        // Keyframes every second: a cut at 1.0 is clean, one at 0.5 is not.
+        assert!(video_sync_at(&movie, 0.0).unwrap());
+        assert!(video_sync_at(&movie, 1.0).unwrap());
+        assert!(!video_sync_at(&movie, 0.5).unwrap());
+
+        // Passthrough (no re-encode) trims, but a cut between keyframes keeps
+        // the frames back to the previous keyframe in the file (hidden by an
+        // edit list) ...
+        let pass = dir.path().join("pass.mp4");
+        export_video(&movie, &pass, 0.5, 1.5, VideoExportPreset::Passthrough, true, None, None).unwrap();
+        assert!((media_duration(&pass).unwrap() - 1.0).abs() < 0.1);
+        assert_eq!(video_size(&pass).unwrap(), (64, 48));
+        assert!(video_info(&pass).unwrap().stored_samples.unwrap() > 10);
+        // ... while a cut on a keyframe, or a re-encode, stores only the range.
+        let clean = dir.path().join("clean.mp4");
+        export_video(&movie, &clean, 1.0, 2.0, VideoExportPreset::Passthrough, true, None, None).unwrap();
+        assert_eq!(video_info(&clean).unwrap().stored_samples, Some(10));
+        export_video(&movie, &clean, 0.5, 1.5, VideoExportPreset::Highest, true, None, None).unwrap();
+        assert_eq!(video_info(&clean).unwrap().stored_samples, Some(10));
+
+        // A frame rate with passthrough is refused; a timeout cancels the export.
+        let bad = dir.path().join("bad.mp4");
+        assert!(export_video(&movie, &bad, 0.0, 1.0, VideoExportPreset::Passthrough, true, Some(5), None).is_err());
+        let e = export_video(&movie, &bad, 0.0, 2.0, VideoExportPreset::Highest, true, None, Some(1e-6)).unwrap_err();
+        assert!(e.to_string().contains("timed out"), "{e}");
+        assert!(!bad.exists());
+
+        // Bad ranges and inputs fail without leaving a file behind.
+        let bad = dir.path().join("bad.mp4");
+        assert!(export_video(&movie, &bad, 1.5, 1.0, VideoExportPreset::Passthrough, true, None, None).is_err());
+        assert!(export_video(&dir.path().join("missing.mp4"), &bad, 0.0, 1.0, VideoExportPreset::Passthrough, true, None, None).is_err());
+        assert!(!bad.exists());
+        assert!(VideoFrameReader::open(&dir.path().join("missing.mp4"), 0.0).is_err());
+    }
+
+    #[test]
+    fn frame_writer_rejects_bad_sizes_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.mp4");
+        assert!(VideoFrameWriter::create(&p, 63, 48, 10, true).is_err(), "odd width");
+        assert!(VideoFrameWriter::create(&p, 64, 48, 0, true).is_err(), "zero fps");
+        // No frames: finishing fails and removes the file.
+        let w = VideoFrameWriter::create(&p, 64, 48, 10, true).unwrap();
+        assert!(w.finish().is_err());
+        assert!(!p.exists());
+        // Dropped unfinished: discarded.
+        let mut w = VideoFrameWriter::create(&p, 64, 48, 10, true).unwrap();
+        w.append(&solid(64, 48, [0, 255, 0])).unwrap();
+        drop(w);
+        assert!(!p.exists());
     }
 
     #[test]

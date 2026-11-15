@@ -51,6 +51,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
 | `export_audio_m4a`, `export_mp4`, `export_mov`, `video_frame`, `media_duration` | `AVAssetExportSession`, `AVAssetImageGenerator` |
 | `mix_audio_tracks`, `audio_track_count`, `video_track_count` | `AVAssetReaderAudioMixOutput` (+ `AVMutableAudioMix` levels) → `AVAssetWriter` (AAC), video samples copied on their own timescale |
+| `export_video`, `video_info`, `video_sync_at`, `VideoFrameReader`, `VideoFrameWriter` | `AVAssetExportSession` with `timeRange`/preset, an `AVMutableVideoComposition` on every re-encode (`frameDuration` + `sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid` for a new frame rate), bounded wait + `cancelExport`; `AVSampleCursor` (stored samples, sync sample at a cut); one reusable `AVAssetImageGenerator`; `AVAssetWriter` + pixel-buffer adaptor (H.264 or HEVC) |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
 
 Window shadows: ScreenCaptureKit clips single-window screenshots to the window
@@ -119,6 +120,30 @@ recorder state machine, and exposes one method per user-facing action:
   recorder comment: the writer session opens before the stream starts, a static
   screen's stale first-frame timestamp is clamped, and the last frame is
   re-appended at the stop time so the video track covers the whole recording.
+* `edit` (`edit.rs`) — trims a recording (`start`/`end` seconds, negative from
+  the end, measured on the video track) and exports it with a preset. Video →
+  video is one `AVAssetExportSession` over the time range, audio kept.
+  `original` copies samples only when the cut starts on a sync sample (checked
+  with an `AVSampleCursor`); otherwise it re-encodes, because a copied cut
+  between keyframes keeps the frames back to the previous keyframe in the file
+  behind an edit list. `lossless` always copies and says so. Every re-encode
+  renders through a video composition, which stores only frames inside the
+  range (an export without one also starts at the earlier keyframe) and is how
+  `fps` resamples. `high`/`hevc` keep the source size, `1080p`/`720p`/`540p`
+  fit a box (never upscaling). Exports are cancelled after 120 s + 10 s per
+  second of output, and an engine runs at most two edits at once. Video → GIF
+  decodes frames exactly (zero tolerance, so the cut never bleeds to a keyframe
+  outside it) in the middle of each output frame interval, holding the last
+  frame if the track ends early. GIF sources are streamed twice (timeline, then
+  frames) under decoder size/allocation limits, never held whole: GIF → GIF is
+  a frame-exact cut (edge delays shortened) unless a rate is given; GIF → video
+  resamples to a constant rate for `AVAssetWriter` (HEVC for `hevc`). GIF delays
+  are written in centiseconds with the rounding error carried forward (minimum
+  2 cs), and the recorded duration is what was written. The `gif` preset uses
+  `recordings.gif_frame_rate` for video sources and keeps a GIF source's timing;
+  both are scaled to `gif_max_size`. Output is written to a temp file beside the
+  target (extension corrected to the container) and renamed, then added to
+  history, with the source as `parent` when it is a history item.
 * `ocr` (Apple Vision or an AI provider, per request or `[ocr] engine`), `describe` (images or sampled video frames), `transcribe`
   (extracts the audio track first), `subtitles`, `annotate`, `pin`, `select_area`.
 * `sync` (`sync.rs`) — runs after every successful save (`save_image`, so
@@ -193,8 +218,10 @@ plus the shutter sound; the status item title shows `● m:ss` while recording.
 Bugle is a standalone app; this is the backlog, roughly in the order it would
 earn its keep.
 
-* **Post-capture video editor** — trim, auto-zoom on clicks, cursor smoothing,
-  export presets.
+* **Video editor extras** — auto-zoom on clicks and cursor smoothing (the
+  recorders bake the cursor into the frames and log no click or cursor
+  positions, so these first need a click/cursor event track recorded alongside
+  the video), and an editing window on top of the headless `edit` pipeline.
 * **Audio mixing extras** — per-source levels (or ducking system audio under
   the microphone) for the mixed track.
 * **Quick-access panel** after a capture (the toast with a thumbnail is the
