@@ -9,6 +9,7 @@ members = [
     "crates/bugle-api",
     "crates/bugle-cli",
     "crates/bugle-app",
+    "xtask",
 ]
 
 [workspace.package]
