@@ -4,8 +4,8 @@
 //! * Video: either the system `screencapture -v` recorder (H.264 .mov,
 //!   optional microphone, click highlight), remuxed to MP4 on request, or the
 //!   in-process ScreenCaptureKit recorder (`SCStream` + `AVAssetWriter`,
-//!   H.264 + AAC straight to .mp4) which is the only one that can capture
-//!   system audio. `recording.backend` picks between them; `auto` uses
+//!   H.264 + AAC straight to .mp4, click highlight on macOS 15+) which is the
+//!   only one that can capture system audio. `recording.backend` picks between them; `auto` uses
 //!   ScreenCaptureKit whenever system audio is requested.
 
 use crate::Engine;
@@ -64,7 +64,7 @@ enum Backend {
     /// ScreenCaptureKit stream written by AVAssetWriter. Always produces an
     /// MP4; a `.mov` request is remuxed afterwards. `rec` is `None` once
     /// stopped.
-    Sck { rec: Option<SckRecorder>, wants_mov: bool },
+    Sck { rec: Option<SckRecorder>, wants_mov: bool, mix_audio: bool },
 }
 
 impl Backend {
@@ -239,6 +239,116 @@ fn keep_raw_after_failed_export(tmp: &Path, output: &Path, ext: &str, e: anyhow:
     }
 }
 
+/// The audio mixer: `bugle_platform::mix_audio_tracks` (a parameter so the
+/// tests can make it fail).
+type MixFn<'a> = &'a dyn Fn(&Path, &Path) -> Result<bool>;
+
+/// Check that `mixed`, a mix of `src`, is complete before it replaces
+/// anything: one audio track, as many video tracks as `src`, and the same
+/// duration give or take half a second (or 2%).
+fn check_mixed_copy(src: &Path, mixed: &Path) -> Result<()> {
+    let audio = bugle_platform::audio_track_count(mixed)?;
+    if audio != 1 {
+        bail!("the mixed copy has {audio} audio tracks");
+    }
+    let (v0, v1) = (bugle_platform::video_track_count(src)?, bugle_platform::video_track_count(mixed)?);
+    if v0 != v1 {
+        bail!("the mixed copy has {v1} video tracks instead of {v0}");
+    }
+    let (d0, d1) = (bugle_platform::media_duration(src)?, bugle_platform::media_duration(mixed)?);
+    if (d0 - d1).abs() > (d0 * 0.02).max(0.5) {
+        bail!("the mixed copy lasts {d1:.2}s instead of {d0:.2}s");
+    }
+    Ok(())
+}
+
+/// Mix the audio tracks of `src` into `dst` and check the result. Returns
+/// whether `dst` now holds a good mix; on failure `dst` is removed and the
+/// reason logged (`src` is never touched). With fewer than two audio tracks
+/// nothing is written.
+fn mix_into(src: &Path, dst: &Path, mix: MixFn) -> bool {
+    let result = mix(src, dst).and_then(|mixed| {
+        if mixed {
+            check_mixed_copy(src, dst)?;
+        }
+        Ok(mixed)
+    });
+    match result {
+        Ok(mixed) => {
+            if !mixed {
+                tracing::info!("mix_audio: the recording has fewer than two audio tracks; nothing to mix");
+            }
+            mixed
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(dst);
+            tracing::warn!("mixing the audio tracks failed; keeping them separate: {e:#}");
+            false
+        }
+    }
+}
+
+/// Create a new, uniquely named hidden file next to `path` for its mixed
+/// copy. Creating it (rather than picking a name) guarantees no existing
+/// file is ever overwritten or removed.
+fn reserve_mix_temp(path: &Path) -> std::io::Result<PathBuf> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut last = None;
+    for n in 0..100 {
+        let candidate = dir.join(format!(".{stem}.{}-{n}.mix.mp4", std::process::id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no free temp name")))
+}
+
+/// Fold the audio tracks of the finished recording at `path` into one,
+/// replacing the file once the mixed copy has been checked. Needs free
+/// space for a second copy while it runs. With fewer than two tracks there
+/// is nothing to do; any failure is logged and leaves the recording as it
+/// was. Returns whether the file was replaced.
+fn mix_audio_in_place(path: &Path, mix: MixFn) -> bool {
+    let tmp = match reserve_mix_temp(path) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("mixing the audio tracks failed (no temp file next to the recording: {e}); keeping them separate");
+            return false;
+        }
+    };
+    if mix_into(path, &tmp, mix) {
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => return true,
+            Err(e) => tracing::warn!("replacing the recording with its mixed copy failed; keeping separate audio tracks: {e}"),
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    false
+}
+
+/// Turn the stream recorder's MP4 at `written` into the final `output`:
+/// mix the audio tracks if asked, and for a `.mov` request write QuickTime
+/// (straight from the mixer when it ran, otherwise by remuxing). `written`
+/// is removed once it is no longer needed.
+fn finish_stream_file(written: &Path, output: &Path, wants_mov: bool, mix_audio: bool, mix: MixFn) -> Result<()> {
+    if !wants_mov {
+        if mix_audio {
+            mix_audio_in_place(written, mix);
+        }
+        return Ok(());
+    }
+    if !(mix_audio && mix_into(written, output, mix)) {
+        if let Err(e) = bugle_platform::export_mov(written, output) {
+            return Err(keep_raw_after_failed_export(written, output, "mp4", e));
+        }
+    }
+    let _ = std::fs::remove_file(written);
+    Ok(())
+}
+
 /// Read whatever the child wrote to its piped stderr.
 fn child_stderr(child: &mut std::process::Child) -> String {
     let mut err = String::new();
@@ -322,6 +432,9 @@ impl Engine {
         let frames = Arc::new(AtomicU64::new(0));
         let (output, backend) = match req.format {
             RecordingFormat::Gif => {
+                if req.mix_audio {
+                    tracing::warn!("mix_audio applies to video recordings; a GIF has no audio");
+                }
                 let output = self.output_path(req.output.as_deref(), "gif", &vars);
                 let stop = Arc::new(AtomicBool::new(false));
                 let capture_done = Arc::new(AtomicBool::new(false));
@@ -344,6 +457,7 @@ impl Engine {
                 let output = self.output_path(req.output.as_deref(), if wants_mp4 { "mp4" } else { "mov" }, &vars);
                 let microphone = req.microphone || self.config.recordings.microphone;
                 let system_audio = req.system_audio || self.config.recordings.system_audio;
+                let mix_audio = req.mix_audio || self.config.recordings.mix_audio;
                 let highlight_clicks = req.highlight_clicks || self.config.recordings.highlight_clicks;
                 let sck_available = bugle_platform::sck_record_available();
                 let use_sck = match self.config.recordings.backend {
@@ -361,10 +475,12 @@ impl Engine {
                         system_audio && sck_available
                     }
                 };
+                if mix_audio && !(use_sck && microphone && system_audio) {
+                    tracing::warn!(
+                        "mix_audio has nothing to mix: it needs both the microphone and system audio, recorded by the ScreenCaptureKit recorder"
+                    );
+                }
                 if use_sck {
-                    if highlight_clicks {
-                        tracing::warn!("click highlighting is only available with the system recorder backend");
-                    }
                     // AVAssetWriter writes the MP4 container directly; a .mov
                     // request is remuxed on stop.
                     let tmp = if wants_mp4 { output.clone() } else { temp_path(&output, "mp4") };
@@ -376,13 +492,14 @@ impl Engine {
                         system_audio,
                         microphone,
                         show_cursor: true,
+                        highlight_clicks,
                         max_seconds: req.max_seconds,
                     };
                     let rec = SckRecorder::start(&opts, &tmp).context("starting ScreenCaptureKit recording")?;
                     if let Some(w) = rec.warnings() {
                         tracing::warn!("{w}");
                     }
-                    (output, Backend::Sck { rec: Some(rec), wants_mov: !wants_mp4 })
+                    (output, Backend::Sck { rec: Some(rec), wants_mov: !wants_mp4, mix_audio })
                 } else {
                     let tmp_mov = if wants_mp4 { temp_path(&output, "mov") } else { output.clone() };
                     let mut cmd = std::process::Command::new("/usr/sbin/screencapture");
@@ -517,8 +634,8 @@ impl Engine {
                 }
                 MediaKind::Video
             }
-            Backend::Sck { rec, wants_mov } => {
-                let wants_mov = *wants_mov;
+            Backend::Sck { rec, wants_mov, mix_audio } => {
+                let (wants_mov, mix_audio) = (*wants_mov, *mix_audio);
                 let rec = rec.take().ok_or_else(|| anyhow!("recorder already stopped"))?;
                 // The file AVAssetWriter writes: the output itself, or a
                 // temp MP4 when a .mov was asked for.
@@ -536,12 +653,7 @@ impl Engine {
                     let _ = std::fs::remove_file(&written);
                     bail!("no frames were captured");
                 }
-                if wants_mov {
-                    if let Err(e) = bugle_platform::export_mov(&written, &active.output) {
-                        return Err(keep_raw_after_failed_export(&written, &active.output, "mp4", e));
-                    }
-                    let _ = std::fs::remove_file(&written);
-                }
+                finish_stream_file(&written, &active.output, wants_mov, mix_audio, &bugle_platform::mix_audio_tracks)?;
                 MediaKind::Video
             }
         };
@@ -788,7 +900,7 @@ mod tests {
 
     #[test]
     fn sck_deadline_counts_as_finished_and_elapsed_is_capped() {
-        let mut a = active(Backend::Sck { rec: None, wants_mov: false }, PathBuf::from("/nonexistent/x.mp4"), Some(0.01));
+        let mut a = active(Backend::Sck { rec: None, wants_mov: false, mix_audio: false }, PathBuf::from("/nonexistent/x.mp4"), Some(0.01));
         a.started -= Duration::from_secs(3);
         assert_eq!(a.poll(), RecordingState::Finishing);
         assert_eq!(a.elapsed_seconds(), 0.01);
@@ -845,6 +957,130 @@ mod tests {
         assert!(engine.record_stop().is_err());
         assert!(!out.exists());
         assert!(engine.record_stop().is_err(), "slot is free after a failed stop");
+    }
+
+    use bugle_platform::{audio_track_count, mix_audio_tracks, video_track_count, write_tone_fixture, ToneFixture};
+
+    fn two_tracks_with_video(path: &Path) {
+        let f = ToneFixture { tracks: 2, seconds: 1.0, video: true, ..Default::default() };
+        write_tone_fixture(path, &f).unwrap();
+    }
+
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn mixing_in_place_replaces_the_file_and_spares_neighbours() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = tmp.path().join("clip.mp4");
+        two_tracks_with_video(&rec);
+        // Files that a predictable temp name could have clobbered.
+        std::fs::write(tmp.path().join("clip.mix.mp4"), b"keep me").unwrap();
+        std::fs::write(tmp.path().join("clip.rec.mix.mp4"), b"keep me too").unwrap();
+        assert!(mix_audio_in_place(&rec, &mix_audio_tracks));
+        assert_eq!(audio_track_count(&rec).unwrap(), 1);
+        assert_eq!(video_track_count(&rec).unwrap(), 1);
+        assert_eq!(std::fs::read(tmp.path().join("clip.mix.mp4")).unwrap(), b"keep me");
+        assert_eq!(std::fs::read(tmp.path().join("clip.rec.mix.mp4")).unwrap(), b"keep me too");
+        assert_eq!(dir_names(tmp.path()), ["clip.mix.mp4", "clip.mp4", "clip.rec.mix.mp4"]);
+
+        // One track now: nothing to do, file and folder untouched.
+        let before = std::fs::read(&rec).unwrap();
+        assert!(!mix_audio_in_place(&rec, &mix_audio_tracks));
+        assert_eq!(std::fs::read(&rec).unwrap(), before);
+        assert_eq!(dir_names(tmp.path()).len(), 3);
+    }
+
+    #[test]
+    fn failed_mix_keeps_the_recording() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A real AVFoundation failure: the track headers are intact but the
+        // sample data is cut off.
+        let rec = tmp.path().join("cut.mp4");
+        two_tracks_with_video(&rec);
+        let full = std::fs::read(&rec).unwrap();
+        std::fs::write(&rec, &full[..full.len() / 2]).unwrap();
+        assert_eq!(audio_track_count(&rec).unwrap(), 2, "fixture must keep its track headers");
+        let before = std::fs::read(&rec).unwrap();
+        assert!(!mix_audio_in_place(&rec, &mix_audio_tracks));
+        assert_eq!(std::fs::read(&rec).unwrap(), before);
+        assert_eq!(dir_names(tmp.path()), ["cut.mp4"]);
+
+        // The mixer reports an error after writing part of its output.
+        let rec = tmp.path().join("clip.mp4");
+        two_tracks_with_video(&rec);
+        let before = std::fs::read(&rec).unwrap();
+        let failing = |_: &Path, dst: &Path| -> Result<bool> {
+            std::fs::write(dst, b"partial")?;
+            bail!("encoder exploded")
+        };
+        assert!(!mix_audio_in_place(&rec, &failing));
+        assert_eq!(std::fs::read(&rec).unwrap(), before);
+        assert_eq!(dir_names(tmp.path()), ["clip.mp4", "cut.mp4"]);
+
+        // The mixer claims success but its output is not a full copy (the
+        // video track is missing): rejected before it replaces anything.
+        let no_video = |_: &Path, dst: &Path| -> Result<bool> {
+            write_tone_fixture(dst, &ToneFixture { tracks: 1, seconds: 1.0, ..Default::default() })?;
+            Ok(true)
+        };
+        assert!(!mix_audio_in_place(&rec, &no_video));
+        assert_eq!(std::fs::read(&rec).unwrap(), before);
+        assert_eq!(dir_names(tmp.path()), ["clip.mp4", "cut.mp4"]);
+    }
+
+    #[test]
+    fn failed_rename_keeps_the_recording() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("rec");
+        std::fs::create_dir(&dir).unwrap();
+        let rec = dir.join("clip.mp4");
+        two_tracks_with_video(&rec);
+        let before = std::fs::read(&rec).unwrap();
+        // Mix for real, then make the folder read-only so the rename fails.
+        let lock = dir.clone();
+        let mix_then_lock = move |src: &Path, dst: &Path| -> Result<bool> {
+            let r = mix_audio_tracks(src, dst)?;
+            std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o555))?;
+            Ok(r)
+        };
+        let replaced = mix_audio_in_place(&rec, &mix_then_lock);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!replaced);
+        assert_eq!(std::fs::read(&rec).unwrap(), before);
+        assert_eq!(audio_track_count(&rec).unwrap(), 2);
+    }
+
+    #[test]
+    fn mov_requests_are_mixed_straight_to_quicktime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("clip.mov");
+        let written = temp_path(&out, "mp4");
+        two_tracks_with_video(&written);
+        finish_stream_file(&written, &out, true, true, &mix_audio_tracks).unwrap();
+        assert!(!written.exists());
+        assert_eq!(&std::fs::read(&out).unwrap()[4..12], b"ftypqt  ");
+        assert_eq!(audio_track_count(&out).unwrap(), 1);
+        assert_eq!(video_track_count(&out).unwrap(), 1);
+
+        // A failed mix falls back to the plain remux with both tracks.
+        two_tracks_with_video(&written);
+        let failing = |_: &Path, _: &Path| -> Result<bool> { bail!("no") };
+        finish_stream_file(&written, &out, true, true, &failing).unwrap();
+        assert!(!written.exists());
+        assert_eq!(&std::fs::read(&out).unwrap()[4..12], b"ftypqt  ");
+        assert_eq!(audio_track_count(&out).unwrap(), 2);
+
+        // MP4 without mixing: left exactly as written.
+        let mp4 = tmp.path().join("plain.mp4");
+        two_tracks_with_video(&mp4);
+        let before = std::fs::read(&mp4).unwrap();
+        finish_stream_file(&mp4, &mp4, false, false, &mix_audio_tracks).unwrap();
+        assert_eq!(std::fs::read(&mp4).unwrap(), before);
     }
 
     #[test]

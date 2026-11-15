@@ -81,6 +81,9 @@ pub struct RecordingConfig {
     pub microphone: bool,
     /// Record system audio; needs the ScreenCaptureKit backend.
     pub system_audio: bool,
+    /// Fold the microphone and system-audio tracks into one when both are
+    /// recorded (otherwise they are two AAC tracks).
+    pub mix_audio: bool,
     pub highlight_clicks: bool,
     pub retina: bool,
     pub backend: RecordingBackend,
@@ -221,6 +224,7 @@ impl Default for RecordingConfig {
             video_fps: 30,
             microphone: false,
             system_audio: false,
+            mix_audio: false,
             highlight_clicks: false,
             retina: true,
             backend: RecordingBackend::Auto,

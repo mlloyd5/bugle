@@ -458,6 +458,96 @@ pub fn export_mov(input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Number of audio tracks in a movie (0 for a file AVFoundation cannot read).
+pub fn audio_track_count(path: &Path) -> Result<usize> {
+    let p = path_cstr(path)?;
+    Ok(unsafe { ffi::bugle_audio_track_count(p.as_ptr()) }.max(0) as usize)
+}
+
+/// Number of video tracks in a movie (0 for a file AVFoundation cannot read).
+pub fn video_track_count(path: &Path) -> Result<usize> {
+    let p = path_cstr(path)?;
+    Ok(unsafe { ffi::bugle_video_track_count(p.as_ptr()) }.max(0) as usize)
+}
+
+/// Fold every enabled audio track of `input` into one AAC track in `output`
+/// (a `.mov` extension writes QuickTime, anything else MP4), each of the `n`
+/// sources at `1/n` so the sum cannot clip. The audio is re-encoded; video
+/// is copied without re-encoding, frame times untouched. An existing
+/// `output` is replaced. Returns `false`, writing nothing, when the input
+/// has fewer than two audio tracks; `input` and `output` must be different
+/// files.
+pub fn mix_audio_tracks(input: &Path, output: &Path) -> Result<bool> {
+    if same_file(input, output) {
+        return Err(BugleError::Invalid(format!("mixing {}: input and output are the same file", input.display())).into());
+    }
+    let i = path_cstr(input)?;
+    let o = path_cstr(output)?;
+    match unsafe { ffi::bugle_mix_audio_tracks(i.as_ptr(), o.as_ptr()) } {
+        0 => Ok(true),
+        1 => Ok(false),
+        _ => bail!("{}", last_error()),
+    }
+}
+
+/// Whether both paths name the same existing file (hard and symbolic links
+/// included).
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+/// Test fixture parameters for [`write_tone_fixture`].
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct ToneFixture {
+    /// Number of AAC tracks (1-8).
+    pub tracks: u32,
+    pub seconds: f64,
+    /// Sine amplitude, full scale = 1.0.
+    pub amplitude: f64,
+    /// All tracks play the same 440 Hz tone throughout; otherwise track `i`
+    /// plays `440*(i+1)` Hz during the `i`-th equal slice only.
+    pub overlap: bool,
+    /// Tracks after the first start this many seconds in.
+    pub delay: f64,
+    /// Add a 64x64 H.264 video track at 10 fps.
+    pub video: bool,
+}
+
+impl Default for ToneFixture {
+    fn default() -> Self {
+        Self { tracks: 2, seconds: 1.0, amplitude: 0.5, overlap: false, delay: 0.0, video: false }
+    }
+}
+
+/// Test fixture: write an `.mp4` described by `f`. Lives in its own object
+/// file, which shipped binaries do not reference and so do not contain.
+#[doc(hidden)]
+pub fn write_tone_fixture(output: &Path, f: &ToneFixture) -> Result<()> {
+    let o = path_cstr(output)?;
+    let e = unsafe {
+        ffi::bugle_fixture_write_tones(
+            o.as_ptr(),
+            f.tracks.min(i32::MAX as u32) as i32,
+            f.seconds,
+            f.amplitude,
+            f.overlap as i32,
+            f.delay,
+            f.video as i32,
+        )
+    };
+    if !e.is_null() {
+        let msg = unsafe { CStr::from_ptr(e) }.to_string_lossy().into_owned();
+        unsafe { ffi::bugle_free(e as *mut _) };
+        bail!("{msg}");
+    }
+    Ok(())
+}
+
 pub fn media_duration(path: &Path) -> Result<f64> {
     let p = path_cstr(path)?;
     let d = unsafe { ffi::bugle_media_duration(p.as_ptr()) };
@@ -493,6 +583,8 @@ pub struct SckRecordOptions {
     pub system_audio: bool,
     pub microphone: bool,
     pub show_cursor: bool,
+    /// Draw a highlight around mouse clicks (macOS 15+; a warning otherwise).
+    pub highlight_clicks: bool,
     /// Stop capturing by itself after this long; `stop` then only finalises.
     pub max_seconds: Option<f64>,
 }
@@ -526,6 +618,7 @@ impl SckRecorder {
                 opts.system_audio as i32,
                 opts.microphone as i32,
                 opts.show_cursor as i32,
+                opts.highlight_clicks as i32,
                 opts.max_seconds.unwrap_or(0.0),
                 out.as_ptr(),
             )
@@ -750,6 +843,148 @@ mod tests {
         for th in threads {
             th.join().expect("worker thread panicked");
         }
+    }
+
+    /// The first audio track of `path` decoded by the system `afconvert` to
+    /// 48 kHz stereo float samples (interleaved). Float output keeps values
+    /// beyond full scale, so clipping shows up as |sample| > 1.
+    fn decode(path: &Path) -> Vec<f32> {
+        let wav = path.with_extension("wav");
+        let st = std::process::Command::new("/usr/bin/afconvert")
+            .args(["-f", "WAVE", "-d", "LEF32@48000"])
+            .arg(path)
+            .arg(&wav)
+            .status()
+            .expect("afconvert");
+        assert!(st.success(), "afconvert failed on {}", path.display());
+        let bytes = std::fs::read(&wav).unwrap();
+        // Walk the RIFF chunks to "data".
+        let mut i = 12;
+        let data = loop {
+            let id = &bytes[i..i + 4];
+            let len = u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap()) as usize;
+            if id == b"data" {
+                break &bytes[i + 8..(i + 8 + len).min(bytes.len())];
+            }
+            i += 8 + len + (len & 1);
+        };
+        data.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
+    }
+
+    /// RMS of each of `parts` equal slices of `samples`.
+    fn slice_rms(samples: &[f32], parts: usize) -> Vec<f64> {
+        let n = samples.len() / parts;
+        (0..parts)
+            .map(|p| {
+                // Skip the edges of each slice: AAC priming and the tone's
+                // on/off transitions smear across them.
+                let s = &samples[p * n + n / 5..(p + 1) * n - n / 5];
+                (s.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / s.len() as f64).sqrt()
+            })
+            .collect()
+    }
+
+    fn peak(samples: &[f32]) -> f32 {
+        samples.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+    }
+
+    #[test]
+    fn mixes_audio_tracks_into_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let two = tmp.path().join("two.mp4");
+        write_tone_fixture(&two, &ToneFixture { tracks: 2, seconds: 2.0, ..Default::default() }).unwrap();
+        assert_eq!(audio_track_count(&two).unwrap(), 2);
+        // Decoding picks the first track only: tone in the first half.
+        let rms = slice_rms(&decode(&two), 2);
+        assert!(rms[0] > 0.1 && rms[1] < 0.01, "fixture track 0 levels {rms:?}");
+
+        let mixed = tmp.path().join("mixed.mp4");
+        assert!(mix_audio_tracks(&two, &mixed).unwrap());
+        assert_eq!(audio_track_count(&mixed).unwrap(), 1);
+        let d = media_duration(&mixed).unwrap();
+        assert!((d - 2.0).abs() < 0.15, "mixed duration {d}");
+        // Both tracks are in the one track (each at half level): tone in
+        // both halves.
+        let rms = slice_rms(&decode(&mixed), 2);
+        assert!(rms[0] > 0.1 && rms[1] > 0.1, "mixed levels {rms:?}");
+
+        // A .mov output is QuickTime.
+        let mov = tmp.path().join("mixed.mov");
+        assert!(mix_audio_tracks(&two, &mov).unwrap());
+        let head = std::fs::read(&mov).unwrap();
+        assert_eq!(&head[4..12], b"ftypqt  ");
+        assert_eq!(audio_track_count(&mov).unwrap(), 1);
+    }
+
+    #[test]
+    fn loud_sources_do_not_clip() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Two in-phase tones at 0.9: an unscaled sum would peak at 1.8.
+        let loud = tmp.path().join("loud.mp4");
+        let f = ToneFixture { tracks: 2, seconds: 1.0, amplitude: 0.9, overlap: true, ..Default::default() };
+        write_tone_fixture(&loud, &f).unwrap();
+        let p = peak(&decode(&loud));
+        assert!(p > 0.8, "fixture track peak {p}");
+        let mixed = tmp.path().join("mixed.mp4");
+        assert!(mix_audio_tracks(&loud, &mixed).unwrap());
+        let p = peak(&decode(&mixed));
+        assert!(p > 0.5 && p < 1.0, "mixed peak {p}");
+    }
+
+    #[test]
+    fn mixing_keeps_video_and_track_offsets() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Track 0 sounds in [0, 1.5); track 1 only starts at 1.5 s and
+        // sounds in [1.5, 3). Losing the offset would move its tone to the
+        // start and leave the second half silent.
+        let src = tmp.path().join("src.mp4");
+        let f = ToneFixture { tracks: 2, seconds: 3.0, delay: 1.5, video: true, ..Default::default() };
+        write_tone_fixture(&src, &f).unwrap();
+        assert_eq!(video_track_count(&src).unwrap(), 1);
+        let mixed = tmp.path().join("mixed.mp4");
+        assert!(mix_audio_tracks(&src, &mixed).unwrap());
+        assert_eq!(audio_track_count(&mixed).unwrap(), 1);
+        assert_eq!(video_track_count(&mixed).unwrap(), 1);
+        let (d0, d1) = (media_duration(&src).unwrap(), media_duration(&mixed).unwrap());
+        assert!((d0 - d1).abs() < 0.05, "duration {d0} -> {d1}");
+        let rms = slice_rms(&decode(&mixed), 2);
+        assert!(rms[0] > 0.1 && rms[1] > 0.1, "mixed levels {rms:?}");
+        // The video samples are copied, so decoded frames are identical.
+        for t in [0.25, 1.55, 2.75] {
+            assert_eq!(video_frame(&src, t).unwrap(), video_frame(&mixed, t).unwrap(), "frame at {t}s");
+        }
+    }
+
+    #[test]
+    fn mixing_one_track_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let one = tmp.path().join("one.mp4");
+        write_tone_fixture(&one, &ToneFixture { tracks: 1, seconds: 0.5, ..Default::default() }).unwrap();
+        let out = tmp.path().join("out.mp4");
+        assert!(!mix_audio_tracks(&one, &out).unwrap());
+        assert!(!out.exists());
+        // Not a movie: no audio tracks, nothing to do.
+        let junk = tmp.path().join("junk.mp4");
+        std::fs::write(&junk, b"not a movie").unwrap();
+        assert_eq!(audio_track_count(&junk).unwrap(), 0);
+        assert!(!mix_audio_tracks(&junk, &out).unwrap());
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn mixing_refuses_to_overwrite_its_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let two = tmp.path().join("two.mp4");
+        write_tone_fixture(&two, &ToneFixture::default()).unwrap();
+        let before = std::fs::read(&two).unwrap();
+        let link = tmp.path().join("link.mp4");
+        std::fs::hard_link(&two, &link).unwrap();
+        let dotted = tmp.path().join(".").join("two.mp4");
+        for out in [&two, &link, &dotted] {
+            let e = mix_audio_tracks(&two, out).unwrap_err();
+            assert!(e.to_string().contains("same file"), "{e}");
+        }
+        assert_eq!(std::fs::read(&two).unwrap(), before);
     }
 
     #[test]

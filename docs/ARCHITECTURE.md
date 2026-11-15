@@ -48,8 +48,9 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `pin_image_blocking`, `pin_image_show` | floating borderless window, drag/resize/close; blocking or fire-and-forget |
 | `toast_show` | non-activating `NSPanel` with `NSVisualEffectView`, thumbnail + two lines, fades out |
 | `clipboard_*` | `NSPasteboard` |
-| `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
+| `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
 | `export_audio_m4a`, `export_mp4`, `export_mov`, `video_frame`, `media_duration` | `AVAssetExportSession`, `AVAssetImageGenerator` |
+| `mix_audio_tracks`, `audio_track_count`, `video_track_count` | `AVAssetReaderAudioMixOutput` (+ `AVMutableAudioMix` levels) → `AVAssetWriter` (AAC), video samples copied on their own timescale |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
 
 Window shadows: ScreenCaptureKit clips single-window screenshots to the window
@@ -101,8 +102,20 @@ recorder state machine, and exposes one method per user-facing action:
   sample buffers, `AVAssetWriter` encodes them to H.264 + AAC straight into the
   `.mp4` (a `.mov` request is remuxed afterwards). The microphone is an
   `AVCaptureSession` audio tap written as a second AAC track, retimed to the host
-  clock; `export_audio_m4a` mixes both tracks when transcribing. Click highlighting
-  is only available with the system recorder (`"system"`). Timing details live in the shim's
+  clock; `export_audio_m4a` mixes both tracks when transcribing. With
+  `mix_audio` (`[recordings]`, `--mix-audio`, action argument) a post-pass on the
+  finished file folds all audio tracks into one AAC track (a `.mov` request is
+  mixed straight to QuickTime); mixing after capture keeps the real-time path
+  unchanged (no cross-clock resampling or buffering between two live sources).
+  Each of the n sources is scaled by 1/n so the sum cannot clip; the audio is
+  re-encoded (a second AAC generation) while video samples and frame times are
+  copied. The mix runs during stop, writes a uniquely named hidden copy next to
+  the recording (so it needs free space equal to the recording) and replaces the
+  file only after checking the copy's tracks and duration; a failed mix logs a
+  warning and keeps the two tracks. Asking for it without both sources on the
+  stream recorder warns at start. Click highlighting
+  uses `screencapture -k` or, on the stream recorder, `SCStreamConfiguration.showMouseClicks`
+  (macOS 15+). Timing details live in the shim's
   recorder comment: the writer session opens before the stream starts, a static
   screen's stale first-frame timestamp is clamped, and the last frame is
   re-appended at the stop time so the video track covers the whole recording.
@@ -182,8 +195,8 @@ earn its keep.
 
 * **Post-capture video editor** — trim, auto-zoom on clicks, cursor smoothing,
   export presets.
-* **Audio mixing** — fold the microphone and system-audio tracks into one when
-  asked; click highlighting on the ScreenCaptureKit recorder.
+* **Audio mixing extras** — per-source levels (or ducking system audio under
+  the microphone) for the mixed track.
 * **Quick-access panel** after a capture (the toast with a thumbnail is the
   minimal version): annotate, copy, pin or send from one place.
 * **Window picker extras** — Space to switch to area selection, a picker for

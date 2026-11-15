@@ -483,6 +483,7 @@ dependencies = [
  "cc",
  "image",
  "libc",
+ "tempfile",
  "tracing",
 ]
 
