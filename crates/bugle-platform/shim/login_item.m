@@ -1,8 +1,10 @@
-// Open at Login for Bugle.app through SMAppService.mainAppService (macOS 13+).
+// Open at Login for Bugle.app through SMAppService.mainAppService.
 //
 // Kept apart from shim.m: it only means something when the process runs from
 // an app bundle, and it is the only user of ServiceManagement. Bindings live
-// in src/login_item.rs.
+// in src/login_item.rs. SMAppService is macOS 13, the deployment target, so
+// no availability checks are needed (and `@available` would not link; see
+// the note in shim.m).
 
 #import <Foundation/Foundation.h>
 #import <ServiceManagement/ServiceManagement.h>
@@ -15,31 +17,29 @@ int bugle_running_in_app_bundle(void) {
 }
 
 /// SMAppServiceStatus of the main app: 0 not registered, 1 enabled,
-/// 2 requires approval, 3 not found; -1 before macOS 13.
+/// 2 requires approval, 3 not found.
 int bugle_login_item_status(void) {
-    if (@available(macOS 13.0, *)) {
-        return (int)SMAppService.mainAppService.status;
-    }
-    return -1;
+    return (int)SMAppService.mainAppService.status;
 }
 
 /// Registers (enabled != 0) or unregisters the app as a login item. Returns
 /// the new status, or -1 with a malloc'd message in *err (free with bugle_free).
 int bugle_login_item_set(int enabled, char **err) {
     if (err) *err = NULL;
-    if (@available(macOS 13.0, *)) {
-        SMAppService *svc = SMAppService.mainAppService;
-        NSError *e = nil;
-        BOOL ok = enabled ? [svc registerAndReturnError:&e] : [svc unregisterAndReturnError:&e];
-        if (!ok) {
-            if (err) {
-                const char *u = (e.localizedDescription ?: @"login item request failed").UTF8String;
-                *err = strdup(u ? u : "login item request failed");
-            }
-            return -1;
+    SMAppService *svc = SMAppService.mainAppService;
+    NSError *e = nil;
+    BOOL ok = enabled ? [svc registerAndReturnError:&e] : [svc unregisterAndReturnError:&e];
+    if (!ok) {
+        if (err) {
+            const char *u = (e.localizedDescription ?: @"login item request failed").UTF8String;
+            *err = strdup(u ? u : "login item request failed");
         }
-        return (int)svc.status;
+        return -1;
     }
-    if (err) *err = strdup("Open at Login needs macOS 13 or later");
-    return -1;
+    return (int)svc.status;
+}
+
+/// Opens System Settings → General → Login Items.
+void bugle_login_item_open_settings(void) {
+    [SMAppService openSystemSettingsLoginItems];
 }

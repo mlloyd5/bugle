@@ -25,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
-use tray_icon::menu::{accelerator::Accelerator, CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::menu::{accelerator::Accelerator, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 #[derive(Parser, Debug)]
@@ -366,7 +366,7 @@ struct MenuItems {
     stop: MenuItem,
     recent: Submenu,
     api: MenuItem,
-    login: Option<CheckMenuItem>,
+    login: Option<login::LoginMenu>,
 }
 
 fn accelerator(config: &Config, key: &str) -> Option<Accelerator> {
@@ -420,9 +420,9 @@ fn build_menu(config: &Config) -> Result<MenuItems> {
         &quit,
     ])?;
     // Open at Login sits just above the final separator and Quit.
-    let login = login::menu_item();
+    let login = login::LoginMenu::new();
     if let Some(l) = &login {
-        menu.insert(l, menu.items().len().saturating_sub(2))?;
+        menu.insert(&l.item, menu.items().len().saturating_sub(2))?;
     }
     Ok(MenuItems { menu, record_video, record_gif, stop, recent, api, login })
 }
@@ -490,7 +490,7 @@ impl App {
             "prefs" => self.open_preferences(),
             "open_folder" => bugle_platform::open_path(&self.engine.config.save_dir()),
             "api_toggle" => self.toggle_api(),
-            login::MENU_ID => match self.items.login.as_ref().map(login::toggle) {
+            login::MENU_ID => match self.items.login.as_mut().map(login::LoginMenu::toggle) {
                 Some(Ok(Some(msg))) => self.toast_error(&msg),
                 Some(Err(e)) => self.toast_error(&format!("Open at Login: {e:#}")),
                 _ => {}
@@ -636,6 +636,9 @@ impl App {
         self.last_tick = Instant::now();
         self.update_recording_ui();
         self.refresh_recent();
+        if let Some(l) = self.items.login.as_mut() {
+            l.refresh();
+        }
     }
 }
 
