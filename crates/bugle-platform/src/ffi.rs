@@ -105,6 +105,7 @@ extern "C" {
 
     pub fn bugle_post_scroll(x: f64, y: f64, dx_lines: i32, dy_lines: i32) -> i32;
     pub fn bugle_cursor_position(x: *mut f64, y: *mut f64);
+    pub fn bugle_mouse_buttons() -> i32;
 
     pub fn bugle_clipboard_write_image(png: *const u8, len: size_t) -> i32;
     pub fn bugle_clipboard_write_text(text: *const c_char) -> i32;
@@ -161,6 +162,18 @@ extern "C" {
     pub fn bugle_writer_append(handle: *mut c_void, rgba: *const u8, len: size_t, w: i32, h: i32) -> i32;
     pub fn bugle_writer_finish(handle: *mut c_void, timeout: f64) -> i32;
     pub fn bugle_writer_cancel(handle: *mut c_void);
+    pub fn bugle_seq_open(path: *const c_char, start: f64, end: f64) -> *mut c_void;
+    pub fn bugle_seq_next(handle: *mut c_void, pts: *mut f64) -> bugle_image_t;
+    pub fn bugle_seq_close(handle: *mut c_void);
+    pub fn bugle_mux_audio(
+        video_path: *const c_char,
+        audio_path: *const c_char,
+        start: f64,
+        end: f64,
+        out_path: *const c_char,
+        mp4: i32,
+        timeout: f64,
+    ) -> i32;
     pub fn bugle_play_sound(name: *const c_char);
     pub fn bugle_open_path(path: *const c_char);
 

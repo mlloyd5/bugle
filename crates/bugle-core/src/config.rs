@@ -86,6 +86,10 @@ pub struct RecordingConfig {
     /// recorded (otherwise they are two AAC tracks).
     pub mix_audio: bool,
     pub highlight_clicks: bool,
+    /// Write a pointer/click event track next to every recording.
+    pub cursor_events: bool,
+    /// Leave the pointer out of the frames (implies `cursor_events`).
+    pub hide_cursor: bool,
     pub retina: bool,
     pub backend: RecordingBackend,
 }
@@ -228,6 +232,8 @@ impl Default for RecordingConfig {
             system_audio: false,
             mix_audio: false,
             highlight_clicks: false,
+            cursor_events: false,
+            hide_cursor: false,
             retina: true,
             backend: RecordingBackend::Auto,
         }

@@ -241,6 +241,15 @@ pub struct RecordRequest {
     /// Show mouse clicks.
     #[serde(default)]
     pub highlight_clicks: bool,
+    /// Log pointer moves and clicks to an event track next to the
+    /// recording (`clip.events.json`), for auto-zoom and cursor smoothing
+    /// in `edit`.
+    #[serde(default)]
+    pub cursor_events: bool,
+    /// Leave the pointer out of the frames (implies `cursor_events`, so an
+    /// edit can draw it back, smoothed).
+    #[serde(default)]
+    pub hide_cursor: bool,
     #[serde(default)]
     pub output: Option<String>,
     #[serde(default)]

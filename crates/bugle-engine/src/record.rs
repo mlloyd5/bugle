@@ -8,11 +8,12 @@
 //!   only one that can capture system audio. `recording.backend` picks between them; `auto` uses
 //!   ScreenCaptureKit whenever system audio is requested.
 
+use crate::event_log::EventLog;
 use crate::Engine;
 use anyhow::{anyhow, bail, Context, Result};
 use bugle_core::config::RecordingBackend;
 use bugle_platform::{SckRecordOptions, SckRecorder};
-use bugle_core::{BugleError, CaptureTarget, MediaItem, MediaKind, Rect, RecordRequest, RecordingFormat, RecordingState, RecordingStatus};
+use bugle_core::{BugleError, CaptureTarget, EventTrack, MediaItem, MediaKind, Rect, RecordRequest, RecordingFormat, RecordingState, RecordingStatus};
 use chrono::Utc;
 use image::codecs::gif::{GifEncoder, Repeat};
 use image::{Delay, Frame, RgbaImage};
@@ -48,6 +49,8 @@ struct Active {
     max_seconds: Option<f64>,
     /// When the backend was first seen to have stopped by itself.
     finished_at: Option<Instant>,
+    /// Pointer/click log written next to the recording (`cursor_events`).
+    events: Option<EventLog>,
 }
 
 /// A running recorder. Dropping it stops the recorder (the file may or may
@@ -430,6 +433,23 @@ impl Engine {
             vars.insert("title", w.title.clone());
         }
         let frames = Arc::new(AtomicU64::new(0));
+        let hide_cursor = req.hide_cursor || self.config.recordings.hide_cursor;
+        let cursor_events = hide_cursor || req.cursor_events || self.config.recordings.cursor_events;
+        // Whether the frames end up without the pointer (the system recorder
+        // cannot leave it out).
+        let mut cursor_hidden = hide_cursor;
+        // Started before the recorder; aligned to the video when finalised.
+        let mut log = if cursor_events {
+            match EventLog::start(rect, !hide_cursor, req.max_seconds) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    tracing::warn!("could not start the cursor event log: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let (output, backend) = match req.format {
             RecordingFormat::Gif => {
                 if req.mix_audio {
@@ -441,7 +461,7 @@ impl Engine {
                 let fps = req.fps.unwrap_or(self.config.recordings.gif_frame_rate).clamp(1, 30);
                 let max_size = self.config.recordings.gif_max_size;
                 let max_secs = req.max_seconds;
-                let show_cursor = true;
+                let show_cursor = !hide_cursor;
                 let out = output.clone();
                 let stop2 = stop.clone();
                 let done2 = capture_done.clone();
@@ -472,9 +492,13 @@ impl Engine {
                         if system_audio && !sck_available {
                             tracing::warn!("system audio needs the ScreenCaptureKit recorder (macOS 14+); recording without it");
                         }
-                        system_audio && sck_available
+                        (system_audio || hide_cursor) && sck_available
                     }
                 };
+                if hide_cursor && !use_sck {
+                    tracing::warn!("hide_cursor needs the ScreenCaptureKit recorder (macOS 14+); the pointer stays in the frames");
+                    cursor_hidden = false;
+                }
                 if mix_audio && !(use_sck && microphone && system_audio) {
                     tracing::warn!(
                         "mix_audio has nothing to mix: it needs both the microphone and system audio, recorded by the ScreenCaptureKit recorder"
@@ -491,7 +515,7 @@ impl Engine {
                         retina: self.config.recordings.retina,
                         system_audio,
                         microphone,
-                        show_cursor: true,
+                        show_cursor: !hide_cursor,
                         highlight_clicks,
                         max_seconds: req.max_seconds,
                     };
@@ -548,6 +572,9 @@ impl Engine {
             Some(w) => format!("window {} — {} ({})", w.id, w.owner, w.title),
             None => format!("area {rect}"),
         };
+        if let Some(l) = log.as_mut() {
+            l.set_cursor_in_video(!cursor_hidden);
+        }
         *g = Some(Active {
             format: req.format,
             started: Instant::now(),
@@ -559,6 +586,7 @@ impl Engine {
             frames,
             max_seconds: req.max_seconds,
             finished_at: None,
+            events: log,
         });
         drop(g);
         Ok(self.record_status())
@@ -665,6 +693,14 @@ impl Engine {
         });
         m.label = active.label.take();
         m.source = Some(std::mem::take(&mut active.source));
+        if let Some(log) = active.events.take() {
+            let track = log.finish(m.duration_seconds.unwrap_or(duration));
+            let path = EventTrack::sidecar_path(&active.output);
+            match track.save(&path) {
+                Ok(()) => m.events = Some(path),
+                Err(e) => tracing::warn!("could not write the cursor event track {}: {e:#}", path.display()),
+            }
+        }
         if kind == MediaKind::Gif {
             if let Ok(d) = image::image_dimensions(&active.output) {
                 m.width = Some(d.0);
@@ -762,6 +798,7 @@ mod tests {
             frames: Arc::new(AtomicU64::new(0)),
             max_seconds,
             finished_at: None,
+            events: None,
         }
     }
 

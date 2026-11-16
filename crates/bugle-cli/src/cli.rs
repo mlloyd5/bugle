@@ -282,6 +282,13 @@ pub struct RecordArgs {
     /// Highlight mouse clicks.
     #[arg(long)]
     pub clicks: bool,
+    /// Log pointer moves and clicks to `<name>.events.json` next to the recording
+    /// (used by `bugle edit --zoom / --smooth-cursor`).
+    #[arg(long)]
+    pub cursor_events: bool,
+    /// Leave the pointer out of the frames (implies --cursor-events; an edit draws it back).
+    #[arg(long)]
+    pub hide_cursor: bool,
     #[arg(long, short = 'o')]
     pub output: Option<String>,
     #[arg(long, short = 'l')]
@@ -376,6 +383,13 @@ pub struct EditArgs {
     /// Long edge of GIF output, in pixels.
     #[arg(long)]
     pub max_size: Option<u32>,
+    /// Zoom in on clicks (factor above 1, at most 4; 2 when given without a value).
+    /// Needs a recording made with --cursor-events.
+    #[arg(long, num_args = 0..=1, default_missing_value = "2", value_name = "FACTOR")]
+    pub zoom: Option<f64>,
+    /// Draw the pointer along a smoothed path (recordings made with --hide-cursor).
+    #[arg(long)]
+    pub smooth_cursor: bool,
     #[arg(long, short = 'o')]
     pub output: Option<String>,
     #[arg(long)]
@@ -601,6 +615,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                     mix_audio: a.mix_audio,
                     max_seconds: a.seconds,
                     highlight_clicks: a.clicks,
+                    cursor_events: a.cursor_events,
+                    hide_cursor: a.hide_cursor,
                     output: a.output,
                     label: a.label,
                 };
@@ -712,6 +728,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 max_size: a.max_size,
                 output: a.output,
                 label: a.label,
+                zoom: a.zoom,
+                smooth_cursor: a.smooth_cursor,
             };
             let media = tokio::task::spawn_blocking({
                 let e = engine.clone();

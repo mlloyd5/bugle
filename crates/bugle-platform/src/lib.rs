@@ -341,6 +341,12 @@ pub fn cursor_position() -> Point {
     Point { x, y }
 }
 
+/// Mouse buttons held down right now: bit 0 left, bit 1 right, bit 2 middle.
+/// Reads the session state (no permission needed, no events posted).
+pub fn mouse_buttons() -> u32 {
+    unsafe { ffi::bugle_mouse_buttons() as u32 }
+}
+
 pub fn clipboard_write_png(png: &[u8]) -> Result<()> {
     if unsafe { ffi::bugle_clipboard_write_image(png.as_ptr(), png.len()) } != 0 {
         bail!("clipboard write failed");
@@ -798,6 +804,63 @@ impl Drop for VideoFrameWriter {
         if !self.handle.is_null() {
             unsafe { ffi::bugle_writer_cancel(self.handle) }
         }
+    }
+}
+
+/// Decodes a movie's video track in presentation order over a time range,
+/// one decode per frame (`AVAssetReader`). The first frame may start before
+/// the range: it is the one shown at its start.
+pub struct SequentialFrameReader {
+    handle: *mut libc::c_void,
+}
+
+unsafe impl Send for SequentialFrameReader {}
+
+impl SequentialFrameReader {
+    /// Read `start..end` seconds; `end <= start` reads the whole track.
+    pub fn open(path: &Path, start: f64, end: f64) -> Result<Self> {
+        let p = path_cstr(path)?;
+        let handle = unsafe { ffi::bugle_seq_open(p.as_ptr(), start, end) };
+        if handle.is_null() {
+            bail!("{}", last_error());
+        }
+        Ok(Self { handle })
+    }
+
+    /// The next frame and its presentation time (seconds), or `None` at the
+    /// end of the range.
+    pub fn next_frame(&mut self) -> Result<Option<(f64, RgbaImage)>> {
+        let mut pts = 0.0;
+        let img = unsafe { ffi::bugle_seq_next(self.handle, &mut pts) };
+        if img.data.is_null() {
+            let e = unsafe { ffi::bugle_last_error() };
+            if e.is_null() {
+                return Ok(None);
+            }
+            let msg = unsafe { CStr::from_ptr(e) }.to_string_lossy().into_owned();
+            unsafe { ffi::bugle_free(e as *mut _) };
+            bail!("{msg}");
+        }
+        Ok(Some((pts, take_image(img)?)))
+    }
+}
+
+impl Drop for SequentialFrameReader {
+    fn drop(&mut self) {
+        unsafe { ffi::bugle_seq_close(self.handle) }
+    }
+}
+
+/// Copy the video track of `video` and the audio tracks of `audio_source`
+/// over `start..end` (placed at 0) into `output`, without re-encoding.
+/// Returns `false` (nothing written) when the source has no audio there.
+pub fn mux_audio(video: &Path, audio_source: &Path, start: f64, end: f64, output: &Path, mp4: bool, timeout: Option<f64>) -> Result<bool> {
+    let (v, a, o) = (path_cstr(video)?, path_cstr(audio_source)?, path_cstr(output)?);
+    let timeout = timeout.filter(|t| t.is_finite() && *t > 0.0).unwrap_or(0.0);
+    match unsafe { ffi::bugle_mux_audio(v.as_ptr(), a.as_ptr(), start, end, o.as_ptr(), mp4 as i32, timeout) } {
+        0 => Ok(true),
+        1 => Ok(false),
+        _ => bail!("{}", last_error()),
     }
 }
 
