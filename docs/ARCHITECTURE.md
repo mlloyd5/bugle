@@ -29,7 +29,12 @@ Pure data: `Rect`/`Point`, `CaptureTarget`, `CaptureOptions`, `OcrResult`,
 `destinations`), filename
 templates (`naming`) and the JSON-lines `History`. A history line whose id is
 already present replaces the earlier record, which is how a moved file or a new
-sync URL is stored without rewriting the file.
+sync URL is stored without rewriting the file. `events` defines a recording's
+pointer/click event track, the `<name>.events.json` sidecar (format in the
+module docs: recorded area in global points, `move`/`down`/`up` events in
+points relative to it on the video's timeline, `cursor_in_video`), with
+validation, interpolation and trimming; `MediaItem.events` remembers where a
+recording's track is.
 
 
 ### `bugle-platform`
@@ -43,6 +48,8 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `ocr` | `VNRecognizeTextRequest` (accurate, `usesLanguageCorrection`, `recognitionLanguages`, auto-detect) |
 | `register_translation` | `VNTranslationalImageRegistrationRequest` via `VNSequenceRequestHandler` |
 | `post_scroll`, `cursor_position` | `CGEventCreateScrollWheelEvent`, `CGEventPost` |
+| `mouse_buttons` | `CGEventSourceButtonState` (session state; no permission, nothing posted) |
+| `SequentialFrameReader`, `mux_audio` | `AVAssetReader` over a time range (BGRA, presentation order); `AVMutableComposition` (rendered video + source audio range) → passthrough `AVAssetExportSession` |
 | `select_rect_blocking`, `select_rect_begin`/`_cancel` | borderless `NSWindow` per screen, dim fill, crosshair, size label; blocking (`[NSApp run]`) or callback-based for a host with its own run loop |
 | `window_pick_begin`/`_highlight`/`_cancel` (`shim/picker.m`) | see-through `NSWindow` per screen with an always-active `NSTrackingArea`; reports pointer moves and the final click/Esc/timeout through a C callback and draws whatever rect the host hands back |
 | `pin_image_blocking`, `pin_image_show` | floating borderless window, drag/resize/close; blocking or fire-and-forget |
@@ -123,6 +130,14 @@ recorder state machine, and exposes one method per user-facing action:
   recorder comment: the writer session opens before the stream starts, a static
   screen's stale first-frame timestamp is clamped, and the last frame is
   re-appended at the stop time so the video track covers the whole recording.
+  With `cursor_events` (`event_log.rs`) a thread polls the pointer and the
+  button state at 60 Hz from just before the recorder starts and logs changes;
+  on stop the log is aligned on its end (the video ends when the recording
+  is stopped, so the difference in length, up to 2 s, is the recorder's
+  startup delay) and written next to the file. `hide_cursor` sets
+  `showsCursor = NO` on the stream recorder (chosen for it in `auto`) and the
+  GIF grabs, and implies the track; the system recorder cannot hide the
+  pointer, so the track then says `cursor_in_video`.
 * `edit` (`edit.rs`) — trims a recording (`start`/`end` seconds, negative from
   the end, measured on the video track) and exports it with a preset. Video →
   video is one `AVAssetExportSession` over the time range, audio kept.
@@ -147,6 +162,22 @@ recorder state machine, and exposes one method per user-facing action:
   both are scaled to `gif_max_size`. Output is written to a temp file beside the
   target (extension corrected to the container) and renamed, then added to
   history, with the source as `parent` when it is a history item.
+  `zoom` and `smooth_cursor` (`cursor_fx.rs`) use the source's event track:
+  clicks become zoom segments (ease in so the view is fully zoomed at the
+  click, hold 1.5 s past the last click of a run, ease out; a click before
+  the view is back at 1x joins the run and the view pans to it, arriving as
+  it happens), the visible rect keeps the frame's aspect and stays inside it,
+  and frames are cropped and scaled with a bilinear sampler. Smoothing
+  resamples the pointer path at 120 Hz and convolves it with a centred
+  Gaussian (σ 0.1 s, so no lag), blending back to the raw path around each
+  click; the pointer is drawn as an anti-aliased signed-distance arrow,
+  scaled with the zoom. Positions map to pixels by the frame size over the
+  area size, so any preset works. Video → video renders through
+  `SequentialFrameReader` → effects → `VideoFrameWriter` (each output frame
+  shows the source frame on screen at its midpoint) and `mux_audio` copies
+  the source's audio over the same range back in; the GIF pipelines apply
+  the effects to the frames they already decode. A plain edit of a
+  recording with a track writes the trimmed track next to its output.
 * `ocr` (Apple Vision or an AI provider, per request or `[ocr] engine`), `describe` (images or sampled video frames), `transcribe`
   (extracts the audio track first), `subtitles`, `annotate`, `pin`, `select_area`.
 * `sync` (`sync.rs`) — runs after every successful save (`save_image`, so
@@ -288,10 +319,8 @@ handler on a later main-loop turn, so closing from inside the callback is safe.
 Bugle is a standalone app; this is the backlog, roughly in the order it would
 earn its keep.
 
-* **Video editor extras** — auto-zoom on clicks and cursor smoothing (the
-  recorders bake the cursor into the frames and log no click or cursor
-  positions, so these first need a click/cursor event track recorded alongside
-  the video), and an editing window on top of the headless `edit` pipeline.
+* **Video editor extras** — an editing window on top of the headless `edit`
+  pipeline (trim, zoom and pointer options with a preview).
 * **Audio mixing extras** — per-source levels (or ducking system audio under
   the microphone) for the mixed track.
 * **Markup editor extras** — crop and canvas (padding, background) in the
