@@ -47,6 +47,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `window_pick_begin`/`_highlight`/`_cancel` (`shim/picker.m`) | see-through `NSWindow` per screen with an always-active `NSTrackingArea`; reports pointer moves and the final click/Esc/timeout through a C callback and draws whatever rect the host hands back |
 | `pin_image_blocking`, `pin_image_show` | floating borderless window, drag/resize/close; blocking or fire-and-forget |
 | `toast_show` | non-activating `NSPanel` with `NSVisualEffectView`, thumbnail + two lines, fades out |
+| `editor_open` (`shim/editor.m`) | markup editor window: toolbar, canvas scaled to fit, label text field, unsaved-changes sheet; reports input in image pixels through a callback and draws the image and overlay primitives it is handed |
 | `panel_show` (`shim/panel.m`) | quick-access panel: non-activating, never-key `NSPanel`, thumbnail, buttons, close; reports clicks through a callback |
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
@@ -263,11 +264,24 @@ which buttons a media kind gets, the current panel generation (stale clicks are
 ignored), the timeout (paused while hovered, checked on the loop tick) and
 `perform`, which maps each button onto the engine through a `Backend` trait —
 Copy → `Engine::copy_media`, Pin → `Engine::pin`, Sync → `Engine::sync_media`,
-Annotate → open in `annotate_app`, Reveal → Finder. `quick_panel.rs` is the glue:
+Annotate → the markup editor (or open in `annotate_app`), Reveal → Finder. `quick_panel.rs` is the glue:
 it shows the panel, turns clicks into `AppEvent::QuickAccess`, runs blocking
 actions on a short-lived thread (Pin must, since its `UiHost` request
 round-trips through the main thread) and swaps in a sharper thumbnail rendered
 off the main thread.
+
+The markup editor follows the same split. `markup_editor.rs` is the
+platform-free part: `Editor::handle` turns the window's events (pointer in
+image pixels, tool, colour, size, commands, typed text) into edits of a
+`Vec<Shape>` with snapshot undo, and answers with `Effects` saying what to
+refresh. `editor_window.rs` is the glue: it renders `Editor::document` with
+`Engine::render_annotations` and hands the pixels to the window, so the preview
+is the renderer's output; only the shape being dragged (and the selection
+marks) go to the window as overlay primitives, and a shape being moved is left
+out of the render meanwhile. Save runs `Engine::apply_annotations` on a thread
+and the window closes only once it succeeded; `shim/editor.m` frees the Rust
+handler on a later main-loop turn, so closing from inside the callback is safe.
+`--smoke-test` drives it through `editor_inject`.
 
 ## Feature ideas
 
@@ -280,9 +294,10 @@ earn its keep.
   the video), and an editing window on top of the headless `edit` pipeline.
 * **Audio mixing extras** — per-source levels (or ducking system audio under
   the microphone) for the mixed track.
-* **Built-in markup editor** — draw arrows, boxes and text on a capture inside
-  Bugle (the quick-access panel's *Annotate* opens the file in `annotate_app`
-  for now), and keep the quick-access panel's thumbnails stacked when several
+* **Markup editor extras** — crop and canvas (padding, background) in the
+  window, multi-line labels, arrow and redaction styles, zoom, a preview
+  render off the main thread for very large captures, and opening a second
+  editor. Also: keep the quick-access panel's thumbnails stacked when several
   captures arrive in a row.
 * **Window picker extras** — Space to switch to area selection, a picker for
   window recordings, and offering the picker to API callers through `UiHost`.

@@ -7,8 +7,10 @@
 //! the selection overlay or pin windows through [`UiHost`].
 
 mod commands;
+mod editor_window;
 mod icon;
 mod login;
+mod markup_editor;
 mod picker;
 mod quick_access;
 mod quick_panel;
@@ -45,10 +47,15 @@ struct Cli {
     /// Debug logging.
     #[arg(short, long)]
     verbose: bool,
-    /// Show the overlay, a toast, a pin and the quick-access panel, then exit.
-    /// Exercises the in-app UI plumbing without needing a keyboard.
+    /// Show the overlay, a toast, a pin, the quick-access panel and the
+    /// markup editor, then exit. Exercises the in-app UI plumbing without
+    /// needing a keyboard.
     #[arg(long, hide = true)]
     smoke_test: bool,
+    /// Open the markup editor at launch for a media id, `latest` or an
+    /// image path.
+    #[arg(long, hide = true, value_name = "SOURCE")]
+    annotate: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +102,7 @@ enum AppEvent {
     Done(Action, Result<Option<Notice>, String>),
     ApiStopped(Option<String>),
     QuickAccess(quick_access::QuickEvent),
+    Editor(editor_window::EditorMsg),
     Quit,
 }
 
@@ -426,6 +434,8 @@ struct App {
     proxy: Proxy,
     last_tick: Instant,
     quick: quick_access::QuickAccess,
+    /// Counts editor windows, so a late save result closes only its own.
+    editor_generation: u64,
 }
 
 impl App {
@@ -497,6 +507,7 @@ impl App {
         }
         match command {
             Command::Run(a) => self.dispatch(a),
+            Command::AnnotateLatest => self.annotate_latest(),
             Command::OpenFolder => bugle_platform::open_path(&self.engine.config.save_dir()),
             Command::ToggleApi => self.toggle_api(),
             Command::Preferences => self.open_preferences(),
@@ -752,6 +763,7 @@ fn main() -> Result<()> {
         proxy: proxy.clone(),
         last_tick: Instant::now() - Duration::from_secs(5),
         quick: quick_access::QuickAccess::new(engine.config.quick_access.clone()),
+        editor_generation: 0,
     };
     app.refresh_recent();
     app.update_recording_ui();
@@ -762,6 +774,10 @@ fn main() -> Result<()> {
     if let Some(first) = hotkey_warnings.first() {
         let n = hotkey_warnings.len();
         app.toast_error(&format!("{n} hotkey binding{} skipped: {first}", if n == 1 { "" } else { "s" }));
+    }
+
+    if let Some(source) = cli.annotate.clone() {
+        proxy.send(AppEvent::Editor(editor_window::EditorMsg::Open(source)));
     }
 
     let smoke_started = cli.smoke_test.then(|| smoke_test(engine.clone(), proxy.clone()));
@@ -793,6 +809,7 @@ fn main() -> Result<()> {
                 AppEvent::Done(action, result) => app.on_done(action, result),
                 AppEvent::ApiStopped(err) => app.on_api_stopped(err),
                 AppEvent::QuickAccess(e) => app.on_quick(e),
+                AppEvent::Editor(m) => app.on_editor(m),
                 AppEvent::Quit => app.quit(control_flow),
             },
             Event::LoopDestroyed => {
@@ -839,6 +856,7 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
             t.elapsed().as_secs_f64()
         );
         quick_panel::smoke(&proxy);
+        editor_window::smoke(&proxy);
         std::thread::sleep(Duration::from_millis(1500));
         proxy.send(AppEvent::Quit);
     });

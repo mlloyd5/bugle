@@ -772,10 +772,19 @@ pub struct QuickAccessConfig {
     pub timeout_seconds: f64,
     /// Screen corner: `top-right`, `top-left`, `bottom-right`, `bottom-left`.
     pub position: PanelCorner,
-    /// Bundle id of the app *Annotate* opens the capture in; edits made there
-    /// change the saved file in place. When it is not installed the default
-    /// app for the file is used and a warning is logged.
+    /// What *Annotate* opens the capture in: `builtin` for Bugle's own
+    /// markup editor (which saves an annotated copy), or the bundle id of
+    /// another app, where edits change the saved file in place. An empty
+    /// string, or a bundle id that is not installed (logged as a warning),
+    /// means the default app for the file.
     pub annotate_app: String,
+}
+
+impl QuickAccessConfig {
+    /// *Annotate* opens Bugle's own markup editor.
+    pub fn builtin_editor(&self) -> bool {
+        self.annotate_app.trim().eq_ignore_ascii_case("builtin")
+    }
 }
 
 impl Default for QuickAccessConfig {
@@ -784,7 +793,7 @@ impl Default for QuickAccessConfig {
             enabled: true,
             timeout_seconds: 8.0,
             position: PanelCorner::BottomRight,
-            annotate_app: "com.apple.Preview".into(),
+            annotate_app: "builtin".into(),
         }
     }
 }

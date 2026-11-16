@@ -386,6 +386,7 @@ dependencies = [
  "bugle-api",
  "bugle-core",
  "bugle-engine",
+ "bugle-markup",
  "bugle-platform",
  "chrono",
  "clap",

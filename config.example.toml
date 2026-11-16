@@ -71,6 +71,7 @@ record = "cmd+shift+5"        # starts an MP4 recording, or stops the active one
 # record_gif = "cmd+shift+g"
 ocr_latest = "cmd+shift+2"
 pin_latest = "cmd+shift+p"
+# annotate_latest = "cmd+shift+e"   # markup editor for the newest screenshot
 # stop_recording = "cmd+shift+."
 # sync_latest = "ctrl+alt+s"
 # open_folder = "ctrl+alt+o"
@@ -87,8 +88,10 @@ enabled = true
 # it (and up to 2 s after the pointer leaves). 0 = stay open until a button or ×.
 timeout_seconds = 8.0
 position = "bottom-right" # bottom-right | bottom-left | top-right | top-left
-# Bundle id Annotate opens the file in; edits there change the saved file in place.
-annotate_app = "com.apple.Preview"
+# What Annotate opens: "builtin" is Bugle's markup editor, which saves an
+# annotated copy. A bundle id (e.g. "com.apple.Preview") opens that app instead;
+# edits there change the saved file in place.
+annotate_app = "builtin"
 
 # ---------------------------------------------------------------------------
 # Sync every new capture to storage you own. There is no hosted service: pick
