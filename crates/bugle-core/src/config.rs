@@ -39,6 +39,10 @@ pub struct GeneralConfig {
     pub copy_to_clipboard: bool,
     /// Where the history file lives.
     pub history_path: Option<String>,
+    /// `bugle-app` run from Bugle.app: also post a macOS notification
+    /// (Notification Center) for each toast. macOS asks for permission the
+    /// first time; denied or unbundled, only the toast is shown.
+    pub system_notifications: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +206,7 @@ impl Default for GeneralConfig {
             shutter_sound: false,
             copy_to_clipboard: false,
             history_path: None,
+            system_notifications: false,
         }
     }
 }

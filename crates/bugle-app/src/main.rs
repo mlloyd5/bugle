@@ -11,6 +11,7 @@ mod editor_window;
 mod icon;
 mod login;
 mod markup_editor;
+mod notifications;
 mod picker;
 mod quick_access;
 mod quick_panel;
@@ -445,11 +446,13 @@ impl App {
 
     fn toast(&self, n: &Notice) {
         bugle_platform::toast_show(n.thumb.as_deref(), &n.title, &n.subtitle, n.open.as_deref(), 3.0);
+        notifications::post(&n.title, &n.subtitle, n.open.as_deref());
     }
 
     fn toast_error(&self, msg: &str) {
         tracing::warn!("{msg}");
         bugle_platform::toast_show(None, "Bugle", msg, None, 5.0);
+        notifications::post("Bugle", msg, None);
     }
 
     fn dispatch(&mut self, mut action: Action) {
@@ -691,6 +694,7 @@ fn main() -> Result<()> {
     let mut engine = Engine::new(config, false)?;
     engine.ui_host = Some(Arc::new(AppUiHost { proxy: proxy.clone(), select_gate: Mutex::new(()) }));
     let engine = Arc::new(engine);
+    notifications::init(engine.config.general.system_notifications, cli.smoke_test);
 
     if !bugle_platform::screen_access_preflight() {
         tracing::warn!("Screen Recording permission not granted; asking");

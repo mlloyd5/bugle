@@ -21,6 +21,8 @@ pub use panel::{
 #[cfg(target_os = "macos")]
 pub mod login_item;
 #[cfg(target_os = "macos")]
+pub mod notify;
+#[cfg(target_os = "macos")]
 mod editor;
 #[cfg(target_os = "macos")]
 pub use editor::{
