@@ -47,7 +47,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `window_pick_begin`/`_highlight`/`_cancel` (`shim/picker.m`) | see-through `NSWindow` per screen with an always-active `NSTrackingArea`; reports pointer moves and the final click/Esc/timeout through a C callback and draws whatever rect the host hands back |
 | `pin_image_blocking`, `pin_image_show` | floating borderless window, drag/resize/close; blocking or fire-and-forget |
 | `toast_show` | non-activating `NSPanel` with `NSVisualEffectView`, thumbnail + two lines, fades out |
-| `editor_open` (`shim/editor.m`) | markup editor window: toolbar, canvas scaled to fit, label text field, unsaved-changes sheet; reports input in image pixels through a callback and draws the image and overlay primitives it is handed |
+| `editor_open` (`shim/editor.m`) | markup editor window: toolbar with pull-down menus, canvas in an `NSScrollView` (fit, zoom stops, pinch, ⌘+/⌘−/⌘1/⌘0), multi-line label text field, unsaved-changes sheet; reports input in edited-image pixels through a callback and draws the image (told where the edited image's origin lies in it), overlay primitives and menus it is handed |
 | `panel_show` (`shim/panel.m`) | quick-access panel: non-activating, never-key `NSPanel`, thumbnail, buttons, close; reports clicks through a callback |
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
@@ -71,7 +71,12 @@ variants, which never nest a run loop.
 ### `bugle-markup`
 `Annotation` documents (serde) and a renderer. Shapes are rasterised from signed
 distance functions so strokes are anti-aliased without a vector library; text uses
-`ab_glyph` with a system font (Arial Bold → Helvetica → Geneva).
+`ab_glyph` with a system font (Arial Bold → Helvetica → Geneva), one line per
+`text_lines` entry (`\n`, `\r\n`, a lone `\r`, U+2028/U+2029). The canvas
+shadow blurs a one-channel mask with three box blurs (running sums), so its
+cost does not grow with the blur radius. `Shape::translate` and
+`Annotation::source_origin` (where source pixel (0, 0) lands after crop and
+canvas) let an editor keep shapes in original-image pixels.
 
 
 ### `bugle-ai`
@@ -272,16 +277,27 @@ off the main thread.
 
 The markup editor follows the same split. `markup_editor.rs` is the
 platform-free part: `Editor::handle` turns the window's events (pointer in
-image pixels, tool, colour, size, commands, typed text) into edits of a
-`Vec<Shape>` with snapshot undo, and answers with `Effects` saying what to
-refresh. `editor_window.rs` is the glue: it renders `Editor::document` with
-`Engine::render_annotations` and hands the pixels to the window, so the preview
-is the renderer's output; only the shape being dragged (and the selection
-marks) go to the window as overlay primitives, and a shape being moved is left
-out of the render meanwhile. Save runs `Engine::apply_annotations` on a thread
-and the window closes only once it succeeded; `shim/editor.m` frees the Rust
-handler on a later main-loop turn, so closing from inside the callback is safe.
-`--smoke-test` drives it through `editor_inject`.
+image pixels, tool, colour, size, menu picks, commands, typed text) into edits
+of the shapes, the crop and the canvas choice, with snapshot undo over all
+three, and answers with `Effects` saying what to refresh. Shapes and the crop
+stay in original-image pixels; `Editor::document` translates the shapes by the
+crop for the renderer and adds the canvas, except while the crop tool is
+picked, when the whole image is shown with the crop as an overlay.
+`Editor::menus` describes the toolbar's style menu (arrow or redaction styles,
+for the tool or the selected shape) and canvas menu (padding, background).
+`editor_window.rs` is the glue: it renders `Editor::document` with
+`Engine::render_annotations` on a per-window preview thread (only the newest
+waiting document is rendered, stale results are dropped) and hands the pixels
+and `Annotation::source_origin` to the window, so the preview is the
+renderer's output. Only the shape being dragged (and the selection or crop
+marks) go to the window as overlay primitives; a shape being moved is left out
+of the render meanwhile, and the overlay waits for the render it belongs with.
+The window owns the zoom and reports image pixels per point on a later
+main-loop turn, so nothing it does in reply to Rust calls back into Rust.
+Save runs `Engine::apply_annotations` on a thread and the window closes only
+once it succeeded; `shim/editor.m` frees the Rust handler on a later
+main-loop turn, so closing from inside the callback is safe. `--smoke-test`
+drives it through `editor_inject` and `editor_zoom`.
 
 ## Feature ideas
 
@@ -294,11 +310,9 @@ earn its keep.
   the video), and an editing window on top of the headless `edit` pipeline.
 * **Audio mixing extras** — per-source levels (or ducking system audio under
   the microphone) for the mixed track.
-* **Markup editor extras** — crop and canvas (padding, background) in the
-  window, multi-line labels, arrow and redaction styles, zoom, a preview
-  render off the main thread for very large captures, and opening a second
-  editor. Also: keep the quick-access panel's thumbnails stacked when several
-  captures arrive in a row.
+* **Markup editor extras** — opening a second editor (the window shim keeps
+  one editor today). Also: keep the quick-access panel's thumbnails stacked
+  when several captures arrive in a row.
 * **Window picker extras** — Space to switch to area selection, a picker for
   window recordings, and offering the picker to API callers through `UiHost`.
 * **Packaging extras** — a universal (arm64 + x86_64) build (bundles are
