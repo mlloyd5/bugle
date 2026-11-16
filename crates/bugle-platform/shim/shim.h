@@ -77,6 +77,19 @@ int32_t bugle_select_rect_blocking(double *x, double *y, double *w, double *h);
 // selection or window picker is already up (cb is then never called).
 typedef void (*bugle_select_callback_t)(void *ctx, int32_t ok, double x, double y, double w, double h);
 int32_t bugle_select_rect_begin(bugle_select_callback_t cb, void *ctx);
+// Like bugle_select_rect_begin, plus: with `allow_switch`, Space (while not
+// dragging) ends the selection with ok=2 and leaves Bugle active, so the host
+// can open the window picker; `timeout_seconds` > 0 cancels (ok=0) after that
+// long.
+int32_t bugle_select_rect_begin_ex(bugle_select_callback_t cb, void *ctx, int32_t allow_switch, double timeout_seconds);
+// What Space does (ok=2), when allowed and not dragging; no-op otherwise.
+void bugle_select_rect_switch(void);
+// Draws a one-line hint centred near the bottom of an overlay view (shared by
+// the selection overlay and the window picker).
+#ifdef __OBJC__
+#import <AppKit/AppKit.h>
+void bugle_draw_overlay_hint(NSRect bounds, NSString *text);
+#endif
 int32_t bugle_select_rect_active(void);
 void bugle_select_rect_cancel(void);
 void bugle_pin_image_blocking(const uint8_t *png, size_t len, double x, double y, double w, double h, double opacity);
@@ -150,13 +163,16 @@ int32_t bugle_sck_record_stop(void *handle);
 // Window picker overlay (picker.m). `cb` gets kind 0 for every pointer move
 // (global top-left points), then exactly one final call: 1 = clicked at
 // (x, y), 2 = cancelled (Esc, right click, timeout, Bugle losing active
-// status, bugle_pick_cancel). The
+// status, bugle_pick_cancel), 3 = Space pressed with `allow_switch` set (the
+// host opens the area selection instead; Bugle stays active). The
 // final call arrives on a later main-queue turn, after the overlay is gone.
 // Returns 0 (cb never called) when a picker or selection is already active.
 // Main thread only, needs a running AppKit loop.
 typedef void (*bugle_pick_callback_t)(void *ctx, int32_t kind, double x, double y);
-int32_t bugle_pick_begin(bugle_pick_callback_t cb, void *ctx, double timeout_seconds);
+int32_t bugle_pick_begin(bugle_pick_callback_t cb, void *ctx, double timeout_seconds, int32_t allow_switch);
 // Highlight a global top-left rect with a centred label; w or h <= 0 clears.
 void bugle_pick_highlight(double x, double y, double w, double h, const char *label);
 int32_t bugle_pick_active(void);
 void bugle_pick_cancel(void);
+// What Space does (kind 3), when the picker was opened with allow_switch.
+void bugle_pick_switch(void);

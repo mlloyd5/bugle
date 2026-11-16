@@ -391,6 +391,7 @@ impl Engine {
     }
 
     pub fn record_start(&self, req: &RecordRequest) -> Result<RecordingStatus> {
+        self.check_target_host(&req.target)?;
         if !bugle_platform::screen_access_preflight() {
             return Err(bugle_core::BugleError::PermissionDenied.into());
         }
@@ -414,9 +415,13 @@ impl Engine {
                 let r = self.select_area()?.ok_or(BugleError::Cancelled)?;
                 (r, None)
             }
+            CaptureTarget::PickWindow => {
+                let w = self.pick_window()?;
+                (w.frame, Some(w))
+            }
             CaptureTarget::AllScreens => {
                 return Err(BugleError::Invalid(
-                    "recordings support screen (one display), area, window and interactive targets, not all screens".into(),
+                    "recordings support screen (one display), area, window, interactive and pick_window targets, not all screens".into(),
                 )
                 .into())
             }

@@ -588,7 +588,22 @@ static void stop_app(void) {
     [NSApp postEvent:e atStart:YES];
 }
 
-typedef void (^BugleSelectCompletion)(BOOL ok, CGRect rect);
+/// `result`: 0 = cancelled, 1 = `rect` selected, 2 = Space asked for the
+/// window picker instead.
+typedef void (^BugleSelectCompletion)(int32_t result, CGRect rect);
+
+void bugle_draw_overlay_hint(NSRect bounds, NSString *text) {
+    if (text.length == 0) return;
+    NSDictionary *attrs = @{
+        NSFontAttributeName : [NSFont systemFontOfSize:13 weight:NSFontWeightMedium],
+        NSForegroundColorAttributeName : [NSColor whiteColor]
+    };
+    NSSize sz = [text sizeWithAttributes:attrs];
+    NSRect r = NSMakeRect(NSMidX(bounds) - (sz.width + 24) / 2, NSMinY(bounds) + 48, sz.width + 24, sz.height + 12);
+    [[NSColor colorWithWhite:0 alpha:0.66] setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:r xRadius:8 yRadius:8] fill];
+    [text drawAtPoint:NSMakePoint(r.origin.x + 12, r.origin.y + 6) withAttributes:attrs];
+}
 
 @class BugleSelectSession;
 
@@ -603,7 +618,9 @@ typedef void (^BugleSelectCompletion)(BOOL ok, CGRect rect);
 @property(nonatomic, strong) NSMutableArray<NSWindow *> *windows;
 @property(nonatomic, copy) BugleSelectCompletion completion;
 @property(nonatomic) BOOL finished;
-- (void)finishWithRect:(CGRect)rect ok:(BOOL)ok;
+@property(nonatomic) BOOL allowSwitch;
+@property(nonatomic, strong) NSTimer *timer;
+- (void)finishWithRect:(CGRect)rect result:(int32_t)result;
 @end
 
 static BugleSelectSession *g_select_session = nil;
@@ -615,6 +632,9 @@ static BugleSelectSession *g_select_session = nil;
 - (void)drawRect:(NSRect)dirty {
     [[NSColor colorWithWhite:0 alpha:0.28] setFill];
     NSRectFill(self.bounds);
+    if (self.session.allowSwitch && !self.dragging) {
+        bugle_draw_overlay_hint(self.bounds, @"Drag an area  ·  Space: pick a window  ·  Esc: cancel");
+    }
     if (self.dragging && self.sel.size.width > 0 && self.sel.size.height > 0) {
         [[NSColor clearColor] setFill];
         NSRectFillUsingOperation(self.sel, NSCompositingOperationCopy);
@@ -657,13 +677,15 @@ static BugleSelectSession *g_select_session = nil;
         CGFloat primaryH = [NSScreen screens].firstObject.frame.size.height;
         CGRect r = CGRectMake(screenRect.origin.x, primaryH - screenRect.origin.y - screenRect.size.height,
                               screenRect.size.width, screenRect.size.height);
-        [self.session finishWithRect:r ok:YES];
+        [self.session finishWithRect:r result:1];
     }
     [self setNeedsDisplay:YES];
 }
 - (void)keyDown:(NSEvent *)e {
     if (e.keyCode == 53) { // Esc
-        [self.session finishWithRect:CGRectZero ok:NO];
+        [self.session finishWithRect:CGRectZero result:0];
+    } else if (e.keyCode == 49 && !e.isARepeat) { // Space
+        bugle_select_rect_switch();
     }
 }
 @end
@@ -676,30 +698,35 @@ static BugleSelectSession *g_select_session = nil;
 @end
 
 @implementation BugleSelectSession
-- (void)finishWithRect:(CGRect)rect ok:(BOOL)ok {
+- (void)finishWithRect:(CGRect)rect result:(int32_t)result {
     if (self.finished) return;
     self.finished = YES;
+    [self.timer invalidate];
+    self.timer = nil;
     [NSCursor pop];
     for (NSWindow *win in self.windows) [win orderOut:nil];
     [self.windows removeAllObjects];
     BugleSelectCompletion done = self.completion;
     self.completion = nil;
     if (g_select_session == self) g_select_session = nil;
-    // Give keyboard focus back to whatever the user was working in.
-    [NSApp deactivate];
-    if (done) done(ok, rect);
+    // Give keyboard focus back to whatever the user was working in, unless
+    // the window picker opens next (it needs Bugle active for Esc, and a
+    // resign-active would cancel it).
+    if (result != 2) [NSApp deactivate];
+    if (done) done(result, rect);
 }
 @end
 
 /// Show the overlay on every screen. Returns NO when a selection is already
 /// in progress (the completion is then never called).
-static BOOL select_begin(BugleSelectCompletion completion) {
+static BOOL select_begin(BugleSelectCompletion completion, BOOL allowSwitch, double timeoutSeconds) {
     if (g_select_session || bugle_pick_active()) return NO;
     NSApplication *app = [NSApplication sharedApplication];
     [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
     BugleSelectSession *session = [[BugleSelectSession alloc] init];
     session.windows = [NSMutableArray array];
     session.completion = completion;
+    session.allowSwitch = allowSwitch;
     for (NSScreen *screen in [NSScreen screens]) {
         BugleOverlayWindow *win = [[BugleOverlayWindow alloc] initWithContentRect:screen.frame
                                                                         styleMask:NSWindowStyleMaskBorderless
@@ -722,6 +749,15 @@ static BOOL select_begin(BugleSelectCompletion completion) {
         [win makeKeyAndOrderFront:nil];
         [session.windows addObject:win];
     }
+    if (timeoutSeconds > 0) {
+        __weak BugleSelectSession *weak = session;
+        session.timer = [NSTimer timerWithTimeInterval:timeoutSeconds
+                                               repeats:NO
+                                                 block:^(NSTimer *timer) {
+                                                     [weak finishWithRect:CGRectZero result:0];
+                                                 }];
+        [[NSRunLoop mainRunLoop] addTimer:session.timer forMode:NSRunLoopCommonModes];
+    }
     g_select_session = session;
     [app activateIgnoringOtherApps:YES];
     [[NSCursor crosshairCursor] push];
@@ -732,11 +768,13 @@ int32_t bugle_select_rect_blocking(double *x, double *y, double *w, double *h) {
     @autoreleasepool {
         __block BOOL ok = NO;
         __block CGRect r = CGRectZero;
-        if (!select_begin(^(BOOL k, CGRect rect) {
-                ok = k;
-                r = rect;
-                stop_app();
-            })) {
+        if (!select_begin(
+                ^(int32_t k, CGRect rect) {
+                    ok = k == 1;
+                    r = rect;
+                    stop_app();
+                },
+                NO, 0)) {
             return 0;
         }
         [NSApp run];
@@ -749,21 +787,40 @@ int32_t bugle_select_rect_blocking(double *x, double *y, double *w, double *h) {
     }
 }
 
-int32_t bugle_select_rect_begin(bugle_select_callback_t cb, void *ctx) {
+int32_t bugle_select_rect_begin_ex(bugle_select_callback_t cb, void *ctx, int32_t allow_switch, double timeout_seconds) {
     @autoreleasepool {
-        BOOL started = select_begin(^(BOOL ok, CGRect r) {
-            cb(ctx, ok ? 1 : 0, r.origin.x, r.origin.y, r.size.width, r.size.height);
-        });
+        BOOL started = select_begin(
+            ^(int32_t result, CGRect r) {
+                cb(ctx, result, r.origin.x, r.origin.y, r.size.width, r.size.height);
+            },
+            allow_switch != 0, timeout_seconds);
         return started ? 1 : 0;
     }
 }
 
+int32_t bugle_select_rect_begin(bugle_select_callback_t cb, void *ctx) {
+    return bugle_select_rect_begin_ex(cb, ctx, 0, 0);
+}
+
 int32_t bugle_select_rect_active(void) { return g_select_session ? 1 : 0; }
+
+/// What Space does: hand over to the window picker, when the host allowed it
+/// and no drag is in progress.
+void bugle_select_rect_switch(void) {
+    @autoreleasepool {
+        BugleSelectSession *s = g_select_session;
+        if (!s || !s.allowSwitch) return;
+        for (NSWindow *win in s.windows) {
+            if ([win.contentView isKindOfClass:[BugleSelectView class]] && ((BugleSelectView *)win.contentView).dragging) return;
+        }
+        [s finishWithRect:CGRectZero result:2];
+    }
+}
 
 /// Dismiss an in-progress selection as cancelled (the callback fires with ok=0).
 void bugle_select_rect_cancel(void) {
     @autoreleasepool {
-        [g_select_session finishWithRect:CGRectZero ok:NO];
+        [g_select_session finishWithRect:CGRectZero result:0];
     }
 }
 

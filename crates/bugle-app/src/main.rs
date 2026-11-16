@@ -18,7 +18,7 @@ mod quick_panel;
 use anyhow::{anyhow, Context, Result};
 use bugle_core::{
     CaptureOptions, CaptureRequest, CaptureTarget, Config, MediaKind, OcrOptions, RecordRequest, RecordingFormat,
-    RecordingState, Rect, ScrollCaptureRequest,
+    RecordingState, Rect, ScrollCaptureRequest, WindowInfo,
 };
 use commands::{Command, Slot};
 use bugle_engine::{Engine, UiHost};
@@ -72,6 +72,8 @@ enum Action {
     ScrollCapture,
     RecordVideo,
     RecordGif,
+    /// MP4 recording of a window picked with the window picker.
+    RecordWindow,
     StopRecording,
     OcrLatest,
     PinLatest,
@@ -90,9 +92,11 @@ struct Notice {
 enum UiRequest {
     Select(Sender<Option<Rect>>),
     Pin { png: Vec<u8>, frame: Option<Rect>, opacity: f64, reply: Sender<Result<(), String>> },
-    /// Hover-to-highlight window picker; `None` when cancelled.
-    /// Not opened after `deadline`, when the worker may have stopped waiting.
-    PickWindow { timeout: Duration, deadline: Instant, reply: picker::PickReply },
+    /// Window picker / area selection session (Space switches); see
+    /// [`picker::begin`].
+    PickWindow(picker::Request),
+    /// Space or Esc for the open overlay, without a keyboard (`--smoke-test`).
+    PickControl(picker::Control),
 }
 
 enum AppEvent {
@@ -142,6 +146,11 @@ impl UiHost for AppUiHost {
         self.proxy.send(AppEvent::Ui(UiRequest::Pin { png, frame, opacity, reply }));
         rx.recv().context("pin request dropped")?.map_err(|e| anyhow!(e))
     }
+
+    fn pick_window(&self) -> Result<Option<WindowInfo>> {
+        let _gate = self.select_gate.lock().map_err(|_| anyhow!("selection gate poisoned"))?;
+        picker::pick_window(&self.proxy, picker::PICK_TIMEOUT)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -157,14 +166,14 @@ fn worker(engine: Arc<Engine>, rx: Receiver<Action>, proxy: Proxy) {
 
 fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<Notice>> {
     match action {
-        Action::CaptureArea => capture(engine, CaptureTarget::Interactive),
-        Action::CaptureWindow if engine.config.screenshots.window_picker => {
-            let Some(w) = picker::pick(proxy, picker::PICK_TIMEOUT)? else { return Ok(None) };
-            // The overlay activated Bugle; give the target app a moment to
-            // become active again so its window is not captured dimmed.
-            std::thread::sleep(Duration::from_millis(150));
-            capture(engine, CaptureTarget::Window { id: Some(w.id), title: None, owner: None })
+        // With the window picker on, Space switches between it and the area
+        // selection; the session answers with whichever the user finished in.
+        Action::CaptureArea | Action::CaptureWindow if engine.config.screenshots.window_picker => {
+            let start = if action == Action::CaptureArea { picker::Mode::Area } else { picker::Mode::Window };
+            let Some(picked) = picker::pick(proxy, start, true, picker::PICK_TIMEOUT)? else { return Ok(None) };
+            capture(engine, picked_target(picked))
         }
+        Action::CaptureArea => capture(engine, CaptureTarget::Interactive),
         Action::CaptureWindow => {
             // Let the status menu fade before grabbing.
             std::thread::sleep(Duration::from_millis(150));
@@ -195,10 +204,21 @@ fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<N
                 open: Some(out.item.path.clone()),
             }))
         }
-        Action::RecordVideo | Action::RecordGif => {
+        Action::RecordVideo | Action::RecordGif | Action::RecordWindow => {
             let format = if action == Action::RecordGif { RecordingFormat::Gif } else { RecordingFormat::Mp4 };
+            let target = if engine.config.screenshots.window_picker {
+                let start = if action == Action::RecordWindow { picker::Mode::Window } else { picker::Mode::Area };
+                let Some(picked) = picker::pick(proxy, start, true, picker::PICK_TIMEOUT)? else { return Ok(None) };
+                picked_target(picked)
+            } else if action == Action::RecordWindow {
+                // Front-most window, like Capture Window without the picker.
+                std::thread::sleep(Duration::from_millis(150));
+                CaptureTarget::Window { id: None, title: None, owner: None }
+            } else {
+                CaptureTarget::Interactive
+            };
             let req = RecordRequest {
-                target: CaptureTarget::Interactive,
+                target,
                 format,
                 fps: None,
                 microphone: false,
@@ -291,6 +311,14 @@ fn is_cancelled(e: &anyhow::Error) -> bool {
         || format!("{e:#}").contains("selection cancelled")
 }
 
+/// The capture target for what a pick session returned.
+fn picked_target(picked: picker::Picked) -> CaptureTarget {
+    match picked {
+        picker::Picked::Window(w) => CaptureTarget::Window { id: Some(w.id), title: None, owner: None },
+        picker::Picked::Area(rect) => CaptureTarget::Area { rect },
+    }
+}
+
 fn capture(engine: &Engine, target: CaptureTarget) -> Result<Option<Notice>> {
     let req = CaptureRequest { target, options: CaptureOptions::default() };
     let out = match engine.capture(&req) {
@@ -370,6 +398,7 @@ struct MenuItems {
     menu: Menu,
     record: MenuItem,
     record_gif: MenuItem,
+    record_window: MenuItem,
     stop: MenuItem,
     recent: Submenu,
     api: MenuItem,
@@ -404,6 +433,7 @@ fn build_menu(config: &Config, keys: &HashMap<&'static str, String>) -> Result<M
     let items = MenuItems {
         record: take("record")?,
         record_gif: take("record_gif")?,
+        record_window: take("record_window")?,
         stop: take("stop_recording")?,
         api: take("toggle_api")?,
         menu,
@@ -454,7 +484,7 @@ impl App {
 
     fn dispatch(&mut self, mut action: Action) {
         let recording = self.is_recording();
-        if matches!(action, Action::RecordVideo | Action::RecordGif) && recording {
+        if matches!(action, Action::RecordVideo | Action::RecordGif | Action::RecordWindow) && recording {
             action = Action::StopRecording;
         }
         if action == Action::StopRecording && !recording {
@@ -531,10 +561,11 @@ impl App {
             UiRequest::Pin { png, frame, opacity, reply } => {
                 let _ = reply.send(bugle_platform::pin_image_show(&png, frame, opacity).map_err(|e| e.to_string()));
             }
-            UiRequest::PickWindow { timeout, deadline, reply } => {
-                // On failure `begin` answers `reply` with the reason itself.
-                picker::begin(timeout, deadline, reply);
+            UiRequest::PickWindow(req) => {
+                // On failure `begin` answers the request with the reason itself.
+                picker::begin(req);
             }
+            UiRequest::PickControl(c) => picker::control(c),
         }
     }
 
@@ -556,6 +587,7 @@ impl App {
         self.items.stop.set_enabled(recording);
         self.items.record.set_enabled(!recording);
         self.items.record_gif.set_enabled(!recording);
+        self.items.record_window.set_enabled(!recording);
         if recording {
             let secs = st.elapsed_seconds as u64;
             self.tray.set_title(Some(format!("● {}:{:02}", secs / 60, secs % 60)));
@@ -788,7 +820,7 @@ fn main() -> Result<()> {
             Event::NewEvents(StartCause::ResumeTimeReached { .. }) | Event::MainEventsCleared => {
                 app.tick();
                 if let Some(t0) = smoke_started {
-                    if t0.elapsed() > Duration::from_millis(3500) && bugle_platform::select_rect_active() {
+                    if t0.elapsed() > Duration::from_millis(3500) && bugle_platform::select_rect_active() && !picker::in_session() {
                         tracing::info!("smoke test: cancelling overlay");
                         bugle_platform::select_rect_cancel();
                     }
@@ -849,12 +881,13 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
         // that the answer comes back. A click during the test only reports
         // the window, nothing is captured.
         let t = Instant::now();
-        let r = picker::pick(&proxy, Duration::from_millis(1500));
+        let r = picker::pick_window(&proxy, Duration::from_millis(1500));
         eprintln!(
             "smoke test: window picker → {:?} after {:.1}s",
             r.map(|w| w.map(|w| picker::label(&w))),
             t.elapsed().as_secs_f64()
         );
+        picker::smoke(&proxy);
         quick_panel::smoke(&proxy);
         editor_window::smoke(&proxy);
         std::thread::sleep(Duration::from_millis(1500));

@@ -292,7 +292,7 @@ pub struct HotkeyConfig {
     /// Pin the latest capture to the screen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pin_latest: Option<String>,
-    /// Bindings for the other menu items (`stop_recording`, `sync_latest`,
+    /// Bindings for the other menu items (`record_window`, `stop_recording`, `sync_latest`,
     /// `open_folder`, `toggle_api`, `preferences`, `quit`), plus any value
     /// that is not a string. `bugle-app` owns the list of valid names and
     /// warns about unknown keys and non-string values.

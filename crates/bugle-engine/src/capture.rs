@@ -144,8 +144,11 @@ impl Engine {
                 let scale = img.width() as f64 / rect.w.max(1.0);
                 Ok((self.maybe_downscale(img, scale), Some(*rect), None))
             }
-            CaptureTarget::Window { id, title, owner } => {
-                let w = self.resolve_window(*id, title.as_deref(), owner.as_deref())?;
+            CaptureTarget::Window { .. } | CaptureTarget::PickWindow => {
+                let w = match target {
+                    CaptureTarget::Window { id, title, owner } => self.resolve_window(*id, title.as_deref(), owner.as_deref())?,
+                    _ => self.pick_window()?,
+                };
                 let img = bugle_platform::capture_window(w.id, shadow, show_cursor)?;
                 let scale = if shadow { 1.0 } else { img.width() as f64 / w.frame.w.max(1.0) };
                 Ok((self.maybe_downscale(img, scale), Some(w.frame), Some(w)))
@@ -201,6 +204,7 @@ impl Engine {
 
     /// Full screenshot flow: delay, grab, save, clipboard, history.
     pub fn capture(&self, req: &CaptureRequest) -> Result<CaptureOutcome> {
+        self.check_target_host(&req.target)?;
         if !bugle_platform::screen_access_preflight() {
             bugle_platform::screen_access_request();
             return Err(BugleError::PermissionDenied.into());
@@ -231,7 +235,7 @@ impl Engine {
             vars.insert("label", l.clone());
         }
         let source = match &req.target {
-            CaptureTarget::Window { .. } => window
+            CaptureTarget::Window { .. } | CaptureTarget::PickWindow => window
                 .as_ref()
                 .map(|w| format!("window {} — {} ({})", w.id, w.owner, w.title))
                 .unwrap_or_else(|| "window".into()),
