@@ -44,7 +44,8 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `register_translation` | `VNTranslationalImageRegistrationRequest` via `VNSequenceRequestHandler` |
 | `post_scroll`, `cursor_position` | `CGEventCreateScrollWheelEvent`, `CGEventPost` |
 | `select_rect_blocking`, `select_rect_begin`/`_cancel` | borderless `NSWindow` per screen, dim fill, crosshair, size label; blocking (`[NSApp run]`) or callback-based for a host with its own run loop |
-| `window_pick_begin`/`_highlight`/`_cancel` (`shim/picker.m`) | see-through `NSWindow` per screen with an always-active `NSTrackingArea`; reports pointer moves and the final click/Esc/timeout through a C callback and draws whatever rect the host hands back |
+| `window_pick_begin`/`_highlight`/`_cancel`/`_switch` (`shim/picker.m`) | see-through `NSWindow` per screen with an always-active `NSTrackingArea`; reports pointer moves and the final click/Esc/Space/timeout through a C callback and draws whatever rect the host hands back |
+| `select_rect_begin_ex`, `select_rect_switch` | the selection overlay with an optional timeout and a Space "switch" result (not while dragging); a switch from either overlay leaves Bugle active so the other can open at once |
 | `pin_image_blocking`, `pin_image_show` | floating borderless window, drag/resize/close; blocking or fire-and-forget |
 | `toast_show` | non-activating `NSPanel` with `NSVisualEffectView`, thumbnail + two lines, fades out |
 | `editor_open` (`shim/editor.m`) | markup editor window: toolbar, canvas scaled to fit, label text field, unsaved-changes sheet; reports input in image pixels through a callback and draws the image and overlay primitives it is handed |
@@ -197,7 +198,7 @@ built by walking it and `[hotkeys]` keys are resolved against its names, so ever
 item is bindable and the two cannot drift. Unknown keys, unparsable or duplicate
 combinations and bindings the OS refuses are logged, summarised in one toast and
 skipped. Menu and hotkey events are forwarded to the loop as user events.
-*Capture Window* opens the window picker (`picker.rs`): the main thread snapshots
+*Capture Window* and *Record Window* open the window picker (`picker.rs`): the main thread snapshots
 the on-screen window list, shows the shim's overlay and, on every pointer move,
 asks `window_at` — a pure function over the z-ordered list that skips Bugle's
 own windows, non-zero layers, fully transparent (alpha 0), off-screen and
@@ -206,8 +207,18 @@ by id after a 150 ms settle; Esc, a right click, Bugle losing active status (Esc
 only arrives while it is active) or the 30-second timeout cancel. A request the
 main thread reaches more than 3 s late is refused, and every refusal reaches
 the worker with its reason. The picker and the area selection refuse to open
-over each other. `[screenshots] window_picker = false` restores the immediate
-front-most capture, which the CLI and API always use.
+over each other. Space switches between them: a pick *session* is a small
+state machine (`picker::Session`, unit-tested without a screen) that starts in
+either mode, flips on each switch and answers with a window or a rect; the
+main thread opens the next overlay from the previous one's final callback.
+*Capture Area*, *Capture Window* and the three *Record* items run through it;
+each picker turn keeps the 30 s timeout and a whole session closes after two
+minutes. `[screenshots] window_picker = false` restores the immediate
+front-most capture (and plain area selection), which the CLI always uses.
+`UiHost::pick_window` offers the picker (without the switch) to API callers:
+the `pick_window` target kind of `capture` and `record_start` goes through it,
+and an engine without a host refuses that target up front with
+`BugleError::NoUiHost` (HTTP 503) before any permission prompt.
 Engine actions run on one worker thread so the menu never blocks; when an action
 needs the crosshair overlay or a pin window, the engine's `UiHost` (implemented
 here) sends a request to the main thread and blocks the worker on a channel until
@@ -299,8 +310,8 @@ earn its keep.
   render off the main thread for very large captures, and opening a second
   editor. Also: keep the quick-access panel's thumbnails stacked when several
   captures arrive in a row.
-* **Window picker extras** — Space to switch to area selection, a picker for
-  window recordings, and offering the picker to API callers through `UiHost`.
+* **Window picker extras** — Space in the Scrolling Capture selection, and the
+  picker for `bugle capture` in a terminal (it needs a run loop of its own).
 * **Packaging extras** — a universal (arm64 + x86_64) build (bundles are
   host-architecture only today), a DMG, the final bundle id, and system
   notifications (`UNUserNotificationCenter`) alongside the toast now that the

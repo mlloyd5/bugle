@@ -116,3 +116,15 @@ recoverable. One engine runs at most two edits at a time; a third is refused.
 `source` accepts a media id (or prefix), `latest`, or a file path.
 Target coordinates are screen points (top-left origin); annotation and OCR
 coordinates are image pixels.
+
+`target.kind` is one of `screen`, `window`, `area`, `interactive` (the user
+drags a rectangle), `pick_window` and `all_screens`. `pick_window` (for
+`capture` and `record_start`) asks the user to click a window in the menu-bar
+app's hover-highlight picker, for when the agent cannot tell which window is
+meant. It works only when the Bugle menu-bar app serves the API (*Start Agent
+API* in its menu, or `bugle-app --serve`); `bugle serve` and `bugle mcp`
+answer with an error naming that, HTTP status 503. The usual auth and `Host`
+checks run first, so a page or client without the token never gets the
+overlay on screen. The picker closes after 30 seconds; a cancel or timeout is
+HTTP 409 (`selection cancelled`). Space does not switch to the area selection
+for API requests: the result is always a window.
