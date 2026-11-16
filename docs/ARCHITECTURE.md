@@ -117,18 +117,23 @@ recorder state machine, and exposes one method per user-facing action:
   tracks are lined up by presentation time (late starts and gaps become
   silence); `bugle_core::audio_mix::Mixer` then mixes each block. Each of the
   n sources gets a base share of 1/n, so at the default levels the sum cannot
-  clip; `microphone_gain` and `system_audio_gain` scale those shares (track 0
-  is system audio, track 1 the microphone, the order the recorder writes
-  them). With `ducking`, a peak detector on the microphone (instant rise,
+  clip; `microphone_gain` and `system_audio_gain` are linear factors on those
+  shares, 1.0 being the default share (track 0 is system audio, track 1 the
+  microphone, the order the recorder writes them). With `ducking`, a peak
+  detector on the microphone as recorded (before its gain; instant rise,
   60 ms release) decides when it is active, above `ducking_threshold_db`, and
   the system-audio gain follows towards `-ducking_amount_db` with
-  `ducking_attack_ms` and back with `ducking_release_ms`. A stereo-linked
-  peak limiter (instant attack, 100 ms release, ceiling -0.3 dBFS) catches
-  what gains above unity push past full scale. Levels come from `[recordings]`
-  with per-recording overrides (`--mic-gain`, `--system-gain`, `--duck` /
-  `--no-duck`, `--duck-amount`; the same names as action arguments), are
-  checked at start (out of range is an invalid request) and only apply to the
-  mixed track. The audio is
+  `ducking_attack_ms` and back with `ducking_release_ms`; a microphone at gain
+  0 never ducks. With every gain at 1 or below the sum is passed through
+  untouched; with any gain above 1 a stereo-linked peak limiter (instant
+  attack, 100 ms release, ceiling -0.3 dBFS, headroom because decoded AAC can
+  overshoot slightly) catches what the gains push past full scale. Levels come
+  from `[recordings]` with per-recording overrides (`--mic-gain`,
+  `--system-gain`, `--duck` / `--no-duck`, `--duck-amount`; the same names as
+  action arguments) and only apply to the mixed track. Out-of-range
+  `[recordings]` levels are logged when the engine loads the config; starting
+  a mixed recording with out-of-range levels (config or request) is an
+  invalid request. The audio is
   re-encoded (a second AAC generation) while video samples and frame times are
   copied. The mix runs during stop, writes a uniquely named hidden copy next to
   the recording (so it needs free space equal to the recording) and replaces the

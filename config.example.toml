@@ -30,13 +30,17 @@ mix_audio = false         # one audio track instead of microphone + system audio
                           # (re-encodes the audio after stop; each source at 1/2
                           # times its gain below; needs free space equal to the
                           # recording)
-# Levels for the mixed track (mix_audio only). Gains are linear, 0 to 8
-# (1.0 = as recorded); a peak limiter keeps gains above 1 from clipping.
+# Levels for the mixed track (mix_audio only). Gains are linear factors, 0 to 8,
+# on each source's default share of the mix (1/2 with two sources), so 1.0 =
+# the default share. With any gain above 1 a peak limiter keeps the sum from
+# clipping; at 1 or below the sum cannot clip and the limiter is bypassed.
 microphone_gain = 1.0
 system_audio_gain = 1.0
 ducking = false           # lower system audio while the microphone is active
 ducking_amount_db = 12.0  # how far, 0 to 60 dB
-ducking_threshold_db = -40.0  # mic peak level (dBFS) that counts as active
+ducking_threshold_db = -40.0  # mic peak level (dBFS, as recorded, before
+                              # microphone_gain) that counts as active; no
+                              # ducking when microphone_gain = 0
 ducking_attack_ms = 10.0  # fade down
 ducking_release_ms = 500.0  # fade back up once the mic is quiet
 highlight_clicks = false  # stream backend: macOS 15+

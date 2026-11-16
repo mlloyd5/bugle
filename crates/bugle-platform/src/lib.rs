@@ -521,25 +521,24 @@ pub fn mix_audio_tracks_with(input: &Path, output: &Path, levels: &AudioMixConfi
 }
 
 /// What the shim's mix callback works on; the mixer is built on the first
-/// block, once the track and channel counts are known.
+/// block, once the track count, channel count and sample rate (all set by
+/// the shim) are known.
 struct MixState {
     levels: AudioMixConfig,
-    mixer: Option<(usize, usize, Mixer)>,
+    mixer: Option<((usize, usize, i32), Mixer)>,
 }
-
-/// Sample rate of the PCM the shim decodes to.
-const MIX_SAMPLE_RATE: f32 = 48_000.0;
 
 extern "C" fn mix_block(
     ctx: *mut libc::c_void,
     tracks: *const *const f32,
     n_tracks: i32,
     channels: i32,
+    sample_rate: i32,
     out: *mut f32,
     frames: i32,
 ) -> i32 {
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if ctx.is_null() || tracks.is_null() || out.is_null() || n_tracks <= 0 || channels <= 0 || frames < 0 {
+        if ctx.is_null() || tracks.is_null() || out.is_null() || n_tracks <= 0 || channels <= 0 || sample_rate <= 0 || frames < 0 {
             return false;
         }
         let (n, ch, len) = (n_tracks as usize, channels as usize, frames as usize * channels as usize);
@@ -553,9 +552,10 @@ extern "C" fn mix_block(
             .collect();
         let out = unsafe { std::slice::from_raw_parts_mut(out, len) };
         let levels = state.levels;
-        let (_, _, mixer) = match &mut state.mixer {
-            Some((tn, tc, _)) if (*tn, *tc) == (n, ch) => state.mixer.as_mut().unwrap(),
-            _ => state.mixer.insert((n, ch, Mixer::new(&levels, n, ch, MIX_SAMPLE_RATE))),
+        let key = (n, ch, sample_rate);
+        let (_, mixer) = match &mut state.mixer {
+            Some((k, _)) if *k == key => state.mixer.as_mut().unwrap(),
+            _ => state.mixer.insert((key, Mixer::new(&levels, n, ch, sample_rate as f32))),
         };
         mixer.process(&inputs, out);
         true

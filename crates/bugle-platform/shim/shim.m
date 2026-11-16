@@ -1057,7 +1057,9 @@ int32_t bugle_video_track_count(const char *path) {
 // PCM by its own reader (an AVAssetReaderAudioMixOutput over that one track,
 // so its edit timeline and offset are kept, and no track's reads wait on
 // another's), the tracks are lined up frame for frame by presentation time
-// (gaps and late starts filled with silence), and `process` turns each
+// (gaps and late starts filled with silence; in practice the mix output
+// already renders a track's offset as leading silence and delivers
+// contiguous times, so that path is a guard), and `process` turns each
 // block of aligned tracks into the mixed block, which is encoded once.
 // Video tracks are copied sample for sample without re-encoding, on their
 // own timescale. Returns 1 and writes nothing when there are fewer than two
@@ -1269,6 +1271,12 @@ int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, bugle_
         // One pump per output track, each on its own queue: the writer
         // interleaves tracks and holds one back until the others catch up.
         dispatch_group_t group = dispatch_group_create();
+        // Once this function gives up on a stuck pump (timeout), `abandoned`
+        // is set under the gate: from then on no pump touches the cancelled
+        // writer, and the audio pump never calls `process`/`ctx`, which
+        // belong to the caller.
+        NSLock *gate = [NSLock new];
+        __block BOOL abandoned = NO;
         for (NSUInteger i = 0; i < videoInputs.count; i++) {
             AVAssetReaderOutput *ro = videoOutputs[i];
             AVAssetWriterInput *wi = videoInputs[i];
@@ -1282,7 +1290,9 @@ int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, bugle_
                                               if (sb) CFRelease(sb);
                                               if (!ok) {
                                                   done = YES;
-                                                  [wi markAsFinished];
+                                                  [gate lock];
+                                                  if (!abandoned) [wi markAsFinished];
+                                                  [gate unlock];
                                                   dispatch_group_leave(group);
                                               }
                                           }
@@ -1297,10 +1307,6 @@ int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, bugle_
         __block int64_t cursor = 0;
         __block BOOL audioDone = NO;
         __block NSString *audioError = nil;
-        // `process` and `ctx` belong to the caller: once this function gives
-        // up on a stuck pump, the gate makes sure they are never called again.
-        NSLock *gate = [NSLock new];
-        __block BOOL abandoned = NO;
         dispatch_group_enter(group);
         [ai requestMediaDataWhenReadyOnQueue:dispatch_queue_create("bugle.mix.audio", DISPATCH_QUEUE_SERIAL)
                                   usingBlock:^{
@@ -1308,43 +1314,48 @@ int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, bugle_
             float *mixed = tracks + n * MIX_BLOCK * MIX_CH;
             const float **ptrs = (const float **)(void *)(mixed + MIX_BLOCK * MIX_CH);
             while (!audioDone && ai.readyForMoreMediaData) {
-                BOOL ok = YES;
-                int64_t frames = 0;
-                for (BugleMixSource *s in sources) {
-                    if (!mix_fill(s, cursor, cursor + MIX_BLOCK)) {
-                        ok = NO;
-                        audioError = s.reader.error.localizedDescription ?: @"decoding an audio track failed";
+                @autoreleasepool {
+                    BOOL ok = YES;
+                    int64_t frames = 0;
+                    for (BugleMixSource *s in sources) {
+                        if (!mix_fill(s, cursor, cursor + MIX_BLOCK)) {
+                            ok = NO;
+                            audioError = s.reader.error.localizedDescription ?: @"decoding an audio track failed";
+                        }
+                        frames = MAX(frames, MIN((int64_t)MIX_BLOCK, mix_frames(s.fifo)));
                     }
-                    frames = MAX(frames, MIN((int64_t)MIX_BLOCK, mix_frames(s.fifo)));
-                }
-                if (ok && frames > 0) {
-                    for (NSUInteger t = 0; t < n; t++) {
-                        BugleMixSource *s = sources[t];
-                        int64_t have = MIN(frames, mix_frames(s.fifo));
-                        float *dst = tracks + t * MIX_BLOCK * MIX_CH;
-                        memcpy(dst, s.fifo.bytes, (size_t)have * MIX_FRAME_BYTES);
-                        memset(dst + have * MIX_CH, 0, (size_t)(frames - have) * MIX_FRAME_BYTES);
-                        [s.fifo replaceBytesInRange:NSMakeRange(0, (NSUInteger)have * MIX_FRAME_BYTES) withBytes:NULL length:0];
-                        ptrs[t] = dst;
+                    if (ok && frames > 0) {
+                        for (NSUInteger t = 0; t < n; t++) {
+                            BugleMixSource *s = sources[t];
+                            int64_t have = MIN(frames, mix_frames(s.fifo));
+                            float *dst = tracks + t * MIX_BLOCK * MIX_CH;
+                            memcpy(dst, s.fifo.bytes, (size_t)have * MIX_FRAME_BYTES);
+                            memset(dst + have * MIX_CH, 0, (size_t)(frames - have) * MIX_FRAME_BYTES);
+                            [s.fifo replaceBytesInRange:NSMakeRange(0, (NSUInteger)have * MIX_FRAME_BYTES) withBytes:NULL length:0];
+                            ptrs[t] = dst;
+                        }
+                        [gate lock];
+                        if (abandoned) {
+                            ok = NO;
+                        } else if (process(ctx, ptrs, (int32_t)n, MIX_CH, MIX_RATE, mixed, (int32_t)frames) != 0) {
+                            ok = NO;
+                            audioError = @"the mix function failed";
+                        } else {
+                            CMSampleBufferRef sb = mix_buffer((__bridge CMAudioFormatDescriptionRef)fmt, mixed, frames, cursor);
+                            if (!sb) audioError = @"could not build a mixed audio buffer";
+                            ok = sb && [ai appendSampleBuffer:sb];
+                            if (sb) CFRelease(sb);
+                        }
+                        [gate unlock];
+                        cursor += frames;
                     }
-                    [gate lock];
-                    int32_t rc = abandoned ? -1 : process(ctx, ptrs, (int32_t)n, MIX_CH, mixed, (int32_t)frames);
-                    [gate unlock];
-                    if (rc != 0) {
-                        ok = NO;
-                        audioError = @"the mix function failed";
-                    } else {
-                        CMSampleBufferRef sb = mix_buffer((__bridge CMAudioFormatDescriptionRef)fmt, mixed, frames, cursor);
-                        if (!sb) audioError = @"could not build a mixed audio buffer";
-                        ok = sb && [ai appendSampleBuffer:sb];
-                        if (sb) CFRelease(sb);
+                    if (!ok || frames == 0) {
+                        audioDone = YES;
+                        [gate lock];
+                        if (!abandoned) [ai markAsFinished];
+                        [gate unlock];
+                        dispatch_group_leave(group);
                     }
-                    cursor += frames;
-                }
-                if (!ok || frames == 0) {
-                    audioDone = YES;
-                    [ai markAsFinished];
-                    dispatch_group_leave(group);
                 }
             }
         }];
@@ -1355,8 +1366,11 @@ int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, bugle_
         if (dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(limit * NSEC_PER_SEC))) != 0) {
             [gate lock];
             abandoned = YES;
-            [gate unlock];
             cancelAll();
+            [gate unlock];
+            // A pump that never returns keeps its enter on the group, and
+            // releasing a group with outstanding enters traps: keep it alive.
+            (void)CFBridgingRetain(group);
             set_error(@"timed out mixing the audio tracks%@",
                       writer.error ? [NSString stringWithFormat:@" (%@)", writer.error.localizedDescription] : @"");
             return -1;

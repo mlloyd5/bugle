@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 pub const MAX_GAIN: f32 = 8.0;
 /// Most ducking accepted, in dB.
 pub const MAX_DUCK_DB: f32 = 60.0;
-/// Limiter ceiling: -0.3 dBFS, a little headroom for the AAC encoder.
+/// Limiter ceiling: -0.3 dBFS, a little headroom for the AAC encoder
+/// (decoded AAC can still overshoot the ceiling slightly).
 pub const LIMIT_CEILING: f32 = 0.966;
 /// Limiter release time.
 const LIMIT_RELEASE_MS: f32 = 100.0;
@@ -24,15 +25,18 @@ const DETECT_RELEASE_MS: f32 = 60.0;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioMixConfig {
-    /// Microphone level in the mixed track (linear, 1.0 = as recorded).
+    /// Microphone level in the mixed track: a linear factor on its default
+    /// share of the mix (`1/n` of `n` sources), so 1.0 = the default share.
     pub microphone_gain: f32,
-    /// System-audio level in the mixed track (linear, 1.0 = as recorded).
+    /// System-audio level in the mixed track: a linear factor on its default
+    /// share of the mix (`1/n` of `n` sources), so 1.0 = the default share.
     pub system_audio_gain: f32,
     /// Lower system audio while the microphone is active.
     pub ducking: bool,
     /// How far system audio is lowered while ducked, in dB.
     pub ducking_amount_db: f32,
-    /// Microphone level (dBFS peak) above which it counts as active.
+    /// Microphone level (dBFS peak, as recorded: before `microphone_gain`)
+    /// above which it counts as active.
     pub ducking_threshold_db: f32,
     /// Time for system audio to fade down once the microphone is active.
     pub ducking_attack_ms: f32,
@@ -57,10 +61,12 @@ impl Default for AudioMixConfig {
 /// Per-recording overrides of [`AudioMixConfig`] (CLI flags, API arguments).
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct AudioMixOverrides {
-    /// Microphone level in the mixed track (linear, 1.0 = as recorded).
+    /// Microphone level in the mixed track: a linear factor on its default
+    /// share of the mix (`1/n` of `n` sources), so 1.0 = the default share.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub microphone_gain: Option<f32>,
-    /// System-audio level in the mixed track (linear, 1.0 = as recorded).
+    /// System-audio level in the mixed track: a linear factor on its default
+    /// share of the mix (`1/n` of `n` sources), so 1.0 = the default share.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_audio_gain: Option<f32>,
     /// Duck system audio under the microphone.
@@ -201,15 +207,17 @@ impl Limiter {
 /// Mixes the decoded audio tracks of a recording into one. Track 0 is
 /// system audio and track 1 the microphone (the order the stream recorder
 /// writes them); further tracks are mixed at unity. Each of the `n` tracks
-/// gets a base share of `1/n`, so at unity gains the sum cannot exceed full
-/// scale; the per-source gains scale that share, and the limiter catches
-/// the peaks gains above unity can push past the ceiling.
+/// gets a base share of `1/n`, so at gains of 1 or below the sum cannot
+/// exceed full scale (ducking only lowers it) and is passed through as is;
+/// with any gain above 1 the limiter catches the peaks past the ceiling.
+/// Ducking is keyed on the microphone as recorded, and is off while
+/// `microphone_gain` is 0 (a muted mic does not duck anything).
 #[derive(Debug, Clone)]
 pub struct Mixer {
     channels: usize,
     shares: Vec<f32>,
     ducker: Option<Ducker>,
-    limiter: Limiter,
+    limiter: Option<Limiter>,
 }
 
 /// Index of the system-audio track.
@@ -227,8 +235,10 @@ impl Mixer {
                 _ => base,
             })
             .collect();
-        let ducker = (cfg.ducking && tracks > MIC_TRACK).then(|| Ducker::new(cfg, sample_rate));
-        Self { channels: channels.max(1), shares, ducker, limiter: Limiter::new(LIMIT_CEILING, sample_rate) }
+        let ducker = (cfg.ducking && tracks > MIC_TRACK && cfg.microphone_gain > 0.0).then(|| Ducker::new(cfg, sample_rate));
+        let boosted = cfg.microphone_gain > 1.0 || cfg.system_audio_gain > 1.0;
+        let limiter = boosted.then(|| Limiter::new(LIMIT_CEILING, sample_rate));
+        Self { channels: channels.max(1), shares, ducker, limiter }
     }
 
     /// Mix `inputs` (one interleaved buffer per track, each at least as long
@@ -256,7 +266,9 @@ impl Mixer {
                 }
                 *o = sum;
             }
-            self.limiter.apply(frame);
+            if let Some(l) = &mut self.limiter {
+                l.apply(frame);
+            }
         }
     }
 }
@@ -309,6 +321,34 @@ mod tests {
         for (o, s) in out.iter().zip(&sys) {
             assert!((o - s * 0.5).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn default_levels_are_the_plain_sum() {
+        // Loud, in phase: the sum peaks at 0.99, between the limiter ceiling
+        // and full scale. Without a gain above 1 nothing touches it.
+        let a = sine(50.0, 0.99, 0.5);
+        let b = sine(50.0, 0.99, 0.5);
+        for cfg in [AudioMixConfig::default(), AudioMixConfig { microphone_gain: 0.7, system_audio_gain: 1.0, ..Default::default() }] {
+            let out = mix(&cfg, &[&a, &b]);
+            let plain: Vec<f32> = a.iter().zip(&b).map(|(x, y)| cfg.system_audio_gain * 0.5 * x + cfg.microphone_gain * 0.5 * y).collect();
+            assert_eq!(out, plain, "{cfg:?}");
+        }
+        assert!(peak(&mix(&AudioMixConfig::default(), &[&a, &b])) > LIMIT_CEILING);
+    }
+
+    #[test]
+    fn muted_mic_does_not_duck() {
+        let sys = sine(220.0, 0.5, 0.5);
+        let loud_mic = sine(1000.0, 0.5, 0.5);
+        let cfg = AudioMixConfig { ducking: true, microphone_gain: 0.0, ..Default::default() };
+        let out = mix(&cfg, &[&sys, &loud_mic]);
+        let plain: Vec<f32> = sys.iter().map(|s| 0.5 * s).collect();
+        assert_eq!(out, plain);
+        // The same mic at any audible gain does duck.
+        let ducked = mix(&AudioMixConfig { microphone_gain: 0.1, ..cfg }, &[&sys, &loud_mic]);
+        let sys_part: Vec<f32> = ducked.iter().zip(&loud_mic).map(|(o, m)| o - 0.05 * m).collect();
+        assert!(rms(&sys_part[sys.len() / 2..]) < rms(&plain) * 0.3);
     }
 
     #[test]

@@ -277,10 +277,12 @@ pub struct RecordArgs {
     /// Fold the microphone and system audio into one audio track.
     #[arg(long)]
     pub mix_audio: bool,
-    /// Microphone level in the mixed track (linear, 1.0 = as recorded).
+    /// Microphone level in the mixed track: a linear factor on its default
+    /// share of the mix (1/2 with two sources), so 1.0 = the default share.
     #[arg(long, value_name = "GAIN")]
     pub mic_gain: Option<f32>,
-    /// System-audio level in the mixed track (linear, 1.0 = as recorded).
+    /// System-audio level in the mixed track: a linear factor on its default
+    /// share of the mix (1/2 with two sources), so 1.0 = the default share.
     #[arg(long, value_name = "GAIN")]
     pub system_gain: Option<f32>,
     /// Lower system audio while the microphone is active (mixed track).

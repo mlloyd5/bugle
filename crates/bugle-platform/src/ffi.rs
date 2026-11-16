@@ -5,7 +5,15 @@ use libc::{c_char, c_double, c_void, size_t};
 
 /// See `bugle_mix_fn` in `shim.h`.
 pub type bugle_mix_fn =
-    extern "C" fn(ctx: *mut c_void, tracks: *const *const f32, n_tracks: i32, channels: i32, out: *mut f32, frames: i32) -> i32;
+    extern "C" fn(
+        ctx: *mut c_void,
+        tracks: *const *const f32,
+        n_tracks: i32,
+        channels: i32,
+        sample_rate: i32,
+        out: *mut f32,
+        frames: i32,
+    ) -> i32;
 
 #[repr(C)]
 #[derive(Default)]
