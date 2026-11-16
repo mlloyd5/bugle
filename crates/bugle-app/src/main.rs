@@ -204,6 +204,7 @@ fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<N
                 microphone: false,
                 system_audio: engine.config.recordings.system_audio,
                 mix_audio: false,
+                mix: Default::default(),
                 max_seconds: None,
                 highlight_clicks: false,
                 output: None,

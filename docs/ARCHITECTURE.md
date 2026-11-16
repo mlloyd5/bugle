@@ -29,7 +29,9 @@ Pure data: `Rect`/`Point`, `CaptureTarget`, `CaptureOptions`, `OcrResult`,
 `destinations`), filename
 templates (`naming`) and the JSON-lines `History`. A history line whose id is
 already present replaces the earlier record, which is how a moved file or a new
-sync URL is stored without rewriting the file.
+sync URL is stored without rewriting the file. `audio_mix` holds the sample
+math for the mixed recording track (per-source gain, ducking, peak limiter),
+so it is tested on synthetic buffers without AVFoundation.
 
 
 ### `bugle-platform`
@@ -52,7 +54,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
 | `export_audio_m4a`, `export_mp4`, `export_mov`, `video_frame`, `media_duration` | `AVAssetExportSession`, `AVAssetImageGenerator` |
-| `mix_audio_tracks`, `audio_track_count`, `video_track_count` | `AVAssetReaderAudioMixOutput` (+ `AVMutableAudioMix` levels) → `AVAssetWriter` (AAC), video samples copied on their own timescale |
+| `mix_audio_tracks(_with)`, `audio_track_count`, `video_track_count` | one `AVAssetReaderAudioMixOutput` per audio track (float PCM) → Rust mix callback (`bugle_core::audio_mix`) → `AVAssetWriter` (AAC), video samples copied on their own timescale |
 | `export_video`, `video_info`, `video_sync_at`, `VideoFrameReader`, `VideoFrameWriter` | `AVAssetExportSession` with `timeRange`/preset, an `AVMutableVideoComposition` on every re-encode (`frameDuration` + `sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid` for a new frame rate), bounded wait + `cancelExport`; `AVSampleCursor` (stored samples, sync sample at a cut); one reusable `AVAssetImageGenerator`; `AVAssetWriter` + pixel-buffer adaptor (H.264 or HEVC) |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
 | `login_item::{in_app_bundle, status, set_enabled}` | `SMAppService.mainAppService` (`shim/login_item.m`, ServiceManagement) |
@@ -111,7 +113,22 @@ recorder state machine, and exposes one method per user-facing action:
   finished file folds all audio tracks into one AAC track (a `.mov` request is
   mixed straight to QuickTime); mixing after capture keeps the real-time path
   unchanged (no cross-clock resampling or buffering between two live sources).
-  Each of the n sources is scaled by 1/n so the sum cannot clip; the audio is
+  Each track is decoded to 48 kHz stereo float by its own reader and the
+  tracks are lined up by presentation time (late starts and gaps become
+  silence); `bugle_core::audio_mix::Mixer` then mixes each block. Each of the
+  n sources gets a base share of 1/n, so at the default levels the sum cannot
+  clip; `microphone_gain` and `system_audio_gain` scale those shares (track 0
+  is system audio, track 1 the microphone, the order the recorder writes
+  them). With `ducking`, a peak detector on the microphone (instant rise,
+  60 ms release) decides when it is active, above `ducking_threshold_db`, and
+  the system-audio gain follows towards `-ducking_amount_db` with
+  `ducking_attack_ms` and back with `ducking_release_ms`. A stereo-linked
+  peak limiter (instant attack, 100 ms release, ceiling -0.3 dBFS) catches
+  what gains above unity push past full scale. Levels come from `[recordings]`
+  with per-recording overrides (`--mic-gain`, `--system-gain`, `--duck` /
+  `--no-duck`, `--duck-amount`; the same names as action arguments), are
+  checked at start (out of range is an invalid request) and only apply to the
+  mixed track. The audio is
   re-encoded (a second AAC generation) while video samples and frame times are
   copied. The mix runs during stop, writes a uniquely named hidden copy next to
   the recording (so it needs free space equal to the recording) and replaces the
@@ -292,8 +309,9 @@ earn its keep.
   recorders bake the cursor into the frames and log no click or cursor
   positions, so these first need a click/cursor event track recorded alongside
   the video), and an editing window on top of the headless `edit` pipeline.
-* **Audio mixing extras** — per-source levels (or ducking system audio under
-  the microphone) for the mixed track.
+* **Audio mixing extras** — per-source levels and ducking work on the mixed
+  track; still open: levels for the two-track (unmixed) output, and setting
+  them from the menu-bar app instead of the config file.
 * **Markup editor extras** — crop and canvas (padding, background) in the
   window, multi-line labels, arrow and redaction styles, zoom, a preview
   render off the main thread for very large captures, and opening a second

@@ -34,7 +34,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | Pin to screen | Floating AppKit panel (drag, scroll-to-resize, Esc/double-click closes) | ✅ |
 | GIF recording | In-process frame grab loop + `image` GIF encoder | ✅ |
 | Video recording | `screencapture -v` (H.264 .mov → remuxed .mp4), microphone, click highlight | ✅ |
-| System audio in recordings | ScreenCaptureKit `SCStream` audio tap + `AVAssetWriter` (H.264 + AAC .mp4), microphone as a second track or mixed into one (`--mix-audio`) | ✅ (macOS 14+) |
+| System audio in recordings | ScreenCaptureKit `SCStream` audio tap + `AVAssetWriter` (H.264 + AAC .mp4), microphone as a second track or mixed into one (`--mix-audio`) with per-source levels, optional ducking of system audio under the microphone and a peak limiter | ✅ (macOS 14+) |
 | Describe image / video frames with a vision model | OpenAI-compatible, Ollama, Anthropic, command | ✅ |
 | Transcribe / subtitles (SRT, VTT) | whisper.cpp server, OpenAI-compatible, command | ✅ |
 | History | JSON-lines file, ids, delete | ✅ |
@@ -165,6 +165,7 @@ bugle record start area --rect 0,30,1280,720 -f gif --fps 10 -s 8
 bugle record start window --app Xcode -f mp4 --mic --subtitles   # Ctrl-C to stop
 bugle record start screen -f mp4 --system-audio -s 30              # ScreenCaptureKit backend
 bugle record start screen --system-audio --mic --mix-audio --clicks # one audio track, clicks shown
+bugle record start screen --system-audio --mic --mix-audio --mic-gain 1.5 --duck  # voice over, system audio ducked
 
 bugle ocr latest                   # Apple Vision, reading order, --json for boxes
 bugle ocr latest --engine llama    # OCR through a vision model instead
@@ -370,7 +371,7 @@ Any OpenAI-compatible server works for `kind = "openai"` (LM Studio, vLLM,
 OpenRouter, Groq…). `kind = "command"` wraps a local executable, e.g. `whisper-cli`.
 
 The other sections: `[general]` (save folder, filename template, clipboard),
-`[screenshots]`, `[recordings]` (backend, audio), `[ocr]`, `[markup]` defaults,
+`[screenshots]`, `[recordings]` (backend, audio, mix levels and ducking), `[ocr]`, `[markup]` defaults,
 `[api]` (bind address, token, CORS), `[hotkeys]` and `[quick_access]` for the
 menu-bar app and `[sync]` below.
 
