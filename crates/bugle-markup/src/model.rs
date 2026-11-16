@@ -75,7 +75,7 @@ pub enum ArrowStyle {
     #[default]
     Standard,
     Double,
-    /// Thin shaft, open head.
+    /// Thin shaft, narrow head.
     Slim,
     /// Tapered shaft.
     Fancy,
@@ -411,6 +411,17 @@ impl Annotation {
         Ok(())
     }
 
+    /// Where pixel (0, 0) of the source image lands in the rendered image,
+    /// before `scale`: the canvas inset (padding plus border) minus the
+    /// crop's origin as the renderer applies it (whole pixels, clamped at
+    /// zero). An editor that keeps shapes in source pixels maps them onto a
+    /// rendered preview with it.
+    pub fn source_origin(&self) -> Point {
+        let inset = self.canvas.as_ref().map_or(0.0, |c| c.padding as f64 + c.border_width as f64);
+        let (cx, cy) = self.crop.map_or((0.0, 0.0), |r| (r.x.floor().max(0.0), r.y.floor().max(0.0)));
+        Point { x: inset - cx, y: inset - cy }
+    }
+
     /// Size of the rendered image for an input of `width` x `height` pixels
     /// (measured after `crop`, which the renderer applies first). Errors when
     /// the image after canvas padding, or after `scale`, would exceed
@@ -503,7 +514,55 @@ fn check_style(prefix: &str, st: &Style) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The lines of a `text` label. Splits on `\n`, `\r\n`, a lone `\r` and the
+/// Unicode line and paragraph separators (what a macOS text field can hand
+/// over), keeping empty lines in the middle; a trailing line break adds no
+/// line. The renderer and the editor's label measurement both use this.
+pub fn text_lines(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        match rest.find(['\n', '\r', '\u{2028}', '\u{2029}']) {
+            Some(i) => {
+                out.push(&rest[..i]);
+                let brk = rest[i..].chars().next().map_or(1, char::len_utf8);
+                let skip = if rest[i..].starts_with("\r\n") { 2 } else { brk };
+                rest = &rest[i + skip..];
+            }
+            None => {
+                out.push(rest);
+                break;
+            }
+        }
+    }
+    out
+}
+
 impl Shape {
+    /// Move the shape by `dx`, `dy` image pixels.
+    pub fn translate(&mut self, dx: f64, dy: f64) {
+        let mv = |p: &mut Point| {
+            p.x += dx;
+            p.y += dy;
+        };
+        match self {
+            Shape::Rectangle { rect, .. }
+            | Shape::Ellipse { rect, .. }
+            | Shape::Highlight { rect, .. }
+            | Shape::Redact { rect, .. }
+            | Shape::Spotlight { rect, .. } => {
+                rect.x += dx;
+                rect.y += dy;
+            }
+            Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => {
+                mv(from);
+                mv(to);
+            }
+            Shape::Freehand { points, .. } => points.iter_mut().for_each(mv),
+            Shape::Text { at, .. } | Shape::Counter { at, .. } | Shape::Image { at, .. } => mv(at),
+        }
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             Shape::Rectangle { .. } => "rectangle",
@@ -765,6 +824,51 @@ mod tests {
         assert!(a.output_size(2000, 1000).unwrap_err().to_string().contains("scale"));
         let a = Annotation { scale: Some(f32::MAX), ..Default::default() };
         assert!(a.output_size(1000, 1000).is_err());
+    }
+
+    #[test]
+    fn text_lines_split_every_kind_of_break() {
+        assert_eq!(text_lines("one"), vec!["one"]);
+        assert_eq!(text_lines(""), Vec::<&str>::new());
+        assert_eq!(text_lines("a\nb\r\nc\rd\u{2028}e\u{2029}f"), vec!["a", "b", "c", "d", "e", "f"]);
+        assert_eq!(text_lines("a\n\nb\n"), vec!["a", "", "b"]);
+        assert_eq!(text_lines("\nx"), vec!["", "x"]);
+        assert_eq!(text_lines("héllo\u{2028}wörld"), vec!["héllo", "wörld"]);
+    }
+
+    #[test]
+    fn shapes_translate() {
+        let p = |x, y| Point { x, y };
+        let mut shapes: Vec<Shape> = serde_json::from_value(serde_json::json!([
+            {"type":"rectangle","rect":{"x":1,"y":2,"w":3,"h":4}},
+            {"type":"arrow","from":{"x":0,"y":0},"to":{"x":5,"y":5}},
+            {"type":"freehand","points":[{"x":1,"y":1},{"x":2,"y":2}]},
+            {"type":"text","at":{"x":7,"y":8},"text":"x"},
+            {"type":"redact","rect":{"x":0,"y":0,"w":1,"h":1}}
+        ]))
+        .unwrap();
+        for s in &mut shapes {
+            s.translate(10.0, -1.0);
+        }
+        assert!(matches!(&shapes[0], Shape::Rectangle { rect, .. } if *rect == Rect::new(11.0, 1.0, 3.0, 4.0)));
+        assert!(matches!(&shapes[1], Shape::Arrow { from, to, .. } if *from == p(10.0, -1.0) && *to == p(15.0, 4.0)));
+        assert!(matches!(&shapes[2], Shape::Freehand { points, .. } if points[..] == [p(11.0, 0.0), p(12.0, 1.0)]));
+        assert!(matches!(&shapes[3], Shape::Text { at, .. } if *at == p(17.0, 7.0)));
+        assert!(matches!(&shapes[4], Shape::Redact { rect, .. } if *rect == Rect::new(10.0, -1.0, 1.0, 1.0)));
+    }
+
+    #[test]
+    fn source_origin_follows_crop_and_canvas() {
+        let p = |x, y| Point { x, y };
+        assert_eq!(Annotation::default().source_origin(), p(0.0, 0.0));
+        let a = Annotation { crop: Some(Rect::new(10.7, -5.0, 50.0, 50.0)), ..Default::default() };
+        assert_eq!(a.source_origin(), p(-10.0, 0.0));
+        let a = Annotation {
+            crop: Some(Rect::new(10.0, 20.0, 50.0, 50.0)),
+            canvas: Some(Canvas { padding: 30, border_width: 2, ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(a.source_origin(), p(22.0, 12.0));
     }
 
     #[test]
