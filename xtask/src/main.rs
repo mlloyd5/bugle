@@ -17,6 +17,7 @@ mod plist;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -252,55 +253,68 @@ fn bundle(args: &BundleArgs) -> Result<()> {
     codesign(&app, &args.sign, None)?;
     verify(&app, &ws, archs.expected())?;
 
-    if let Some(creds) = &notary {
-        let upload = staging.join(format!("{APP_NAME}-upload.zip"));
-        make_zip(&app, &upload)?;
-        notarize(&upload, creds)?;
-        run(Command::new("xcrun").args(["stapler", "staple"]).arg(&app))?;
-        run(Command::new("xcrun").args(["stapler", "validate"]).arg(&app))?;
-        run(Command::new("spctl").args(["--assess", "--type", "execute", "-vv"]).arg(&app))
-            .context("Gatekeeper rejected the notarized bundle")?;
-    } else if !adhoc {
-        println!("not notarized; Gatekeeper will reject this bundle on other Macs (see --notarize)");
-    }
-
-    // Only now replace the previous bundle.
     let final_app = out.join(format!("{APP_NAME}.app"));
-    if final_app.exists() {
-        std::fs::remove_dir_all(&final_app).with_context(|| format!("removing old {}", final_app.display()))?;
-    }
-    std::fs::rename(&app, &final_app).with_context(|| format!("moving the bundle to {}", final_app.display()))?;
-
     let zip = out.join(format!("{APP_NAME}-{VERSION}.zip"));
-    let _ = std::fs::remove_file(&zip);
-    if args.zip || args.notarize {
-        make_zip(&final_app, &zip)?;
-    }
-
-    // The disk image is made from the finished (stapled) bundle, signed and
-    // notarized itself, verified, and only then moved next to it.
     let dmg = out.join(dmg_name());
-    let _ = std::fs::remove_file(&dmg);
-    if args.dmg {
-        let staged = staging.join(dmg_name());
-        make_dmg(&final_app, &staged, &ws)?;
-        if !adhoc {
-            codesign_dmg(&staged, &args.sign)?;
+    let staged_dmg = staging.join(dmg_name());
+    let steps = release_steps(&ReleaseOptions {
+        notarize: notary.is_some(),
+        signed: !adhoc,
+        zip: args.zip || args.notarize,
+        dmg: args.dmg,
+        smoke_test: args.smoke_test,
+    });
+    for step in steps {
+        match step {
+            Step::NotarizeApp => {
+                let creds = notary.as_ref().expect("planned only with credentials");
+                let upload = staging.join(format!("{APP_NAME}-upload.zip"));
+                make_zip(&app, &upload)?;
+                notarize(&upload, creds)?;
+                run(Command::new("xcrun").args(["stapler", "staple"]).arg(&app))?;
+                run(Command::new("xcrun").args(["stapler", "validate"]).arg(&app))?;
+                run(Command::new("spctl").args(["--assess", "--type", "execute", "-vv"]).arg(&app))
+                    .context("Gatekeeper rejected the notarized bundle")?;
+            }
+            // The image is made from the staged (stapled) bundle, so a
+            // failure here leaves the previous bundle and image untouched.
+            Step::MakeDmg => make_dmg(&app, &staged_dmg, &ws)?,
+            Step::SignDmg => codesign_dmg(&staged_dmg, &args.sign)?,
+            Step::NotarizeDmg => {
+                let creds = notary.as_ref().expect("planned only with credentials");
+                notarize(&staged_dmg, creds)?;
+                run(Command::new("xcrun").args(["stapler", "staple"]).arg(&staged_dmg))?;
+                run(Command::new("spctl")
+                    .args(["--assess", "--type", "open", "--context", "context:primary-signature", "-vv"])
+                    .arg(&staged_dmg))
+                .context("Gatekeeper rejected the notarized disk image")?;
+            }
+            Step::VerifyDmg => verify_dmg(&staged_dmg, &ws, archs.expected(), !adhoc)?,
+            Step::ReplaceApp => {
+                if final_app.exists() {
+                    std::fs::remove_dir_all(&final_app).with_context(|| format!("removing old {}", final_app.display()))?;
+                }
+                std::fs::rename(&app, &final_app).with_context(|| format!("moving the bundle to {}", final_app.display()))?;
+            }
+            // A rename over the old image: replaced, never removed first.
+            Step::ReplaceDmg => {
+                std::fs::rename(&staged_dmg, &dmg).with_context(|| format!("moving the disk image to {}", dmg.display()))?
+            }
+            // Without --dmg / --zip, an older file of this version would no
+            // longer match the new bundle.
+            Step::RemoveStaleDmg => {
+                let _ = std::fs::remove_file(&dmg);
+            }
+            Step::RemoveStaleZip => {
+                let _ = std::fs::remove_file(&zip);
+            }
+            Step::Zip => make_zip(&final_app, &zip)?,
+            Step::Smoke => smoke(&final_app)?,
         }
-        if let Some(creds) = &notary {
-            notarize(&staged, creds)?;
-            run(Command::new("xcrun").args(["stapler", "staple"]).arg(&staged))?;
-            run(Command::new("spctl")
-                .args(["--assess", "--type", "open", "--context", "context:primary-signature", "-vv"])
-                .arg(&staged))
-            .context("Gatekeeper rejected the notarized disk image")?;
-        }
-        verify_dmg(&staged, &ws, archs.expected(), !adhoc)?;
-        std::fs::rename(&staged, &dmg).with_context(|| format!("moving the disk image to {}", dmg.display()))?;
     }
     std::fs::remove_dir_all(&staging)?;
-    if args.smoke_test {
-        smoke(&final_app)?;
+    if !adhoc && notary.is_none() {
+        println!("not notarized; Gatekeeper will reject this bundle on other Macs (see --notarize)");
     }
 
     let signature = match (adhoc, notary.is_some()) {
@@ -317,6 +331,59 @@ fn bundle(args: &BundleArgs) -> Result<()> {
         println!("  dmg: {}", dmg.display());
     }
     Ok(())
+}
+
+/// What happens after the staged bundle is signed and verified.
+struct ReleaseOptions {
+    notarize: bool,
+    /// A Developer ID identity (the image gets its own signature).
+    signed: bool,
+    zip: bool,
+    dmg: bool,
+    smoke_test: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    NotarizeApp,
+    MakeDmg,
+    SignDmg,
+    NotarizeDmg,
+    VerifyDmg,
+    ReplaceApp,
+    ReplaceDmg,
+    RemoveStaleDmg,
+    RemoveStaleZip,
+    Zip,
+    Smoke,
+}
+
+/// The order of the release steps. Everything that can fail on the staged
+/// bundle and image (notarization, the image itself) runs before anything
+/// in the output directory is touched, so a failure leaves the previous
+/// bundle and image as they were.
+fn release_steps(o: &ReleaseOptions) -> Vec<Step> {
+    let mut steps = Vec::new();
+    if o.notarize {
+        steps.push(Step::NotarizeApp);
+    }
+    if o.dmg {
+        steps.push(Step::MakeDmg);
+        if o.signed {
+            steps.push(Step::SignDmg);
+        }
+        if o.notarize {
+            steps.push(Step::NotarizeDmg);
+        }
+        steps.push(Step::VerifyDmg);
+    }
+    steps.push(Step::ReplaceApp);
+    steps.push(if o.dmg { Step::ReplaceDmg } else { Step::RemoveStaleDmg });
+    steps.push(if o.zip { Step::Zip } else { Step::RemoveStaleZip });
+    if o.smoke_test {
+        steps.push(Step::Smoke);
+    }
+    steps
 }
 
 /// The architectures a bundle is built for: the host's (plain `cargo build`,
@@ -441,11 +508,11 @@ fn build_release(target: Option<&str>) -> Result<HashMap<&'static str, PathBuf>>
     let args = cargo_build_args(target);
     let mut cmd = cargo();
     cmd.args(&args);
-    if target.is_some() {
-        // A cross build would otherwise get rustc's per-target default
-        // minimum (10.12 for x86_64), below the shim's.
-        cmd.env("MACOSX_DEPLOYMENT_TARGET", MIN_MACOS);
-    }
+    // Host and cross builds alike: rustc's per-target default minimum
+    // (11.0 for arm64, 10.12 for x86_64) is below the shim's, and both
+    // modes should produce the same LC_BUILD_VERSION. Every xtask build sets
+    // it, so consecutive runs still reuse target/release.
+    cmd.env("MACOSX_DEPLOYMENT_TARGET", MIN_MACOS);
     let shown: Vec<&str> = args.iter().map(String::as_str).filter(|a| !a.starts_with("--message-format")).collect();
     println!("$ cargo {}", shown.join(" "));
     let out = cmd.stderr(Stdio::inherit()).output().context("running cargo build")?;
@@ -541,18 +608,54 @@ fn verify_dmg(dmg: &Path, ws: &Workspace, archs: Option<&[&str]>, signed: bool) 
     if signed {
         run(Command::new("codesign").args(["--verify", "--strict", "--verbose=2"]).arg(dmg))?;
     }
+    let mount = ws.target_dir.join("xtask").join("dmg-mount");
+    // An interrupted earlier run may have left its image attached here,
+    // which would make the scratch cleanup and the attach fail.
+    if mount.exists() {
+        detach_quietly(&mount);
+    }
     let mount = ws.scratch("dmg-mount")?;
     run(Command::new("hdiutil")
         .args(["attach", "-readonly", "-nobrowse", "-noautoopen", "-mountpoint"])
         .arg(&mount)
         .arg(dmg))?;
-    let checked = check_dmg_contents(&mount, archs);
-    let detached = run(Command::new("hdiutil").arg("detach").arg(&mount).stdout(Stdio::null()))
-        .or_else(|_| run(Command::new("hdiutil").args(["detach", "-force"]).arg(&mount)));
-    checked?;
-    detached?;
+    let mut guard = Attached { mount, detached: false };
+    check_dmg_contents(&guard.mount, archs)?;
+    guard.detach()?;
     println!("verified {}", dmg.display());
     Ok(())
+}
+
+/// A mounted image, detached (forcibly) when dropped without [`detach`]
+/// having succeeded, so an error or panic while checking it does not leave
+/// it attached.
+///
+/// [`detach`]: Attached::detach
+struct Attached {
+    mount: PathBuf,
+    detached: bool,
+}
+
+impl Attached {
+    fn detach(&mut self) -> Result<()> {
+        run(Command::new("hdiutil").arg("detach").arg(&self.mount).stdout(Stdio::null()))
+            .or_else(|_| run(Command::new("hdiutil").args(["detach", "-force"]).arg(&self.mount).stdout(Stdio::null())))?;
+        self.detached = true;
+        Ok(())
+    }
+}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        if !self.detached {
+            detach_quietly(&self.mount);
+        }
+    }
+}
+
+/// Best-effort `hdiutil detach -force`; silent when nothing is mounted.
+fn detach_quietly(mount: &Path) {
+    let _ = Command::new("hdiutil").args(["detach", "-force"]).arg(mount).stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 
 fn check_dmg_contents(mount: &Path, archs: Option<&[&str]>) -> Result<()> {
@@ -635,16 +738,56 @@ fn verify(app: &Path, ws: &Workspace, archs: Option<&[&str]>) -> Result<()> {
         bail!("icon has {n} images, expected {}", icns::ICNS_ELEMENTS.len());
     }
 
+    // Every slice runs `--version`: the native one directly, an x86_64 one
+    // on Apple silicon through Rosetta when it is installed.
+    let rosetta = OnceCell::new();
     for exe in [APP_EXECUTABLE, CLI_EXECUTABLE] {
-        let out = Command::new(contents.join("MacOS").join(exe)).arg("--version").output()?;
-        let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        println!("  {exe} --version: {line}");
-        if !out.status.success() || !line.ends_with(VERSION) {
-            bail!("{exe} --version printed {line:?}, expected version {VERSION}");
+        let path = contents.join("MacOS").join(exe);
+        check_version(exe, None, Command::new(&path).arg("--version"))?;
+        for slice in foreign_slices(&lipo_archs(&path)?, host_lipo_arch()) {
+            if slice == "x86_64" && *rosetta.get_or_init(rosetta_available) {
+                check_version(exe, Some(&slice), Command::new("arch").args(["-x86_64"]).arg(&path).arg("--version"))?;
+            } else {
+                println!("  {exe} ({slice}): not executed, this Mac cannot run that slice (no Rosetta)");
+            }
         }
     }
     println!("verified {}", app.display());
     Ok(())
+}
+
+fn check_version(exe: &str, slice: Option<&str>, cmd: &mut Command) -> Result<()> {
+    let out = cmd.output().with_context(|| format!("running {exe} --version"))?;
+    let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let label = slice.map_or_else(|| exe.to_string(), |s| format!("{exe} ({s})"));
+    println!("  {label} --version: {line}");
+    if !out.status.success() || !line.ends_with(VERSION) {
+        bail!("{label} --version printed {line:?}, expected version {VERSION}");
+    }
+    Ok(())
+}
+
+/// The host's architecture as `lipo` names it.
+fn host_lipo_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+/// The slices of a binary that the host does not run natively.
+fn foreign_slices(archs: &[String], host: &str) -> Vec<String> {
+    archs.iter().filter(|a| a.as_str() != host).cloned().collect()
+}
+
+/// Whether x86_64 code runs here (natively or through Rosetta 2).
+fn rosetta_available() -> bool {
+    Command::new("arch")
+        .args(["-x86_64", "/usr/bin/true"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// Launches the bundled app with `--smoke-test` (overlay, toast and pin for a
@@ -825,6 +968,42 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-format", "UDZO"]));
         assert!(args.windows(2).any(|w| w == ["-volname", "Bugle 1.0"]));
         assert_eq!(&args[args.len() - 3..], ["-srcfolder", "/r", "/o/Bugle.dmg"]);
+    }
+
+    #[test]
+    fn release_steps_touch_the_output_last() {
+        let opts = |notarize, signed, zip, dmg| ReleaseOptions { notarize, signed, zip, dmg, smoke_test: false };
+        use Step::*;
+        assert_eq!(release_steps(&opts(false, false, false, false)), [ReplaceApp, RemoveStaleDmg, RemoveStaleZip]);
+        assert_eq!(
+            release_steps(&opts(false, false, false, true)),
+            [MakeDmg, VerifyDmg, ReplaceApp, ReplaceDmg, RemoveStaleZip]
+        );
+        assert_eq!(
+            release_steps(&opts(true, true, true, true)),
+            [NotarizeApp, MakeDmg, SignDmg, NotarizeDmg, VerifyDmg, ReplaceApp, ReplaceDmg, Zip]
+        );
+        assert_eq!(release_steps(&ReleaseOptions { smoke_test: true, ..opts(false, true, false, true) }).last(), Some(&Smoke));
+        // Nothing in the output directory changes before every check on the
+        // staged bundle and image has passed, and the old image is never
+        // deleted when a new one is being made.
+        for notarize in [false, true] {
+            for dmg in [false, true] {
+                let steps = release_steps(&opts(notarize, notarize, true, dmg));
+                let first_output = steps.iter().position(|s| *s == ReplaceApp).unwrap();
+                assert!(steps[first_output..].iter().all(|s| !matches!(s, NotarizeApp | MakeDmg | SignDmg | NotarizeDmg | VerifyDmg)));
+                assert_eq!(steps.contains(&RemoveStaleDmg), !dmg);
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_slices_are_the_non_host_ones() {
+        let archs = vec!["arm64".to_string(), "x86_64".to_string()];
+        assert_eq!(foreign_slices(&archs, "arm64"), ["x86_64"]);
+        assert_eq!(foreign_slices(&archs, "x86_64"), ["arm64"]);
+        assert!(foreign_slices(&archs[..1], "arm64").is_empty());
+        assert_eq!(host_lipo_arch(), if cfg!(target_arch = "aarch64") { "arm64" } else { "x86_64" });
     }
 
     /// `lipo` merging and the architecture check, on two tiny C programs
