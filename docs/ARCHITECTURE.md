@@ -221,12 +221,16 @@ When the process runs from `Bugle.app`, an *Open at Login* check item
 re-read on the periodic tick (every 5 s) and set only for an enabled item; a
 pending approval is shown in the title, and clicking it then opens System
 Settings → Login Items. With `[general] system_notifications`,
-`notifications.rs` also posts each toast (`App::toast`/`toast_error`) to
-Notification Center: authorization is requested once at launch from the
-bundle, the answer arrives asynchronously, and until it is "authorized" (or
-when unbundled, switched off or denied) only the toast shows; a denial is
-re-read without prompting on the next message. `--smoke-test` only reads the
-setting and never prompts; test binaries are never bundles.
+`notifications.rs` also posts to Notification Center from `App::toast` /
+`toast_error` and from `on_done` when the quick-access panel takes the
+toast's place (direct `toast_show` feedback to panel and editor clicks does
+not post). Authorization is requested once at launch from the bundle; the
+shim always takes the state from `getNotificationSettings` (a refusal often
+arrives as an error, not a plain "no"), and until it is "authorized" (or
+when unbundled or switched off) only the in-app feedback shows. While not
+authorized, the 1 s tick re-reads the setting every 5 s without prompting.
+`--smoke-test` with the switch on only reads the setting and never prompts;
+with it off it does not touch the framework; test binaries are never bundles.
 
 The status-bar glyph is a signed distance field (`icon/glyph.rs`) that scales
 its stroke widths with the render size, so the same drawing serves the 36 px
@@ -268,17 +272,23 @@ renamed over `dist/Bugle.app` and the final zip written.
 `--universal` checks up front (`rustc --print target-libdir`) that both
 `aarch64-apple-darwin` and `x86_64-apple-darwin` have a standard library,
 naming the `rustup target add` command otherwise, then runs one
-`cargo build --target` per triple (with `MACOSX_DEPLOYMENT_TARGET` set to the
-shim's minimum) and `lipo -create`s each executable into
-`<target dir>/xtask/universal` before assembly; verification checks
-`lipo -archs` of both executables (a host build only prints them).
-`--dmg` / `cargo xtask dmg` `ditto`s the finished bundle next to an
+`cargo build --target` per triple and `lipo -create`s each executable into
+`<target dir>/xtask/universal` before assembly. Every xtask build (host or
+cross) sets `MACOSX_DEPLOYMENT_TARGET` to the shim's minimum, so both modes
+produce the same `LC_BUILD_VERSION` and consecutive host runs still reuse
+`target/release`. Verification checks `lipo -archs` of both executables (a
+host build only prints them) and runs `--version` on every slice: the
+native one directly, x86_64 on Apple silicon through `arch -x86_64` when
+Rosetta is installed, otherwise it reports the slice as not executed.
+`--dmg` / `cargo xtask dmg` `ditto`s the staged (notarized) bundle next to an
 `Applications → /Applications` symlink, `hdiutil create -format UDZO`s it in
 the staging directory, signs (Developer ID) and notarizes/staples it when the
 bundle was, runs `hdiutil verify`, attaches it read-only with `-nobrowse` at a
-mount point under the target directory, checks the link, the bundle's
-signature and architectures, detaches, and only then moves it to
-`dist/Bugle-<version>.dmg`.
+mount point under the target directory (force-detaching anything an
+interrupted run left there; a guard detaches on any error), checks the link,
+the bundle's signature and architectures, and detaches. `release_steps`
+fixes the order: all of that happens before `dist/Bugle.app` is replaced, and
+the new image is renamed over the old one (never deleted first).
 
 After a capture the app shows the quick-access panel instead of the toast
 (`[quick_access]`, on by default). `quick_access.rs` is the platform-free part:

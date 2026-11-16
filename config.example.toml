@@ -10,9 +10,9 @@ filename_template = "Bugle {date} at {time}"
 shutter_sound = false
 copy_to_clipboard = false
 # history_path = "~/Library/Application Support/bugle/history.jsonl"
-# bugle-app from Bugle.app only: also post each toast to Notification Center.
-# macOS asks once; if notifications are denied (or the app runs unbundled)
-# only the toast is shown.
+# bugle-app from Bugle.app only: also post finished actions and errors to
+# Notification Center. macOS asks once; if notifications are denied (or the
+# app runs unbundled) only the panel or toast is shown.
 system_notifications = false
 
 [screenshots]

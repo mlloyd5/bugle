@@ -544,7 +544,7 @@ impl App {
     fn on_done(&mut self, action: Action, result: Result<Option<Notice>, String>) {
         self.busy = false;
         match result {
-            Ok(Some(n)) if self.quick_show(action, &n) => {}
+            Ok(Some(n)) if self.quick_show(action, &n) => notifications::post(&n.title, &n.subtitle, n.open.as_deref()),
             Ok(Some(n)) => self.toast(&n),
             Ok(None) => {}
             Err(e) => self.toast_error(&format!("{action:?}: {e}")),
@@ -661,6 +661,7 @@ impl App {
         if let Some(l) = self.items.login.as_mut() {
             l.refresh();
         }
+        notifications::tick();
     }
 }
 

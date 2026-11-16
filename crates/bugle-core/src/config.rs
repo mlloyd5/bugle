@@ -39,9 +39,9 @@ pub struct GeneralConfig {
     pub copy_to_clipboard: bool,
     /// Where the history file lives.
     pub history_path: Option<String>,
-    /// `bugle-app` run from Bugle.app: also post a macOS notification
-    /// (Notification Center) for each toast. macOS asks for permission the
-    /// first time; denied or unbundled, only the toast is shown.
+    /// `bugle-app` run from Bugle.app: also post finished actions and errors
+    /// to Notification Center. macOS asks for permission the first time;
+    /// denied or unbundled, only the panel or toast is shown.
     pub system_notifications: bool,
 }
 

@@ -83,9 +83,12 @@ entitlements embedded in each signature), `codesign --verify --deep --strict`,
 By default the binaries are built for the host architecture only (arm64 on
 Apple silicon, x86_64 on Intel), and the bundle does not launch on the other
 kind of Mac. `--universal` builds both (`--target aarch64-apple-darwin` and
-`--target x86_64-apple-darwin`, with `MACOSX_DEPLOYMENT_TARGET=13.0`) and
-merges each executable with `lipo -create`; verification then requires
-`lipo -archs` to report `arm64 x86_64` for both. It needs the Rust standard
+`--target x86_64-apple-darwin`) and merges each executable with
+`lipo -create`; verification then requires `lipo -archs` to report
+`arm64 x86_64` for both, and runs `--version` on each slice the Mac can
+execute (the x86_64 slice through Rosetta on Apple silicon, when installed;
+otherwise it says the slice was not executed). Every xtask build sets
+`MACOSX_DEPLOYMENT_TARGET=13.0`, the shim's minimum. It needs the Rust standard
 library for both targets and stops before building, naming the command, when
 one is missing:
 
@@ -97,13 +100,15 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 toolchain for universal builds.)
 
 `--dmg` (or `cargo xtask dmg`, which takes the same options) writes
-`Bugle-<version>.dmg` from the finished bundle: a compressed (UDZO), read-only
-HFS+ image named "Bugle <version>" holding `Bugle.app` and an `Applications`
-link for drag-to-install. With a Developer ID identity the image is signed as
-well, and with `--notarize` it is notarized and stapled too. It is checked with
-`hdiutil verify`, then mounted read-only (out of sight, under the target
-directory) to check the link, `codesign --verify --deep --strict` the bundle on
-it and its architectures, and replaces the previous image only after that.
+`Bugle-<version>.dmg` from the finished staged bundle: a compressed (UDZO),
+read-only HFS+ image named "Bugle <version>" holding `Bugle.app` and an
+`Applications` link for drag-to-install. With a Developer ID identity the image
+is signed as well, and with `--notarize` it is notarized and stapled too. It is
+checked with `hdiutil verify`, then mounted read-only (out of sight, under the
+target directory) to check the link, `codesign --verify --deep --strict` the
+bundle on it and its architectures. Only after all of that are `dist/Bugle.app`
+and then the previous image replaced, so a failing image leaves both as they
+were.
 
 When Bugle.app is launched from Finder, the Dock, `open` or as a login item,
 the Screen Recording, Microphone and Accessibility prompts and System Settings
@@ -279,13 +284,18 @@ file) · Open at Login (only when running from `Bugle.app`) · Quit. While recor
 report through a small toast in the top-right corner (thumbnail and file name;
 click to open).
 
-With `system_notifications = true` under `[general]`, Bugle.app also posts
-each toast's message to Notification Center (`UNUserNotificationCenter`;
-clicking it opens the file), named and badged as Bugle. macOS asks for
-permission at the first launch with the switch on. The toast is shown either
-way: an unbundled `bugle-app`, a denied permission or the switch left off
-(the default) means toasts only. Turning notifications back on in System
-Settings → Notifications → Bugle takes effect from the next message.
+With `system_notifications = true` under `[general]`, Bugle.app also posts to
+Notification Center (`UNUserNotificationCenter`), named and badged as Bugle:
+every finished menu or hotkey action (capture, recording, OCR, pin, sync —
+whether the quick-access panel or the toast shows it; clicking a saved file's
+notification opens it), a markup-editor save that falls back to the toast, and
+every error. Immediate feedback to a click in the panel or the editor (such as
+"Copied to clipboard") and the agent API's start message stay in-app only.
+macOS asks for permission at the first launch with the switch on. The panel or
+toast is shown either way: an unbundled `bugle-app`, a denied permission or
+the switch left off (the default) means in-app feedback only. While not
+authorized the app re-reads the setting every few seconds without prompting,
+so turning Bugle on in System Settings → Notifications applies within seconds.
 
 After a capture or recording, the **quick-access panel** takes the toast's
 place, in the bottom-right corner by default: the thumbnail (click to open)

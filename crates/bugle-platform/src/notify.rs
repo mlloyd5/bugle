@@ -29,7 +29,7 @@ pub enum NotifyState {
     Authorized,
     /// The user said no, or switched notifications off in System Settings.
     Denied,
-    /// Not running from an app bundle, or the framework reported an error.
+    /// Not running from an app bundle.
     Unavailable,
 }
 

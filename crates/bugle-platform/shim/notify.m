@@ -8,8 +8,9 @@
 //
 // State is one atomic int the completion handlers write from their own
 // queues: 0 not started, 1 waiting for an answer, 2 authorized, 3 denied,
-// 4 unavailable (no bundle, or the framework reported an error), 5 not
-// determined (the user has not been asked yet).
+// 4 unavailable (no bundle), 5 not determined (the user has not been asked
+// yet). After start, the state always comes from the stored setting
+// (getNotificationSettings), never from a request's granted/error answer.
 
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
@@ -82,7 +83,12 @@ int bugle_notify_start(int request) {
         [c requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound)
                          completionHandler:^(BOOL granted, NSError *error) {
                              if (error) NSLog(@"bugle: notification authorization: %@", error.localizedDescription);
-                             atomic_store(&g_state, granted ? 2 : (error ? 4 : 3));
+                             // A refusal often arrives as an error rather than
+                             // a plain NO; the stored setting is what counts.
+                             [UNUserNotificationCenter.currentNotificationCenter
+                                 getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *s) {
+                                     atomic_store(&g_state, state_from_settings(s));
+                                 }];
                          }];
     } else {
         [c getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *s) {
