@@ -24,7 +24,7 @@ pub mod login_item;
 mod editor;
 #[cfg(target_os = "macos")]
 pub use editor::{
-    editor_active, editor_begin_text, editor_close, editor_focus, editor_inject, editor_open, editor_set_image,
+    editor_active, editor_begin_text, editor_close, editor_focus, editor_inject, editor_open, editor_set_busy, editor_set_image,
     editor_set_overlay, editor_set_state, EditorCommand, EditorEvent, EditorPrim, EditorState, EditorTool,
 };
 

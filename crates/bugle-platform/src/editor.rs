@@ -41,6 +41,7 @@ extern "C" {
     fn bugle_editor_set_overlay(values: *const f64, n: usize);
     fn bugle_editor_set_state(tool: i32, color: i32, width: i32, can_undo: i32, can_redo: i32, dirty: i32);
     fn bugle_editor_begin_text(x: f64, y: f64, font_px: f64, initial: *const c_char, rgba: u32);
+    fn bugle_editor_set_busy(busy: i32);
     fn bugle_editor_close();
     fn bugle_editor_active() -> i32;
     fn bugle_editor_focus();
@@ -299,6 +300,12 @@ pub fn editor_set_state(s: EditorState) {
 pub fn editor_begin_text(at: Point, font_px: f64, initial: &str, color: [u8; 4]) {
     let initial = CString::new(initial.replace('\0', "")).unwrap_or_default();
     unsafe { bugle_editor_begin_text(at.x, at.y, font_px, initial.as_ptr(), u32::from_be_bytes(color)) }
+}
+
+/// While busy (a save is running) the window refuses to close; the caller
+/// is expected to ignore input meanwhile.
+pub fn editor_set_busy(busy: bool) {
+    unsafe { bugle_editor_set_busy(busy as i32) }
 }
 
 /// Close the editor without asking about unsaved changes. May be called

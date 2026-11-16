@@ -93,6 +93,8 @@ impl Session {
         let (engine, proxy, source, generation) = (self.engine.clone(), self.proxy.clone(), self.source.clone(), self.generation);
         let saving = self.saving.clone();
         saving.store(true, Ordering::SeqCst);
+        // No closing half-way: the copy is being written either way.
+        bugle_platform::editor_set_busy(true);
         let flag = saving.clone();
         let spawned = std::thread::Builder::new().name("bugle-editor-save".into()).spawn(move || {
             let result = engine
@@ -111,6 +113,7 @@ impl Session {
         });
         if let Err(e) = spawned {
             saving.store(false, Ordering::SeqCst);
+            bugle_platform::editor_set_busy(false);
             self.proxy.send(AppEvent::Editor(EditorMsg::Saved { generation, result: Err(e.to_string()) }));
         }
     }
@@ -162,7 +165,12 @@ impl App {
             base,
             engine: self.engine.clone(),
             proxy: self.proxy.clone(),
-            source: source.to_string(),
+            // Pin down what is on screen: `latest` may be something else by
+            // the time the copy is saved.
+            source: match self.engine.history.get(&item.id) {
+                Ok(Some(_)) => item.id.clone(),
+                _ => item.path.display().to_string(),
+            },
             generation: self.editor_generation,
             saving: Arc::new(AtomicBool::new(false)),
         }));
@@ -197,7 +205,13 @@ impl App {
                 }
                 self.refresh_recent();
             }
-            EditorMsg::Saved { result: Err(e), .. } => self.toast_error(&format!("Annotate: could not save: {e}")),
+            EditorMsg::Saved { generation, result: Err(e) } => {
+                // The window is still up with the work in it; let it go on.
+                if generation == self.editor_generation {
+                    bugle_platform::editor_set_busy(false);
+                }
+                self.toast_error(&format!("Annotate: could not save: {e}"));
+            }
             EditorMsg::Copied(Ok(())) => bugle_platform::toast_show(None, "Copied to clipboard", "Annotated image", None, 2.5),
             EditorMsg::Copied(Err(e)) => self.toast_error(&format!("Annotate: could not copy: {e}")),
             EditorMsg::Inject(event) => bugle_platform::editor_inject(&event),

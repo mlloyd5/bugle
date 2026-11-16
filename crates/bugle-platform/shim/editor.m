@@ -72,6 +72,7 @@ static BugleEditor *g_editor = nil;
 @property(nonatomic) int32_t tool;
 @property(nonatomic) BOOL dirty;
 @property(nonatomic) BOOL closing;
+@property(nonatomic) BOOL busy;  // a save is running: no closing
 @property(nonatomic, strong) NSTextField *field;  // label being typed, or nil
 @property(nonatomic) CGFloat lastScale;
 - (void)emit:(int32_t)kind x:(double)x y:(double)y arg:(int32_t)arg text:(const char *)text;
@@ -451,6 +452,10 @@ static int32_t mouse_flags(NSEvent *e) { return (e.modifierFlags & NSEventModifi
 // ---- closing ----
 
 - (BOOL)windowShouldClose:(NSWindow *)sender {
+    if (self.busy) {
+        NSBeep();
+        return NO;
+    }
     if (self.field) [self endText:YES];
     if (!self.dirty) {
         [self teardown];
@@ -738,6 +743,9 @@ void bugle_editor_begin_text(double x, double y, double font_px, const char *ini
         [e beginTextAt:NSMakePoint(x, y) fontPx:font_px initial:str(initial) color:c];
     }
 }
+
+/// While busy the window refuses to close (a save is being written).
+void bugle_editor_set_busy(int32_t busy) { g_editor.busy = busy != 0; }
 
 /// Close the editor without asking. Safe to call from inside the callback.
 void bugle_editor_close(void) {

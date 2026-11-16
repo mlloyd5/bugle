@@ -348,8 +348,9 @@ can. Only the shape under the pointer is drawn by the window, so an arrow
 head or a redaction can look slightly different while you drag it. Crop,
 padding and backgrounds are `bugle annotate` only for now.
 
-The editor's window, shapes, selection, undo and saving are checked by
-`bugle-app --smoke-test`, which feeds it synthetic events rather than clicks.
+The editor's window, shapes, selection and undo are checked by
+`bugle-app --smoke-test`, which feeds it synthetic events rather than clicks
+(and saves a copy too when `BUGLE_SMOKE_SAVE` is set).
 
 ## Configuration
 

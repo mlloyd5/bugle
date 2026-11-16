@@ -8,7 +8,7 @@
 //! [`Editor::overlay`].
 
 use bugle_core::{Point, Rect};
-use bugle_markup::{Annotation, ArrowStyle, Color, RedactStyle, Shape, Style};
+use bugle_markup::{limits, Annotation, ArrowStyle, Color, RedactStyle, Shape, Style};
 use bugle_platform::{EditorCommand, EditorEvent, EditorPrim, EditorState, EditorTool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +102,8 @@ const STROKES: [f64; 3] = [3.0, 5.0, 9.0];
 const FONTS: [f64; 3] = [18.0, 28.0, 44.0];
 const HIGHLIGHT_ALPHA: u8 = 0x80;
 const UNDO_LIMIT: usize = 200;
+/// Points kept for one pen stroke; the rest of a very long drag is dropped.
+const MAX_STROKE_POINTS: usize = 5_000;
 
 /// What the glue should do after an event.
 #[derive(Debug, Default, PartialEq)]
@@ -138,7 +140,7 @@ enum Drag {
     /// Moving the selected shape; `original` is what it was at mouse down.
     Move { index: usize, start: Point, original: Shape, moved: bool },
     /// Dragging one of the selected shape's handles.
-    Resize { index: usize, handle: usize, original: Shape, moved: bool },
+    Resize { index: usize, handle: usize, start: Point, original: Shape, moved: bool },
 }
 
 /// A label being typed in the window's text field.
@@ -284,24 +286,29 @@ impl Editor {
     }
 
     fn pick_tool(&mut self, tool: Tool) -> Effects {
-        self.cancel_drag();
+        // A cancelled move put a shape back that the image was drawn without.
+        let render = self.cancel_drag();
         self.tool = tool;
         if tool != Tool::Select {
             self.selected = None;
         }
-        Effects { overlay: true, state: true, ..Default::default() }
+        Effects { render, overlay: true, state: true, ..Default::default() }
     }
 
     fn mouse_down(&mut self, at: Point, clicks: u32) -> Effects {
-        self.cancel_drag();
-        let mut fx = Effects { overlay: true, ..Default::default() };
+        // A drag still armed here lost its mouse-up; put its shape back.
+        let render = self.cancel_drag();
+        let mut fx = Effects { render, overlay: true, ..Default::default() };
+        if self.shapes.len() >= limits::MAX_SHAPES && self.tool != Tool::Select {
+            return fx;
+        }
         match self.tool {
             Tool::Select => {
                 if let Some(index) = self.selected {
                     let grab = handles(&self.shapes[index]).iter().position(|h| distance(*h, at) <= self.slack());
                     if let Some(handle) = grab {
                         let original = self.shapes[index].clone();
-                        self.drag = Some(Drag::Resize { index, handle, original, moved: false });
+                        self.drag = Some(Drag::Resize { index, handle, start: at, original, moved: false });
                         return fx;
                     }
                 }
@@ -346,7 +353,7 @@ impl Editor {
             None => return fx,
             Some(Drag::Draw { start, current, points }) => {
                 *current = if shift { constrain(tool, *start, at) } else { at };
-                if points.last().is_none_or(|l| distance(*l, at) >= 1.0) {
+                if points.len() < MAX_STROKE_POINTS && points.last().is_none_or(|l| distance(*l, at) >= 1.0) {
                     points.push(at);
                 }
             }
@@ -363,7 +370,11 @@ impl Editor {
                     self.hide_while_dragging(index, &mut fx);
                 }
             }
-            Some(Drag::Resize { index, handle, original, moved }) => {
+            Some(Drag::Resize { index, handle, start, original, moved }) => {
+                // A click on a handle is not a resize.
+                if !*moved && distance(at, *start) < slack {
+                    return fx;
+                }
                 let first = !*moved;
                 *moved = true;
                 let index = *index;
@@ -424,8 +435,14 @@ impl Editor {
     fn command(&mut self, c: EditorCommand) -> Effects {
         let mut fx = Effects::default();
         match c {
-            EditorCommand::Save => fx.request = Some(Request::Save),
-            EditorCommand::Copy => fx.request = Some(Request::Copy),
+            EditorCommand::Save | EditorCommand::Copy => {
+                // Mid-drag, the shape goes back where it was first.
+                if self.cancel_drag() {
+                    fx.render = true;
+                    fx.overlay = true;
+                }
+                fx.request = Some(if c == EditorCommand::Save { Request::Save } else { Request::Copy });
+            }
             EditorCommand::Undo | EditorCommand::Redo => {
                 self.cancel_drag();
                 let (from, to) = if c == EditorCommand::Undo { (&mut self.undo, &mut self.redo) } else { (&mut self.redo, &mut self.undo) };
@@ -436,7 +453,7 @@ impl Editor {
                 fx.render = true;
             }
             EditorCommand::Delete => {
-                self.cancel_drag();
+                fx.render = self.cancel_drag();
                 if let Some(index) = self.selected.take() {
                     let before = self.shapes.clone();
                     self.shapes.remove(index);
@@ -464,7 +481,9 @@ impl Editor {
         let Some(edit) = self.text.take() else { return fx };
         let was_hidden = self.hidden.take().is_some();
         fx.render = was_hidden;
-        let typed = typed.trim();
+        // No longer than the renderer accepts.
+        let typed: String = typed.trim().chars().take(limits::MAX_TEXT_CHARS).collect();
+        let typed = typed.trim_end();
         if typed.is_empty() {
             // Cancelled or left blank: an edited label stays as it was.
             return fx;
@@ -532,7 +551,9 @@ impl Editor {
             Tool::Ellipse => big_enough.then(|| Shape::Ellipse { rect, style }),
             Tool::Pen => {
                 let travelled: f64 = points.windows(2).map(|w| distance(w[0], w[1])).sum();
-                (travelled >= min).then(|| Shape::Freehand { points: points.to_vec(), style })
+                let used: usize = self.shapes.iter().map(|s| if let Shape::Freehand { points, .. } = s { points.len() } else { 0 }).sum();
+                let fits = used + points.len() <= limits::MAX_FREEHAND_POINTS;
+                (travelled >= min && fits).then(|| Shape::Freehand { points: points.to_vec(), style })
             }
             Tool::Highlight => big_enough.then(|| Shape::Highlight {
                 rect,
@@ -1070,6 +1091,75 @@ mod tests {
         e.handle(EditorEvent::MouseDown { at: pt(400.0, 300.0), shift: false, clicks: 1 });
         e.handle(EditorEvent::MouseUp { at: pt(420.0, 380.0), shift: false });
         assert!(matches!(&e.shapes[1], Shape::Arrow { from, to, .. } if *from == pt(300.0, 300.0) && *to == pt(420.0, 380.0)));
+    }
+
+    #[test]
+    fn a_click_on_a_handle_is_not_a_resize() {
+        let mut e = editor();
+        pick(&mut e, Tool::Rectangle);
+        drag(&mut e, pt(100.0, 100.0), pt(200.0, 180.0));
+        pick(&mut e, Tool::Select);
+        e.handle(EditorEvent::MouseDown { at: pt(100.0, 140.0), shift: false, clicks: 1 });
+        e.handle(EditorEvent::MouseUp { at: pt(100.0, 140.0), shift: false });
+        let depth = e.undo.len();
+        e.handle(EditorEvent::MouseDown { at: pt(203.0, 183.0), shift: false, clicks: 1 });
+        let fx = e.handle(EditorEvent::MouseUp { at: pt(203.5, 183.0), shift: false });
+        assert!(!fx.render);
+        assert_eq!(e.undo.len(), depth);
+        assert!(matches!(&e.shapes[0], Shape::Rectangle { rect, .. } if *rect == Rect::new(100.0, 100.0, 100.0, 80.0)));
+    }
+
+    #[test]
+    fn a_drag_cancelled_by_another_input_redraws_the_shape() {
+        let start = |e: &mut Editor| {
+            pick(e, Tool::Select);
+            e.handle(EditorEvent::MouseDown { at: pt(150.0, 100.0), shift: false, clicks: 1 });
+            assert!(e.handle(EditorEvent::MouseDrag { at: pt(190.0, 140.0), shift: false }).render);
+            assert!(e.document().shapes.is_empty());
+        };
+        let mut e = editor();
+        pick(&mut e, Tool::Rectangle);
+        drag(&mut e, pt(100.0, 100.0), pt(200.0, 180.0));
+        let depth = e.undo.len();
+        let home = Rect::new(100.0, 100.0, 100.0, 80.0);
+        // A tool key, a save, and a mouse-down after a lost mouse-up.
+        start(&mut e);
+        assert!(e.handle(EditorEvent::Key('a')).render);
+        assert_eq!(e.document().shapes.len(), 1);
+        start(&mut e);
+        let fx = cmd(&mut e, EditorCommand::Save);
+        assert!(fx.render && fx.request == Some(Request::Save));
+        assert!(matches!(&e.final_document().shapes[0], Shape::Rectangle { rect, .. } if *rect == home));
+        start(&mut e);
+        assert!(e.handle(EditorEvent::MouseDown { at: pt(500.0, 500.0), shift: false, clicks: 1 }).render);
+        assert!(matches!(&e.shapes[0], Shape::Rectangle { rect, .. } if *rect == home));
+        assert_eq!(e.undo.len(), depth);
+    }
+
+    #[test]
+    fn the_renderer_limits_are_kept() {
+        let mut e = editor();
+        pick(&mut e, Tool::Text);
+        e.handle(EditorEvent::MouseDown { at: pt(10.0, 10.0), shift: false, clicks: 1 });
+        e.handle(EditorEvent::Text("x".repeat(limits::MAX_TEXT_CHARS + 50)));
+        assert!(matches!(&e.shapes[0], Shape::Text { text, .. } if text.chars().count() == limits::MAX_TEXT_CHARS));
+        // One endless pen stroke keeps a bounded number of points.
+        pick(&mut e, Tool::Pen);
+        e.handle(EditorEvent::MouseDown { at: pt(0.0, 0.0), shift: false, clicks: 1 });
+        for i in 0..(MAX_STROKE_POINTS * 2) {
+            e.handle(EditorEvent::MouseDrag { at: pt(i as f64 * 2.0, 5.0), shift: false });
+        }
+        e.handle(EditorEvent::MouseUp { at: pt(1.0, 9.0), shift: false });
+        assert!(matches!(&e.shapes[1], Shape::Freehand { points, .. } if points.len() == MAX_STROKE_POINTS));
+        e.final_document().validate().unwrap();
+        // A full document takes no more shapes.
+        let line = Shape::Line { from: pt(0.0, 0.0), to: pt(9.0, 9.0), style: Style::default() };
+        e.shapes = vec![line; limits::MAX_SHAPES];
+        pick(&mut e, Tool::Counter);
+        e.handle(EditorEvent::MouseDown { at: pt(10.0, 10.0), shift: false, clicks: 1 });
+        pick(&mut e, Tool::Arrow);
+        drag(&mut e, pt(10.0, 10.0), pt(200.0, 200.0));
+        assert_eq!(e.shapes.len(), limits::MAX_SHAPES);
     }
 
     #[test]
