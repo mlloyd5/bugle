@@ -88,9 +88,14 @@ int32_t bugle_export_audio_m4a(const char *in_path, const char *out_path);
 int32_t bugle_export_mp4(const char *in_path, const char *out_path);
 int32_t bugle_export_mov(const char *in_path, const char *out_path);
 int32_t bugle_audio_track_count(const char *path);
-// Fold all audio tracks into one AAC track (video copied as is). 0 on
-// success, 1 (nothing written) with fewer than two audio tracks.
-int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path);
+// Mixes one block of aligned audio: `tracks[i]` holds `frames` interleaved
+// frames of `channels` floats for track i; writes as many into `out`.
+// Non-zero aborts the mix.
+typedef int32_t (*bugle_mix_fn)(void *ctx, const float *const *tracks, int32_t n_tracks, int32_t channels,
+                                float *out, int32_t frames);
+// Fold all audio tracks into one AAC track through `process` (video copied
+// as is). 0 on success, 1 (nothing written) with fewer than two audio tracks.
+int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, bugle_mix_fn process, void *ctx);
 int32_t bugle_video_track_count(const char *path);
 
 // Test fixtures (shim/fixtures.m, its own object file: nothing in the app

@@ -1053,13 +1053,104 @@ int32_t bugle_video_track_count(const char *path) {
 }
 
 // Fold every enabled audio track of a movie into one AAC track. A post-pass
-// on the finished file: AVAssetReaderAudioMixOutput sums the tracks (each on
-// its own edit timeline, so their offsets are kept) into float PCM, which is
-// encoded once; video tracks are copied sample for sample without
-// re-encoding, on their own timescale. Each of the n tracks is scaled by 1/n
-// so the sum can never exceed full scale. Returns 1 and writes nothing when
-// there are fewer than two audio tracks; refuses to write over its input.
-int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path) {
+// on the finished file: each audio track is decoded to 48 kHz stereo float
+// PCM by its own reader (an AVAssetReaderAudioMixOutput over that one track,
+// so its edit timeline and offset are kept, and no track's reads wait on
+// another's), the tracks are lined up frame for frame by presentation time
+// (gaps and late starts filled with silence), and `process` turns each
+// block of aligned tracks into the mixed block, which is encoded once.
+// Video tracks are copied sample for sample without re-encoding, on their
+// own timescale. Returns 1 and writes nothing when there are fewer than two
+// audio tracks; refuses to write over its input.
+
+#define MIX_RATE 48000
+#define MIX_CH 2
+#define MIX_BLOCK 4096
+#define MIX_FRAME_BYTES (sizeof(float) * MIX_CH)
+
+@interface BugleMixSource : NSObject
+@property (nonatomic, strong) AVAssetReader *reader;
+@property (nonatomic, strong) AVAssetReaderOutput *output;
+// Interleaved frames from the mix cursor on.
+@property (nonatomic, strong) NSMutableData *fifo;
+// A decoded buffer that starts beyond the FIFO's end, and its first frame.
+@property (nonatomic, strong) NSData *pending;
+@property (nonatomic) int64_t pendingPos;
+@property (nonatomic) BOOL eof;
+@end
+
+@implementation BugleMixSource
+@end
+
+static int64_t mix_frames(NSData *d) { return (int64_t)(d.length / MIX_FRAME_BYTES); }
+
+/// Fill `s` until its FIFO covers [cursor, want) or the track is exhausted.
+/// NO when the track's reader failed.
+static BOOL mix_fill(BugleMixSource *s, int64_t cursor, int64_t want) {
+    for (;;) {
+        int64_t have = cursor + mix_frames(s.fifo);
+        if (have >= want) return YES;
+        if (s.pending) {
+            if (s.pendingPos > have) {
+                // Silence up to the buffer (zero-filled), but not past `want`:
+                // a far-off start is reached one block at a time.
+                int64_t to = MIN(s.pendingPos, want);
+                [s.fifo increaseLengthBy:(NSUInteger)(to - have) * MIX_FRAME_BYTES];
+                if (to == want) return YES;
+                have = to;
+            }
+            // Frames before `have` are already covered: drop the overlap.
+            int64_t skip = have - s.pendingPos, n = mix_frames(s.pending);
+            if (skip < n) {
+                [s.fifo appendBytes:(const char *)s.pending.bytes + skip * MIX_FRAME_BYTES
+                             length:(NSUInteger)(n - skip) * MIX_FRAME_BYTES];
+            }
+            s.pending = nil;
+            continue;
+        }
+        if (s.eof) return YES;
+        CMSampleBufferRef sb = [s.output copyNextSampleBuffer];
+        if (!sb) {
+            s.eof = YES;
+            if (s.reader.status == AVAssetReaderStatusFailed) return NO;
+            continue;
+        }
+        CMItemCount n = CMSampleBufferGetNumSamples(sb);
+        CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
+        size_t need = (size_t)n * MIX_FRAME_BYTES;
+        if (n > 0 && bb && CMBlockBufferGetDataLength(bb) >= need) {
+            NSMutableData *d = [NSMutableData dataWithLength:need];
+            if (CMBlockBufferCopyDataBytes(bb, 0, need, d.mutableBytes) == kCMBlockBufferNoErr) {
+                CMTime pts = CMTimeConvertScale(CMSampleBufferGetPresentationTimeStamp(sb), MIX_RATE,
+                                                kCMTimeRoundingMethod_RoundHalfAwayFromZero);
+                s.pendingPos = CMTIME_IS_NUMERIC(pts) ? pts.value : have;
+                s.pending = d;
+            }
+        }
+        CFRelease(sb);
+    }
+}
+
+/// A sample buffer holding `frames` interleaved float frames at `pos`.
+static CMSampleBufferRef mix_buffer(CMAudioFormatDescriptionRef fmt, const float *pcm, int64_t frames, int64_t pos) {
+    size_t bytes = (size_t)frames * MIX_FRAME_BYTES;
+    CMBlockBufferRef bb = NULL;
+    if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, bytes, kCFAllocatorDefault, NULL, 0, bytes,
+                                           kCMBlockBufferAssureMemoryNowFlag, &bb) != kCMBlockBufferNoErr) {
+        return NULL;
+    }
+    if (CMBlockBufferReplaceDataBytes(pcm, bb, 0, bytes) != kCMBlockBufferNoErr) {
+        CFRelease(bb);
+        return NULL;
+    }
+    CMSampleBufferRef sb = NULL;
+    OSStatus st = CMAudioSampleBufferCreateReadyWithPacketDescriptions(kCFAllocatorDefault, bb, fmt, (CMItemCount)frames,
+                                                                       CMTimeMake(pos, MIX_RATE), NULL, &sb);
+    CFRelease(bb);
+    return st == noErr ? sb : NULL;
+}
+
+int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, bugle_mix_fn process, void *ctx) {
     @autoreleasepool {
         clear_error();
         NSURL *in = [NSURL fileURLWithPath:[NSString stringWithUTF8String:in_path]];
@@ -1068,6 +1159,7 @@ int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path) {
             set_error(@"mixing %s: input and output are the same file", in_path);
             return -1;
         }
+        if (!process) { set_error(@"mixing %s: no mix function", in_path); return -1; }
         AVURLAsset *asset = [AVURLAsset URLAssetWithURL:in options:nil];
         NSMutableArray<AVAssetTrack *> *audio = [NSMutableArray array];
         for (AVAssetTrack *t in [asset tracksWithMediaType:AVMediaTypeAudio]) {
@@ -1076,86 +1168,113 @@ int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path) {
         if (audio.count < 2) return 1;
         NSArray<AVAssetTrack *> *video = [asset tracksWithMediaType:AVMediaTypeVideo];
         NSError *err = nil;
-        AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&err];
-        if (!reader) { set_error(@"could not read %s: %@", in_path, err.localizedDescription); return -1; }
         [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
         AVFileType type = [out.pathExtension.lowercaseString isEqualToString:@"mov"] ? AVFileTypeQuickTimeMovie : AVFileTypeMPEG4;
         AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:out fileType:type error:&err];
         if (!writer) { set_error(@"AVAssetWriter: %@", err.localizedDescription); return -1; }
         writer.shouldOptimizeForNetworkUse = YES;
 
-        NSMutableArray<AVAssetReaderOutput *> *outputs = [NSMutableArray array];
-        NSMutableArray<AVAssetWriterInput *> *inputs = [NSMutableArray array];
-        for (AVAssetTrack *t in video) {
-            AVAssetReaderTrackOutput *ro = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:t outputSettings:nil];
-            ro.alwaysCopiesSampleData = NO;
-            CMFormatDescriptionRef hint = (__bridge CMFormatDescriptionRef)t.formatDescriptions.firstObject;
-            AVAssetWriterInput *wi = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
-                                                                        outputSettings:nil
-                                                                      sourceFormatHint:hint];
-            wi.transform = t.preferredTransform;
-            // Keep the source's frame times exactly (the default is 1/600 s).
-            if (t.naturalTimeScale > 0) wi.mediaTimeScale = t.naturalTimeScale;
-            if (![reader canAddOutput:ro] || ![writer canAddInput:wi]) { set_error(@"could not copy the video track"); return -1; }
-            [reader addOutput:ro];
-            [writer addInput:wi];
-            [outputs addObject:ro];
-            [inputs addObject:wi];
+        NSMutableArray<AVAssetReader *> *readers = [NSMutableArray array];
+        NSMutableArray<AVAssetReaderOutput *> *videoOutputs = [NSMutableArray array];
+        NSMutableArray<AVAssetWriterInput *> *videoInputs = [NSMutableArray array];
+        if (video.count > 0) {
+            AVAssetReader *vr = [[AVAssetReader alloc] initWithAsset:asset error:&err];
+            if (!vr) { set_error(@"could not read %s: %@", in_path, err.localizedDescription); return -1; }
+            for (AVAssetTrack *t in video) {
+                AVAssetReaderTrackOutput *ro = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:t outputSettings:nil];
+                ro.alwaysCopiesSampleData = NO;
+                CMFormatDescriptionRef hint = (__bridge CMFormatDescriptionRef)t.formatDescriptions.firstObject;
+                AVAssetWriterInput *wi = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
+                                                                            outputSettings:nil
+                                                                          sourceFormatHint:hint];
+                wi.transform = t.preferredTransform;
+                // Keep the source's frame times exactly (the default is 1/600 s).
+                if (t.naturalTimeScale > 0) wi.mediaTimeScale = t.naturalTimeScale;
+                if (![vr canAddOutput:ro] || ![writer canAddInput:wi]) { set_error(@"could not copy the video track"); return -1; }
+                [vr addOutput:ro];
+                [writer addInput:wi];
+                [videoOutputs addObject:ro];
+                [videoInputs addObject:wi];
+            }
+            [readers addObject:vr];
         }
         NSDictionary *pcm = @{
             AVFormatIDKey: @(kAudioFormatLinearPCM),
-            AVSampleRateKey: @48000,
-            AVNumberOfChannelsKey: @2,
+            AVSampleRateKey: @(MIX_RATE),
+            AVNumberOfChannelsKey: @(MIX_CH),
             AVLinearPCMBitDepthKey: @32,
             AVLinearPCMIsFloatKey: @YES,
             AVLinearPCMIsBigEndianKey: @NO,
             AVLinearPCMIsNonInterleaved: @NO,
         };
-        AVAssetReaderAudioMixOutput *mix = [AVAssetReaderAudioMixOutput assetReaderAudioMixOutputWithAudioTracks:audio
-                                                                                                   audioSettings:pcm];
-        // Headroom: n sources at 1/n each cannot clip, however loud they are.
-        AVMutableAudioMix *levels = [AVMutableAudioMix audioMix];
-        NSMutableArray<AVAudioMixInputParameters *> *params = [NSMutableArray array];
+        NSMutableArray<BugleMixSource *> *sources = [NSMutableArray array];
         for (AVAssetTrack *t in audio) {
-            AVMutableAudioMixInputParameters *pm = [AVMutableAudioMixInputParameters audioMixInputParametersWithTrack:t];
-            [pm setVolume:1.0f / (float)audio.count atTime:kCMTimeZero];
-            [params addObject:pm];
+            AVAssetReader *r = [[AVAssetReader alloc] initWithAsset:asset error:&err];
+            if (!r) { set_error(@"could not read %s: %@", in_path, err.localizedDescription); return -1; }
+            AVAssetReaderAudioMixOutput *o = [AVAssetReaderAudioMixOutput assetReaderAudioMixOutputWithAudioTracks:@[t]
+                                                                                                     audioSettings:pcm];
+            if (![r canAddOutput:o]) { set_error(@"could not decode audio track %d", t.trackID); return -1; }
+            [r addOutput:o];
+            BugleMixSource *s = [BugleMixSource new];
+            s.reader = r;
+            s.output = o;
+            s.fifo = [NSMutableData data];
+            [sources addObject:s];
+            [readers addObject:r];
         }
-        levels.inputParameters = params;
-        mix.audioMix = levels;
         NSDictionary *aac = @{
             AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: @48000,
-            AVNumberOfChannelsKey: @2,
+            AVSampleRateKey: @(MIX_RATE),
+            AVNumberOfChannelsKey: @(MIX_CH),
             AVEncoderBitRateKey: @160000,
         };
         AVAssetWriterInput *ai = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:aac];
-        if (![reader canAddOutput:mix] || ![writer canAddInput:ai]) { set_error(@"could not set up the audio mix"); return -1; }
-        [reader addOutput:mix];
+        if (![writer canAddInput:ai]) { set_error(@"could not set up the audio mix"); return -1; }
         [writer addInput:ai];
-        [outputs addObject:mix];
-        [inputs addObject:ai];
+        AudioStreamBasicDescription asbd = {
+            .mSampleRate = MIX_RATE,
+            .mFormatID = kAudioFormatLinearPCM,
+            .mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            .mBytesPerPacket = MIX_FRAME_BYTES,
+            .mFramesPerPacket = 1,
+            .mBytesPerFrame = MIX_FRAME_BYTES,
+            .mChannelsPerFrame = MIX_CH,
+            .mBitsPerChannel = 32,
+        };
+        CMAudioFormatDescriptionRef fmtRef = NULL;
+        if (CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &asbd, 0, NULL, 0, NULL, NULL, &fmtRef) != noErr) {
+            set_error(@"could not describe the mixed audio");
+            return -1;
+        }
+        id fmt = CFBridgingRelease(fmtRef);
 
+        void (^cancelAll)(void) = ^{
+            for (AVAssetReader *r in readers) [r cancelReading];
+            [writer cancelWriting];
+            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+        };
         if (![writer startWriting]) {
             set_error(@"could not start writing %s: %@", out_path, writer.error.localizedDescription);
             return -1;
         }
-        if (![reader startReading]) {
-            [writer cancelWriting];
-            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
-            set_error(@"could not read %s: %@", in_path, reader.error.localizedDescription);
-            return -1;
+        for (AVAssetReader *r in readers) {
+            if (![r startReading]) {
+                NSString *why = r.error.localizedDescription;
+                cancelAll();
+                set_error(@"could not read %s: %@", in_path, why);
+                return -1;
+            }
         }
         [writer startSessionAtSourceTime:kCMTimeZero];
-        // One pump per track, each on its own queue: the writer interleaves
-        // tracks and holds one back until the others catch up.
+        // One pump per output track, each on its own queue: the writer
+        // interleaves tracks and holds one back until the others catch up.
         dispatch_group_t group = dispatch_group_create();
-        for (NSUInteger i = 0; i < inputs.count; i++) {
-            AVAssetReaderOutput *ro = outputs[i];
-            AVAssetWriterInput *wi = inputs[i];
+        for (NSUInteger i = 0; i < videoInputs.count; i++) {
+            AVAssetReaderOutput *ro = videoOutputs[i];
+            AVAssetWriterInput *wi = videoInputs[i];
             __block BOOL done = NO;
             dispatch_group_enter(group);
-            [wi requestMediaDataWhenReadyOnQueue:dispatch_queue_create("bugle.mix", DISPATCH_QUEUE_SERIAL)
+            [wi requestMediaDataWhenReadyOnQueue:dispatch_queue_create("bugle.mix.video", DISPATCH_QUEUE_SERIAL)
                                       usingBlock:^{
                                           while (!done && wi.readyForMoreMediaData) {
                                               CMSampleBufferRef sb = [ro copyNextSampleBuffer];
@@ -1169,23 +1288,86 @@ int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path) {
                                           }
                                       }];
         }
+        // The audio pump: line the tracks up block by block, mix, encode.
+        // Its buffers are owned by the block (`scratch` is captured), so a
+        // pump still running after a timeout never touches freed memory.
+        NSUInteger n = sources.count;
+        NSMutableData *scratch = [NSMutableData dataWithLength:(n + 1) * MIX_BLOCK * MIX_FRAME_BYTES
+                                                               + n * sizeof(float *)];
+        __block int64_t cursor = 0;
+        __block BOOL audioDone = NO;
+        __block NSString *audioError = nil;
+        // `process` and `ctx` belong to the caller: once this function gives
+        // up on a stuck pump, the gate makes sure they are never called again.
+        NSLock *gate = [NSLock new];
+        __block BOOL abandoned = NO;
+        dispatch_group_enter(group);
+        [ai requestMediaDataWhenReadyOnQueue:dispatch_queue_create("bugle.mix.audio", DISPATCH_QUEUE_SERIAL)
+                                  usingBlock:^{
+            float *tracks = scratch.mutableBytes;
+            float *mixed = tracks + n * MIX_BLOCK * MIX_CH;
+            const float **ptrs = (const float **)(void *)(mixed + MIX_BLOCK * MIX_CH);
+            while (!audioDone && ai.readyForMoreMediaData) {
+                BOOL ok = YES;
+                int64_t frames = 0;
+                for (BugleMixSource *s in sources) {
+                    if (!mix_fill(s, cursor, cursor + MIX_BLOCK)) {
+                        ok = NO;
+                        audioError = s.reader.error.localizedDescription ?: @"decoding an audio track failed";
+                    }
+                    frames = MAX(frames, MIN((int64_t)MIX_BLOCK, mix_frames(s.fifo)));
+                }
+                if (ok && frames > 0) {
+                    for (NSUInteger t = 0; t < n; t++) {
+                        BugleMixSource *s = sources[t];
+                        int64_t have = MIN(frames, mix_frames(s.fifo));
+                        float *dst = tracks + t * MIX_BLOCK * MIX_CH;
+                        memcpy(dst, s.fifo.bytes, (size_t)have * MIX_FRAME_BYTES);
+                        memset(dst + have * MIX_CH, 0, (size_t)(frames - have) * MIX_FRAME_BYTES);
+                        [s.fifo replaceBytesInRange:NSMakeRange(0, (NSUInteger)have * MIX_FRAME_BYTES) withBytes:NULL length:0];
+                        ptrs[t] = dst;
+                    }
+                    [gate lock];
+                    int32_t rc = abandoned ? -1 : process(ctx, ptrs, (int32_t)n, MIX_CH, mixed, (int32_t)frames);
+                    [gate unlock];
+                    if (rc != 0) {
+                        ok = NO;
+                        audioError = @"the mix function failed";
+                    } else {
+                        CMSampleBufferRef sb = mix_buffer((__bridge CMAudioFormatDescriptionRef)fmt, mixed, frames, cursor);
+                        if (!sb) audioError = @"could not build a mixed audio buffer";
+                        ok = sb && [ai appendSampleBuffer:sb];
+                        if (sb) CFRelease(sb);
+                    }
+                    cursor += frames;
+                }
+                if (!ok || frames == 0) {
+                    audioDone = YES;
+                    [ai markAsFinished];
+                    dispatch_group_leave(group);
+                }
+            }
+        }];
         // A failed writer stops asking for data, so bound the wait by the
         // media length (decoding runs many times faster than real time).
         double secs = CMTimeGetSeconds(asset.duration);
         double limit = 60.0 + (isfinite(secs) && secs > 0 ? secs * 2.0 : 0.0);
         if (dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(limit * NSEC_PER_SEC))) != 0) {
-            [reader cancelReading];
-            [writer cancelWriting];
-            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+            [gate lock];
+            abandoned = YES;
+            [gate unlock];
+            cancelAll();
             set_error(@"timed out mixing the audio tracks%@",
                       writer.error ? [NSString stringWithFormat:@" (%@)", writer.error.localizedDescription] : @"");
             return -1;
         }
-        if (reader.status == AVAssetReaderStatusFailed || writer.status == AVAssetWriterStatusFailed) {
-            NSString *why = (reader.error ?: writer.error).localizedDescription ?: @"unknown error";
-            [reader cancelReading];
-            [writer cancelWriting];
-            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+        NSString *why = audioError;
+        for (AVAssetReader *r in readers) {
+            if (!why && r.status == AVAssetReaderStatusFailed) why = r.error.localizedDescription ?: @"unknown error";
+        }
+        if (!why && writer.status == AVAssetWriterStatusFailed) why = writer.error.localizedDescription ?: @"unknown error";
+        if (why) {
+            cancelAll();
             set_error(@"mixing the audio tracks failed: %@", why);
             return -1;
         }
