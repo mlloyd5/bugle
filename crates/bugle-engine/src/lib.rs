@@ -297,6 +297,12 @@ impl Engine {
         f(guard.as_ref().unwrap())
     }
 
+    /// Render `doc` over `img` with the configured `[markup]` defaults, without
+    /// saving anything (the editor's live preview).
+    pub fn render_annotations(&self, img: &RgbaImage, doc: &Annotation) -> Result<RgbaImage> {
+        self.with_renderer(|r| r.render(img, doc))
+    }
+
     pub fn apply_annotations(&self, source: &str, mut doc: Annotation, output: Option<&str>, copy: bool) -> Result<(MediaItem, RgbaImage)> {
         let (parent, img) = self.load_image(source)?;
         if let Some(c) = doc.canvas.as_mut() {

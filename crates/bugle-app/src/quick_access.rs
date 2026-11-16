@@ -21,7 +21,8 @@ const HOVER_GRACE: Duration = Duration::from_secs(2);
 pub enum PanelAction {
     /// Put the capture on the clipboard (`Engine::copy_media`).
     Copy,
-    /// Open the file in the configured markup app (`[quick_access] annotate_app`).
+    /// Open the capture in the markup editor, or in the app named by
+    /// `[quick_access] annotate_app`.
     Annotate,
     /// Float it above all windows (`Engine::pin`).
     Pin,

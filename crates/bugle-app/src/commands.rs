@@ -12,6 +12,8 @@ use std::collections::HashMap;
 pub enum Command {
     /// An engine action, run on the worker thread.
     Run(Action),
+    /// Open the markup editor for the newest image (main thread, not the worker).
+    AnnotateLatest,
     OpenFolder,
     ToggleApi,
     Preferences,
@@ -58,6 +60,7 @@ pub const MENU: &[Slot] = &[
     item("record_gif", "Record GIF", Command::Run(Action::RecordGif)),
     item("stop_recording", "Stop Recording", Command::Run(Action::StopRecording)),
     Slot::Separator,
+    item("annotate_latest", "Annotate Latest", Command::AnnotateLatest),
     item("ocr_latest", "OCR Latest", Command::Run(Action::OcrLatest)),
     item("pin_latest", "Pin Latest", Command::Run(Action::PinLatest)),
     item("sync_latest", "Sync Latest", Command::Run(Action::SyncLatest)),

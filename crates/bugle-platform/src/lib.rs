@@ -20,6 +20,13 @@ pub use panel::{
 };
 #[cfg(target_os = "macos")]
 pub mod login_item;
+#[cfg(target_os = "macos")]
+mod editor;
+#[cfg(target_os = "macos")]
+pub use editor::{
+    editor_active, editor_begin_text, editor_close, editor_focus, editor_inject, editor_open, editor_set_busy, editor_set_image,
+    editor_set_overlay, editor_set_state, EditorCommand, EditorEvent, EditorPrim, EditorState, EditorTool,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bugle_core::{BugleError, DisplayInfo, OcrLine, Point, Rect, WindowInfo};

@@ -24,6 +24,7 @@ impl Backend for EngineBackend<'_> {
     fn copy(&self, source: &str) -> Result<()> {
         self.engine.copy_media(source).map(|_| ())
     }
+    /// *Annotate* with an external app (`annotate_app` is not `builtin`).
     fn annotate(&self, path: &Path) -> Result<()> {
         let app = self.engine.config.quick_access.annotate_app.trim();
         let opened = bugle_platform::open_with(path, (!app.is_empty()).then_some(app))?;
@@ -75,6 +76,12 @@ impl App {
         if matches!(action, Action::OcrLatest | Action::PinLatest | Action::SyncLatest) {
             return false;
         }
+        self.quick_show_notice(n)
+    }
+
+    /// Show the panel for a saved file, whatever produced it. `false` when
+    /// the panel is disabled or there is nothing to act on.
+    pub(crate) fn quick_show_notice(&mut self, n: &Notice) -> bool {
         if !self.quick.wants_panel(n.thumb.is_some(), n.open.as_deref()) {
             return false;
         }
@@ -134,6 +141,10 @@ impl App {
     }
 
     fn quick_run(&mut self, action: PanelAction, target: Target) {
+        if action == PanelAction::Annotate && self.engine.config.quick_access.builtin_editor() {
+            // The editor is a window of this app: open it here, on the main thread.
+            return self.open_editor(&target.source);
+        }
         if !action.runs_off_main() {
             let result = quick_access::perform(&EngineBackend { engine: &self.engine }, action, &target);
             self.on_quick(QuickEvent::Finished { action, result: result.map_err(|e| format!("{e:#}")) });

@@ -30,6 +30,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | OCR with bounding boxes | Apple Vision `VNRecognizeTextRequest` (accurate, language correction) | ✅ |
 | Scrolling capture | Vision `VNTranslationalImageRegistrationRequest` + row-profile fallback | ✅ (needs Accessibility) |
 | Annotation | Pure-Rust renderer: arrows (4 styles), boxes, ellipses, lines, freehand, text, highlight, counters, pixelate/blur/black-out/secure-blur, spotlight, crop, padding + gradient background + shadow | ✅ |
+| Markup editor | `bugle-app` window: toolbar and canvas in AppKit, editing logic in Rust, preview and saved file drawn by the annotation renderer | ✅ |
 | Pin to screen | Floating AppKit panel (drag, scroll-to-resize, Esc/double-click closes) | ✅ |
 | GIF recording | In-process frame grab loop + `image` GIF encoder | ✅ |
 | Video recording | `screencapture -v` (H.264 .mov → remuxed .mp4), microphone, click highlight | ✅ |
@@ -242,8 +243,8 @@ menu bar and listens for global hotkeys. Everything it does goes through the sam
 history, and play the shutter sound when `general.shutter_sound` is on.
 
 Menu: Capture Area · Capture Window · Capture Screen ·
-Scrolling Capture · Record Video · Record GIF · Stop Recording · OCR Latest
-(copies the text) · Pin Latest · Recent Captures (last five, click to open) ·
+Scrolling Capture · Record Video · Record GIF · Stop Recording · Annotate Latest
+(opens the markup editor) · OCR Latest (copies the text) · Pin Latest · Recent Captures (last five, click to open) ·
 Open History Folder · Start/Stop Agent API · Preferences… (opens the config
 file) · Open at Login (only when running from `Bugle.app`) · Quit. While recording, the status item shows `● m:ss`. Other actions
 report through a small toast in the top-right corner (thumbnail and file name;
@@ -252,8 +253,9 @@ click to open).
 After a capture or recording, the **quick-access panel** takes the toast's
 place, in the bottom-right corner by default: the thumbnail (click to open)
 with **Copy**, **Annotate**, **Pin**, **Sync** and **Reveal** in Finder, plus a
-close (×) button. **Annotate** opens the file in Preview (or the app named by
-`annotate_app`); edits made there change the saved capture in place. **Sync**
+close (×) button. **Annotate** opens the [markup editor](#markup-editor); set
+`annotate_app` to a bundle id such as `com.apple.Preview` to open that app
+instead, where edits change the saved capture in place. **Sync**
 appears when a `[sync]` destination is set and the file is not there yet — so
 it is also the retry when the automatic sync failed. The panel never takes
 keyboard focus, so it has no keyboard shortcut: it goes away after any button,
@@ -267,7 +269,7 @@ Configure it in `[quick_access]`:
 enabled = true            # false: plain toast instead
 timeout_seconds = 8.0     # 0: stays until a button or × is clicked
 position = "bottom-right" # bottom-left | top-right | top-left
-annotate_app = "com.apple.Preview"
+annotate_app = "builtin"  # or a bundle id, e.g. "com.apple.Preview"
 ```
 
 *Capture Window* dims the screen slightly and highlights the window under the
@@ -309,6 +311,46 @@ from the menu uses `[api]` from the config and serves the in-app overlay for
 Screen Recording permission is requested on first launch (granted to the
 terminal or app that launched `bugle-app` when run from a shell, or to Bugle
 itself when run from [the app bundle](#app-bundle)).
+
+### Markup editor
+
+*Annotate* on the quick-access panel and *Annotate Latest* in the menu (bind it
+with `annotate_latest` in `[hotkeys]`) open the newest screenshot in a window:
+a toolbar above the image, which is scaled to fit and never cropped.
+
+| Tool | Key | Draws |
+|---|---|---|
+| Select | V | click a shape to select it, drag to move, drag a handle to resize, Delete to remove; double-click a label to retype it |
+| Arrow, Line | A, L | drag; Shift snaps to 45° steps |
+| Rectangle, Ellipse | R, O | drag; Shift makes a square or circle |
+| Pen | P | freehand stroke |
+| Text | T | click, type, Return (Esc cancels) |
+| Highlight | H | marker-pen band in the current colour |
+| Numbered step | N | click to place 1, 2, 3… |
+| Redact | B | pixelates the area |
+| Spotlight | S | dims everything outside the area |
+
+The swatches and S/M/L set the colour and the stroke or text size for new
+shapes, and restyle the selected one. Strokes and text are sized relative to
+the image, so they look the same on a Retina capture as on a small one. ⌘Z and
+⇧⌘Z undo and redo; Esc backs out of a drag, then the selection, then the tool,
+and never closes the window.
+
+**Save** (⌘S) writes an annotated copy as a new history item (kind
+`annotated`, named and synced like any other capture) and leaves the original
+alone; the quick-access panel then offers the copy. **Copy** (⌘C) puts the
+annotated image on the clipboard and keeps the window open. Closing with
+unsaved shapes asks first. One editor is open at a time.
+
+What you see is what is saved: finished shapes are drawn by the same renderer
+as `bugle annotate`, and a saved document can use everything that command
+can. Only the shape under the pointer is drawn by the window, so an arrow
+head or a redaction can look slightly different while you drag it. Crop,
+padding and backgrounds are `bugle annotate` only for now.
+
+The editor's window, shapes, selection and undo are checked by
+`bugle-app --smoke-test`, which feeds it synthetic events rather than clicks
+(and saves a copy too when `BUGLE_SMOKE_SAVE` is set).
 
 ## Configuration
 
