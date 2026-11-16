@@ -439,7 +439,7 @@ pub fn status_for(err: &anyhow::Error) -> u16 {
         Some(E::PermissionDenied) => 403,
         Some(E::NoSuchDisplay(_)) | Some(E::NoSuchWindow(_)) | Some(E::MediaNotFound(_)) => 404,
         Some(E::Invalid(_)) | Some(E::ProviderNotConfigured(_)) => 400,
-        Some(E::Cancelled) => 409,
+        Some(E::Cancelled) | Some(E::Busy(_)) => 409,
         Some(E::Unsupported(_)) => 501,
         Some(E::NoUiHost(_)) => 503,
         None => {
@@ -552,6 +552,7 @@ pub(crate) mod tests {
     fn status_codes() {
         assert_eq!(status_for(&BugleError::Cancelled.into()), 409);
         assert_eq!(status_for(&BugleError::NoUiHost("x".into()).into()), 503);
+        assert_eq!(status_for(&BugleError::Busy("x".into()).into()), 409);
         assert_eq!(status_for(&BugleError::PermissionDenied.into()), 403);
         assert_eq!(status_for(&BugleError::MediaNotFound("x".into()).into()), 404);
         assert_eq!(status_for(&anyhow!("boom")), 500);

@@ -129,13 +129,13 @@ impl Proxy {
 
 struct AppUiHost {
     proxy: Proxy,
-    /// One selection at a time; a second caller waits for the first.
-    select_gate: Mutex<()>,
 }
 
 impl UiHost for AppUiHost {
     fn select_area(&self) -> Result<Option<Rect>> {
-        let _gate = self.select_gate.lock().map_err(|_| anyhow!("selection gate poisoned"))?;
+        // One overlay request at a time (shared with pick sessions); a
+        // second selection waits for the first.
+        let _gate = picker::wait_gate();
         let (tx, rx) = mpsc::channel();
         self.proxy.send(AppEvent::Ui(UiRequest::Select(tx)));
         rx.recv().context("selection overlay closed without a result")
@@ -148,7 +148,8 @@ impl UiHost for AppUiHost {
     }
 
     fn pick_window(&self) -> Result<Option<WindowInfo>> {
-        let _gate = self.select_gate.lock().map_err(|_| anyhow!("selection gate poisoned"))?;
+        // Refused (BugleError::Busy), not queued, while another pick or
+        // selection is open or just after the user dismissed one.
         picker::pick_window(&self.proxy, picker::PICK_TIMEOUT)
     }
 }
@@ -721,7 +722,7 @@ fn main() -> Result<()> {
     let proxy = Proxy(Arc::new(Mutex::new(event_loop.create_proxy())));
 
     let mut engine = Engine::new(config, false)?;
-    engine.ui_host = Some(Arc::new(AppUiHost { proxy: proxy.clone(), select_gate: Mutex::new(()) }));
+    engine.ui_host = Some(Arc::new(AppUiHost { proxy: proxy.clone() }));
     let engine = Arc::new(engine);
 
     if !bugle_platform::screen_access_preflight() {

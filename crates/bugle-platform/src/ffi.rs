@@ -117,6 +117,7 @@ extern "C" {
     pub fn bugle_select_rect_active() -> i32;
     pub fn bugle_select_rect_cancel();
     pub fn bugle_select_rect_switch();
+    pub fn bugle_app_deactivate();
     pub fn bugle_pin_image_show(png: *const u8, len: size_t, x: f64, y: f64, w: f64, h: f64, opacity: f64) -> i32;
     pub fn bugle_toast_show(
         png: *const u8,

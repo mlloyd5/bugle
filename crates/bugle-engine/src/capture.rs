@@ -211,6 +211,22 @@ impl Engine {
         }
         validate_target(&req.target)?;
         let o = &req.options;
+        // A picked window is chosen first and the delay counts from the
+        // click, so the user can open a menu in it before the grab.
+        // (`interactive` keeps its delay before the selection.)
+        let picked;
+        let target = match &req.target {
+            CaptureTarget::PickWindow => {
+                let w = self.pick_window()?;
+                let t = CaptureTarget::Window { id: Some(w.id), title: None, owner: None };
+                picked = Some(w);
+                t
+            }
+            t => {
+                picked = None;
+                t.clone()
+            }
+        };
         if let Some(d) = o.delay {
             if d > 0.0 {
                 std::thread::sleep(std::time::Duration::from_secs_f64(d));
@@ -218,7 +234,8 @@ impl Engine {
         }
         let shadow = o.shadow.unwrap_or(self.config.screenshots.window_shadow);
         let show_cursor = !o.hide_cursor.unwrap_or(true);
-        let (image, rect, window) = self.grab(&req.target, shadow, show_cursor)?;
+        let (image, rect, window) = self.grab(&target, shadow, show_cursor)?;
+        let window = window.or(picked);
         if self.config.general.shutter_sound {
             bugle_platform::play_sound("Tink");
         }
@@ -234,7 +251,7 @@ impl Engine {
         if let Some(l) = &o.label {
             vars.insert("label", l.clone());
         }
-        let source = match &req.target {
+        let source = match &target {
             CaptureTarget::Window { .. } | CaptureTarget::PickWindow => window
                 .as_ref()
                 .map(|w| format!("window {} — {} ({})", w.id, w.owner, w.title))

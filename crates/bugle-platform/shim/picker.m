@@ -33,6 +33,7 @@
 @property(nonatomic, strong) id resignObserver;
 @property(nonatomic) BOOL finished;
 @property(nonatomic) BOOL allowSwitch;
+@property(nonatomic) NSTimeInterval openedAt;
 - (void)moved;
 - (void)finish:(int32_t)kind;
 @end
@@ -191,6 +192,7 @@ int32_t bugle_pick_begin(bugle_pick_callback_t cb, void *ctx, double timeout_sec
                                                  }];
         [[NSRunLoop mainRunLoop] addTimer:session.timer forMode:NSRunLoopCommonModes];
         g_pick_session = session;
+        session.openedAt = [NSDate timeIntervalSinceReferenceDate];
         [app activateIgnoringOtherApps:YES];
         // Esc only reaches the overlay while Bugle is active. Switching to
         // another app (Cmd-Tab) therefore cancels, so the overlay is never
@@ -201,7 +203,19 @@ int32_t bugle_pick_begin(bugle_pick_callback_t cb, void *ctx, double timeout_sec
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(NSNotification *note) {
-                        [weak finish:2];
+                        BuglePickSession *s = weak;
+                        if (!s || s.finished) return;
+                        // A resign-active right after opening may be the
+                        // previous overlay's deactivate arriving late, not the
+                        // user leaving: look again once activation settled.
+                        if ([NSDate timeIntervalSinceReferenceDate] - s.openedAt < 0.5) {
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                                           dispatch_get_main_queue(), ^{
+                                               if (!NSApp.isActive) [weak finish:2];
+                                           });
+                            return;
+                        }
+                        [s finish:2];
                     }];
         // Highlight whatever is under the pointer before it moves.
         dispatch_async(dispatch_get_main_queue(), ^{

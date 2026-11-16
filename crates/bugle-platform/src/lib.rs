@@ -435,6 +435,12 @@ pub fn select_rect_begin_ex(allow_switch: bool, timeout: Option<std::time::Durat
     started
 }
 
+/// Hand keyboard focus back to the app the user was in (`[NSApp deactivate]`).
+/// Main thread only.
+pub fn app_deactivate() {
+    unsafe { ffi::bugle_app_deactivate() }
+}
+
 /// Whether a selection overlay is currently on screen.
 pub fn select_rect_active() -> bool {
     unsafe { ffi::bugle_select_rect_active() == 1 }

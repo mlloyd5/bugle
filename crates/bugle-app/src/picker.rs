@@ -14,10 +14,11 @@
 
 use crate::{AppEvent, Proxy, UiRequest};
 use anyhow::{anyhow, Result};
-use bugle_core::{Point, Rect, WindowInfo};
+use bugle_core::{BugleError, Point, Rect, WindowInfo};
 use bugle_platform::{PickEvent, SelectOutcome};
 use std::cell::Cell;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 /// How long the window picker waits for a choice before closing itself.
@@ -36,6 +37,58 @@ pub const START_WINDOW: Duration = Duration::from_secs(3);
 /// After a window is picked: the overlay activated Bugle, so give the
 /// target app a moment to become active again and not be captured dimmed.
 pub const SETTLE: Duration = Duration::from_millis(150);
+
+/// After the user dismisses a picker, how long API requests for another one
+/// are refused, so a client cannot raise the overlay again straight away.
+pub const COOLDOWN: Duration = Duration::from_secs(3);
+
+/// Held for a whole pick session (and by `UiHost::select_area`), so at most
+/// one interactive overlay request is in flight. A second pick is refused
+/// rather than queued.
+static OVERLAY_GATE: Mutex<()> = Mutex::new(());
+
+/// When the user last dismissed a pick session (see [`COOLDOWN`]).
+static LAST_CANCEL: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Take the overlay gate, waiting for it (area selection requests).
+pub fn wait_gate() -> MutexGuard<'static, ()> {
+    OVERLAY_GATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Take the overlay gate, or refuse with [`BugleError::Busy`] when another
+/// pick or selection holds it.
+pub fn try_gate() -> Result<MutexGuard<'static, ()>> {
+    match OVERLAY_GATE.try_lock() {
+        Ok(g) => Ok(g),
+        Err(TryLockError::Poisoned(e)) => Ok(e.into_inner()),
+        Err(TryLockError::WouldBlock) => {
+            Err(BugleError::Busy("another window pick or area selection is already open".into()).into())
+        }
+    }
+}
+
+/// How much of the cool-down is left at `now` after a cancel at `last`.
+pub fn cooldown_left(last: Option<Instant>, now: Instant) -> Option<Duration> {
+    let left = (last? + COOLDOWN).saturating_duration_since(now);
+    (!left.is_zero()).then_some(left)
+}
+
+fn note_cancel(at: Instant) {
+    *LAST_CANCEL.lock().unwrap_or_else(|e| e.into_inner()) = Some(at);
+}
+
+/// Refuse with [`BugleError::Busy`] while the cool-down runs.
+fn check_cooldown(now: Instant) -> Result<()> {
+    let last = *LAST_CANCEL.lock().unwrap_or_else(|e| e.into_inner());
+    match cooldown_left(last, now) {
+        Some(left) => Err(BugleError::Busy(format!(
+            "the window picker was just dismissed; try again in {:.0} s",
+            left.as_secs_f64().ceil()
+        ))
+        .into()),
+        None => Ok(()),
+    }
+}
 
 /// Smallest side, in points, of a window worth picking. Matches what
 /// `bugle_platform::app_windows` (and so window capture by id) accepts.
@@ -160,9 +213,28 @@ impl Session {
     }
 }
 
+/// Why a session could not open or continue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// Another overlay or session is up, or the request came too late:
+    /// trying again later can work (HTTP 409).
+    Busy(String),
+    /// Something broke (the window list could not be read).
+    Failed(String),
+}
+
+impl Refusal {
+    pub fn into_error(self) -> anyhow::Error {
+        match self {
+            Refusal::Busy(why) => BugleError::Busy(format!("window picker unavailable: {why}")).into(),
+            Refusal::Failed(why) => anyhow!("window picker unavailable: {why}"),
+        }
+    }
+}
+
 /// The main thread's answer: what was picked, `None` when cancelled, or why
 /// the overlay could not open.
-pub type PickReply = Sender<Result<Option<Picked>, String>>;
+pub type PickReply = Sender<Result<Option<Picked>, Refusal>>;
 
 /// A pick request from a worker thread.
 pub struct Request {
@@ -240,22 +312,32 @@ pub fn label(w: &WindowInfo) -> String {
     format!("{name}  {:.0} × {:.0}", w.frame.w, w.frame.h)
 }
 
-fn fail(reply: &PickReply, why: String) -> bool {
-    tracing::warn!("window picker not started: {why}");
-    IN_SESSION.with(|s| s.set(false));
+/// Answer `reply` with a refusal. `switched`: an earlier overlay of this
+/// session left Bugle active for a successor that is not coming, so hand
+/// focus back. Does not touch [`IN_SESSION`]; the caller owns that.
+fn fail(reply: &PickReply, why: Refusal, switched: bool) -> bool {
+    tracing::warn!("window picker not started: {why:?}");
+    if switched {
+        bugle_platform::app_deactivate();
+    }
     let _ = reply.send(Err(why));
     false
 }
 
 /// Main thread: start a pick session and answer `req.reply` when it ends.
-/// When the first overlay cannot open (`deadline` has passed, the window
-/// list cannot be read, or another overlay is up) `reply` gets an `Err`
-/// naming the reason and this returns `false`.
+/// When the first overlay cannot open (another session is running,
+/// `deadline` has passed, the window list cannot be read, or another
+/// overlay is up) `reply` gets an `Err` naming the reason and this returns
+/// `false`.
 pub fn begin(req: Request) -> bool {
     let Request { start, allow_switch, timeout, deadline, reply } = req;
     let now = Instant::now();
+    if in_session() {
+        // Leave IN_SESSION alone: it belongs to the running session.
+        return fail(&reply, Refusal::Busy("another window pick is in progress".into()), false);
+    }
     if now > deadline {
-        return fail(&reply, "the request expired before the overlay could open".into());
+        return fail(&reply, Refusal::Busy("the request expired before the overlay could open".into()), false);
     }
     let session = Session::new(start, allow_switch, timeout, now);
     let next = session.start(now);
@@ -267,6 +349,11 @@ fn advance(session: Session, next: Next, reply: PickReply) -> bool {
     match next {
         Next::Done(picked) => {
             IN_SESSION.with(|s| s.set(false));
+            if session.switches() > 0 {
+                // A switch skipped the deactivation; the session may have
+                // ended without another overlay (time limit).
+                bugle_platform::app_deactivate();
+            }
             let _ = reply.send(Ok(picked));
             true
         }
@@ -278,25 +365,30 @@ fn advance(session: Session, next: Next, reply: PickReply) -> bool {
             // Kept for the refusal case: the handler (and the `reply` it
             // owns) is dropped unused when the overlay does not start.
             let refused = reply.clone();
+            let switched = session.switches() > 0;
             let opened = match mode {
                 Mode::Window => open_window(session, timeout, reply),
                 Mode::Area => open_area(session, timeout, reply),
             };
             match opened {
                 Ok(()) => true,
-                Err(why) => fail(&refused, why),
+                Err(why) => {
+                    // Set just above, so this session owns the flag.
+                    IN_SESSION.with(|s| s.set(false));
+                    fail(&refused, why, switched)
+                }
             }
         }
     }
 }
 
-fn open_window(session: Session, timeout: Duration, reply: PickReply) -> Result<(), String> {
+fn open_window(session: Session, timeout: Duration, reply: PickReply) -> Result<(), Refusal> {
     let filter = PickFilter::current();
     // Snapshot before the overlay exists (and again after every switch
     // back); the filter drops Bugle's own windows anyway.
     let windows: Vec<WindowInfo> = match bugle_platform::windows(true) {
         Ok(w) => w.into_iter().filter(|w| filter.accepts(w)).collect(),
-        Err(e) => return Err(format!("could not list windows: {e:#}")),
+        Err(e) => return Err(Refusal::Failed(format!("could not list windows: {e:#}"))),
     };
     let allow_switch = session.allow_switch();
     // Outer `None` until the first move, so the first position is always drawn.
@@ -326,11 +418,11 @@ fn open_window(session: Session, timeout: Duration, reply: PickReply) -> Result<
     if started {
         Ok(())
     } else {
-        Err("another overlay is open".into())
+        Err(Refusal::Busy("another overlay is open".into()))
     }
 }
 
-fn open_area(mut session: Session, timeout: Duration, reply: PickReply) -> Result<(), String> {
+fn open_area(mut session: Session, timeout: Duration, reply: PickReply) -> Result<(), Refusal> {
     let allow_switch = session.allow_switch();
     let started = bugle_platform::select_rect_begin_ex(allow_switch, Some(timeout), move |out| {
         let end = match out {
@@ -344,7 +436,7 @@ fn open_area(mut session: Session, timeout: Duration, reply: PickReply) -> Resul
     if started {
         Ok(())
     } else {
-        Err("another overlay is open".into())
+        Err(Refusal::Busy("another overlay is open".into()))
     }
 }
 
@@ -360,8 +452,11 @@ pub fn control(c: Control) {
 
 /// Worker thread: ask the main thread for a pick session and wait for the
 /// answer. `Ok(None)` means the user cancelled. A picked window comes back
-/// after [`SETTLE`].
+/// after [`SETTLE`]. Refused with [`BugleError::Busy`] (not queued) while
+/// another pick or selection is in flight; the gate is held for the whole
+/// session, so nothing can open in the gap between two of its overlays.
 pub fn pick(proxy: &Proxy, start: Mode, allow_switch: bool, timeout: Duration) -> Result<Option<Picked>> {
+    let _gate = try_gate()?;
     let (tx, rx) = mpsc::channel();
     let deadline = Instant::now() + START_WINDOW;
     proxy.send(AppEvent::Ui(UiRequest::PickWindow(Request { start, allow_switch, timeout, deadline, reply: tx })));
@@ -369,18 +464,22 @@ pub fn pick(proxy: &Proxy, start: Mode, allow_switch: bool, timeout: Duration) -
     // `session_limit` later; the slack covers the hop back.
     let picked = match rx.recv_timeout(START_WINDOW + session_limit(allow_switch, timeout) + Duration::from_secs(2)) {
         Ok(Ok(p)) => p,
-        Ok(Err(why)) => return Err(anyhow!("window picker unavailable: {why}")),
+        Ok(Err(why)) => return Err(why.into_error()),
         Err(RecvTimeoutError::Timeout) => return Err(anyhow!("window picker did not answer")),
         Err(RecvTimeoutError::Disconnected) => return Err(anyhow!("window picker request dropped")),
     };
-    if matches!(picked, Some(Picked::Window(_))) {
-        std::thread::sleep(SETTLE);
+    match picked {
+        Some(Picked::Window(_)) => std::thread::sleep(SETTLE),
+        None => note_cancel(Instant::now()),
+        Some(Picked::Area(_)) => {}
     }
     Ok(picked)
 }
 
 /// [`pick`] for a window only (no Space toggle), as API callers get it.
+/// Also refused for [`COOLDOWN`] after the user dismissed a picker.
 pub fn pick_window(proxy: &Proxy, timeout: Duration) -> Result<Option<WindowInfo>> {
+    check_cooldown(Instant::now())?;
     Ok(match pick(proxy, Mode::Window, false, timeout)? {
         Some(Picked::Window(w)) => Some(w),
         // Without `allow_switch` the session never shows the area overlay.
@@ -512,9 +611,55 @@ mod tests {
             let req = Request { start: Mode::Window, allow_switch, timeout: Duration::from_secs(1), deadline: past, reply: tx };
             assert!(!begin(req));
             let got = rx.recv().unwrap();
-            assert!(got.unwrap_err().contains("expired"));
+            assert!(matches!(got, Err(Refusal::Busy(why)) if why.contains("expired")));
             assert!(!in_session());
         }
+    }
+
+    #[test]
+    fn a_second_session_is_refused_and_keeps_the_running_flag() {
+        IN_SESSION.with(|s| s.set(true));
+        let (tx, rx) = mpsc::channel();
+        let req = Request {
+            start: Mode::Window,
+            allow_switch: true,
+            timeout: PICK_TIMEOUT,
+            deadline: Instant::now() + START_WINDOW,
+            reply: tx,
+        };
+        assert!(!begin(req));
+        assert!(matches!(rx.recv().unwrap(), Err(Refusal::Busy(_))));
+        assert!(in_session(), "the running session still owns the flag");
+        IN_SESSION.with(|s| s.set(false));
+    }
+
+    #[test]
+    fn refusals_map_to_typed_errors() {
+        let busy = Refusal::Busy("another overlay is open".into()).into_error();
+        assert!(matches!(busy.downcast_ref::<BugleError>(), Some(BugleError::Busy(_))), "{busy:#}");
+        let failed = Refusal::Failed("could not list windows".into()).into_error();
+        assert!(failed.downcast_ref::<BugleError>().is_none());
+    }
+
+    #[test]
+    fn a_second_pick_is_refused_not_queued() {
+        let held = try_gate().expect("gate free");
+        let e = try_gate().unwrap_err();
+        assert!(matches!(e.downcast_ref::<BugleError>(), Some(BugleError::Busy(_))), "{e:#}");
+        drop(held);
+        drop(try_gate().expect("free again"));
+    }
+
+    #[test]
+    fn cooldown_after_a_cancel() {
+        let t0 = Instant::now();
+        assert_eq!(cooldown_left(None, t0), None);
+        assert_eq!(cooldown_left(Some(t0), t0 + Duration::from_secs(1)), Some(COOLDOWN - Duration::from_secs(1)));
+        assert_eq!(cooldown_left(Some(t0), t0 + COOLDOWN), None);
+        note_cancel(t0);
+        let e = check_cooldown(t0 + Duration::from_millis(500)).unwrap_err();
+        assert!(matches!(e.downcast_ref::<BugleError>(), Some(BugleError::Busy(m)) if m.contains("try again in 3 s")), "{e:#}");
+        check_cooldown(t0 + COOLDOWN).unwrap();
     }
 
     fn open(n: &Next) -> Option<(Mode, Duration)> {

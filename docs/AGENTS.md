@@ -123,8 +123,16 @@ drags a rectangle), `pick_window` and `all_screens`. `pick_window` (for
 app's hover-highlight picker, for when the agent cannot tell which window is
 meant. It works only when the Bugle menu-bar app serves the API (*Start Agent
 API* in its menu, or `bugle-app --serve`); `bugle serve` and `bugle mcp`
-answer with an error naming that, HTTP status 503. The usual auth and `Host`
-checks run first, so a page or client without the token never gets the
-overlay on screen. The picker closes after 30 seconds; a cancel or timeout is
-HTTP 409 (`selection cancelled`). Space does not switch to the area selection
-for API requests: the result is always a window.
+answer with an error naming that, HTTP status 503. The usual `Host` and token
+checks run first: with a token configured, a client without it never gets the
+overlay on screen; with the default (no token, loopback bind) any local
+process that can reach the port can raise it, as it can call every other
+action. The picker closes after 30 seconds; a cancel or timeout is HTTP 409
+(`selection cancelled`). Requests are not queued: while another pick or area
+selection is open, or for 3 seconds after the user dismissed a picker, a
+`pick_window` request is refused with HTTP 409 and an error starting with
+`busy:`; retry later. Abandoning the HTTP request does not close a picker
+that is already up (the user, or its 30-second timeout, does). Space does not
+switch to the area selection for API requests: the result is always a window.
+`pick_window` works whatever `[screenshots] window_picker` says, since the
+caller asked for it. A `delay` counts from the click, not from the request.

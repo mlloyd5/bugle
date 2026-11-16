@@ -621,6 +621,7 @@ void bugle_draw_overlay_hint(NSRect bounds, NSString *text) {
 @property(nonatomic) BOOL allowSwitch;
 @property(nonatomic, strong) NSTimer *timer;
 - (void)finishWithRect:(CGRect)rect result:(int32_t)result;
+- (void)armTimer:(double)seconds;
 @end
 
 static BugleSelectSession *g_select_session = nil;
@@ -698,6 +699,27 @@ static BugleSelectSession *g_select_session = nil;
 @end
 
 @implementation BugleSelectSession
+/// Cancel after `seconds`, but never in the middle of a drag: a drag in
+/// progress pushes the timeout back a few seconds at a time.
+- (void)armTimer:(double)seconds {
+    [self.timer invalidate];
+    __weak BugleSelectSession *weak = self;
+    self.timer = [NSTimer timerWithTimeInterval:seconds
+                                        repeats:NO
+                                          block:^(NSTimer *timer) {
+                                              BugleSelectSession *s = weak;
+                                              if (!s || s.finished) return;
+                                              for (NSWindow *win in s.windows) {
+                                                  if ([win.contentView isKindOfClass:[BugleSelectView class]] &&
+                                                      ((BugleSelectView *)win.contentView).dragging) {
+                                                      [s armTimer:3.0];
+                                                      return;
+                                                  }
+                                              }
+                                              [s finishWithRect:CGRectZero result:0];
+                                          }];
+    [[NSRunLoop mainRunLoop] addTimer:self.timer forMode:NSRunLoopCommonModes];
+}
 - (void)finishWithRect:(CGRect)rect result:(int32_t)result {
     if (self.finished) return;
     self.finished = YES;
@@ -749,15 +771,7 @@ static BOOL select_begin(BugleSelectCompletion completion, BOOL allowSwitch, dou
         [win makeKeyAndOrderFront:nil];
         [session.windows addObject:win];
     }
-    if (timeoutSeconds > 0) {
-        __weak BugleSelectSession *weak = session;
-        session.timer = [NSTimer timerWithTimeInterval:timeoutSeconds
-                                               repeats:NO
-                                                 block:^(NSTimer *timer) {
-                                                     [weak finishWithRect:CGRectZero result:0];
-                                                 }];
-        [[NSRunLoop mainRunLoop] addTimer:session.timer forMode:NSRunLoopCommonModes];
-    }
+    if (timeoutSeconds > 0) [session armTimer:timeoutSeconds];
     g_select_session = session;
     [app activateIgnoringOtherApps:YES];
     [[NSCursor crosshairCursor] push];
@@ -803,6 +817,12 @@ int32_t bugle_select_rect_begin(bugle_select_callback_t cb, void *ctx) {
 }
 
 int32_t bugle_select_rect_active(void) { return g_select_session ? 1 : 0; }
+
+void bugle_app_deactivate(void) {
+    @autoreleasepool {
+        [NSApp deactivate];
+    }
+}
 
 /// What Space does: hand over to the window picker, when the host allowed it
 /// and no drag is in progress.

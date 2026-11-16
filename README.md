@@ -291,9 +291,11 @@ Window* use the same pair of overlays: Record Window starts in the picker and
 records the window you click (MP4), the other two start in the area selection.
 A picked window is recorded by id, the way `record_start` with a window target
 records it, not as the screen area under it. The two overlays together close after two minutes
-(each picker turn still after 30 seconds). With `window_picker = false` the
-picker is off everywhere: Space does nothing, and *Record Window* records the
-front-most window at once.
+(each picker turn still after 30 seconds; never in the middle of a drag).
+With `window_picker = false` the menu items do without the picker: Space does
+nothing, Capture Area and the Record items use the plain area selection, and
+*Record Window* records the front-most window at once. An API caller that asks
+for `pick_window` explicitly still gets the picker.
 
 Hotkeys live in the `[hotkeys]` section of the config file and are parsed as
 `modifier+modifier+key` (`cmd`, `shift`, `alt`/`option`, `ctrl`; letters,
@@ -321,8 +323,11 @@ from the menu uses `[api]` from the config and serves the in-app overlay for
 `select_area`, `pin` and interactive captures — no helper processes. It also
 offers the window picker: a `capture` or `record_start` whose target is
 `{"kind":"pick_window"}` shows the picker and uses the window the user clicks
-(Space does not switch to the area selection there). `bugle serve` and
-`bugle mcp` cannot show it and answer with an error (HTTP 503) that says so.
+(Space does not switch to the area selection there), whatever
+`window_picker` says. One overlay request is served at a time: a second pick
+while one is open, or one within 3 seconds of the user dismissing the picker,
+is refused with HTTP 409 instead of queuing. `bugle serve` and `bugle mcp`
+cannot show the picker and answer with an error (HTTP 503) that says so.
 
 Screen Recording permission is requested on first launch (granted to the
 terminal or app that launched `bugle-app` when run from a shell, or to Bugle

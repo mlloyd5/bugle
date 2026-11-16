@@ -206,14 +206,19 @@ sub-50-point windows — which window to highlight. A click captures that window
 by id after a 150 ms settle; Esc, a right click, Bugle losing active status (Esc
 only arrives while it is active) or the 30-second timeout cancel. A request the
 main thread reaches more than 3 s late is refused, and every refusal reaches
-the worker with its reason. The picker and the area selection refuse to open
-over each other. Space switches between them: a pick *session* is a small
+the worker with its reason (a typed `BugleError::Busy`, HTTP 409, when retrying
+can help). The picker and the area selection refuse to open over each other,
+and one gate (`picker.rs`) is held for a whole pick session and by
+`UiHost::select_area`: a second pick is refused rather than queued, and nothing
+can open in the gap between two overlays of a session. API picks are also
+refused for 3 s after the user dismissed one. Space switches between them: a pick *session* is a small
 state machine (`picker::Session`, unit-tested without a screen) that starts in
 either mode, flips on each switch and answers with a window or a rect; the
 main thread opens the next overlay from the previous one's final callback.
 *Capture Area*, *Capture Window* and the three *Record* items run through it;
 each picker turn keeps the 30 s timeout and a whole session closes after two
-minutes. `[screenshots] window_picker = false` restores the immediate
+minutes (an area phase never times out mid-drag). A switch leaves Bugle active
+for the next overlay; if none follows, the session deactivates Bugle itself. `[screenshots] window_picker = false` restores the immediate
 front-most capture (and plain area selection), which the CLI always uses.
 `UiHost::pick_window` offers the picker (without the switch) to API callers:
 the `pick_window` target kind of `capture` and `record_start` goes through it,

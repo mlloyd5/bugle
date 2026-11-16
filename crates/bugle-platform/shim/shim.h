@@ -84,6 +84,8 @@ int32_t bugle_select_rect_begin(bugle_select_callback_t cb, void *ctx);
 int32_t bugle_select_rect_begin_ex(bugle_select_callback_t cb, void *ctx, int32_t allow_switch, double timeout_seconds);
 // What Space does (ok=2), when allowed and not dragging; no-op otherwise.
 void bugle_select_rect_switch(void);
+// [NSApp deactivate]: hand focus back after a switch that led nowhere.
+void bugle_app_deactivate(void);
 // Draws a one-line hint centred near the bottom of an overlay view (shared by
 // the selection overlay and the window picker).
 #ifdef __OBJC__
