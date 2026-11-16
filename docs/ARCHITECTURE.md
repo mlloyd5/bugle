@@ -56,6 +56,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `export_video`, `video_info`, `video_sync_at`, `VideoFrameReader`, `VideoFrameWriter` | `AVAssetExportSession` with `timeRange`/preset, an `AVMutableVideoComposition` on every re-encode (`frameDuration` + `sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid` for a new frame rate), bounded wait + `cancelExport`; `AVSampleCursor` (stored samples, sync sample at a cut); one reusable `AVAssetImageGenerator`; `AVAssetWriter` + pixel-buffer adaptor (H.264 or HEVC) |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
 | `login_item::{in_app_bundle, status, set_enabled}` | `SMAppService.mainAppService` (`shim/login_item.m`, ServiceManagement) |
+| `notify::{start, state, refresh, post}` | `UNUserNotificationCenter` (`shim/notify.m`, UserNotifications): delegate (banner while active, click opens the file), `requestAuthorizationWithOptions` or `getNotificationSettings`, `addNotificationRequest`; nothing is called outside an app bundle |
 
 Window shadows: ScreenCaptureKit clips single-window screenshots to the window
 bounds, so the shadow path uses `CGWindowListCreateImage` (deprecated but
@@ -219,7 +220,13 @@ When the process runs from `Bugle.app`, an *Open at Login* check item
 (`login.rs`) registers the bundle with `SMAppService`. Its check mark is
 re-read on the periodic tick (every 5 s) and set only for an enabled item; a
 pending approval is shown in the title, and clicking it then opens System
-Settings → Login Items.
+Settings → Login Items. With `[general] system_notifications`,
+`notifications.rs` also posts each toast (`App::toast`/`toast_error`) to
+Notification Center: authorization is requested once at launch from the
+bundle, the answer arrives asynchronously, and until it is "authorized" (or
+when unbundled, switched off or denied) only the toast shows; a denial is
+re-read without prompting on the next message. `--smoke-test` only reads the
+setting and never prompts; test binaries are never bundles.
 
 The status-bar glyph is a signed distance field (`icon/glyph.rs`) that scales
 its stroke widths with the render size, so the same drawing serves the 36 px
@@ -257,6 +264,21 @@ or an App Store Connect API key file (never a password in argv) and fails up
 front without them; it submits a temporary `ditto` zip to `notarytool`,
 staples, and requires `spctl --assess` to pass. Only then is the staged bundle
 renamed over `dist/Bugle.app` and the final zip written.
+
+`--universal` checks up front (`rustc --print target-libdir`) that both
+`aarch64-apple-darwin` and `x86_64-apple-darwin` have a standard library,
+naming the `rustup target add` command otherwise, then runs one
+`cargo build --target` per triple (with `MACOSX_DEPLOYMENT_TARGET` set to the
+shim's minimum) and `lipo -create`s each executable into
+`<target dir>/xtask/universal` before assembly; verification checks
+`lipo -archs` of both executables (a host build only prints them).
+`--dmg` / `cargo xtask dmg` `ditto`s the finished bundle next to an
+`Applications → /Applications` symlink, `hdiutil create -format UDZO`s it in
+the staging directory, signs (Developer ID) and notarizes/staples it when the
+bundle was, runs `hdiutil verify`, attaches it read-only with `-nobrowse` at a
+mount point under the target directory, checks the link, the bundle's
+signature and architectures, detaches, and only then moves it to
+`dist/Bugle-<version>.dmg`.
 
 After a capture the app shows the quick-access panel instead of the toast
 (`[quick_access]`, on by default). `quick_access.rs` is the platform-free part:
@@ -301,7 +323,6 @@ earn its keep.
   captures arrive in a row.
 * **Window picker extras** — Space to switch to area selection, a picker for
   window recordings, and offering the picker to API callers through `UiHost`.
-* **Packaging extras** — a universal (arm64 + x86_64) build (bundles are
-  host-architecture only today), a DMG, the final bundle id, and system
-  notifications (`UNUserNotificationCenter`) alongside the toast now that the
-  bundle gives them Bugle's name.
+* **Packaging extras** — the final bundle id; notification thumbnails
+  (an attachment needs a copy of the file, since the notification center
+  moves what it is given).

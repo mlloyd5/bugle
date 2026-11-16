@@ -44,6 +44,8 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | Sync to your own storage | folder copy/move, or SigV4 uploads (multipart for large files) to any S3-compatible bucket; a destination per media kind; subtitles follow their video | ✅ |
 | Trim and export recordings (presets: trim, H.264/HEVC, 1080p/720p/540p, frame rate, GIF) | `AVAssetExportSession` + video composition, `AVAssetImageGenerator` → GIF, `AVAssetWriter` for GIF → MP4 | ✅ (headless: CLI/API) |
 | `Bugle.app` bundle | `cargo xtask bundle` (hardened runtime, ad-hoc or Developer ID) | ✅ ad-hoc; Developer ID signing and notarization not yet exercised |
+| Disk image, universal binary | `cargo xtask dmg` (`hdiutil`, `/Applications` link), `--universal` (`lipo`) | ✅ DMG; universal needs both Rust targets installed |
+| System notifications | `UNUserNotificationCenter` from Bugle.app, alongside the toast (`[general] system_notifications`) | built; reading the authorization verified from the bundle, posting unverified |
 | Open at Login | `SMAppService.mainAppService` | built, status read verified; registering not yet exercised |
 
 ## Build
@@ -62,6 +64,8 @@ line tools; no Xcode project is needed.
 ```bash
 cargo xtask bundle                 # → dist/Bugle.app, ad-hoc signed
 cargo xtask bundle --zip           # also dist/Bugle-<version>.zip
+cargo xtask dmg                    # also dist/Bugle-<version>.dmg (= bundle --dmg)
+cargo xtask bundle --universal     # arm64 + x86_64 in one bundle
 cargo xtask verify --smoke-test    # re-check a bundle and launch it briefly
 ```
 
@@ -76,8 +80,30 @@ the app is not sandboxed), then checked with `plutil -lint` (Info.plist and the
 entitlements embedded in each signature), `codesign --verify --deep --strict`,
 `iconutil` and `--version`. Only a bundle that passes replaces `dist/Bugle.app`.
 
-The binaries are built for the host architecture only (arm64 on Apple silicon,
-x86_64 on Intel); the bundle does not launch on the other kind of Mac.
+By default the binaries are built for the host architecture only (arm64 on
+Apple silicon, x86_64 on Intel), and the bundle does not launch on the other
+kind of Mac. `--universal` builds both (`--target aarch64-apple-darwin` and
+`--target x86_64-apple-darwin`, with `MACOSX_DEPLOYMENT_TARGET=13.0`) and
+merges each executable with `lipo -create`; verification then requires
+`lipo -archs` to report `arm64 x86_64` for both. It needs the Rust standard
+library for both targets and stops before building, naming the command, when
+one is missing:
+
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+```
+
+(Homebrew's `rust` formula has no rustup and cannot add targets; use a rustup
+toolchain for universal builds.)
+
+`--dmg` (or `cargo xtask dmg`, which takes the same options) writes
+`Bugle-<version>.dmg` from the finished bundle: a compressed (UDZO), read-only
+HFS+ image named "Bugle <version>" holding `Bugle.app` and an `Applications`
+link for drag-to-install. With a Developer ID identity the image is signed as
+well, and with `--notarize` it is notarized and stapled too. It is checked with
+`hdiutil verify`, then mounted read-only (out of sight, under the target
+directory) to check the link, `codesign --verify --deep --strict` the bundle on
+it and its architectures, and replaces the previous image only after that.
 
 When Bugle.app is launched from Finder, the Dock, `open` or as a login item,
 the Screen Recording, Microphone and Accessibility prompts and System Settings
@@ -103,6 +129,9 @@ ln -sf /Applications/Bugle.app/Contents/MacOS/bugle ~/.local/bin/bugle
 | `--bundle-id ID` | `BUGLE_BUNDLE_ID` | `bundle_id` under `[workspace.metadata.bugle]` in the root `Cargo.toml` (the CLI is signed as `<id>.cli`) |
 | `--build-number N` | `BUGLE_BUILD_NUMBER` | the workspace version |
 | `--out DIR` | — | `dist/` |
+| `--universal` | — | off (host architecture) |
+| `--dmg` | — | off (`cargo xtask dmg` turns it on) |
+| `--zip` | — | off |
 
 The default bundle id is provisional until the project's final domain is
 chosen; it is defined only in `Cargo.toml`. macOS keys permission grants and the
@@ -249,6 +278,14 @@ Open History Folder · Start/Stop Agent API · Preferences… (opens the config
 file) · Open at Login (only when running from `Bugle.app`) · Quit. While recording, the status item shows `● m:ss`. Other actions
 report through a small toast in the top-right corner (thumbnail and file name;
 click to open).
+
+With `system_notifications = true` under `[general]`, Bugle.app also posts
+each toast's message to Notification Center (`UNUserNotificationCenter`;
+clicking it opens the file), named and badged as Bugle. macOS asks for
+permission at the first launch with the switch on. The toast is shown either
+way: an unbundled `bugle-app`, a denied permission or the switch left off
+(the default) means toasts only. Turning notifications back on in System
+Settings → Notifications → Bugle takes effect from the next message.
 
 After a capture or recording, the **quick-access panel** takes the toast's
 place, in the bottom-right corner by default: the thumbnail (click to open)
