@@ -15,6 +15,14 @@
 //! * GIF → video: frames resampled to a constant rate and encoded to H.264
 //!   (HEVC with `hevc`).
 //!
+//! * Event-track effects (`zoom`, `smooth_cursor`; see [`crate::cursor_fx`]):
+//!   frames are rendered one by one. Video → video decodes the range in
+//!   order (`AVAssetReader`), applies the effects, encodes with
+//!   `AVAssetWriter` and copies the source's audio over the same range back
+//!   in; the other pipelines apply them to the frames they already decode.
+//!   A plain edit of a recording that has a track writes the trimmed track
+//!   next to its output, so it can be zoomed later.
+//!
 //! GIF sources are streamed (one pass for the timeline, one for the frames),
 //! never held in memory whole. GIF delays are written in centiseconds with
 //! the rounding error carried forward, so the output keeps its length.
@@ -24,11 +32,12 @@
 //! it is added to history (with the source as `parent` when the source is a
 //! history item).
 
+use crate::cursor_fx::{Effects, MAX_ZOOM};
 use crate::Engine;
 use anyhow::{anyhow, Context, Result};
 use bugle_core::config::RecordingConfig;
-use bugle_core::{BugleError, MediaItem, MediaKind};
-use bugle_platform::{VideoExportPreset, VideoFrameReader, VideoFrameWriter};
+use bugle_core::{BugleError, EventTrack, MediaItem, MediaKind};
+use bugle_platform::{SequentialFrameReader, VideoExportPreset, VideoFrameReader, VideoFrameWriter};
 use image::codecs::gif::{GifDecoder, GifEncoder, Repeat};
 use image::{AnimationDecoder, Delay, Frame, ImageDecoder, RgbaImage};
 use serde::{Deserialize, Serialize};
@@ -197,6 +206,104 @@ pub struct EditRequest {
     pub output: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
+    /// Zoom in on clicks to this factor (above 1, at most 4), using the
+    /// recording's cursor event track.
+    #[serde(default)]
+    pub zoom: Option<f64>,
+    /// Draw the pointer along a smoothed path (recordings made with
+    /// `hide_cursor`, which have an event track and no pointer in the frames).
+    #[serde(default)]
+    pub smooth_cursor: bool,
+}
+
+impl EditRequest {
+    /// Whether the edit needs the recording's event track.
+    fn uses_events(&self) -> bool {
+        self.zoom.is_some() || self.smooth_cursor
+    }
+}
+
+/// The event track of a recording: for a history item, the one history
+/// recorded for it (an effects edit has none, whatever lies next to it);
+/// for a file, the sidecar named after it. `None` when there is none.
+fn event_track_of(item: &MediaItem, in_history: bool) -> Option<Result<EventTrack>> {
+    let path = if in_history { item.events.clone()? } else { EventTrack::sidecar_path(&item.path) };
+    path.is_file().then(|| EventTrack::load(&path))
+}
+
+/// Frame rate for re-rendering with effects: asked for, else the rate the
+/// recording was made at, else the source's nominal rate but at least 30
+/// (stream recordings of a still screen store only a few frames a second,
+/// and the redrawn pointer and zoom need a steady rate), at most 60.
+fn effects_fps(requested: Option<u32>, recorded: Option<f64>, nominal: f64) -> u32 {
+    if let Some(f) = requested {
+        return f.clamp(1, VIDEO_MAX_FPS);
+    }
+    let base = recorded.unwrap_or(if nominal.is_finite() { nominal.max(30.0) } else { 30.0 });
+    (base.round() as u32).clamp(1, 60)
+}
+
+/// Check the event-track options against the track (if any).
+fn check_effects(req: &EditRequest, track: Option<&EventTrack>, source: &Path) -> std::result::Result<(), BugleError> {
+    if let Some(z) = req.zoom {
+        if !(z.is_finite() && z > 1.0 && z <= MAX_ZOOM) {
+            return Err(BugleError::Invalid(format!("zoom must be above 1 and at most {MAX_ZOOM} (got {z})")));
+        }
+    }
+    if !req.uses_events() {
+        return Ok(());
+    }
+    if req.preset == ExportPreset::Lossless {
+        return Err(BugleError::Invalid("zoom and smooth_cursor re-render the frames; use another preset than lossless".into()));
+    }
+    let Some(track) = track else {
+        return Err(BugleError::Invalid(format!(
+            "{} has no cursor event track ({}); record with cursor_events (CLI --cursor-events) to use zoom or smooth_cursor",
+            source.display(),
+            EventTrack::sidecar_path(source).display()
+        )));
+    };
+    if req.smooth_cursor && track.cursor_in_video {
+        return Err(BugleError::Invalid(
+            "smooth_cursor needs a recording made with hide_cursor: this one has the pointer in its frames".into(),
+        ));
+    }
+    if track.area_changed {
+        return Err(BugleError::Invalid(
+            "the recorded window was resized during the recording, so its pointer positions no longer match the frames".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Render `start..end` of a video through `fx` at `fps` into a silent movie
+/// of `size`: frames decoded in order, each output frame showing the source
+/// frame on screen at the middle of its interval.
+#[allow(clippy::too_many_arguments)]
+fn render_effects(src: &Path, out: &Path, start: f64, end: f64, fps: u32, size: (u32, u32), mp4: bool, hevc: bool, fx: &Effects) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(export_timeout(end - start));
+    let mut reader = SequentialFrameReader::open(src, start, end)?;
+    let mut writer = VideoFrameWriter::create_with_codec(out, size.0, size.1, fps, mp4, hevc)?;
+    let mut current: Option<RgbaImage> = None;
+    let mut next = reader.next_frame()?;
+    for (t, _) in sample_times(start, end, fps) {
+        if std::time::Instant::now() > deadline {
+            return Err(anyhow!("rendering timed out after {:.0} s and was cancelled", export_timeout(end - start)));
+        }
+        while next.as_ref().is_some_and(|(pts, _)| *pts <= t) {
+            current = next.take().map(|(_, f)| f);
+            next = reader.next_frame()?;
+        }
+        // Before the first decoded frame, show that one.
+        let frame = current.as_ref().or(next.as_ref().map(|(_, f)| f)).ok_or_else(|| anyhow!("the source has no frames in the range"))?;
+        let f = fx.apply(frame, t);
+        if f.dimensions() != size {
+            writer.append(&image::imageops::resize(&*f, size.0, size.1, image::imageops::FilterType::Triangle))?;
+        } else {
+            writer.append(&f)?;
+        }
+    }
+    writer.finish()
 }
 
 /// Parse a time given as seconds (`90`, `1.5`, `-2`, `3s`) or as
@@ -468,15 +575,16 @@ fn cut_overlap(s: f64, d: f64, start: f64, end: f64) -> Option<f64> {
 }
 
 /// Stream the frames of a GIF source that `start..end` needs into `emit`
-/// as `(frame, seconds)`: a frame-exact cut, or a resample at `fps`.
-fn stream_gif_range(path: &Path, start: f64, end: f64, fps: Option<u32>, mut emit: impl FnMut(RgbaImage, f64) -> Result<()>) -> Result<()> {
+/// as `(frame, time, seconds)`: a frame-exact cut, or a resample at `fps`.
+/// `time` is the source time in the middle of the output frame.
+fn stream_gif_range(path: &Path, start: f64, end: f64, fps: Option<u32>, mut emit: impl FnMut(RgbaImage, f64, f64) -> Result<()>) -> Result<()> {
     match fps {
         None => for_each_gif_frame(path, |img, s, d| {
             if s >= end {
                 return Ok(false);
             }
             if let Some(shown) = cut_overlap(s, d, start, end) {
-                emit(img, shown)?;
+                emit(img, s.max(start) + shown / 2.0, shown)?;
             }
             Ok(true)
         }),
@@ -487,14 +595,14 @@ fn stream_gif_range(path: &Path, start: f64, end: f64, fps: Option<u32>, mut emi
                 // Every sample time inside this frame's interval shows it.
                 let mut taken = Vec::new();
                 while k < samples.len() && samples[k].0 < s + d {
-                    taken.push(samples[k].1);
+                    taken.push(samples[k]);
                     k += 1;
                 }
                 let n = taken.len();
                 let mut img = Some(img);
-                for (i, secs) in taken.into_iter().enumerate() {
+                for (i, (t, secs)) in taken.into_iter().enumerate() {
                     let f = if i + 1 == n { img.take().expect("frame") } else { img.clone().expect("frame") };
-                    emit(f, secs)?;
+                    emit(f, t, secs)?;
                 }
                 Ok(k < samples.len())
             })
@@ -618,6 +726,25 @@ impl Engine {
         if kind == MediaKind::Gif && req.preset == ExportPreset::Lossless {
             return Err(BugleError::Invalid("preset lossless applies to video sources; GIF cuts are always exact".into()).into());
         }
+        let in_history = self.history.all().map(|all| all.iter().any(|m| m.id == src.id)).unwrap_or(false);
+        let track = match event_track_of(&src, in_history) {
+            Some(Ok(t)) => Some(t),
+            Some(Err(e)) if req.uses_events() => return Err(e),
+            Some(Err(e)) => {
+                tracing::warn!("ignoring the cursor event track: {e:#}");
+                None
+            }
+            None => None,
+        };
+        check_effects(req, track.as_ref(), &src.path)?;
+        let fx = track.as_ref().filter(|_| req.uses_events()).map(|t| Effects::new(t, req.zoom, req.smooth_cursor));
+        let apply = |f: RgbaImage, t: f64| {
+            let rendered = fx.as_ref().and_then(|fx| match fx.apply(&f, t) {
+                std::borrow::Cow::Owned(o) => Some(o),
+                std::borrow::Cow::Borrowed(_) => None,
+            });
+            rendered.unwrap_or(f)
+        };
         let src_ext = extension_of(&src.path.to_string_lossy());
         let target = choose_target(req.preset, req.output.as_deref(), &src_ext)?;
         let mut vars = HashMap::new();
@@ -644,6 +771,25 @@ impl Engine {
         let rec = &self.config.recordings;
         let no_video = || anyhow!("the export produced no video");
         let (w, h, duration, range) = match (kind, target) {
+            (MediaKind::Video, Target::Video { mp4 }) if fx.is_some() => {
+                let info = bugle_platform::video_info(&src.path)?;
+                let (s, e) = resolve_range(req.start, req.end, info.end())?;
+                let fps = effects_fps(req.fps, track.as_ref().and_then(|t| t.fps), info.nominal_fps);
+                let (w, h) = video_frame_size(info.width.max(1) as u32, info.height.max(1) as u32, req.preset.video_box());
+                let silent = tempfile::Builder::new()
+                    .prefix(".bugle-edit-")
+                    .suffix(&format!(".video.{}", target.extension()))
+                    .tempfile_in(dir)
+                    .context("creating a temporary file")?
+                    .into_temp_path();
+                let hevc = req.preset == ExportPreset::Hevc;
+                render_effects(&src.path, &silent, s, e, fps, (w, h), mp4, hevc, fx.as_ref().expect("checked"))?;
+                if !bugle_platform::mux_audio(&silent, &src.path, s, e, &tmp, mp4, Some(export_timeout(e - s)))? {
+                    std::fs::rename(&silent, &tmp).context("moving the rendered video")?;
+                }
+                let d = bugle_platform::media_duration(&tmp).ok().filter(|d| *d > 0.0).unwrap_or(e - s);
+                (w, h, d, (s, e))
+            }
             (MediaKind::Video, Target::Video { mp4 }) => {
                 let fps = req.fps.map(|f| f.min(VIDEO_MAX_FPS));
                 // Ranges are measured on the video track: an audio track
@@ -669,7 +815,7 @@ impl Engine {
                 let mut last: Option<RgbaImage> = None;
                 for (t, secs) in sample_times(s, e, fps) {
                     let frame = match reader.frame_at(t) {
-                        Ok(f) => fit_gif_frame(f, g.max_size),
+                        Ok(f) => fit_gif_frame(apply(f, t), g.max_size),
                         // Past the last decodable frame: hold the previous one.
                         Err(_) if last.is_some() => last.clone().unwrap(),
                         Err(e) => return Err(e),
@@ -685,7 +831,7 @@ impl Engine {
                 let g = gif_settings(req.preset, req.fps, req.max_size, false, rec);
                 let (s, e) = resolve_range(req.start, req.end, meta.duration)?;
                 let mut sink = create_gif_sink(&tmp)?;
-                stream_gif_range(&src.path, s, e, g.fps, |img, secs| sink.push(fit_gif_frame(img, g.max_size), secs))?;
+                stream_gif_range(&src.path, s, e, g.fps, |img, t, secs| sink.push(fit_gif_frame(apply(img, t), g.max_size), secs))?;
                 let ((w, h), d) = sink.finish()?;
                 (w, h, d, (s, e))
             }
@@ -696,7 +842,8 @@ impl Engine {
                 let (w, h) = video_frame_size(meta.width, meta.height, req.preset.video_box());
                 let hevc = req.preset == ExportPreset::Hevc;
                 let mut writer = VideoFrameWriter::create_with_codec(&tmp, w, h, fps, mp4, hevc)?;
-                stream_gif_range(&src.path, s, e, Some(fps), |f, _| {
+                stream_gif_range(&src.path, s, e, Some(fps), |f, t, _| {
+                    let f = apply(f, t);
                     let f = if f.dimensions() == (w, h) { f } else { image::imageops::resize(&f, w, h, image::imageops::FilterType::Triangle) };
                     writer.append(&f)
                 })?;
@@ -707,13 +854,37 @@ impl Engine {
         };
         tmp.persist(&out).with_context(|| format!("moving the export to {}", out.display()))?;
 
-        let in_history = self.history.all().map(|all| all.iter().any(|m| m.id == src.id)).unwrap_or(false);
         let mut m = MediaItem::new(if target == Target::Gif { MediaKind::Gif } else { MediaKind::Video }, &out);
         m.width = Some(w);
         m.height = Some(h);
         m.duration_seconds = Some(duration);
         m.label = req.label.clone();
-        let what = format!("{:.2}s–{:.2}s, preset {}", range.0, range.1, req.preset);
+        let mut what = format!("{:.2}s–{:.2}s, preset {}", range.0, range.1, req.preset);
+        if let Some(z) = req.zoom {
+            what.push_str(&format!(", zoom {z}x on clicks"));
+        }
+        if req.smooth_cursor {
+            what.push_str(", smoothed cursor");
+        }
+        // A plain edit keeps the track (trimmed) so the output can be zoomed
+        // later; after effects the pointer and framing are in the pixels, and
+        // a track left by an earlier file of the same name would not match.
+        // The sidecar is named after the output's full file name, so no
+        // other file's track is touched.
+        let side = EventTrack::sidecar_path(&out);
+        match (&track, &fx) {
+            (Some(t), None) => match t.trimmed(range.0, range.1).save(&side) {
+                Ok(()) => m.events = Some(side),
+                Err(e) => tracing::warn!("could not write the cursor event track {}: {e:#}", side.display()),
+            },
+            _ => {
+                if side.is_file() {
+                    if let Err(e) = std::fs::remove_file(&side) {
+                        tracing::warn!("could not remove the stale event track {}: {e}", side.display());
+                    }
+                }
+            }
+        }
         if in_history {
             m.parent = Some(src.id.clone());
             m.source = Some(format!("edit: {what}"));
@@ -1238,5 +1409,194 @@ mod tests {
         assert!(engine.history.latest().unwrap().is_none(), "nothing recorded");
         let missing = engine.edit(&EditRequest { source: "/nonexistent/clip.mp4".into(), ..Default::default() }).unwrap_err();
         assert!(matches!(missing.downcast_ref::<BugleError>(), Some(BugleError::MediaNotFound(_))));
+    }
+
+    use bugle_core::events::{CursorEvent, EventKind, MouseButton};
+
+    fn click_at(t: f64, x: f64, y: f64) -> CursorEvent {
+        CursorEvent { t, kind: EventKind::Down, button: Some(MouseButton::Left), x, y }
+    }
+
+    /// 2 s, 160x120 at 10 fps: left half red, right half blue.
+    fn split_movie(dir: &Path) -> PathBuf {
+        let p = dir.join("split.mp4");
+        let mut frame = solid(160, 120, BLUE);
+        for y in 0..120 {
+            for x in 0..80 {
+                frame.put_pixel(x, y, image::Rgba([255, 0, 0, 255]));
+            }
+        }
+        let mut w = VideoFrameWriter::create(&p, 160, 120, 10, true).unwrap();
+        for _ in 0..20 {
+            w.append(&frame).unwrap();
+        }
+        w.finish().unwrap();
+        p
+    }
+
+    #[test]
+    fn event_options_need_a_matching_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        let src = split_movie(dir.path());
+        let s = path_str(&src);
+        let no_track = engine.edit(&EditRequest { source: s.clone(), zoom: Some(2.0), ..Default::default() }).unwrap_err();
+        assert!(invalid(&no_track) && format!("{no_track:#}").contains("cursor_events"), "{no_track:#}");
+        // 80x60 pt area recorded at 2 px/pt, pointer in the frames.
+        let track = EventTrack::new(bugle_core::Rect::new(0.0, 0.0, 80.0, 60.0), true, 2.0, vec![click_at(1.0, 60.0, 30.0)]);
+        track.save(&EventTrack::sidecar_path(&src)).unwrap();
+        for req in [
+            EditRequest { source: s.clone(), zoom: Some(1.0), ..Default::default() },
+            EditRequest { source: s.clone(), zoom: Some(f64::NAN), ..Default::default() },
+            EditRequest { source: s.clone(), zoom: Some(2.0), preset: ExportPreset::Lossless, ..Default::default() },
+            EditRequest { source: s.clone(), smooth_cursor: true, ..Default::default() },
+        ] {
+            let e = engine.edit(&req).unwrap_err();
+            assert!(invalid(&e), "{req:?}: {e:#}");
+        }
+        // A broken track is an error only when it is needed.
+        std::fs::write(EventTrack::sidecar_path(&src), b"{}").unwrap();
+        assert!(engine.edit(&EditRequest { source: s.clone(), zoom: Some(2.0), ..Default::default() }).is_err());
+        engine.edit(&EditRequest { source: s, end: Some(1.0), ..Default::default() }).unwrap();
+    }
+
+    #[test]
+    fn zoom_follows_the_click_and_plain_edits_keep_the_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        let src = split_movie(dir.path());
+        let track = EventTrack::new(
+            bugle_core::Rect::new(100.0, 100.0, 80.0, 60.0),
+            true,
+            2.0,
+            vec![CursorEvent::moved(0.0, 10.0, 10.0), click_at(1.0, 60.0, 30.0)],
+        );
+        track.save(&EventTrack::sidecar_path(&src)).unwrap();
+
+        let out = dir.path().join("zoomed.mp4");
+        let req = EditRequest { source: path_str(&src), zoom: Some(2.0), output: Some(path_str(&out)), ..Default::default() };
+        let m = engine.edit(&req).unwrap();
+        assert_eq!((m.width, m.height), (Some(160), Some(120)));
+        assert!((m.duration_seconds.unwrap() - 2.0).abs() < 0.05, "{:?}", m.duration_seconds);
+        assert!(m.source.as_deref().unwrap().contains("zoom 2x"), "{:?}", m.source);
+        assert_eq!(m.events, None, "the framing is in the pixels now");
+        assert!(!EventTrack::sidecar_path(&out).exists());
+        let mut r = VideoFrameReader::open(&out, 0.0).unwrap();
+        // Before the zoom: both halves. At the click: only the blue half.
+        let f = r.frame_at(0.15).unwrap();
+        assert!(near(f.get_pixel(20, 60), RED) && near(f.get_pixel(140, 60), BLUE));
+        let f = r.frame_at(1.05).unwrap();
+        assert!(near(f.get_pixel(5, 60), BLUE) && near(f.get_pixel(155, 60), BLUE));
+        let leftovers = std::fs::read_dir(dir.path()).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with(".bugle-edit-")).count();
+        assert_eq!(leftovers, 0);
+
+        // To GIF, the same effects apply.
+        let gif = dir.path().join("zoomed.gif");
+        let req = EditRequest { source: path_str(&src), start: Some(0.9), end: Some(1.2), zoom: Some(2.0), preset: ExportPreset::Gif, output: Some(path_str(&gif)), ..Default::default() };
+        engine.edit(&req).unwrap();
+        for (_, c) in gif_timeline(&gif) {
+            assert!(near_rgb(c, BLUE), "{c:?}");
+        }
+
+        // A plain trim writes the trimmed track next to its output.
+        let cut = dir.path().join("cut.mp4");
+        let req = EditRequest { source: path_str(&src), start: Some(0.5), output: Some(path_str(&cut)), ..Default::default() };
+        let m = engine.edit(&req).unwrap();
+        let side = EventTrack::sidecar_path(&cut);
+        assert_eq!(m.events.as_deref(), Some(side.as_path()));
+        let t = EventTrack::load(&side).unwrap();
+        assert!((t.duration - 1.5).abs() < 1e-9);
+        assert_eq!(t.clicks().map(|c| c.0).collect::<Vec<_>>(), vec![0.5]);
+        // ... which the next edit picks up through history.
+        let m2 = engine.edit(&EditRequest { source: m.id.clone(), zoom: Some(2.0), ..Default::default() }).unwrap();
+        assert_eq!(m2.parent.as_deref(), Some(m.id.as_str()));
+    }
+
+    #[test]
+    fn hidden_pointer_is_drawn_back_and_audio_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        // 64x64 grey-ish video at 10 fps with one AAC track, 1 s.
+        let src = dir.path().join("tone.mp4");
+        bugle_platform::write_tone_fixture(&src, &bugle_platform::ToneFixture { tracks: 1, seconds: 1.0, video: true, ..Default::default() }).unwrap();
+        let before = VideoFrameReader::open(&src, 0.0).unwrap().frame_at(0.5).unwrap();
+        // 32x32 pt area (2 px/pt); the pointer rests at (4, 4) pt.
+        let track = EventTrack::new(bugle_core::Rect::new(0.0, 0.0, 32.0, 32.0), false, 1.0, vec![CursorEvent::moved(0.0, 4.0, 4.0)]);
+        track.save(&EventTrack::sidecar_path(&src)).unwrap();
+        let out = dir.path().join("drawn.mp4");
+        let req = EditRequest { source: path_str(&src), smooth_cursor: true, output: Some(path_str(&out)), ..Default::default() };
+        engine.edit(&req).unwrap();
+        assert_eq!(bugle_platform::audio_track_count(&out).unwrap(), 1, "audio copied back in");
+        assert_eq!(bugle_platform::video_size(&out).unwrap(), (64, 64));
+        let after = VideoFrameReader::open(&out, 0.0).unwrap().frame_at(0.5).unwrap();
+        // Arrow body 3 pt right and 10 pt below the tip: dark now.
+        let (x, y) = (8 + 6, 8 + 20);
+        let lum = |p: &image::Rgba<u8>| p.0[..3].iter().map(|&v| v as u32).sum::<u32>();
+        assert!(lum(after.get_pixel(x, y)) < 150, "{:?} (was {:?})", after.get_pixel(x, y), before.get_pixel(x, y));
+        assert!(lum(after.get_pixel(50, 50)).abs_diff(lum(before.get_pixel(50, 50))) < 60, "far from the pointer: unchanged");
+    }
+
+    #[test]
+    fn sidecars_belong_to_one_file_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        // col.mp4, a recording with a click, in history like a real one.
+        let src = dir.path().join("col.mp4");
+        std::fs::rename(split_movie(dir.path()), &src).unwrap();
+        let side = EventTrack::sidecar_path(&src);
+        let track = EventTrack::new(bugle_core::Rect::new(0.0, 0.0, 80.0, 60.0), true, 2.0, vec![click_at(1.0, 60.0, 30.0)]);
+        track.save(&side).unwrap();
+        let mut rec = MediaItem::new(MediaKind::Video, &src);
+        rec.events = Some(side.clone());
+        engine.history.push(&rec).unwrap();
+
+        // A plain trim to col.gif beside it: its own sidecar, the source's
+        // untouched.
+        let gif = dir.path().join("col.gif");
+        let m = engine.edit(&EditRequest { source: rec.id.clone(), start: Some(0.5), output: Some(path_str(&gif)), ..Default::default() }).unwrap();
+        assert_eq!(EventTrack::load(&side).unwrap(), track, "the source's track is untouched");
+        assert_eq!(m.events, Some(dir.path().join("col.gif.events.json")));
+        assert_eq!(EventTrack::load(&EventTrack::sidecar_path(&gif)).unwrap().clicks().next().unwrap().0, 0.5);
+
+        // A zoomed export col.mov (where a stale track lies) has no track,
+        // by id or by path, and cannot be zoomed with col.mp4's.
+        let mov = dir.path().join("col.mov");
+        std::fs::write(EventTrack::sidecar_path(&mov), b"stale").unwrap();
+        let z = engine.edit(&EditRequest { source: rec.id.clone(), zoom: Some(2.0), output: Some(path_str(&mov)), ..Default::default() }).unwrap();
+        assert_eq!(z.events, None);
+        assert!(!EventTrack::sidecar_path(&mov).exists(), "the stale track is gone");
+        for source in [z.id.clone(), path_str(&mov)] {
+            let e = engine.edit(&EditRequest { source, zoom: Some(2.0), ..Default::default() }).unwrap_err();
+            assert!(invalid(&e) && format!("{e:#}").contains("no cursor event track"), "{e:#}");
+        }
+        assert_eq!(EventTrack::load(&side).unwrap(), track);
+    }
+
+    #[test]
+    fn effects_render_at_a_steady_rate() {
+        assert_eq!(effects_fps(Some(12), Some(60.0), 2.0), 12);
+        assert_eq!(effects_fps(None, Some(24.0), 2.0), 24);
+        assert_eq!(effects_fps(None, None, 2.0), 30, "a sparse variable-rate source");
+        assert_eq!(effects_fps(None, None, 0.4), 30);
+        assert_eq!(effects_fps(None, None, f64::NAN), 30);
+        assert_eq!(effects_fps(None, None, 50.0), 50);
+        assert_eq!(effects_fps(None, None, 120.0), 60);
+
+        // A 2 fps source zoomed comes out at 30 fps.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        let src = dir.path().join("slow.mp4");
+        let mut w = VideoFrameWriter::create(&src, 160, 120, 2, true).unwrap();
+        for _ in 0..4 {
+            w.append(&solid(160, 120, RED)).unwrap();
+        }
+        w.finish().unwrap();
+        EventTrack::new(bugle_core::Rect::new(0.0, 0.0, 80.0, 60.0), true, 2.0, vec![click_at(1.0, 40.0, 30.0)])
+            .save(&EventTrack::sidecar_path(&src))
+            .unwrap();
+        let m = engine.edit(&EditRequest { source: path_str(&src), zoom: Some(2.0), ..Default::default() }).unwrap();
+        let info = bugle_platform::video_info(&m.path).unwrap();
+        assert!((info.nominal_fps - 30.0).abs() < 1.0, "{info:?}");
+        assert_eq!(info.stored_samples, Some(60));
     }
 }

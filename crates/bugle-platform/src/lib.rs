@@ -10,7 +10,7 @@ mod ffi;
 #[cfg(target_os = "macos")]
 mod picker;
 #[cfg(target_os = "macos")]
-pub use picker::{window_pick_active, window_pick_begin, window_pick_cancel, window_pick_highlight, PickEvent};
+pub use picker::{window_pick_active, window_pick_begin, window_pick_cancel, window_pick_highlight, window_pick_switch, PickEvent};
 #[cfg(target_os = "macos")]
 mod panel;
 #[cfg(target_os = "macos")]
@@ -21,6 +21,8 @@ pub use panel::{
 #[cfg(target_os = "macos")]
 pub mod login_item;
 #[cfg(target_os = "macos")]
+pub mod notify;
+#[cfg(target_os = "macos")]
 mod editor;
 #[cfg(target_os = "macos")]
 pub use editor::{
@@ -30,6 +32,7 @@ pub use editor::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use bugle_core::audio_mix::{AudioMixConfig, Mixer};
 use bugle_core::{BugleError, DisplayInfo, OcrLine, Point, Rect, WindowInfo};
 use image::RgbaImage;
 use std::ffi::{CStr, CString};
@@ -342,6 +345,32 @@ pub fn cursor_position() -> Point {
     Point { x, y }
 }
 
+/// Mouse buttons held down right now: bit 0 left, bit 1 right, bit 2 middle.
+/// Reads the session state (no permission needed, no events posted).
+pub fn mouse_buttons() -> u32 {
+    unsafe { ffi::bugle_mouse_buttons() as u32 }
+}
+
+/// Now on the host clock, in seconds: the clock ScreenCaptureKit stamps
+/// frames with (see [`SckRecorder::session_start`]).
+pub fn host_time_now() -> f64 {
+    unsafe { ffi::bugle_host_time_now() }
+}
+
+/// A window's current frame (global points), `None` once it is gone.
+pub fn window_frame(window_id: u32) -> Option<Rect> {
+    let (mut x, mut y, mut w, mut h) = (0.0, 0.0, 0.0, 0.0);
+    (unsafe { ffi::bugle_window_frame(window_id, &mut x, &mut y, &mut w, &mut h) } == 0).then_some(Rect { x, y, w, h })
+}
+
+/// Whether child process `pid` is no longer running: it exited (not
+/// reaped by this call, so its `std::process::Child` can still be waited
+/// on), or it is no longer waitable at all because its owner already reaped
+/// it. Only "still running" answers `false`.
+pub fn child_exited(pid: u32) -> bool {
+    unsafe { ffi::bugle_child_exited(pid as i32) != 0 }
+}
+
 pub fn clipboard_write_png(png: &[u8]) -> Result<()> {
     if unsafe { ffi::bugle_clipboard_write_image(png.as_ptr(), png.len()) } != 0 {
         bail!("clipboard write failed");
@@ -400,6 +429,48 @@ pub fn select_rect_begin(done: impl FnOnce(Option<Rect>) + 'static) -> bool {
     started
 }
 
+/// How a switchable area selection ended, see [`select_rect_begin_ex`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SelectOutcome {
+    Selected(Rect),
+    /// Esc, the timeout or [`select_rect_cancel`].
+    Cancelled,
+    /// Space: the user wants the window picker instead. Bugle is left active
+    /// so the picker can open at once.
+    Switch,
+}
+
+/// [`select_rect_begin`] with two extras: when `allow_switch` is set, Space
+/// (while not dragging) ends the selection with [`SelectOutcome::Switch`];
+/// a `timeout` cancels the overlay after that long. `done` runs once on the
+/// main thread. Returns `false` (and never calls `done`) when a selection or
+/// window picker is already on screen. Main thread only.
+pub fn select_rect_begin_ex(allow_switch: bool, timeout: Option<std::time::Duration>, done: impl FnOnce(SelectOutcome) + 'static) -> bool {
+    type Cb = Box<dyn FnOnce(SelectOutcome)>;
+    unsafe extern "C" fn trampoline(ctx: *mut libc::c_void, result: i32, x: f64, y: f64, w: f64, h: f64) {
+        let cb: Box<Cb> = unsafe { Box::from_raw(ctx as *mut Cb) };
+        cb(match result {
+            1 => SelectOutcome::Selected(Rect::new(x, y, w, h)),
+            2 => SelectOutcome::Switch,
+            _ => SelectOutcome::Cancelled,
+        });
+    }
+    let boxed: Box<Cb> = Box::new(Box::new(done));
+    let ctx = Box::into_raw(boxed);
+    let secs = timeout.map(|t| t.as_secs_f64().max(0.5)).unwrap_or(0.0);
+    let started = unsafe { ffi::bugle_select_rect_begin_ex(trampoline, ctx as *mut libc::c_void, allow_switch as i32, secs) } == 1;
+    if !started {
+        drop(unsafe { Box::from_raw(ctx) });
+    }
+    started
+}
+
+/// Hand keyboard focus back to the app the user was in (`[NSApp deactivate]`).
+/// Main thread only.
+pub fn app_deactivate() {
+    unsafe { ffi::bugle_app_deactivate() }
+}
+
 /// Whether a selection overlay is currently on screen.
 pub fn select_rect_active() -> bool {
     unsafe { ffi::bugle_select_rect_active() == 1 }
@@ -408,6 +479,13 @@ pub fn select_rect_active() -> bool {
 /// Dismiss the selection overlay as if Esc was pressed. Main thread only.
 pub fn select_rect_cancel() {
     unsafe { ffi::bugle_select_rect_cancel() }
+}
+
+/// Do what Space does in a selection opened by [`select_rect_begin_ex`] with
+/// `allow_switch`: end it with [`SelectOutcome::Switch`] unless a drag is in
+/// progress. Otherwise nothing. Main thread only.
+pub fn select_rect_switch() {
+    unsafe { ffi::bugle_select_rect_switch() }
 }
 
 /// Show a pin window and return immediately; it stays until the user closes
@@ -487,23 +565,82 @@ pub fn video_track_count(path: &Path) -> Result<usize> {
     Ok(unsafe { ffi::bugle_video_track_count(p.as_ptr()) }.max(0) as usize)
 }
 
-/// Fold every enabled audio track of `input` into one AAC track in `output`
-/// (a `.mov` extension writes QuickTime, anything else MP4), each of the `n`
-/// sources at `1/n` so the sum cannot clip. The audio is re-encoded; video
-/// is copied without re-encoding, frame times untouched. An existing
-/// `output` is replaced. Returns `false`, writing nothing, when the input
-/// has fewer than two audio tracks; `input` and `output` must be different
-/// files.
+/// [`mix_audio_tracks_with`] at the default levels: each of the `n` sources
+/// at `1/n`, no ducking.
 pub fn mix_audio_tracks(input: &Path, output: &Path) -> Result<bool> {
+    mix_audio_tracks_with(input, output, &AudioMixConfig::default())
+}
+
+/// Fold every enabled audio track of `input` into one AAC track in `output`
+/// (a `.mov` extension writes QuickTime, anything else MP4) through
+/// [`bugle_core::audio_mix::Mixer`]: each of the `n` sources gets a base
+/// share of `1/n` (so at unity gains the sum cannot clip) scaled by its gain
+/// in `levels`, system audio optionally ducked under the microphone, and a
+/// peak limiter on the sum. Track 0 is system audio and track 1 the
+/// microphone, the order the stream recorder writes them. The audio is
+/// re-encoded; video is copied without re-encoding, frame times untouched.
+/// An existing `output` is replaced. Returns `false`, writing nothing, when
+/// the input has fewer than two audio tracks; `input` and `output` must be
+/// different files.
+pub fn mix_audio_tracks_with(input: &Path, output: &Path, levels: &AudioMixConfig) -> Result<bool> {
     if same_file(input, output) {
         return Err(BugleError::Invalid(format!("mixing {}: input and output are the same file", input.display())).into());
     }
+    levels.validate().map_err(BugleError::Invalid)?;
     let i = path_cstr(input)?;
     let o = path_cstr(output)?;
-    match unsafe { ffi::bugle_mix_audio_tracks(i.as_ptr(), o.as_ptr()) } {
+    let mut state = MixState { levels: *levels, mixer: None };
+    let ctx = &mut state as *mut MixState as *mut libc::c_void;
+    match unsafe { ffi::bugle_mix_audio_tracks(i.as_ptr(), o.as_ptr(), mix_block, ctx) } {
         0 => Ok(true),
         1 => Ok(false),
         _ => bail!("{}", last_error()),
+    }
+}
+
+/// What the shim's mix callback works on; the mixer is built on the first
+/// block, once the track count, channel count and sample rate (all set by
+/// the shim) are known.
+struct MixState {
+    levels: AudioMixConfig,
+    mixer: Option<((usize, usize, i32), Mixer)>,
+}
+
+extern "C" fn mix_block(
+    ctx: *mut libc::c_void,
+    tracks: *const *const f32,
+    n_tracks: i32,
+    channels: i32,
+    sample_rate: i32,
+    out: *mut f32,
+    frames: i32,
+) -> i32 {
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if ctx.is_null() || tracks.is_null() || out.is_null() || n_tracks <= 0 || channels <= 0 || sample_rate <= 0 || frames < 0 {
+            return false;
+        }
+        let (n, ch, len) = (n_tracks as usize, channels as usize, frames as usize * channels as usize);
+        // SAFETY: the shim calls this from one thread at a time while
+        // `mix_audio_tracks_with` blocks with `state` alive; `tracks` holds
+        // `n` pointers to `len` floats each and `out` has room for `len`.
+        let state = unsafe { &mut *(ctx as *mut MixState) };
+        let inputs: Vec<&[f32]> = unsafe { std::slice::from_raw_parts(tracks, n) }
+            .iter()
+            .map(|p| unsafe { std::slice::from_raw_parts(*p, len) })
+            .collect();
+        let out = unsafe { std::slice::from_raw_parts_mut(out, len) };
+        let levels = state.levels;
+        let key = (n, ch, sample_rate);
+        let (_, mixer) = match &mut state.mixer {
+            Some((k, _)) if *k == key => state.mixer.as_mut().unwrap(),
+            _ => state.mixer.insert((key, Mixer::new(&levels, n, ch, sample_rate as f32))),
+        };
+        mixer.process(&inputs, out);
+        true
+    }));
+    match run {
+        Ok(true) => 0,
+        _ => -1,
     }
 }
 
@@ -802,6 +939,63 @@ impl Drop for VideoFrameWriter {
     }
 }
 
+/// Decodes a movie's video track in presentation order over a time range,
+/// one decode per frame (`AVAssetReader`). The first frame may start before
+/// the range: it is the one shown at its start.
+pub struct SequentialFrameReader {
+    handle: *mut libc::c_void,
+}
+
+unsafe impl Send for SequentialFrameReader {}
+
+impl SequentialFrameReader {
+    /// Read `start..end` seconds; `end <= start` reads the whole track.
+    pub fn open(path: &Path, start: f64, end: f64) -> Result<Self> {
+        let p = path_cstr(path)?;
+        let handle = unsafe { ffi::bugle_seq_open(p.as_ptr(), start, end) };
+        if handle.is_null() {
+            bail!("{}", last_error());
+        }
+        Ok(Self { handle })
+    }
+
+    /// The next frame and its presentation time (seconds), or `None` at the
+    /// end of the range.
+    pub fn next_frame(&mut self) -> Result<Option<(f64, RgbaImage)>> {
+        let mut pts = 0.0;
+        let img = unsafe { ffi::bugle_seq_next(self.handle, &mut pts) };
+        if img.data.is_null() {
+            let e = unsafe { ffi::bugle_last_error() };
+            if e.is_null() {
+                return Ok(None);
+            }
+            let msg = unsafe { CStr::from_ptr(e) }.to_string_lossy().into_owned();
+            unsafe { ffi::bugle_free(e as *mut _) };
+            bail!("{msg}");
+        }
+        Ok(Some((pts, take_image(img)?)))
+    }
+}
+
+impl Drop for SequentialFrameReader {
+    fn drop(&mut self) {
+        unsafe { ffi::bugle_seq_close(self.handle) }
+    }
+}
+
+/// Copy the video track of `video` and the audio tracks of `audio_source`
+/// over `start..end` (placed at 0) into `output`, without re-encoding.
+/// Returns `false` (nothing written) when the source has no audio there.
+pub fn mux_audio(video: &Path, audio_source: &Path, start: f64, end: f64, output: &Path, mp4: bool, timeout: Option<f64>) -> Result<bool> {
+    let (v, a, o) = (path_cstr(video)?, path_cstr(audio_source)?, path_cstr(output)?);
+    let timeout = timeout.filter(|t| t.is_finite() && *t > 0.0).unwrap_or(0.0);
+    match unsafe { ffi::bugle_mux_audio(v.as_ptr(), a.as_ptr(), start, end, o.as_ptr(), mp4 as i32, timeout) } {
+        0 => Ok(true),
+        1 => Ok(false),
+        _ => bail!("{}", last_error()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ScreenCaptureKit recording
 // ---------------------------------------------------------------------------
@@ -873,6 +1067,11 @@ impl SckRecorder {
         Ok(Self { handle })
     }
 
+    /// Host-clock time ([`host_time_now`]) of the movie's time 0.
+    pub fn session_start(&self) -> Option<f64> {
+        Some(unsafe { ffi::bugle_sck_record_session_start(self.handle) }).filter(|s| s.is_finite())
+    }
+
     /// Video frames written so far.
     pub fn frames(&self) -> u64 {
         unsafe { ffi::bugle_sck_record_frames(self.handle) }.max(0) as u64
@@ -929,6 +1128,59 @@ pub fn open_path(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_frames_keep_their_colour_through_write_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = [190u8, 60, 35];
+        let close = |p: &image::Rgba<u8>, what: &str| {
+            for i in 0..3 {
+                assert!((p[i] as i32 - c[i] as i32).abs() <= 4, "{what}: {:?} vs {c:?}", p);
+            }
+        };
+        let mut src = dir.path().join("0.mp4");
+        let mut frame = RgbaImage::from_pixel(160, 120, image::Rgba([c[0], c[1], c[2], 255]));
+        // Four generations, as repeated effects edits would make.
+        for gen in 1..=4 {
+            let mut w = VideoFrameWriter::create(&src, 160, 120, 10, true).unwrap();
+            for _ in 0..5 {
+                w.append(&frame).unwrap();
+            }
+            w.finish().unwrap();
+            let mut r = SequentialFrameReader::open(&src, 0.0, 0.0).unwrap();
+            let (pts, f) = r.next_frame().unwrap().unwrap();
+            assert!(pts.abs() < 1e-6);
+            close(f.get_pixel(80, 60), &format!("generation {gen}, sequential reader"));
+            // The generator colour-matches into the bitmap's colour space: a
+            // small fixed offset that does not grow across generations.
+            let g = VideoFrameReader::open(&src, 0.0).unwrap().frame_at(0.25).unwrap();
+            let g = g.get_pixel(80, 60);
+            assert!((0..3).all(|i| (g[i] as i32 - c[i] as i32).abs() <= 12), "generator: {g:?}");
+            let n = 1 + std::iter::from_fn(|| r.next_frame().unwrap()).count();
+            assert_eq!(n, 5);
+            frame = f;
+            src = dir.path().join(format!("{gen}.mp4"));
+        }
+    }
+
+    #[test]
+    fn host_clock_and_child_watch() {
+        let a = host_time_now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let d = host_time_now() - a;
+        assert!(d > 0.015 && d < 0.5, "{d}");
+        let mut child = std::process::Command::new("/bin/sleep").arg("0.1").spawn().unwrap();
+        assert!(!child_exited(child.id()));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(child_exited(child.id()));
+        // Not reaped: the owner still gets the status.
+        assert!(child.try_wait().unwrap().unwrap().success());
+        // Once the owner has reaped it, it still counts as exited.
+        assert!(child_exited(child.id()));
+        let mut quick = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        quick.wait().unwrap();
+        assert!(child_exited(quick.id()), "reaped before the first check");
+    }
 
     #[test]
     fn registration_recovers_vertical_shift() {
@@ -1169,6 +1421,57 @@ mod tests {
         assert!(mix_audio_tracks(&loud, &mixed).unwrap());
         let p = peak(&decode(&mixed));
         assert!(p > 0.5 && p < 1.0, "mixed peak {p}");
+    }
+
+    #[test]
+    fn mix_levels_scale_each_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Track 0 (system audio) sounds in the first half, track 1 (mic) in
+        // the second.
+        let two = tmp.path().join("two.mp4");
+        write_tone_fixture(&two, &ToneFixture { tracks: 2, seconds: 2.0, ..Default::default() }).unwrap();
+        let plain = tmp.path().join("plain.mp4");
+        assert!(mix_audio_tracks(&two, &plain).unwrap());
+        let base = slice_rms(&decode(&plain), 2);
+        let leveled = tmp.path().join("leveled.mp4");
+        let levels = AudioMixConfig { system_audio_gain: 0.25, microphone_gain: 1.8, ..Default::default() };
+        assert!(mix_audio_tracks_with(&two, &leveled, &levels).unwrap());
+        let rms = slice_rms(&decode(&leveled), 2);
+        let (sys, mic) = (rms[0] / base[0], rms[1] / base[1]);
+        assert!((sys - 0.25).abs() < 0.03, "system ratio {sys} ({rms:?} vs {base:?})");
+        assert!((mic - 1.8).abs() < 0.1, "mic ratio {mic} ({rms:?} vs {base:?})");
+        // Out-of-range levels are refused before anything is written.
+        let bad = tmp.path().join("bad.mp4");
+        let e = mix_audio_tracks_with(&two, &bad, &AudioMixConfig { microphone_gain: -1.0, ..Default::default() }).unwrap_err();
+        assert!(e.to_string().contains("microphone_gain"), "{e}");
+        assert!(!bad.exists());
+    }
+
+    #[test]
+    fn mix_ducks_system_audio_and_limits_loud_gains() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Both tracks play the same 440 Hz tone at 0.5 throughout, so the
+        // mic is always active.
+        let src = tmp.path().join("src.mp4");
+        let f = ToneFixture { tracks: 2, seconds: 1.5, overlap: true, ..Default::default() };
+        write_tone_fixture(&src, &f).unwrap();
+        let plain = tmp.path().join("plain.mp4");
+        assert!(mix_audio_tracks(&src, &plain).unwrap());
+        let ducked = tmp.path().join("ducked.mp4");
+        let levels = AudioMixConfig { ducking: true, ducking_amount_db: 12.0, ..Default::default() };
+        assert!(mix_audio_tracks_with(&src, &ducked, &levels).unwrap());
+        // In phase: 0.5*(a + a) without ducking, 0.5*(a/4 + a) with 12 dB.
+        let ratio = slice_rms(&decode(&ducked), 1)[0] / slice_rms(&decode(&plain), 1)[0];
+        assert!((ratio - 0.625).abs() < 0.04, "ducked/plain {ratio}");
+
+        // Two in-phase 0.9 tones at 4x: the unlimited sum would peak at 3.6.
+        let loud = tmp.path().join("loud.mp4");
+        write_tone_fixture(&loud, &ToneFixture { amplitude: 0.9, ..f }).unwrap();
+        let limited = tmp.path().join("limited.mp4");
+        let levels = AudioMixConfig { microphone_gain: 4.0, system_audio_gain: 4.0, ..Default::default() };
+        assert!(mix_audio_tracks_with(&loud, &limited, &levels).unwrap());
+        let p = peak(&decode(&limited));
+        assert!(p > 0.85 && p < 1.0, "limited peak {p}");
     }
 
     #[test]

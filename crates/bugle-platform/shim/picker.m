@@ -6,7 +6,9 @@
 // it; this file knows nothing about windows. A left click, a right click,
 // Esc, switching apps, `bugle_pick_cancel` or the timeout ends the session:
 // the overlay is removed first and the final callback is delivered on a later
-// main-queue turn, so it never re-enters the caller.
+// main-queue turn, so it never re-enters the caller. When the host allows it,
+// Space ends the session with kind 3 ("switch to area selection") and leaves
+// Bugle active, so the host can open the selection overlay straight away.
 
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
@@ -30,6 +32,8 @@
 @property(nonatomic, strong) NSTimer *timer;
 @property(nonatomic, strong) id resignObserver;
 @property(nonatomic) BOOL finished;
+@property(nonatomic) BOOL allowSwitch;
+@property(nonatomic) NSTimeInterval openedAt;
 - (void)moved;
 - (void)finish:(int32_t)kind;
 @end
@@ -66,6 +70,10 @@ static CGPoint pick_mouse(void) {
     [[NSColor colorWithWhite:0 alpha:0.12] setFill];
     NSRectFill(self.bounds);
     BuglePickSession *s = self.session;
+    if (s) {
+        bugle_draw_overlay_hint(self.bounds, s.allowSwitch ? @"Click a window  ·  Space: select an area  ·  Esc: cancel"
+                                                           : @"Click a window  ·  Esc: cancel");
+    }
     if (!s || CGRectIsEmpty(s.highlight)) return;
     CGRect g = s.highlight;
     NSRect cocoa = NSMakeRect(g.origin.x, pick_primary_height() - g.origin.y - g.size.height, g.size.width, g.size.height);
@@ -101,6 +109,8 @@ static CGPoint pick_mouse(void) {
 - (void)rightMouseDown:(NSEvent *)e { [self.session finish:2]; }
 - (void)keyDown:(NSEvent *)e {
     if (e.keyCode == 53) [self.session finish:2];  // Esc
+    // Space (not auto-repeat, or holding it would flip back and forth).
+    else if (e.keyCode == 49 && !e.isARepeat) bugle_pick_switch();
 }
 - (void)cancelOperation:(id)sender { [self.session finish:2]; }
 @end
@@ -129,15 +139,17 @@ static CGPoint pick_mouse(void) {
     self.cb = NULL;
     self.ctx = NULL;
     if (g_pick_session == keep) g_pick_session = nil;
-    // Give keyboard focus back to whatever the user was working in.
-    [NSApp deactivate];
+    // Give keyboard focus back to whatever the user was working in, unless
+    // the host is about to open the selection overlay (kind 3): deactivating
+    // now would post a resign-active that cancels the next overlay.
+    if (kind != 3) [NSApp deactivate];
     dispatch_async(dispatch_get_main_queue(), ^{
         cb(ctx, kind, p.x, p.y);
     });
 }
 @end
 
-int32_t bugle_pick_begin(bugle_pick_callback_t cb, void *ctx, double timeout_seconds) {
+int32_t bugle_pick_begin(bugle_pick_callback_t cb, void *ctx, double timeout_seconds, int32_t allow_switch) {
     @autoreleasepool {
         if (!cb || g_pick_session || bugle_select_rect_active()) return 0;
         NSApplication *app = [NSApplication sharedApplication];
@@ -146,6 +158,7 @@ int32_t bugle_pick_begin(bugle_pick_callback_t cb, void *ctx, double timeout_sec
         session.cb = cb;
         session.ctx = ctx;
         session.highlight = CGRectZero;
+        session.allowSwitch = allow_switch != 0;
         for (NSScreen *screen in [NSScreen screens]) {
             BuglePickWindow *win = [[BuglePickWindow alloc] initWithContentRect:screen.frame
                                                                       styleMask:NSWindowStyleMaskBorderless
@@ -179,6 +192,7 @@ int32_t bugle_pick_begin(bugle_pick_callback_t cb, void *ctx, double timeout_sec
                                                  }];
         [[NSRunLoop mainRunLoop] addTimer:session.timer forMode:NSRunLoopCommonModes];
         g_pick_session = session;
+        session.openedAt = [NSDate timeIntervalSinceReferenceDate];
         [app activateIgnoringOtherApps:YES];
         // Esc only reaches the overlay while Bugle is active. Switching to
         // another app (Cmd-Tab) therefore cancels, so the overlay is never
@@ -189,7 +203,19 @@ int32_t bugle_pick_begin(bugle_pick_callback_t cb, void *ctx, double timeout_sec
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(NSNotification *note) {
-                        [weak finish:2];
+                        BuglePickSession *s = weak;
+                        if (!s || s.finished) return;
+                        // A resign-active right after opening may be the
+                        // previous overlay's deactivate arriving late, not the
+                        // user leaving: look again once activation settled.
+                        if ([NSDate timeIntervalSinceReferenceDate] - s.openedAt < 0.5) {
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                                           dispatch_get_main_queue(), ^{
+                                               if (!NSApp.isActive) [weak finish:2];
+                                           });
+                            return;
+                        }
+                        [s finish:2];
                     }];
         // Highlight whatever is under the pointer before it moves.
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -210,6 +236,13 @@ void bugle_pick_highlight(double x, double y, double w, double h, const char *la
 }
 
 int32_t bugle_pick_active(void) { return g_pick_session ? 1 : 0; }
+
+void bugle_pick_switch(void) {
+    @autoreleasepool {
+        __attribute__((objc_precise_lifetime)) BuglePickSession *s = g_pick_session;  // strong across the call
+        if (s.allowSwitch) [s finish:3];
+    }
+}
 
 void bugle_pick_cancel(void) {
     @autoreleasepool {

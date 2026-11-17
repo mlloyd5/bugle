@@ -66,6 +66,15 @@ int32_t bugle_register_translation(const uint8_t *ref_rgba, size_t ref_len, int3
 
 int32_t bugle_post_scroll(double x, double y, int32_t dx_lines, int32_t dy_lines);
 void bugle_cursor_position(double *x, double *y);
+// Pressed mouse buttons: bit 0 left, 1 right, 2 middle.
+int32_t bugle_mouse_buttons(void);
+// Seconds on the host clock (CMClockGetHostTimeClock), which stamps
+// ScreenCaptureKit samples.
+double bugle_host_time_now(void);
+// Current frame of one window (global points); 0 ok, -1 when it is gone.
+int32_t bugle_window_frame(uint32_t window_id, double *x, double *y, double *w, double *h);
+// 1 when child `pid` has exited (not reaped, so its owner can still wait), 0 if not, -1 on error.
+int32_t bugle_child_exited(int32_t pid);
 
 int32_t bugle_clipboard_write_image(const uint8_t *png, size_t len);
 int32_t bugle_clipboard_write_text(const char *text);
@@ -77,6 +86,21 @@ int32_t bugle_select_rect_blocking(double *x, double *y, double *w, double *h);
 // selection or window picker is already up (cb is then never called).
 typedef void (*bugle_select_callback_t)(void *ctx, int32_t ok, double x, double y, double w, double h);
 int32_t bugle_select_rect_begin(bugle_select_callback_t cb, void *ctx);
+// Like bugle_select_rect_begin, plus: with `allow_switch`, Space (while not
+// dragging) ends the selection with ok=2 and leaves Bugle active, so the host
+// can open the window picker; `timeout_seconds` > 0 cancels (ok=0) after that
+// long.
+int32_t bugle_select_rect_begin_ex(bugle_select_callback_t cb, void *ctx, int32_t allow_switch, double timeout_seconds);
+// What Space does (ok=2), when allowed and not dragging; no-op otherwise.
+void bugle_select_rect_switch(void);
+// [NSApp deactivate]: hand focus back after a switch that led nowhere.
+void bugle_app_deactivate(void);
+// Draws a one-line hint centred near the bottom of an overlay view (shared by
+// the selection overlay and the window picker).
+#ifdef __OBJC__
+#import <AppKit/AppKit.h>
+void bugle_draw_overlay_hint(NSRect bounds, NSString *text);
+#endif
 int32_t bugle_select_rect_active(void);
 void bugle_select_rect_cancel(void);
 void bugle_pin_image_blocking(const uint8_t *png, size_t len, double x, double y, double w, double h, double opacity);
@@ -88,9 +112,14 @@ int32_t bugle_export_audio_m4a(const char *in_path, const char *out_path);
 int32_t bugle_export_mp4(const char *in_path, const char *out_path);
 int32_t bugle_export_mov(const char *in_path, const char *out_path);
 int32_t bugle_audio_track_count(const char *path);
-// Fold all audio tracks into one AAC track (video copied as is). 0 on
-// success, 1 (nothing written) with fewer than two audio tracks.
-int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path);
+// Mixes one block of aligned audio at `sample_rate`: `tracks[i]` holds
+// `frames` interleaved frames of `channels` floats for track i; writes as
+// many into `out`. Non-zero aborts the mix.
+typedef int32_t (*bugle_mix_fn)(void *ctx, const float *const *tracks, int32_t n_tracks, int32_t channels,
+                                int32_t sample_rate, float *out, int32_t frames);
+// Fold all audio tracks into one AAC track through `process` (video copied
+// as is). 0 on success, 1 (nothing written) with fewer than two audio tracks.
+int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, bugle_mix_fn process, void *ctx);
 int32_t bugle_video_track_count(const char *path);
 
 // Test fixtures (shim/fixtures.m, its own object file: nothing in the app
@@ -131,6 +160,16 @@ void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int
 int32_t bugle_writer_append(void *handle, const uint8_t *rgba, size_t len, int32_t w, int32_t h);
 int32_t bugle_writer_finish(void *handle, double timeout);   // finalises and releases the handle
 void bugle_writer_cancel(void *handle);      // discards the file and releases the handle
+// Sequential decoder over [start, end) (end <= start: the whole track).
+// `next` returns frames in presentation order with their time in `pts`; a
+// NULL image with no error pending is the end of the range.
+void *bugle_seq_open(const char *path, double start, double end);
+bugle_image_t bugle_seq_next(void *handle, double *pts);
+void bugle_seq_close(void *handle);
+// Video track of `video_path` + audio of `audio_path` over [start, end),
+// copied into one movie. 0 ok, 1 nothing written (no audio there), -1 error.
+int32_t bugle_mux_audio(const char *video_path, const char *audio_path, double start, double end, const char *out_path,
+                        int32_t mp4, double timeout);
 void bugle_play_sound(const char *name);
 void bugle_open_path(const char *path);
 
@@ -144,19 +183,24 @@ void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t wi
                              int32_t system_audio, int32_t microphone, int32_t show_cursor, int32_t show_clicks,
                              double max_seconds, const char *out_path);
 int64_t bugle_sck_record_frames(void *handle);
+// Host-clock time (seconds) of the movie's time 0; NaN before it starts.
+double bugle_sck_record_session_start(void *handle);
 char *bugle_sck_record_warnings(void *handle);   // malloc'd, NULL when none
 int32_t bugle_sck_record_stop(void *handle);
 
 // Window picker overlay (picker.m). `cb` gets kind 0 for every pointer move
 // (global top-left points), then exactly one final call: 1 = clicked at
 // (x, y), 2 = cancelled (Esc, right click, timeout, Bugle losing active
-// status, bugle_pick_cancel). The
+// status, bugle_pick_cancel), 3 = Space pressed with `allow_switch` set (the
+// host opens the area selection instead; Bugle stays active). The
 // final call arrives on a later main-queue turn, after the overlay is gone.
 // Returns 0 (cb never called) when a picker or selection is already active.
 // Main thread only, needs a running AppKit loop.
 typedef void (*bugle_pick_callback_t)(void *ctx, int32_t kind, double x, double y);
-int32_t bugle_pick_begin(bugle_pick_callback_t cb, void *ctx, double timeout_seconds);
+int32_t bugle_pick_begin(bugle_pick_callback_t cb, void *ctx, double timeout_seconds, int32_t allow_switch);
 // Highlight a global top-left rect with a centred label; w or h <= 0 clears.
 void bugle_pick_highlight(double x, double y, double w, double h, const char *label);
 int32_t bugle_pick_active(void);
 void bugle_pick_cancel(void);
+// What Space does (kind 3), when the picker was opened with allow_switch.
+void bugle_pick_switch(void);
