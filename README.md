@@ -496,7 +496,11 @@ The HTTP API is meant for local agents. Setting a token is recommended; without
 one any local process can call it. Binding to a non-loopback address (e.g.
 `--bind 0.0.0.0:4848`) is refused unless a token is set, a loopback listener
 rejects requests whose `Host` is not `127.0.0.1`, `localhost` or `[::1]`, and
-`cors = true` only takes effect together with a token.
+`cors = true` only takes effect together with a token. Without a token, requests
+a browser sends from another origin (an `Origin` other than the API's own
+address, or `Sec-Fetch-Site` other than `same-origin`/`none`) get 403 on every
+route, so a web page cannot trigger actions; `curl`, scripts and agents send
+neither header and need nothing extra. Web pages need a token plus `cors = true`.
 
 ### Sync
 
