@@ -153,6 +153,13 @@ int32_t bugle_video_track_count(const char *path);
 // success.
 char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double seconds, double amplitude, int32_t overlap,
                                 double delay, int32_t video);
+// Builds an audio sample buffer of `frames` frames at `rate` Hz from
+// `samples` (channel-major floats, `channels` blocks of `frames`), interleaved
+// or not, in `format` (0 float32, 1 int16, 2 float64, 3 int32, 4 big-endian
+// int16), and measures it with bugle_audio_buffer_stats. 0 on success with the
+// peak, RMS and duration in seconds in `out[3]`; -1 when it cannot be measured.
+int32_t bugle_fixture_audio_level(int32_t format, int32_t channels, int32_t interleaved, const float *samples,
+                                  int32_t frames, double rate, double *out);
 double bugle_media_duration(const char *path);
 bugle_image_t bugle_video_frame(const char *path, double seconds);
 
@@ -205,6 +212,31 @@ void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t wi
                              int32_t system_audio, int32_t microphone, int32_t show_cursor, int32_t show_clicks,
                              double max_seconds, const char *out_path);
 int64_t bugle_sck_record_frames(void *handle);
+// Current levels, linear (1.0 = full scale): out[4] = system peak, system RMS,
+// microphone peak, microphone RMS. Returns which sources are recorded:
+// 1 = system audio, 2 = microphone.
+int32_t bugle_sck_record_levels(void *handle, float *out);
+// One source's meter state (shim.m, "Live level"). Linear magnitudes, host
+// seconds. Exposed so tests can drive the ballistics with explicit times.
+typedef struct {
+    int32_t seen;          // a buffer has been measured
+    int32_t unreadable;    // the last buffer was in a format the meter cannot read
+    double updated;        // when the last buffer arrived
+    double covers;         // seconds of audio the last buffer still stands for
+    double peak;           // held peak, 1.0 = full scale
+    double mean_square;    // averaged mean square
+} bugle_level_t;
+// Adds a buffer's peak and mean square, `seconds` long, arriving at `now`.
+void bugle_level_add(bugle_level_t *level, double now, double peak, double mean_square, double seconds);
+// `level` as read at `now` (decayed; `level` is unchanged).
+bugle_level_t bugle_level_at(const bugle_level_t *level, double now);
+// out[2] = peak fall (dB/s), RMS time constant (s).
+void bugle_level_constants(double *out);
+// Peak magnitude, sum of squares, sample count and duration of a linear-PCM
+// CMSampleBufferRef (float32/float64/int16/int32, interleaved or not), as the
+// recorder's level meter measures it. 1 on success, 0 for other formats.
+int32_t bugle_audio_buffer_stats(const void *sample_buffer, double *peak, double *sum_squares, size_t *count,
+                                 double *seconds);
 // Host-clock time (seconds) of the movie's time 0; NaN before it starts.
 double bugle_sck_record_session_start(void *handle);
 char *bugle_sck_record_warnings(void *handle);   // malloc'd, NULL when none

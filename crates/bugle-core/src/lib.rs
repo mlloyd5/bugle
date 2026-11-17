@@ -3,6 +3,7 @@
 //!
 //! Nothing in here touches the OS; the platform crate does that.
 
+pub mod audio_level;
 pub mod audio_mix;
 pub mod config;
 pub mod events;

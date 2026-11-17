@@ -153,3 +153,65 @@ char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double sec
         return NULL;
     }
 }
+
+int32_t bugle_fixture_audio_level(int32_t format, int32_t channels, int32_t interleaved, const float *samples,
+                                  int32_t frames, double rate, double *out) {
+    if (format < 0 || format > 4 || channels < 1 || channels > 8 || frames < 1 || !(rate > 0) || !samples || !out) return -1;
+    BOOL isFloat = format == 0 || format == 2;
+    UInt32 bps = format == 1 || format == 4 ? 2 : format == 2 ? 8 : 4;
+    AudioStreamBasicDescription asbd = {0};
+    asbd.mSampleRate = rate;
+    asbd.mFormatID = kAudioFormatLinearPCM;
+    asbd.mFormatFlags = (isFloat ? kAudioFormatFlagIsFloat : kAudioFormatFlagIsSignedInteger) | kAudioFormatFlagIsPacked |
+                        (interleaved ? 0 : kAudioFormatFlagIsNonInterleaved) | (format == 4 ? kAudioFormatFlagIsBigEndian : 0);
+    asbd.mBitsPerChannel = bps * 8;
+    asbd.mChannelsPerFrame = (UInt32)channels;
+    asbd.mFramesPerPacket = 1;
+    asbd.mBytesPerFrame = interleaved ? bps * (UInt32)channels : bps;
+    asbd.mBytesPerPacket = asbd.mBytesPerFrame;
+    UInt32 nbuf = interleaved ? 1 : (UInt32)channels;
+    size_t bytes = (size_t)frames * channels * bps;
+    uint8_t *data = calloc(1, bytes);
+    AudioBufferList *abl = calloc(1, offsetof(AudioBufferList, mBuffers) + sizeof(AudioBuffer) * nbuf);
+    if (!data || !abl) { free(data); free(abl); return -1; }
+    for (int32_t c = 0; c < channels; c++) {
+        for (int32_t i = 0; i < frames; i++) {
+            float v = samples[(size_t)c * frames + i];
+            size_t k = interleaved ? (size_t)i * channels + c : (size_t)c * frames + i;
+            double x = fmax(-1.0, fmin(v, 1.0));
+            switch (format) {
+                case 0: ((float *)data)[k] = v; break;
+                case 1: case 4: ((int16_t *)data)[k] = (int16_t)lrint(fmin(x * 32768.0, 32767.0)); break;
+                case 2: ((double *)data)[k] = v; break;
+                case 3: ((int32_t *)data)[k] = (int32_t)llrint(fmin(x * 2147483648.0, 2147483647.0)); break;
+            }
+        }
+    }
+    abl->mNumberBuffers = nbuf;
+    for (UInt32 b = 0; b < nbuf; b++) {
+        abl->mBuffers[b].mNumberChannels = interleaved ? (UInt32)channels : 1;
+        abl->mBuffers[b].mDataByteSize = (UInt32)(bytes / nbuf);
+        abl->mBuffers[b].mData = data + b * (bytes / nbuf);
+    }
+    int32_t rc = -1;
+    CMAudioFormatDescriptionRef fmt = NULL;
+    CMSampleBufferRef sb = NULL;
+    if (CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &asbd, 0, NULL, 0, NULL, NULL, &fmt) == noErr &&
+        CMAudioSampleBufferCreateWithPacketDescriptions(kCFAllocatorDefault, NULL, false, NULL, NULL, fmt, frames,
+                                                        CMTimeMake(0, (int32_t)rate), NULL, &sb) == noErr &&
+        CMSampleBufferSetDataBufferFromAudioBufferList(sb, kCFAllocatorDefault, kCFAllocatorDefault, 0, abl) == noErr) {
+        double peak, ss, seconds;
+        size_t n;
+        if (bugle_audio_buffer_stats(sb, &peak, &ss, &n, &seconds) && n > 0) {
+            out[0] = peak;
+            out[1] = sqrt(ss / (double)n);
+            out[2] = seconds;
+            rc = 0;
+        }
+    }
+    if (sb) CFRelease(sb);
+    if (fmt) CFRelease(fmt);
+    free(abl);
+    free(data);
+    return rc;
+}
