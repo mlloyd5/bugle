@@ -68,7 +68,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `export_video`, `video_info`, `video_sync_at`, `VideoFrameReader`, `VideoFrameWriter` | `AVAssetExportSession` with `timeRange`/preset, an `AVMutableVideoComposition` on every re-encode (`frameDuration` + `sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid` for a new frame rate), bounded wait + `cancelExport`; `AVSampleCursor` (stored samples, sync sample at a cut); one reusable `AVAssetImageGenerator`; `AVAssetWriter` + pixel-buffer adaptor (H.264 or HEVC) |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
 | `login_item::{in_app_bundle, status, set_enabled}` | `SMAppService.mainAppService` (`shim/login_item.m`, ServiceManagement) |
-| `notify::{start, state, refresh, post}` | `UNUserNotificationCenter` (`shim/notify.m`, UserNotifications): delegate (banner while active, click opens the file), `requestAuthorizationWithOptions` or `getNotificationSettings`, `addNotificationRequest`; nothing is called outside an app bundle |
+| `notify::{start, state, refresh, post}` | `UNUserNotificationCenter` (`shim/notify.m`, UserNotifications): delegate (banner while active, click opens the file), `requestAuthorizationWithOptions` or `getNotificationSettings`, `addNotificationRequest` with an optional `UNNotificationAttachment` (a PNG copy it consumes); nothing is called outside an app bundle |
 
 Window shadows: ScreenCaptureKit clips single-window screenshots to the window
 bounds, so the shadow path uses `CGWindowListCreateImage` (deprecated but
@@ -336,6 +336,14 @@ when unbundled or switched off) only the in-app feedback shows. While not
 authorized, the 1 s tick re-reads the setting every 5 s without prompting.
 `--smoke-test` with the switch on only reads the setting and never prompts;
 with it off it does not touch the framework; test binaries are never bundles.
+A notice with a thumbnail (the toast's PNG, already downscaled to 112 px)
+carries it as a `UNNotificationAttachment`. The notification center moves an
+attachment's file into its own store, so `notifications::post` writes a
+throwaway copy into `$TMPDIR/bugle-notification-thumbnails/` and hands that
+over, and only once authorized. A copy the center does not take is removed:
+by the shim when the attachment or the request fails, by `post` when the shim
+skips the post, and by a sweep of copies older than 10 minutes on each post
+(all of them at launch).
 
 The status-bar glyph is a signed distance field (`icon/glyph.rs`) that scales
 its stroke widths with the render size, so the same drawing serves the 36 px
@@ -456,6 +464,4 @@ earn its keep.
   when several captures arrive in a row.
 * **Window picker extras** — Space in the Scrolling Capture selection, and the
   picker for `bugle capture` in a terminal (it needs a run loop of its own).
-* **Packaging extras** — the final bundle id; notification thumbnails
-  (an attachment needs a copy of the file, since the notification center
-  moves what it is given).
+* **Packaging extras** — the final bundle id.
