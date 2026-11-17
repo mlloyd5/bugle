@@ -173,6 +173,10 @@ impl App {
             // The editor is a window of this app: open it here, on the main thread.
             return self.open_editor(&target.source);
         }
+        if action == PanelAction::Edit {
+            // The video editor is a window of this app too.
+            return self.open_video_editor(&target.source);
+        }
         if !action.runs_off_main() {
             let result = quick_access::perform(&EngineBackend { engine: &self.engine }, action, &target);
             self.on_quick(QuickEvent::Finished { action, result: result.map_err(|e| format!("{e:#}")) });

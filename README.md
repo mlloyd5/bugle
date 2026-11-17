@@ -42,8 +42,9 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | MCP server (stdio) | JSON-RPC 2.0, image content | ✅ |
 | Menu-bar app, global hotkeys | `bugle-app`: `NSStatusItem` via `tray-icon`, Carbon hotkeys via `global-hotkey`, in-app overlays | ✅ |
 | Sync to your own storage | folder copy/move, or SigV4 uploads (multipart for large files) to any S3-compatible bucket; a destination per media kind; subtitles follow their video | ✅ |
-| Trim and export recordings (presets: trim, H.264/HEVC, 1080p/720p/540p, frame rate, GIF) | `AVAssetExportSession` + video composition, `AVAssetImageGenerator` → GIF, `AVAssetWriter` for GIF → MP4 | ✅ (headless: CLI/API) |
-| Auto-zoom on clicks, smoothed pointer | pointer/click event track recorded next to the video (`clip.mp4.events.json`); frames re-rendered in Rust (`AVAssetReader` → `AVAssetWriter`, audio copied back in) | ✅ headless (CLI/API); track timing measured on real recordings, zoom checked with hand-written clicks, live clicks not exercised |
+| Trim and export recordings (presets: trim, H.264/HEVC, 1080p/720p/540p, frame rate, GIF) | `AVAssetExportSession` + video composition, `AVAssetImageGenerator` → GIF, `AVAssetWriter` for GIF → MP4 | ✅ (CLI/API, and the video editor window) |
+| Auto-zoom on clicks, smoothed pointer | pointer/click event track recorded next to the video (`clip.mp4.events.json`); frames re-rendered in Rust (`AVAssetReader` → `AVAssetWriter`, audio copied back in) | ✅ (CLI/API, and the video editor window); track timing measured on real recordings, zoom checked with hand-written clicks, live clicks not exercised |
+| Video editor | `bugle-app` window: preview, timeline with in/out handles, playback, zoom and pointer options, preset, export through the same edit pipeline | ✅ driven by synthetic events in `--smoke-test`; mouse and keyboard input not exercised |
 | `Bugle.app` bundle | `cargo xtask bundle` (hardened runtime, ad-hoc or Developer ID) | ✅ ad-hoc; Developer ID signing and notarization not yet exercised |
 | Disk image, universal binary | `cargo xtask dmg` (`hdiutil`, `/Applications` link), `--universal` (`lipo`) | ✅ DMG; universal needs both Rust targets installed |
 | System notifications | `UNUserNotificationCenter` from Bugle.app, alongside the toast (`[general] system_notifications`), with the capture's thumbnail attached | built; reading the authorization verified from the bundle, posting and the attached thumbnail unverified |
@@ -315,7 +316,7 @@ Scrolling Capture · Record Video · Record GIF · Record Window · Stop Recordi
 (microphone and system-audio level presets and ducking for the next recordings, saved to
 `[recordings]` in the config file; they apply when `microphone` and `system_audio` are both on
 under `[recordings]`, on macOS 14 or later, and the menu says so otherwise) · Annotate Latest
-(opens the markup editor) · OCR Latest (copies the text) · Pin Latest · Recent Captures (last five, click to open) ·
+(opens the markup editor) · Edit Latest Recording (opens the [video editor](#video-editor)) · OCR Latest (copies the text) · Pin Latest · Recent Captures (last five, click to open) ·
 Open History Folder · Start/Stop Agent API · Preferences… (opens the config
 file) · Open at Login (only when running from `Bugle.app`) · Quit. While recording, the status item shows `● m:ss`. Other actions
 report through a small toast in the top-right corner (thumbnail and file name;
@@ -338,7 +339,8 @@ so turning Bugle on in System Settings → Notifications applies within seconds.
 After a capture or recording, the **quick-access panel** takes the toast's
 place, in the bottom-right corner by default: the thumbnail (click to open)
 with **Copy**, **Annotate**, **Pin**, **Sync** and **Reveal** in Finder, plus a
-close (×) button. **Annotate** opens the [markup editor](#markup-editor); set
+close (×) button; a video recording gets **Edit** instead of Annotate and Pin,
+which opens the [video editor](#video-editor). **Annotate** opens the [markup editor](#markup-editor); set
 `annotate_app` to a bundle id such as `com.apple.Preview` to open that app
 instead, where edits change the saved capture in place. **Sync**
 appears when a `[sync]` destination is set and the file is not there yet — so
@@ -409,7 +411,7 @@ digits, `F1`…`F24`, `space`, …). Defaults:
 | `ocr_latest` | ⌘⇧2 | OCR the latest capture to the clipboard |
 | `pin_latest` | ⌘⇧P | pin the latest capture |
 | `capture_window`, `scroll_capture`, `record_gif` | — | unbound until set |
-| `record_window`, `stop_recording`, `sync_latest`, `open_folder`, `toggle_api`, `preferences`, `quit` | — | unbound until set |
+| `record_window`, `stop_recording`, `annotate_latest`, `edit_latest`, `sync_latest`, `open_folder`, `toggle_api`, `preferences`, `quit` | — | unbound until set |
 
 Every menu item except *Recent Captures* can be bound; the keys are the names
 above. An empty string unbinds an action. Unknown keys, values that are not
@@ -492,6 +494,40 @@ checked by `bugle-app --smoke-test`, which feeds it synthetic events rather
 than clicks (keeping window captures in the temp directory when
 `BUGLE_SMOKE_KEEP` is set, and saving a copy too when `BUGLE_SMOKE_SAVE` is
 set).
+
+### Video editor
+
+*Edit* on the quick-access panel after a recording opens that recording;
+*Edit Latest Recording* in the menu (bind it with `edit_latest` in
+`[hotkeys]`) opens the newest video in the history. Either way the video
+(`.mp4`, `.mov`, `.m4v`) opens in a window: the frame at the playhead, a
+timeline below it and a row of controls.
+
+| Control | Key | Does |
+|---|---|---|
+| Timeline | click, drag | moves the playhead; drag the tabs at either end of the highlighted range to move the in and out points |
+| Play | Space | plays the clip from the playhead (from the in point when the playhead is outside it), stops at the out point |
+| Set In, Set Out | I, O | start or end the clip at the playhead |
+| | ← → | one frame back or forward |
+| | ↑ ↓ (Home, End) | to the in or out point |
+| Zoom | | zoom in on clicks, 1.5× to 3× (recordings made with `cursor_events` or `hide_cursor`) |
+| Smooth pointer | | draw the pointer along a smoothed path (recordings made with `hide_cursor`; on by default for them) |
+| Preset | | the export format, the presets of `bugle edit`; *Lossless (copy)* keeps the frames as recorded, so it turns zoom and smoothing off (turning either on goes back to *Original*) |
+| Export | ⌘E | writes the clip as a new history item |
+
+The preview shows what the export will: frames are decoded exactly at the
+playhead, scaled to the window, and the zoom and pointer are drawn by the same
+code as `bugle edit --zoom --smooth-cursor`. Playback stays in real time, so
+on a slow machine it skips frames rather than slowing down (at most 30 frames a
+second are drawn). **Export** runs the same edit as `bugle edit` with the
+chosen range and options (the audio is kept), leaves the recording alone and
+shows the quick-access panel for the new file; the window stays open with
+your settings if the export fails. A recording without an event track can be
+trimmed and exported, with the zoom and pointer options greyed out. One video
+editor is open at a time; it opens videos, not GIFs (`bugle edit` trims those).
+Quit waits for a running export: it is refused until the export finishes.
+`bugle-app --smoke-test` opens it on a synthetic recording and drives it with
+synthetic events (exporting with `BUGLE_SMOKE_SAVE`).
 
 ## Configuration
 

@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub use capture::CaptureOutcome;
-pub use edit::{EditRequest, ExportPreset};
+pub use edit::{EditRequest, EditSource, ExportPreset, PreviewFrames};
 pub use record::RecorderState;
 pub use sync::SyncReport;
 

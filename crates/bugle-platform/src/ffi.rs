@@ -185,6 +185,7 @@ extern "C" {
     ) -> i32;
     pub fn bugle_frames_open(path: *const c_char, tolerance: f64) -> *mut c_void;
     pub fn bugle_frames_at(handle: *mut c_void, seconds: f64) -> bugle_image_t;
+    pub fn bugle_frames_set_max_size(handle: *mut c_void, max_w: u32, max_h: u32);
     pub fn bugle_frames_close(handle: *mut c_void);
     pub fn bugle_writer_open(path: *const c_char, w: i32, h: i32, fps: i32, mp4: i32, hevc: i32) -> *mut c_void;
     pub fn bugle_writer_append(handle: *mut c_void, rgba: *const u8, len: size_t, w: i32, h: i32) -> i32;

@@ -163,6 +163,7 @@ int32_t bugle_export_video(const char *in_path, const char *out_path, double sta
                            int32_t mp4, int32_t fps, double timeout);
 void *bugle_frames_open(const char *path, double tolerance);
 bugle_image_t bugle_frames_at(void *handle, double seconds);
+void bugle_frames_set_max_size(void *handle, uint32_t max_w, uint32_t max_h);
 void bugle_frames_close(void *handle);
 void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int32_t mp4, int32_t hevc);
 int32_t bugle_writer_append(void *handle, const uint8_t *rgba, size_t len, int32_t w, int32_t h);

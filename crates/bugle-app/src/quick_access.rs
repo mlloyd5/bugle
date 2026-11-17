@@ -27,6 +27,9 @@ pub enum PanelAction {
     /// Open the capture in the markup editor, or in the app named by
     /// `[quick_access] annotate_app`.
     Annotate,
+    /// Open a video recording in the video editor (trim, zoom, pointer,
+    /// export).
+    Edit,
     /// Float it above all windows (`Engine::pin`).
     Pin,
     /// Send it to the `[sync]` destination (`Engine::sync_media`).
@@ -44,6 +47,7 @@ impl PanelAction {
         match self {
             Self::Copy => "Copy",
             Self::Annotate => "Annotate",
+            Self::Edit => "Edit",
             Self::Pin => "Pin",
             Self::Sync => "Sync",
             Self::Reveal => "Reveal",
@@ -78,6 +82,9 @@ pub fn actions_for(kind: MediaKind, sync: SyncState) -> Vec<PanelAction> {
     if image {
         v.push(PanelAction::Annotate);
         v.push(PanelAction::Pin);
+    }
+    if kind == MediaKind::Video {
+        v.push(PanelAction::Edit);
     }
     if sync.destination && !sync.synced {
         v.push(PanelAction::Sync);
@@ -342,6 +349,9 @@ pub fn perform(backend: &dyn Backend, action: PanelAction, target: &Target) -> R
             Ok(Some(Feedback { title: "Copied to clipboard".into(), subtitle: name }))
         }
         PanelAction::Annotate => backend.annotate(&target.path).map(|_| None),
+        // A window of this app, opened on the main thread by the caller
+        // (`quick_run`); nothing for the backend to do.
+        PanelAction::Edit => Ok(None),
         PanelAction::Pin => backend.pin(&target.source).map(|_| None),
         PanelAction::Sync => {
             let (verb, destination) = backend.sync(&target.source)?;
@@ -385,10 +395,11 @@ mod tests {
         use PanelAction::*;
         assert_eq!(actions_for(MediaKind::Screenshot, NO_SYNC), vec![Copy, Annotate, Pin, Reveal]);
         assert_eq!(actions_for(MediaKind::ScrollCapture, NO_SYNC), vec![Copy, Annotate, Pin, Reveal]);
-        assert_eq!(actions_for(MediaKind::Video, NO_SYNC), vec![Copy, Reveal]);
+        assert_eq!(actions_for(MediaKind::Video, NO_SYNC), vec![Copy, Edit, Reveal]);
         let pending = SyncState { destination: true, synced: false };
         assert_eq!(actions_for(MediaKind::Screenshot, pending), vec![Copy, Annotate, Pin, Sync, Reveal]);
         assert_eq!(actions_for(MediaKind::Gif, pending), vec![Copy, Sync, Reveal]);
+        assert_eq!(actions_for(MediaKind::Video, pending), vec![Copy, Edit, Sync, Reveal]);
         let done = SyncState { destination: true, synced: true };
         assert!(!actions_for(MediaKind::Screenshot, done).contains(&Sync), "already at the destination");
     }
@@ -691,6 +702,7 @@ mod tests {
         assert_eq!(fb.title, "Copied to clipboard");
         assert_eq!(fb.subtitle, "Bugle shot.png");
         assert_eq!(perform(&b, PanelAction::Annotate, &t).unwrap(), None);
+        assert_eq!(perform(&b, PanelAction::Edit, &t).unwrap(), None, "the app opens the window itself");
         assert!(perform(&b, PanelAction::Pin, &t).is_err(), "errors propagate");
         let fb = perform(&b, PanelAction::Sync, &t).unwrap().unwrap();
         assert_eq!(fb.title, "Uploaded: Bugle shot.png");
@@ -718,6 +730,7 @@ mod tests {
         assert!(PanelAction::Copy.runs_off_main() && PanelAction::Sync.runs_off_main());
         assert!(PanelAction::Annotate.runs_off_main() && PanelAction::Open.runs_off_main(), "wait for the app");
         assert!(!PanelAction::Reveal.runs_off_main() && !PanelAction::Dismiss.runs_off_main());
+        assert!(!PanelAction::Edit.runs_off_main(), "opens a window of this app");
     }
 
     #[test]

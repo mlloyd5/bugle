@@ -30,6 +30,13 @@ pub use editor::{
     editor_set_image, editor_set_menu, editor_set_overlay, editor_set_state, editor_zoom, EditorCommand, EditorEvent, EditorId,
     EditorMenu, EditorMenuItem, EditorPrim, EditorState, EditorTool, EditorZoom,
 };
+#[cfg(target_os = "macos")]
+mod video_editor;
+#[cfg(target_os = "macos")]
+pub use video_editor::{
+    video_editor_active, video_editor_close, video_editor_focus, video_editor_inject, video_editor_open, video_editor_set_frame,
+    video_editor_set_state, VideoEditorCommand, VideoEditorEvent, VideoEditorState,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bugle_core::audio_mix::{AudioMixConfig, Leveler, Mixer};
@@ -924,6 +931,12 @@ impl VideoFrameReader {
             bail!("{}", last_error());
         }
         take_image(img)
+    }
+
+    /// Decode frames scaled down to fit `max_w` x `max_h` pixels, aspect
+    /// kept (never scaled up); `(0, 0)` restores full size. For previews.
+    pub fn set_max_size(&mut self, max_w: u32, max_h: u32) {
+        unsafe { ffi::bugle_frames_set_max_size(self.handle, max_w, max_h) }
     }
 }
 

@@ -60,12 +60,13 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `pin_image_blocking`, `pin_image_show` | floating borderless window, drag/resize/close; blocking or fire-and-forget |
 | `toast_show` | non-activating `NSPanel` with `NSVisualEffectView`, thumbnail + two lines, fades out |
 | `editor_open` (`shim/editor.m`) | markup editor windows, several at once, each named by the `EditorId` `editor_open` returns: toolbar with pull-down menus, canvas in an `NSScrollView` (fit, zoom stops, pinch, ⌘+/⌘−/⌘1/⌘0), multi-line label text field, unsaved-changes sheet; reports input in edited-image pixels through a callback and draws the image (told where the edited image's origin lies in it), overlay primitives and menus it is handed |
+| `video_editor_open` (`shim/video_editor.m`) | video editor window: `NSImageView` preview, a timeline view (kept range, in/out handles, playhead; drags move locally until Rust answers), control bar (play, Set In/Out, zoom and preset pop-ups, smoothing check box, Export); reports input as times in seconds through a callback and shows the frame and control state it is handed |
 | `panel_show` (`shim/panel.m`) | quick-access panels: non-activating, never-key `NSPanel`s, thumbnail, buttons, close, each named by an id the caller picks; several stack in the corner (newest nearest it) and close up when one goes; `panel_hide_all` / `panel_show_all` take them off screen during a capture; reports clicks through a callback |
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
 | `export_audio_m4a`, `export_mp4`, `export_mov`, `video_frame`, `media_duration` | `AVAssetExportSession`, `AVAssetImageGenerator` |
 | `mix_audio_tracks(_with)`, `level_audio_tracks`, `audio_track_count`, `video_track_count` | one `AVAssetReaderAudioMixOutput` per audio track (float PCM) → Rust mix callback (`bugle_core::audio_mix`) → `AVAssetWriter` (one AAC track, or one per source when leveling), video samples copied on their own timescale |
-| `export_video`, `video_info`, `video_sync_at`, `VideoFrameReader`, `VideoFrameWriter` | `AVAssetExportSession` with `timeRange`/preset, an `AVMutableVideoComposition` on every re-encode (`frameDuration` + `sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid` for a new frame rate), bounded wait + `cancelExport`; `AVSampleCursor` (stored samples, sync sample at a cut); one reusable `AVAssetImageGenerator`; `AVAssetWriter` + pixel-buffer adaptor (H.264 or HEVC) |
+| `export_video`, `video_info`, `video_sync_at`, `VideoFrameReader`, `VideoFrameWriter` | `AVAssetExportSession` with `timeRange`/preset, an `AVMutableVideoComposition` on every re-encode (`frameDuration` + `sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid` for a new frame rate), bounded wait + `cancelExport`; `AVSampleCursor` (stored samples, sync sample at a cut); one reusable `AVAssetImageGenerator` (`maximumSize` for scaled previews); `AVAssetWriter` + pixel-buffer adaptor (H.264 or HEVC) |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
 | `login_item::{in_app_bundle, status, set_enabled}` | `SMAppService.mainAppService` (`shim/login_item.m`, ServiceManagement) |
 | `notify::{start, state, refresh, post}` | `UNUserNotificationCenter` (`shim/notify.m`, UserNotifications): delegate (banner while active, click opens the file), `requestAuthorizationWithOptions` or `getNotificationSettings`, `addNotificationRequest` with an optional `UNNotificationAttachment` (a PNG copy it consumes); nothing is called outside an app bundle |
@@ -249,6 +250,11 @@ recorder state machine, and exposes one method per user-facing action:
   they already decode. A plain edit of a recording with a track writes the
   trimmed track next to its output; an effects edit removes any stale track
   of its output's name. A track whose window was resized is refused.
+  `Engine::edit_source` opens a video for the menu-bar app's video editor:
+  its `VideoInfo`, its track, `check` (the edit's own option checks) and
+  `effects` (the `Effects` the edit would build, from the same function),
+  and `PreviewFrames`, an exact-time frame reader that decodes scaled-down
+  frames and applies those effects, so the preview is the export's code.
 * `ocr` (Apple Vision or an AI provider, per request or `[ocr] engine`), `describe` (images or sampled video frames), `transcribe`
   (extracts the audio track first), `subtitles`, `annotate`, `pin`, `select_area`.
 * `sync` (`sync.rs`) — runs after every successful save (`save_image`, so
@@ -496,13 +502,33 @@ once it succeeded; `shim/editor.m` frees the Rust handler on a later
 main-loop turn, so closing from inside the callback is safe. `--smoke-test`
 drives it through `editor_inject` and `editor_zoom`.
 
+The video editor follows the same split. `video_editor.rs` is the
+platform-free part: `VideoEditor::handle` turns the window's events into the
+in and out points (a minimum clip apart; a mark that passes the other end
+resets it), the playhead, the zoom, smoothing and preset choices, and answers
+with `Effects` (refresh the controls, a frame to show, an `EditRequest` to
+export). Playback is a chain of frame requests: each shown frame asks for the
+next at the time real time has reached, at most `PLAY_FPS` a second, due at
+its wall-clock time, and the out point stops it. `video_editor_window.rs` is
+the glue: it opens `Engine::edit_source`, decodes frames on a per-window
+preview thread (only the newest waiting job; a job due later waits unless a
+newer one replaces it; effects rebuilt only when the options change) and
+sends each result back by sequence number, so a stale frame is dropped.
+Export checks the request with `EditSource::check`, then runs
+`Engine::edit` on a thread with the window's controls disabled; success
+closes the window and shows the quick-access panel for the new file, and a
+failure re-enables it. The panel's **Edit** button (videos) and *Edit Latest
+Recording* (`edit_latest`) open it; `--smoke-test` writes a synthetic
+recording with an event track and drives it through `video_editor_inject`.
+
 ## Feature ideas
 
 Bugle is a standalone app; this is the backlog, roughly in the order it would
 earn its keep.
 
-* **Video editor extras** — an editing window on top of the headless `edit`
-  pipeline (trim, zoom and pointer options with a preview).
+* **Video editor extras** — opening GIFs in the video editor (the headless
+  `edit` trims them), several cuts in one export, an audio waveform on the
+  timeline, and a choice of zoom level per click.
 * **Audio mixing extras** — per-source levels and ducking work on the mixed
   track and on the separate tracks, and are set from the menu-bar app; still
   open: free-form levels and the ducking amount in the app (it offers presets

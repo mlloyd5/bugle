@@ -16,6 +16,8 @@ mod notifications;
 mod picker;
 mod quick_access;
 mod quick_panel;
+mod video_editor;
+mod video_editor_window;
 
 use anyhow::{anyhow, Context, Result};
 use bugle_core::{
@@ -49,8 +51,8 @@ struct Cli {
     /// Debug logging.
     #[arg(short, long)]
     verbose: bool,
-    /// Show the overlay, a toast, a pin, the quick-access panel and the
-    /// markup editor, then exit. Exercises the in-app UI plumbing without
+    /// Show the overlay, a toast, a pin, the quick-access panel, the
+    /// markup editor and the video editor, then exit. Exercises the in-app UI plumbing without
     /// needing a keyboard.
     #[arg(long, hide = true)]
     smoke_test: bool,
@@ -58,6 +60,10 @@ struct Cli {
     /// image path.
     #[arg(long, hide = true, value_name = "SOURCE")]
     annotate: Option<String>,
+    /// Open the video editor at launch for a media id, `latest` or a video
+    /// path.
+    #[arg(long, hide = true, value_name = "SOURCE")]
+    edit_video: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +115,7 @@ enum AppEvent {
     ApiStopped(Option<String>),
     QuickAccess(quick_access::QuickEvent),
     Editor(editor_window::EditorMsg),
+    VideoEditor(video_editor_window::VideoEditorMsg),
     Quit,
 }
 
@@ -261,15 +268,10 @@ fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<N
             if engine.config.general.shutter_sound {
                 bugle_platform::play_sound("Tink");
             }
-            let thumb = if media.kind == MediaKind::Video {
-                bugle_platform::video_frame(&media.path, 0.0).ok().and_then(|f| bugle_engine::encode_png_bounded(&f, 112).ok())
-            } else {
-                image::open(&media.path).ok().and_then(|i| bugle_engine::encode_png_bounded(&i.to_rgba8(), 112).ok())
-            };
             Ok(Some(Notice {
                 title: format!("Recording saved ({:.0}s)", media.duration_seconds.unwrap_or(0.0)),
                 subtitle: saved_subtitle(engine, &media),
-                thumb,
+                thumb: notice_thumb(&media),
                 open: Some(media.path.clone()),
             }))
         }
@@ -316,6 +318,16 @@ fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<N
             }))
         }
     }
+}
+
+/// A small thumbnail of a recording (its first frame) or a GIF/image, for
+/// the quick-access panel or a toast.
+pub(crate) fn notice_thumb(media: &bugle_core::MediaItem) -> Option<Vec<u8>> {
+    let img = match media.kind {
+        MediaKind::Video => bugle_platform::video_frame(&media.path, 0.0).ok(),
+        _ => image::open(&media.path).ok().map(|i| i.to_rgba8()),
+    };
+    img.and_then(|i| bugle_engine::encode_png_bounded(&i, 112).ok())
 }
 
 /// Whether an error means the user cancelled the area selection. Matches the
@@ -488,6 +500,8 @@ struct App {
     quick: quick_access::QuickAccess,
     /// Numbers editor windows, so a late save or preview reaches only its own.
     editor_generation: u64,
+    /// The same for video editor windows and their exports.
+    video_editor_generation: u64,
 }
 
 impl App {
@@ -569,6 +583,7 @@ impl App {
         match command {
             Command::Run(a) => self.dispatch(a),
             Command::AnnotateLatest => self.annotate_latest(),
+            Command::EditLatest => self.edit_latest_recording(),
             Command::OpenFolder => bugle_platform::open_path(&self.engine.config.save_dir()),
             Command::ToggleApi => self.toggle_api(),
             Command::Preferences => self.open_preferences(),
@@ -700,6 +715,12 @@ impl App {
     }
 
     fn quit(&mut self, control_flow: &mut ControlFlow) {
+        // Quitting mid-export would drop the clip and could leave a
+        // temporary file in the save folder.
+        if video_editor_window::export_running() {
+            bugle_platform::video_editor_focus();
+            return self.toast_error("Edit Video: an export is running; quit once it has finished");
+        }
         if self.is_recording() {
             match self.engine.record_stop() {
                 Ok(m) => tracing::info!("recording saved to {}", m.path.display()),
@@ -837,6 +858,7 @@ fn main() -> Result<()> {
         last_tick: Instant::now() - Duration::from_secs(5),
         quick: quick_access::QuickAccess::new(engine.config.quick_access.clone()),
         editor_generation: 0,
+        video_editor_generation: 0,
     };
     app.refresh_recent();
     app.update_recording_ui();
@@ -851,6 +873,9 @@ fn main() -> Result<()> {
 
     if let Some(source) = cli.annotate.clone() {
         proxy.send(AppEvent::Editor(editor_window::EditorMsg::Open(source)));
+    }
+    if let Some(source) = cli.edit_video.clone() {
+        proxy.send(AppEvent::VideoEditor(video_editor_window::VideoEditorMsg::Open(source)));
     }
 
     let smoke_started = cli.smoke_test.then(|| smoke_test(engine.clone(), proxy.clone()));
@@ -883,6 +908,7 @@ fn main() -> Result<()> {
                 AppEvent::ApiStopped(err) => app.on_api_stopped(err),
                 AppEvent::QuickAccess(e) => app.on_quick(e),
                 AppEvent::Editor(m) => app.on_editor(m),
+                AppEvent::VideoEditor(m) => app.on_video_editor(m),
                 AppEvent::Quit => app.quit(control_flow),
             },
             Event::LoopDestroyed => {
@@ -931,6 +957,7 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
         picker::smoke(&proxy);
         quick_panel::smoke(&proxy);
         editor_window::smoke(&proxy);
+        video_editor_window::smoke(&proxy);
         std::thread::sleep(Duration::from_millis(1500));
         proxy.send(AppEvent::Quit);
     });

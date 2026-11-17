@@ -14,6 +14,8 @@ pub enum Command {
     Run(Action),
     /// Open the markup editor for the newest image (main thread, not the worker).
     AnnotateLatest,
+    /// Open the video editor for the newest video recording (main thread).
+    EditLatest,
     OpenFolder,
     ToggleApi,
     Preferences,
@@ -65,6 +67,7 @@ pub const MENU: &[Slot] = &[
     Slot::AudioLevels,
     Slot::Separator,
     item("annotate_latest", "Annotate Latest", Command::AnnotateLatest),
+    item("edit_latest", "Edit Latest Recording", Command::EditLatest),
     item("ocr_latest", "OCR Latest", Command::Run(Action::OcrLatest)),
     item("pin_latest", "Pin Latest", Command::Run(Action::PinLatest)),
     item("sync_latest", "Sync Latest", Command::Run(Action::SyncLatest)),
@@ -174,7 +177,7 @@ mod tests {
         ] {
             assert!(entries().any(|e| e.command == Command::Run(a)), "{a:?} has no menu entry");
         }
-        for c in [Command::OpenFolder, Command::ToggleApi, Command::Preferences, Command::Quit] {
+        for c in [Command::AnnotateLatest, Command::EditLatest, Command::OpenFolder, Command::ToggleApi, Command::Preferences, Command::Quit] {
             assert!(entries().any(|e| e.command == c), "{c:?} has no menu entry");
         }
         assert_eq!(MENU.iter().filter(|s| matches!(s, Slot::Recent)).count(), 1);
