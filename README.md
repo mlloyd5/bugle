@@ -341,7 +341,11 @@ it is also the retry when the automatic sync failed. The panel never takes
 keyboard focus, so it has no keyboard shortcut: it goes away after any button,
 the × button, or `timeout_seconds`. It does not time out while the pointer is
 over it, and stays up to 2 s after the pointer leaves. Starting another capture
-or recording from the menu or a hotkey closes it first so it is not captured.
+or recording from the menu or a hotkey hides the panels while it runs, so they
+are not captured; when it is done they come back with the new capture's panel
+in the corner and the earlier ones stacked behind it, each with its own
+timeout (hovering any of them holds them all). Up to four panels stack; a
+fifth capture closes the oldest.
 Configure it in `[quick_access]`:
 
 ```toml

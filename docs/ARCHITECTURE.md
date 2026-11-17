@@ -60,7 +60,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `pin_image_blocking`, `pin_image_show` | floating borderless window, drag/resize/close; blocking or fire-and-forget |
 | `toast_show` | non-activating `NSPanel` with `NSVisualEffectView`, thumbnail + two lines, fades out |
 | `editor_open` (`shim/editor.m`) | markup editor windows, several at once, each named by the `EditorId` `editor_open` returns: toolbar with pull-down menus, canvas in an `NSScrollView` (fit, zoom stops, pinch, ⌘+/⌘−/⌘1/⌘0), multi-line label text field, unsaved-changes sheet; reports input in edited-image pixels through a callback and draws the image (told where the edited image's origin lies in it), overlay primitives and menus it is handed |
-| `panel_show` (`shim/panel.m`) | quick-access panel: non-activating, never-key `NSPanel`, thumbnail, buttons, close; reports clicks through a callback |
+| `panel_show` (`shim/panel.m`) | quick-access panels: non-activating, never-key `NSPanel`s, thumbnail, buttons, close, each named by an id the caller picks; several stack in the corner (newest nearest it) and close up when one goes; `panel_hide_all` / `panel_show_all` take them off screen during a capture; reports clicks through a callback |
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
 | `export_audio_m4a`, `export_mp4`, `export_mov`, `video_frame`, `media_duration` | `AVAssetExportSession`, `AVAssetImageGenerator` |
@@ -397,12 +397,17 @@ the new image is renamed over the old one (never deleted first).
 
 After a capture the app shows the quick-access panel instead of the toast
 (`[quick_access]`, on by default). `quick_access.rs` is the platform-free part:
-which buttons a media kind gets, the current panel generation (stale clicks are
-ignored), the timeout (paused while hovered, checked on the loop tick) and
+which buttons a media kind gets, the panels up (captures in a row stack up to
+`MAX_PANELS`, the oldest pushed out past it; each panel's generation is its
+id in the shim, and clicks on an ended one are ignored), each panel's timeout
+(held for the whole stack while any panel is hovered, checked on the loop
+tick) and
 `perform`, which maps each button onto the engine through a `Backend` trait —
 Copy → `Engine::copy_media`, Pin → `Engine::pin`, Sync → `Engine::sync_media`,
 Annotate → the markup editor (or open in `annotate_app`), Reveal → Finder. `quick_panel.rs` is the glue:
-it shows the panel, turns clicks into `AppEvent::QuickAccess`, runs blocking
+it shows the panels, hides them while a capture or recording runs and brings
+them back once it is done (`quick_before_action` / `quick_after_action`),
+turns clicks into `AppEvent::QuickAccess`, runs blocking
 actions on a short-lived thread (Pin must, since its `UiHost` request
 round-trips through the main thread) and swaps in a sharper thumbnail rendered
 off the main thread.
@@ -456,9 +461,6 @@ earn its keep.
 * **Audio mixing extras** — per-source levels and ducking work on the mixed
   track; still open: levels for the two-track (unmixed) output, and setting
   them from the menu-bar app instead of the config file.
-* **Markup editor extras** — opening a second editor (the window shim keeps
-  one editor today). Also: keep the quick-access panel's thumbnails stacked
-  when several captures arrive in a row.
 * **Window picker extras** — Space in the Scrolling Capture selection, and the
   picker for `bugle capture` in a terminal (it needs a run loop of its own).
 * **Packaging extras** — the final bundle id; notification thumbnails

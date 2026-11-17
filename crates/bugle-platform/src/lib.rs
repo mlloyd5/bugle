@@ -15,8 +15,8 @@ pub use picker::{window_pick_active, window_pick_begin, window_pick_cancel, wind
 mod panel;
 #[cfg(target_os = "macos")]
 pub use panel::{
-    open_with, panel_active, panel_clear, panel_dismiss, panel_hovered, panel_set_image, panel_show, reveal_path, Corner, Opened,
-    PanelChoice,
+    open_with, panel_count, panel_dismiss, panel_dismiss_all, panel_hide_all, panel_hovered, panel_set_image, panel_show,
+    panel_show_all, reveal_path, Corner, Opened, PanelChoice,
 };
 #[cfg(target_os = "macos")]
 pub mod login_item;

@@ -1,14 +1,15 @@
-//! Windowing glue for the quick-access panel: shows the AppKit panel for a
-//! finished capture, turns its clicks into [`QuickEvent`]s on the main loop,
-//! runs the chosen action against the engine and closes the panel when it
-//! times out. The decisions live in `quick_access.rs`.
+//! Windowing glue for the quick-access panels: shows an AppKit panel for each
+//! finished capture (stacking them when captures come in a row), turns their
+//! clicks into [`QuickEvent`]s on the main loop, runs the chosen action
+//! against the engine and closes each panel when it times out. The decisions
+//! live in `quick_access.rs`.
 
 use crate::quick_access::{self, Backend, Feedback, PanelAction, QuickEvent, SyncState, Target};
 use crate::{file_name, Action, App, AppEvent, Notice, Proxy};
 use anyhow::Result;
 use bugle_engine::Engine;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 /// Long edge of the sharper thumbnail rendered after the panel is up
@@ -53,20 +54,29 @@ impl Backend for EngineBackend<'_> {
 
 impl App {
     /// Before an action that grabs the screen goes to the worker: take the
-    /// panel (and one still fading out) off screen at once, so the capture or
-    /// recording cannot contain it. Actions that only act on an existing item
-    /// leave it alone. The window server drops the window before the grab:
+    /// panels (and any still fading out) off screen at once, so the capture
+    /// or recording cannot contain them. They stay up otherwise and come back
+    /// when the action is done ([`App::quick_after_action`]), with the new
+    /// capture's panel in front. Actions that only act on an existing item
+    /// leave them alone. The window server drops the windows before the grab:
     /// screen and window captures wait 150 ms first, area captures and
     /// recordings wait for the selection overlay.
     pub(crate) fn quick_before_action(&mut self, action: Action) {
         if matches!(action, Action::OcrLatest | Action::PinLatest | Action::SyncLatest) {
             return;
         }
-        if self.quick.is_open() || bugle_platform::panel_active() {
-            tracing::debug!("quick access: clearing the panel before {action:?}");
+        if self.quick.is_open() {
+            tracing::debug!("quick access: hiding {} panel(s) during {action:?}", self.quick.count());
         }
-        self.quick.forget();
-        bugle_platform::panel_clear();
+        bugle_platform::panel_hide_all();
+    }
+
+    /// An action finished: bring back the panels hidden for it, unless a
+    /// recording is still running (it would record them).
+    pub(crate) fn quick_after_action(&mut self) {
+        if !self.is_recording() {
+            bugle_platform::panel_show_all();
+        }
     }
 
     /// Show the panel for a finished action. `false` means the caller should
@@ -93,9 +103,14 @@ impl App {
         let sync = SyncState { destination: dest.is_some(), synced: quick_access::already_synced(&target, dest.as_ref()) };
         let actions = quick_access::actions_for(target.kind, sync);
         let labels: Vec<&str> = actions.iter().map(|a| a.label()).collect();
-        let generation = self.quick.open(target.clone(), actions, Instant::now());
+        let (generation, evicted) = self.quick.open(target.clone(), actions, Instant::now());
+        for g in evicted {
+            // Pushed out of a full stack.
+            bugle_platform::panel_dismiss(g, true);
+        }
         let proxy = self.proxy.clone();
         let shown = bugle_platform::panel_show(
+            generation,
             n.thumb.as_deref(),
             &n.title,
             &n.subtitle,
@@ -104,11 +119,9 @@ impl App {
             move |choice| proxy.send(AppEvent::QuickAccess(QuickEvent::Choice { generation, choice })),
         );
         if let Err(e) = shown {
-            // The shim was never reached, so the previous panel may still be
-            // up with nothing left to time it out: close it too.
+            // The other panels stay up, each with its own timeout.
             tracing::warn!("quick access: {e:#}");
-            self.quick.forget();
-            bugle_platform::panel_dismiss(false);
+            self.quick.forget(generation);
             return false;
         }
         tracing::info!("quick access: panel {generation} for {} with {labels:?}", file_name(&target.path));
@@ -122,14 +135,18 @@ impl App {
                 let Some((action, target)) = self.quick.on_choice(generation, choice) else { return };
                 // A real click already closed the panel; this covers choices
                 // that did not come from the panel itself.
-                let was_up = bugle_platform::panel_active();
-                bugle_platform::panel_dismiss(true);
-                tracing::info!("quick access: {} {} (panel was up: {was_up})", action.label(), file_name(&target.path));
+                bugle_platform::panel_dismiss(generation, true);
+                tracing::info!(
+                    "quick access: {} {} (panel {generation}; {} still up)",
+                    action.label(),
+                    file_name(&target.path),
+                    self.quick.count()
+                );
                 self.quick_run(action, target);
             }
             QuickEvent::Thumb { generation, png } => {
                 if self.quick.is_current(generation) {
-                    bugle_platform::panel_set_image(&png);
+                    bugle_platform::panel_set_image(generation, &png);
                 }
             }
             QuickEvent::Finished { action, result } => match result {
@@ -137,6 +154,9 @@ impl App {
                 Ok(None) => {}
                 Err(e) => self.toast_error(&format!("{}: {e}", action.label())),
             },
+            QuickEvent::Count(tx) => {
+                let _ = tx.send((self.quick.count(), bugle_platform::panel_count()));
+            }
         }
     }
 
@@ -161,10 +181,13 @@ impl App {
         }
     }
 
-    /// Close the panel once it timed out. Called from the main loop's tick.
+    /// Close the panels that timed out. Called from the main loop's tick.
     pub(crate) fn quick_tick(&mut self) {
-        if self.quick.is_open() && self.quick.tick(Instant::now(), bugle_platform::panel_hovered()) {
-            bugle_platform::panel_dismiss(true);
+        if !self.quick.is_open() {
+            return;
+        }
+        for g in self.quick.tick(Instant::now(), bugle_platform::panel_hovered()) {
+            bugle_platform::panel_dismiss(g, true);
         }
     }
 }
@@ -184,11 +207,12 @@ fn spawn_sharper_thumb(proxy: Proxy, generation: u64, target: Target) {
     });
 }
 
-/// `--smoke-test` step: show the panel for a synthetic capture (a gradient
-/// PNG in the temp directory, not added to history), then close it by
-/// injecting the `Choice` event the panel's click callback would send (no
-/// real click: the shim's click path is not exercised here). The first panel
-/// of the process is generation 1. The PNG is removed afterwards.
+/// `--smoke-test` step: show panels for two synthetic captures in a row (a
+/// gradient PNG in the temp directory, not added to history), check that
+/// they stack, then close them by injecting the `Choice` events the panels'
+/// click callback would send (no real click: the shim's click path is not
+/// exercised here). The first panel of the process is generation 1. The PNG
+/// is removed afterwards.
 pub(crate) fn smoke(proxy: &Proxy) {
     let img = image::RgbaImage::from_fn(640, 400, |x, y| image::Rgba([(x / 3) as u8, (y / 2) as u8, 180, 255]));
     let path = std::env::temp_dir().join("bugle-smoke-quick-access.png");
@@ -197,21 +221,30 @@ pub(crate) fn smoke(proxy: &Proxy) {
         return;
     }
     let thumb = bugle_engine::encode_png_bounded(&img, 112).ok();
-    proxy.send(AppEvent::Done(
-        Action::CaptureScreen,
-        Ok(Some(Notice {
-            title: "Quick access smoke test".into(),
-            subtitle: "bugle-smoke-quick-access.png".into(),
-            thumb,
-            open: Some(path.clone()),
-        })),
-    ));
-    std::thread::sleep(Duration::from_millis(1500));
-    proxy.send(AppEvent::QuickAccess(QuickEvent::Choice {
-        generation: 1,
-        choice: bugle_platform::PanelChoice::Close,
-    }));
-    std::thread::sleep(Duration::from_millis(300));
+    for title in ["Quick access smoke test", "Quick access smoke test (stacked)"] {
+        proxy.send(AppEvent::Done(
+            Action::CaptureScreen,
+            Ok(Some(Notice {
+                title: title.into(),
+                subtitle: "bugle-smoke-quick-access.png".into(),
+                thumb: thumb.clone(),
+                open: Some(path.clone()),
+            })),
+        ));
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    let count = || {
+        let (tx, rx) = mpsc::channel();
+        proxy.send(AppEvent::QuickAccess(QuickEvent::Count(tx)));
+        rx.recv_timeout(Duration::from_secs(2)).ok()
+    };
+    std::thread::sleep(Duration::from_millis(1100));
+    eprintln!("smoke test: quick-access panels (state, on screen) {:?} (want Some((2, 2)))", count());
+    for generation in [1, 2] {
+        proxy.send(AppEvent::QuickAccess(QuickEvent::Choice { generation, choice: bugle_platform::PanelChoice::Close }));
+        std::thread::sleep(Duration::from_millis(300));
+        eprintln!("smoke test: quick-access panels after closing {generation}: {:?}", count());
+    }
     if let Err(e) = std::fs::remove_file(&path) {
         eprintln!("smoke test: could not remove {} ({e})", path.display());
     }

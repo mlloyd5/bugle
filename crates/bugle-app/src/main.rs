@@ -584,6 +584,7 @@ impl App {
             Ok(None) => {}
             Err(e) => self.toast_error(&format!("{action:?}: {e}")),
         }
+        self.quick_after_action();
         self.refresh_recent();
         self.update_recording_ui();
     }
@@ -693,6 +694,11 @@ impl App {
         }
         self.last_tick = Instant::now();
         self.update_recording_ui();
+        if !self.busy {
+            // Panels hidden for a recording that ended without a Done
+            // (stopped through the HTTP API, say) come back too.
+            self.quick_after_action();
+        }
         self.refresh_recent();
         if let Some(l) = self.items.login.as_mut() {
             l.refresh();

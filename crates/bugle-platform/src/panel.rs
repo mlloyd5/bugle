@@ -1,8 +1,10 @@
-//! Quick-access panel (`shim/panel.m`): a floating, non-activating panel with
+//! Quick-access panels (`shim/panel.m`): floating, non-activating panels with
 //! a thumbnail, two lines of text, a row of buttons and a close button.
 //!
-//! The panel is dumb on purpose: it reports clicks and closes. Which buttons
+//! A panel is dumb on purpose: it reports clicks and closes. Which buttons
 //! it shows, what they do and when it times out belong to the caller.
+//! Several panels stack up in the chosen corner, the newest nearest to it;
+//! the caller names each by a non-zero id of its own.
 //! Every function here is main-thread only and needs a running AppKit loop.
 
 use super::{cstr, path_cstr};
@@ -16,6 +18,7 @@ type PanelFree = unsafe extern "C" fn(ctx: *mut c_void);
 
 extern "C" {
     fn bugle_panel_show(
+        id: u64,
         png: *const u8,
         len: usize,
         title: *const c_char,
@@ -27,9 +30,12 @@ extern "C" {
         ctx: *mut c_void,
         free_ctx: PanelFree,
     ) -> i32;
-    fn bugle_panel_set_image(png: *const u8, len: usize);
-    fn bugle_panel_dismiss(animated: i32);
-    fn bugle_panel_active() -> i32;
+    fn bugle_panel_set_image(id: u64, png: *const u8, len: usize);
+    fn bugle_panel_dismiss(id: u64, animated: i32);
+    fn bugle_panel_dismiss_all(animated: i32);
+    fn bugle_panel_hide_all();
+    fn bugle_panel_show_all();
+    fn bugle_panel_count() -> i32;
     fn bugle_panel_hovered() -> i32;
     fn bugle_reveal_path(path: *const c_char);
     fn bugle_open_with(path: *const c_char, bundle_id: *const c_char, err: *mut c_char, err_len: usize) -> i32;
@@ -69,10 +75,14 @@ pub enum Corner {
 
 type Handler = Box<dyn FnMut(PanelChoice)>;
 
-/// Show the panel on the screen under the pointer, replacing any panel that
-/// is up. `on_choice` runs on the main thread for at most one click; it is
-/// dropped when the panel closes for any reason.
+/// Show panel `id` (non-zero) on the screen under the pointer, in the corner,
+/// with the panels already up moving one place away from it (all of them on
+/// that screen and corner). A panel already up with the same `id` is
+/// replaced; panels hidden by [`panel_hide_all`] come back. `on_choice` runs
+/// on the main thread for at most one click; it is dropped when the panel
+/// closes for any reason.
 pub fn panel_show(
+    id: u64,
     png: Option<&[u8]>,
     title: &str,
     subtitle: &str,
@@ -99,43 +109,62 @@ pub fn panel_show(
         Corner::BottomRight => 2,
         Corner::BottomLeft => 3,
     };
+    if id == 0 {
+        bail!("a quick-access panel needs a non-zero id");
+    }
     let handler: Box<Handler> = Box::new(Box::new(on_choice));
     let ctx = Box::into_raw(handler) as *mut c_void;
-    // The shim owns `ctx` from here on and frees it through `free`.
+    // On success the shim owns `ctx` and frees it through `free`.
     let ok = unsafe {
-        bugle_panel_show(ptr, len, t.as_ptr(), st.as_ptr(), ptrs.as_ptr(), ptrs.len() as i32, corner, call, ctx, free)
+        bugle_panel_show(id, ptr, len, t.as_ptr(), st.as_ptr(), ptrs.as_ptr(), ptrs.len() as i32, corner, call, ctx, free)
     };
     if ok != 1 {
+        // The shim did not take the context.
+        drop(unsafe { Box::from_raw(ctx as *mut Handler) });
         bail!("could not show the quick-access panel");
     }
     Ok(())
 }
 
-/// Replace the panel's thumbnail, e.g. with a sharper one rendered off the
-/// main thread. No-op when no panel is up.
-pub fn panel_set_image(png: &[u8]) {
-    unsafe { bugle_panel_set_image(png.as_ptr(), png.len()) }
+/// Replace panel `id`'s thumbnail, e.g. with a sharper one rendered off the
+/// main thread. No-op when that panel is gone.
+pub fn panel_set_image(id: u64, png: &[u8]) {
+    unsafe { bugle_panel_set_image(id, png.as_ptr(), png.len()) }
 }
 
-/// Close the panel (fading out when `animated`) without reporting a click.
-pub fn panel_dismiss(animated: bool) {
-    unsafe { bugle_panel_dismiss(animated as i32) }
+/// Close panel `id` (fading out when `animated`) without reporting a click;
+/// the panels behind it move up into its place.
+pub fn panel_dismiss(id: u64, animated: bool) {
+    unsafe { bugle_panel_dismiss(id, animated as i32) }
 }
 
-/// Whether a panel is on screen.
-pub fn panel_active() -> bool {
-    unsafe { bugle_panel_active() == 1 }
+/// Close every panel (fading out when `animated`; otherwise at once,
+/// including panels still fading).
+pub fn panel_dismiss_all(animated: bool) {
+    unsafe { bugle_panel_dismiss_all(animated as i32) }
 }
 
-/// Whether the pointer is over the panel.
+/// Take every panel off screen at once, including ones still fading out, so
+/// the next screen capture cannot contain them. They stay up as far as the
+/// caller is concerned: [`panel_show_all`] or the next [`panel_show`] brings
+/// them back. Hidden panels never count as hovered.
+pub fn panel_hide_all() {
+    unsafe { bugle_panel_hide_all() }
+}
+
+/// Bring back the panels hidden by [`panel_hide_all`]. No-op otherwise.
+pub fn panel_show_all() {
+    unsafe { bugle_panel_show_all() }
+}
+
+/// How many panels are up, hidden ones included.
+pub fn panel_count() -> usize {
+    usize::try_from(unsafe { bugle_panel_count() }).unwrap_or(0)
+}
+
+/// Whether the pointer is over any panel on screen.
 pub fn panel_hovered() -> bool {
     unsafe { bugle_panel_hovered() == 1 }
-}
-
-/// Close the panel at once, including one still fading out, so the next
-/// screen capture cannot contain it.
-pub fn panel_clear() {
-    unsafe { bugle_panel_dismiss(0) }
 }
 
 /// Select `path` in a Finder window.
