@@ -83,6 +83,9 @@ pub fn router_for_bind(engine: Arc<Engine>, token: Option<String>, cors: bool, l
         .route("/v1/media/{id}", get(media_get).delete(media_delete))
         .route("/v1/media/{id}/file", get(media_file))
         .with_state(state.clone())
+        // Every route must be added above this line: a route added after the
+        // layer skips the Host, cross-origin and token checks. New routes also
+        // go in `ROUTES` in the tests below.
         .layer(middleware::from_fn_with_state(state, auth));
     if cors {
         r = r.layer(tower_http::cors::CorsLayer::very_permissive());
@@ -155,12 +158,15 @@ fn error(status: StatusCode, msg: impl Into<String>) -> Response {
 /// attach `Origin` to every cross-origin request that can change state and
 /// `Sec-Fetch-Site` to all requests; other clients send neither. `host` is the
 /// request's own `Host`, so a page served from this listener still passes.
+/// The listener only speaks plain HTTP, so an `https://` origin is never its
+/// own (with the port left out, `https://127.0.0.1` would otherwise match a
+/// listener on port 80).
 fn is_cross_origin(headers: &HeaderMap, host: Option<&str>) -> bool {
     if headers.get("sec-fetch-site").is_some_and(|v| !matches!(v.as_bytes(), b"same-origin" | b"none")) {
         return true;
     }
     let Some(origin) = headers.get(header::ORIGIN) else { return false };
-    let authority = origin.to_str().ok().and_then(|o| o.strip_prefix("http://").or_else(|| o.strip_prefix("https://")));
+    let authority = origin.to_str().ok().and_then(|o| o.strip_prefix("http://"));
     !matches!((authority, host), (Some(a), Some(h)) if a.eq_ignore_ascii_case(h))
 }
 
@@ -487,6 +493,15 @@ mod tests {
     }
 
     /// Every route; the body-less POSTs come first.
+    /// Refused by the cross-origin check itself, not by the Host check or an
+    /// action that answers 403 for its own reasons.
+    fn refused_as_cross_origin(status: StatusCode, body: &[u8], what: &str) {
+        let text = String::from_utf8_lossy(body);
+        assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {text}");
+        assert!(text.contains("cross-origin"), "{what}: {text}");
+        envelope(body);
+    }
+
     const ROUTES: &[(&str, &str)] = &[
         ("POST", "/v1/select"),
         ("POST", "/v1/record/stop"),
@@ -526,14 +541,14 @@ mod tests {
         let app = router(f.engine.clone(), None, false);
         for (method, uri) in ROUTES {
             let (status, _, body) = send(&app, bare(method, uri, &[("origin", "https://example.com")])).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {}", String::from_utf8_lossy(&body));
-            envelope(&body);
+            refused_as_cross_origin(status, &body, &format!("{method} {uri}"));
         }
         // Other shapes of the same request, on the two body-less POST routes.
         let foreign: &[&[(&str, &str)]] = &[
             &[("origin", "null")],
             &[("origin", "http://localhost:3000")],
             &[("origin", "http://127.0.0.1:4848.example.com")],
+            &[("origin", "https://127.0.0.1:4848")],
             &[("origin", "https://example.com"), ("sec-fetch-site", "cross-site")],
             &[("sec-fetch-site", "cross-site")],
             &[("sec-fetch-site", "same-site")],
@@ -543,13 +558,13 @@ mod tests {
         for uri in ["/v1/select", "/v1/record/stop"] {
             for headers in foreign {
                 let (status, _, body) = send(&app, bare("POST", uri, headers)).await;
-                assert_eq!(status, StatusCode::FORBIDDEN, "{uri} {headers:?}: {}", String::from_utf8_lossy(&body));
-                envelope(&body);
+                refused_as_cross_origin(status, &body, &format!("{uri} {headers:?}"));
             }
         }
         // `cors = true` without a token changes nothing.
         let app = router(f.engine.clone(), None, true);
-        assert_eq!(send(&app, bare("POST", "/v1/record/stop", &[("origin", "https://example.com")])).await.0, StatusCode::FORBIDDEN);
+        let (status, _, body) = send(&app, bare("POST", "/v1/record/stop", &[("origin", "https://example.com")])).await;
+        refused_as_cross_origin(status, &body, "cors without a token");
     }
 
     /// The action ran: with no recording in progress `record_stop` fails with

@@ -39,7 +39,7 @@ Every other route was checked for the same property:
 In the `auth` middleware, so it covers every route and method: when no token is configured, refuse with 403 and the
 JSON envelope any request that a browser marks as coming from another origin:
 
-- an `Origin` header whose value is not `http(s)://<Host>` of the request itself (`Origin: null` included), or
+- an `Origin` header whose value is not `http://<Host>` of the request itself (`Origin: null` included), or
 - a `Sec-Fetch-Site` header other than `same-origin` or `none`.
 
 With a token configured nothing changes: such a page cannot attach the token without a preflight, and with
@@ -52,7 +52,9 @@ With a token configured nothing changes: such a page cannot attach the token wit
 - With no token, a request carrying a foreign `Origin` now gets 403 on every route, GETs included
   (`GET /v1/health` with `Origin: https://example.com` used to answer 200). A client that sets `Origin` by hand must
   drop it or use a token.
-- Browser pages and extensions on another origin need a token and `cors = true`, as documented before.
+- Browser pages on another origin need a token and `cors = true`, as documented before. A browser extension that
+  holds host permissions for the API's address is not stopped: it can send requests without `Origin`, like any other
+  local process.
 
 ## Tests
 
@@ -63,5 +65,7 @@ accepted `/v1/select` starts the selection helper.
 
 ## Notes
 
-A browser too old to send `Sec-Fetch-Site` still sends `Origin` on every cross-origin POST, so the state-changing
-routes stay covered there; only its embedded GETs pass.
+Current browsers send `Sec-Fetch-Site` on every request and `Origin` on every cross-origin POST. A browser too old
+for `Sec-Fetch-Site` is covered on the state-changing routes only as far as it sends `Origin`: some old releases
+(Firefox before about version 70, as far as we know) left it off cross-origin form POSTs, so an auto-submitting form
+there could still reach the two body-less routes. Embedded GETs pass on such browsers too. A token closes both.
