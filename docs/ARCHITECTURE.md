@@ -29,7 +29,9 @@ Pure data: `Rect`/`Point`, `CaptureTarget`, `CaptureOptions`, `OcrResult`,
 `destinations`), filename
 templates (`naming`) and the JSON-lines `History`. A history line whose id is
 already present replaces the earlier record, which is how a moved file or a new
-sync URL is stored without rewriting the file.
+sync URL is stored without rewriting the file. `audio_mix` holds the sample
+math for the mixed recording track (per-source gain, ducking, peak limiter),
+so it is tested on synthetic buffers without AVFoundation.
 
 
 ### `bugle-platform`
@@ -53,10 +55,11 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
 | `export_audio_m4a`, `export_mp4`, `export_mov`, `video_frame`, `media_duration` | `AVAssetExportSession`, `AVAssetImageGenerator` |
-| `mix_audio_tracks`, `audio_track_count`, `video_track_count` | `AVAssetReaderAudioMixOutput` (+ `AVMutableAudioMix` levels) → `AVAssetWriter` (AAC), video samples copied on their own timescale |
+| `mix_audio_tracks(_with)`, `audio_track_count`, `video_track_count` | one `AVAssetReaderAudioMixOutput` per audio track (float PCM) → Rust mix callback (`bugle_core::audio_mix`) → `AVAssetWriter` (AAC), video samples copied on their own timescale |
 | `export_video`, `video_info`, `video_sync_at`, `VideoFrameReader`, `VideoFrameWriter` | `AVAssetExportSession` with `timeRange`/preset, an `AVMutableVideoComposition` on every re-encode (`frameDuration` + `sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid` for a new frame rate), bounded wait + `cancelExport`; `AVSampleCursor` (stored samples, sync sample at a cut); one reusable `AVAssetImageGenerator`; `AVAssetWriter` + pixel-buffer adaptor (H.264 or HEVC) |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
 | `login_item::{in_app_bundle, status, set_enabled}` | `SMAppService.mainAppService` (`shim/login_item.m`, ServiceManagement) |
+| `notify::{start, state, refresh, post}` | `UNUserNotificationCenter` (`shim/notify.m`, UserNotifications): delegate (banner while active, click opens the file), `requestAuthorizationWithOptions` or `getNotificationSettings`, `addNotificationRequest`; nothing is called outside an app bundle |
 
 Window shadows: ScreenCaptureKit clips single-window screenshots to the window
 bounds, so the shadow path uses `CGWindowListCreateImage` (deprecated but
@@ -112,7 +115,27 @@ recorder state machine, and exposes one method per user-facing action:
   finished file folds all audio tracks into one AAC track (a `.mov` request is
   mixed straight to QuickTime); mixing after capture keeps the real-time path
   unchanged (no cross-clock resampling or buffering between two live sources).
-  Each of the n sources is scaled by 1/n so the sum cannot clip; the audio is
+  Each track is decoded to 48 kHz stereo float by its own reader and the
+  tracks are lined up by presentation time (late starts and gaps become
+  silence); `bugle_core::audio_mix::Mixer` then mixes each block. Each of the
+  n sources gets a base share of 1/n, so at the default levels the sum cannot
+  clip; `microphone_gain` and `system_audio_gain` are linear factors on those
+  shares, 1.0 being the default share (track 0 is system audio, track 1 the
+  microphone, the order the recorder writes them). With `ducking`, a peak
+  detector on the microphone as recorded (before its gain; instant rise,
+  60 ms release) decides when it is active, above `ducking_threshold_db`, and
+  the system-audio gain follows towards `-ducking_amount_db` with
+  `ducking_attack_ms` and back with `ducking_release_ms`; a microphone at gain
+  0 never ducks. With every gain at 1 or below the sum is passed through
+  untouched; with any gain above 1 a stereo-linked peak limiter (instant
+  attack, 100 ms release, ceiling -0.3 dBFS, headroom because decoded AAC can
+  overshoot slightly) catches what the gains push past full scale. Levels come
+  from `[recordings]` with per-recording overrides (`--mic-gain`,
+  `--system-gain`, `--duck` / `--no-duck`, `--duck-amount`; the same names as
+  action arguments) and only apply to the mixed track. Out-of-range
+  `[recordings]` levels are logged when the engine loads the config; starting
+  a mixed recording with out-of-range levels (config or request) is an
+  invalid request. The audio is
   re-encoded (a second AAC generation) while video samples and frame times are
   copied. The mix runs during stop, writes a uniquely named hidden copy next to
   the recording (so it needs free space equal to the recording) and replaces the
@@ -235,7 +258,17 @@ When the process runs from `Bugle.app`, an *Open at Login* check item
 (`login.rs`) registers the bundle with `SMAppService`. Its check mark is
 re-read on the periodic tick (every 5 s) and set only for an enabled item; a
 pending approval is shown in the title, and clicking it then opens System
-Settings → Login Items.
+Settings → Login Items. With `[general] system_notifications`,
+`notifications.rs` also posts to Notification Center from `App::toast` /
+`toast_error` and from `on_done` when the quick-access panel takes the
+toast's place (direct `toast_show` feedback to panel and editor clicks does
+not post). Authorization is requested once at launch from the bundle; the
+shim always takes the state from `getNotificationSettings` (a refusal often
+arrives as an error, not a plain "no"), and until it is "authorized" (or
+when unbundled or switched off) only the in-app feedback shows. While not
+authorized, the 1 s tick re-reads the setting every 5 s without prompting.
+`--smoke-test` with the switch on only reads the setting and never prompts;
+with it off it does not touch the framework; test binaries are never bundles.
 
 The status-bar glyph is a signed distance field (`icon/glyph.rs`) that scales
 its stroke widths with the render size, so the same drawing serves the 36 px
@@ -274,6 +307,27 @@ front without them; it submits a temporary `ditto` zip to `notarytool`,
 staples, and requires `spctl --assess` to pass. Only then is the staged bundle
 renamed over `dist/Bugle.app` and the final zip written.
 
+`--universal` checks up front (`rustc --print target-libdir`) that both
+`aarch64-apple-darwin` and `x86_64-apple-darwin` have a standard library,
+naming the `rustup target add` command otherwise, then runs one
+`cargo build --target` per triple and `lipo -create`s each executable into
+`<target dir>/xtask/universal` before assembly. Every xtask build (host or
+cross) sets `MACOSX_DEPLOYMENT_TARGET` to the shim's minimum, so both modes
+produce the same `LC_BUILD_VERSION` and consecutive host runs still reuse
+`target/release`. Verification checks `lipo -archs` of both executables (a
+host build only prints them) and runs `--version` on every slice: the
+native one directly, x86_64 on Apple silicon through `arch -x86_64` when
+Rosetta is installed, otherwise it reports the slice as not executed.
+`--dmg` / `cargo xtask dmg` `ditto`s the staged (notarized) bundle next to an
+`Applications → /Applications` symlink, `hdiutil create -format UDZO`s it in
+the staging directory, signs (Developer ID) and notarizes/staples it when the
+bundle was, runs `hdiutil verify`, attaches it read-only with `-nobrowse` at a
+mount point under the target directory (force-detaching anything an
+interrupted run left there; a guard detaches on any error), checks the link,
+the bundle's signature and architectures, and detaches. `release_steps`
+fixes the order: all of that happens before `dist/Bugle.app` is replaced, and
+the new image is renamed over the old one (never deleted first).
+
 After a capture the app shows the quick-access panel instead of the toast
 (`[quick_access]`, on by default). `quick_access.rs` is the platform-free part:
 which buttons a media kind gets, the current panel generation (stale clicks are
@@ -308,8 +362,9 @@ earn its keep.
   recorders bake the cursor into the frames and log no click or cursor
   positions, so these first need a click/cursor event track recorded alongside
   the video), and an editing window on top of the headless `edit` pipeline.
-* **Audio mixing extras** — per-source levels (or ducking system audio under
-  the microphone) for the mixed track.
+* **Audio mixing extras** — per-source levels and ducking work on the mixed
+  track; still open: levels for the two-track (unmixed) output, and setting
+  them from the menu-bar app instead of the config file.
 * **Markup editor extras** — crop and canvas (padding, background) in the
   window, multi-line labels, arrow and redaction styles, zoom, a preview
   render off the main thread for very large captures, and opening a second
@@ -317,7 +372,6 @@ earn its keep.
   captures arrive in a row.
 * **Window picker extras** — Space in the Scrolling Capture selection, and the
   picker for `bugle capture` in a terminal (it needs a run loop of its own).
-* **Packaging extras** — a universal (arm64 + x86_64) build (bundles are
-  host-architecture only today), a DMG, the final bundle id, and system
-  notifications (`UNUserNotificationCenter`) alongside the toast now that the
-  bundle gives them Bugle's name.
+* **Packaging extras** — the final bundle id; notification thumbnails
+  (an attachment needs a copy of the file, since the notification center
+  moves what it is given).

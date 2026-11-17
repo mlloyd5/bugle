@@ -11,6 +11,7 @@ mod editor_window;
 mod icon;
 mod login;
 mod markup_editor;
+mod notifications;
 mod picker;
 mod quick_access;
 mod quick_panel;
@@ -225,6 +226,7 @@ fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<N
                 microphone: false,
                 system_audio: engine.config.recordings.system_audio,
                 mix_audio: false,
+                mix: Default::default(),
                 max_seconds: None,
                 highlight_clicks: false,
                 output: None,
@@ -476,11 +478,13 @@ impl App {
 
     fn toast(&self, n: &Notice) {
         bugle_platform::toast_show(n.thumb.as_deref(), &n.title, &n.subtitle, n.open.as_deref(), 3.0);
+        notifications::post(&n.title, &n.subtitle, n.open.as_deref());
     }
 
     fn toast_error(&self, msg: &str) {
         tracing::warn!("{msg}");
         bugle_platform::toast_show(None, "Bugle", msg, None, 5.0);
+        notifications::post("Bugle", msg, None);
     }
 
     fn dispatch(&mut self, mut action: Action) {
@@ -573,7 +577,7 @@ impl App {
     fn on_done(&mut self, action: Action, result: Result<Option<Notice>, String>) {
         self.busy = false;
         match result {
-            Ok(Some(n)) if self.quick_show(action, &n) => {}
+            Ok(Some(n)) if self.quick_show(action, &n) => notifications::post(&n.title, &n.subtitle, n.open.as_deref()),
             Ok(Some(n)) => self.toast(&n),
             Ok(None) => {}
             Err(e) => self.toast_error(&format!("{action:?}: {e}")),
@@ -691,6 +695,7 @@ impl App {
         if let Some(l) = self.items.login.as_mut() {
             l.refresh();
         }
+        notifications::tick();
     }
 }
 
@@ -724,6 +729,7 @@ fn main() -> Result<()> {
     let mut engine = Engine::new(config, false)?;
     engine.ui_host = Some(Arc::new(AppUiHost { proxy: proxy.clone() }));
     let engine = Arc::new(engine);
+    notifications::init(engine.config.general.system_notifications, cli.smoke_test);
 
     if !bugle_platform::screen_access_preflight() {
         tracing::warn!("Screen Recording permission not granted; asking");

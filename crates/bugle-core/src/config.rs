@@ -39,6 +39,10 @@ pub struct GeneralConfig {
     pub copy_to_clipboard: bool,
     /// Where the history file lives.
     pub history_path: Option<String>,
+    /// `bugle-app` run from Bugle.app: also post finished actions and errors
+    /// to Notification Center. macOS asks for permission the first time;
+    /// denied or unbundled, only the panel or toast is shown.
+    pub system_notifications: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +89,9 @@ pub struct RecordingConfig {
     /// Fold the microphone and system-audio tracks into one when both are
     /// recorded (otherwise they are two AAC tracks).
     pub mix_audio: bool,
+    /// Levels and ducking for the mixed track (flat `[recordings]` keys).
+    #[serde(flatten)]
+    pub mix: crate::audio_mix::AudioMixConfig,
     pub highlight_clicks: bool,
     pub retina: bool,
     pub backend: RecordingBackend,
@@ -202,6 +209,7 @@ impl Default for GeneralConfig {
             shutter_sound: false,
             copy_to_clipboard: false,
             history_path: None,
+            system_notifications: false,
         }
     }
 }
@@ -227,6 +235,7 @@ impl Default for RecordingConfig {
             microphone: false,
             system_audio: false,
             mix_audio: false,
+            mix: Default::default(),
             highlight_clicks: false,
             retina: true,
             backend: RecordingBackend::Auto,
