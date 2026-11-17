@@ -380,10 +380,15 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         log.stop();
         let at = log.logged.as_ref().unwrap().child_exited_at.expect("exit noticed");
-        assert!(at >= reaped && at - reaped < 0.1, "{}", at - reaped);
-        // So the video ends there, not at the start of the log.
+        // The poll that notices the exit stamps it with the time it sampled
+        // the pointer, which can be a moment before `reaped` was read here.
+        assert!((at - reaped).abs() < 0.1, "{}", at - reaped);
+        // So the video ends there, not at the start of the log. Keep the
+        // events in time order: the pointer may have moved while this ran.
         let down = CursorEvent { t: at - 0.5, kind: EventKind::Down, button: Some(MouseButton::Left), x: 1.0, y: 1.0 };
-        log.logged.as_mut().unwrap().events.push(down);
+        let events = &mut log.logged.as_mut().unwrap().events;
+        events.retain(|e| e.t < down.t);
+        events.push(down);
         let t = log.finish(2.0, None);
         assert!((t.clicks().next().unwrap().0 - 1.5).abs() < 1e-9);
     }
