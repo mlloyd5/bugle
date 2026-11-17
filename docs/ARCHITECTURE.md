@@ -64,11 +64,11 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
 | `export_audio_m4a`, `export_mp4`, `export_mov`, `video_frame`, `media_duration` | `AVAssetExportSession`, `AVAssetImageGenerator` |
-| `mix_audio_tracks(_with)`, `audio_track_count`, `video_track_count` | one `AVAssetReaderAudioMixOutput` per audio track (float PCM) → Rust mix callback (`bugle_core::audio_mix`) → `AVAssetWriter` (AAC), video samples copied on their own timescale |
+| `mix_audio_tracks(_with)`, `level_audio_tracks`, `audio_track_count`, `video_track_count` | one `AVAssetReaderAudioMixOutput` per audio track (float PCM) → Rust mix callback (`bugle_core::audio_mix`) → `AVAssetWriter` (one AAC track, or one per source when leveling), video samples copied on their own timescale |
 | `export_video`, `video_info`, `video_sync_at`, `VideoFrameReader`, `VideoFrameWriter` | `AVAssetExportSession` with `timeRange`/preset, an `AVMutableVideoComposition` on every re-encode (`frameDuration` + `sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid` for a new frame rate), bounded wait + `cancelExport`; `AVSampleCursor` (stored samples, sync sample at a cut); one reusable `AVAssetImageGenerator`; `AVAssetWriter` + pixel-buffer adaptor (H.264 or HEVC) |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
 | `login_item::{in_app_bundle, status, set_enabled}` | `SMAppService.mainAppService` (`shim/login_item.m`, ServiceManagement) |
-| `notify::{start, state, refresh, post}` | `UNUserNotificationCenter` (`shim/notify.m`, UserNotifications): delegate (banner while active, click opens the file), `requestAuthorizationWithOptions` or `getNotificationSettings`, `addNotificationRequest`; nothing is called outside an app bundle |
+| `notify::{start, state, refresh, post}` | `UNUserNotificationCenter` (`shim/notify.m`, UserNotifications): delegate (banner while active, click opens the file), `requestAuthorizationWithOptions` or `getNotificationSettings`, `addNotificationRequest` with an optional `UNNotificationAttachment` (a PNG copy it consumes); nothing is called outside an app bundle |
 
 Window shadows: ScreenCaptureKit clips single-window screenshots to the window
 bounds, so the shadow path uses `CGWindowListCreateImage` (deprecated but
@@ -147,10 +147,23 @@ recorder state machine, and exposes one method per user-facing action:
   overshoot slightly) catches what the gains push past full scale. Levels come
   from `[recordings]` with per-recording overrides (`--mic-gain`,
   `--system-gain`, `--duck` / `--no-duck`, `--duck-amount`; the same names as
-  action arguments) and only apply to the mixed track. Out-of-range
+  action arguments). Without `mix_audio` the same levels apply to the two
+  separate tracks (`AudioPass::Level`): when they change the sources (a gain
+  other than 1, or ducking with an audible microphone) the same post-pass
+  runs with `separate`, `bugle_core::audio_mix::Leveler` scales each track on
+  its own (gain 1 = as recorded, no `1/n` share), ducks track 0 under track 1
+  and limits any track above gain 1 on its own, and the shim encodes one AAC
+  track per source in order; the checked copy must keep every audio track.
+  The audio pumps share one serial queue and pull from per-track queues that
+  `process` fills one block at a time. At the default levels the recording
+  is left as written. Out-of-range
   `[recordings]` levels are logged when the engine loads the config; starting
-  a mixed recording with out-of-range levels (config or request) is an
-  invalid request. The audio is
+  a recording that would use out-of-range levels (config or request) is an
+  invalid request: always with `mix_audio`, and for leveling only when the
+  recording gets both tracks (`audio_pass` decides after the backend, so a
+  bad gain does not block a recording without audio). The levels a recording
+  starts from are `Engine::recording_levels`: `[recordings]`, or whatever
+  `Engine::set_recording_levels` set since launch. The audio is
   re-encoded (a second AAC generation) while video samples and frame times are
   copied. The mix runs during stop, writes a uniquely named hidden copy next to
   the recording (so it needs free space equal to the recording) and replaces the
@@ -278,6 +291,14 @@ JSON-RPC server implementing `initialize`, `ping`, `tools/list`, `tools/call`.
 
 ### `bugle-cli`
 Clap front end. Runs the tokio runtime on the main thread so AppKit overlays work.
+The non-blocking overlays (window picker, switchable area selection) need an
+event loop that the caller can step out of, so `pick::run_blocking` bootstraps
+`NSApplication` once (`app_bootstrap`: accessory policy, `finishLaunching`)
+and pumps `run_loop_once` in 50 ms slices until the session answers. That is
+what `pick_window` targets (`bugle capture pick-window`) and, with
+`[screenshots] window_picker`, the Space toggle of every interactive selection
+(`Engine::select_area_or_window`: `bugle capture`, `bugle scroll`, `bugle
+record start`) use; off the main thread it refuses with `NoUiHost`.
 
 ### `bugle-app`
 The menu-bar app. `tao` owns the main thread and the AppKit run loop (activation
@@ -309,10 +330,17 @@ main thread opens the next overlay from the previous one's final callback.
 each picker turn keeps the 30 s timeout and a whole session closes after two
 minutes (an area phase never times out mid-drag). A switch leaves Bugle active
 for the next overlay; if none follows, the session deactivates Bugle itself. `[screenshots] window_picker = false` restores the immediate
-front-most capture (and plain area selection), which the CLI always uses.
+front-most capture (and plain area selection). *Scrolling Capture* runs
+through the same session (starting in the area selection); a picked window
+scrolls the part of its frame on the display it overlaps most
+(`pick::picked_rect`); a pick does not raise the window, so `pick::scroll_rect`
+refuses one that another window partly covers. The session itself (`Session`, `window_at`, `begin`)
+lives in `bugle_engine::pick`, so the CLI can run it too; `picker.rs` keeps the
+app's side (the gate, the cool-down and the worker's `pick`).
 `UiHost::pick_window` offers the picker (without the switch) to API callers:
 the `pick_window` target kind of `capture` and `record_start` goes through it,
-and an engine without a host refuses that target up front with
+and an engine with neither a host nor in-process overlays (`bugle serve`,
+`bugle mcp`) refuses that target up front with
 `BugleError::NoUiHost` (HTTP 503) before any permission prompt.
 Engine actions run on one worker thread so the menu never blocks; when an action
 needs the crosshair overlay or a pin window, the engine's `UiHost` (implemented
@@ -325,7 +353,15 @@ When the process runs from `Bugle.app`, an *Open at Login* check item
 (`login.rs`) registers the bundle with `SMAppService`. Its check mark is
 re-read on the periodic tick (every 5 s) and set only for an enabled item; a
 pending approval is shown in the title, and clicking it then opens System
-Settings → Login Items. With `[general] system_notifications`,
+Settings → Login Items. The *Audio Levels* submenu (`audio_menu.rs`) offers
+level presets for the microphone and system audio and a ducking toggle; a
+click applies to the next recordings, from the menu, hotkeys or the in-app
+API alike (`Engine::set_recording_levels`), and is written back to
+`[recordings]` with `toml_edit`, replacing only that key so the rest of the
+file and its comments stay put (through a temp file and a rename, following
+a symlinked config). Levels need both a microphone and a system-audio
+track; when `[recordings]` (microphone, system_audio, backend) or the macOS
+version rule that out, a disabled first line says what is missing. With `[general] system_notifications`,
 `notifications.rs` also posts to Notification Center from `App::toast` /
 `toast_error` and from `on_done` when the quick-access panel takes the
 toast's place (direct `toast_show` feedback to panel and editor clicks does
@@ -336,6 +372,15 @@ when unbundled or switched off) only the in-app feedback shows. While not
 authorized, the 1 s tick re-reads the setting every 5 s without prompting.
 `--smoke-test` with the switch on only reads the setting and never prompts;
 with it off it does not touch the framework; test binaries are never bundles.
+A notice with a thumbnail (the toast's PNG, already downscaled to 112 px)
+carries it as a `UNNotificationAttachment`. The notification center moves an
+attachment's file into its own store, so `notifications::post` writes a
+throwaway copy into `$TMPDIR/bugle-notification-thumbnails/` and hands that
+over, and only once authorized. The shim removes the copy when the request
+completes, delivered or not (a no-op when the center moved it), or as soon as
+the attachment fails; `post` removes it when the shim skips the post. As a
+backstop each post sweeps copies older than 10 minutes, and every launch sweeps
+all of them, whatever the switch.
 
 The status-bar glyph is a signed distance field (`icon/glyph.rs`) that scales
 its stroke widths with the render size, so the same drawing serves the 36 px
@@ -459,10 +504,7 @@ earn its keep.
 * **Video editor extras** — an editing window on top of the headless `edit`
   pipeline (trim, zoom and pointer options with a preview).
 * **Audio mixing extras** — per-source levels and ducking work on the mixed
-  track; still open: levels for the two-track (unmixed) output, and setting
-  them from the menu-bar app instead of the config file.
-* **Window picker extras** — Space in the Scrolling Capture selection, and the
-  picker for `bugle capture` in a terminal (it needs a run loop of its own).
-* **Packaging extras** — the final bundle id; notification thumbnails
-  (an attachment needs a copy of the file, since the notification center
-  moves what it is given).
+  track and on the separate tracks, and are set from the menu-bar app; still
+  open: free-form levels and the ducking amount in the app (it offers presets
+  and an on/off toggle), and a live level meter while recording.
+* **Packaging extras** — the final bundle id.

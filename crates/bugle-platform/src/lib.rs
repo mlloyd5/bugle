@@ -32,7 +32,7 @@ pub use editor::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use bugle_core::audio_mix::{AudioMixConfig, Mixer};
+use bugle_core::audio_mix::{AudioMixConfig, Leveler, Mixer};
 use bugle_core::{BugleError, DisplayInfo, OcrLine, Point, Rect, WindowInfo};
 use image::RgbaImage;
 use std::ffi::{CStr, CString};
@@ -471,6 +471,28 @@ pub fn app_deactivate() {
     unsafe { ffi::bugle_app_deactivate() }
 }
 
+/// Prepare AppKit for a process that has no run loop of its own (the CLI):
+/// an accessory app (no Dock icon) that has finished launching. Idempotent.
+/// Main thread only; pair with [`run_loop_once`].
+pub fn app_bootstrap() {
+    unsafe { ffi::bugle_app_bootstrap() }
+}
+
+/// Handle AppKit events (and the main dispatch queue, and timers) for up to
+/// `slice`, returning after the first event or when it runs out. Lets a
+/// caller without `[NSApp run]` drive the non-blocking overlays such as
+/// [`window_pick_begin`] and [`select_rect_begin_ex`] while checking its own
+/// state in between. Main thread only, after [`app_bootstrap`].
+pub fn run_loop_once(slice: std::time::Duration) {
+    unsafe { ffi::bugle_run_loop_once(slice.as_secs_f64()) }
+}
+
+/// Whether the caller is on the process main thread, where AppKit overlays
+/// must run.
+pub fn is_main_thread() -> bool {
+    unsafe { ffi::bugle_is_main_thread() == 1 }
+}
+
 /// Whether a selection overlay is currently on screen.
 pub fn select_rect_active() -> bool {
     unsafe { ffi::bugle_select_rect_active() == 1 }
@@ -583,27 +605,53 @@ pub fn mix_audio_tracks(input: &Path, output: &Path) -> Result<bool> {
 /// the input has fewer than two audio tracks; `input` and `output` must be
 /// different files.
 pub fn mix_audio_tracks_with(input: &Path, output: &Path, levels: &AudioMixConfig) -> Result<bool> {
+    run_audio_pass(input, output, levels, false)
+}
+
+/// Apply `levels` to each audio track of `input`, keeping them separate:
+/// the same tracks, in the same order, re-encoded as AAC into `output`
+/// (`.mov` writes QuickTime, anything else MP4) through
+/// [`bugle_core::audio_mix::Leveler`]. Track 0 (system audio) is scaled by
+/// `system_audio_gain` and optionally ducked under track 1 (the microphone),
+/// which is scaled by `microphone_gain`; a gain of 1 leaves a track as
+/// recorded, and a track above 1 is peak-limited. Video is copied without
+/// re-encoding. Returns `false`, writing nothing, when the input has fewer
+/// than two audio tracks (one track cannot say which source it is); `input`
+/// and `output` must be different files.
+pub fn level_audio_tracks(input: &Path, output: &Path, levels: &AudioMixConfig) -> Result<bool> {
+    run_audio_pass(input, output, levels, true)
+}
+
+fn run_audio_pass(input: &Path, output: &Path, levels: &AudioMixConfig, separate: bool) -> Result<bool> {
+    let what = if separate { "leveling" } else { "mixing" };
     if same_file(input, output) {
-        return Err(BugleError::Invalid(format!("mixing {}: input and output are the same file", input.display())).into());
+        return Err(BugleError::Invalid(format!("{what} {}: input and output are the same file", input.display())).into());
     }
     levels.validate().map_err(BugleError::Invalid)?;
     let i = path_cstr(input)?;
     let o = path_cstr(output)?;
-    let mut state = MixState { levels: *levels, mixer: None };
+    let mut state = MixState { levels: *levels, separate, processor: None };
     let ctx = &mut state as *mut MixState as *mut libc::c_void;
-    match unsafe { ffi::bugle_mix_audio_tracks(i.as_ptr(), o.as_ptr(), mix_block, ctx) } {
+    match unsafe { ffi::bugle_mix_audio_tracks(i.as_ptr(), o.as_ptr(), separate as i32, mix_block, ctx) } {
         0 => Ok(true),
         1 => Ok(false),
         _ => bail!("{}", last_error()),
     }
 }
 
-/// What the shim's mix callback works on; the mixer is built on the first
+/// What the shim's callback works on; the processor is built on the first
 /// block, once the track count, channel count and sample rate (all set by
 /// the shim) are known.
 struct MixState {
     levels: AudioMixConfig,
-    mixer: Option<((usize, usize, i32), Mixer)>,
+    /// Keep the tracks apart ([`Leveler`]) instead of mixing them.
+    separate: bool,
+    processor: Option<((usize, usize, i32), Processor)>,
+}
+
+enum Processor {
+    Mix(Mixer),
+    Level(Leveler),
 }
 
 extern "C" fn mix_block(
@@ -613,6 +661,7 @@ extern "C" fn mix_block(
     channels: i32,
     sample_rate: i32,
     out: *mut f32,
+    n_out: i32,
     frames: i32,
 ) -> i32 {
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -621,21 +670,36 @@ extern "C" fn mix_block(
         }
         let (n, ch, len) = (n_tracks as usize, channels as usize, frames as usize * channels as usize);
         // SAFETY: the shim calls this from one thread at a time while
-        // `mix_audio_tracks_with` blocks with `state` alive; `tracks` holds
-        // `n` pointers to `len` floats each and `out` has room for `len`.
+        // `run_audio_pass` blocks with `state` alive; `tracks` holds `n`
+        // pointers to `len` floats each and `out` has room for `n_out` runs
+        // of `len`.
         let state = unsafe { &mut *(ctx as *mut MixState) };
+        let want_out = if state.separate { n } else { 1 };
+        if n_out as usize != want_out {
+            return false;
+        }
         let inputs: Vec<&[f32]> = unsafe { std::slice::from_raw_parts(tracks, n) }
             .iter()
             .map(|p| unsafe { std::slice::from_raw_parts(*p, len) })
             .collect();
-        let out = unsafe { std::slice::from_raw_parts_mut(out, len) };
-        let levels = state.levels;
+        let out = unsafe { std::slice::from_raw_parts_mut(out, len * want_out) };
+        let (levels, separate) = (state.levels, state.separate);
         let key = (n, ch, sample_rate);
-        let (_, mixer) = match &mut state.mixer {
-            Some((k, _)) if *k == key => state.mixer.as_mut().unwrap(),
-            _ => state.mixer.insert((key, Mixer::new(&levels, n, ch, sample_rate as f32))),
+        let (_, processor) = match &mut state.processor {
+            Some((k, _)) if *k == key => state.processor.as_mut().unwrap(),
+            _ => {
+                let p = if separate {
+                    Processor::Level(Leveler::new(&levels, n, ch, sample_rate as f32))
+                } else {
+                    Processor::Mix(Mixer::new(&levels, n, ch, sample_rate as f32))
+                };
+                state.processor.insert((key, p))
+            }
         };
-        mixer.process(&inputs, out);
+        match processor {
+            Processor::Mix(m) => m.process(&inputs, out),
+            Processor::Level(l) => l.process(&inputs, out),
+        }
         true
     }));
     match run {
@@ -1445,6 +1509,49 @@ mod tests {
         let e = mix_audio_tracks_with(&two, &bad, &AudioMixConfig { microphone_gain: -1.0, ..Default::default() }).unwrap_err();
         assert!(e.to_string().contains("microphone_gain"), "{e}");
         assert!(!bad.exists());
+    }
+
+    #[test]
+    fn leveling_keeps_the_tracks_separate_and_scales_each() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Track 0 (system audio) sounds in the first half, track 1 (mic) in
+        // the second.
+        let two = tmp.path().join("two.mp4");
+        write_tone_fixture(&two, &ToneFixture { tracks: 2, seconds: 2.0, video: true, ..Default::default() }).unwrap();
+        let levels = AudioMixConfig { system_audio_gain: 0.25, microphone_gain: 1.8, ..Default::default() };
+        let leveled = tmp.path().join("leveled.mp4");
+        assert!(level_audio_tracks(&two, &leveled, &levels).unwrap());
+        assert_eq!(audio_track_count(&leveled).unwrap(), 2);
+        assert_eq!(video_track_count(&leveled).unwrap(), 1);
+        let (d0, d1) = (media_duration(&two).unwrap(), media_duration(&leveled).unwrap());
+        assert!((d0 - d1).abs() < 0.05, "duration {d0} -> {d1}");
+        // The first track decodes on its own: system audio, scaled, still
+        // silent in the mic's half.
+        let (src0, out0) = (slice_rms(&decode(&two), 2), slice_rms(&decode(&leveled), 2));
+        assert!((out0[0] / src0[0] - 0.25).abs() < 0.03, "system ratio ({out0:?} vs {src0:?})");
+        assert!(out0[1] < 0.01, "track 0 picked up the mic: {out0:?}");
+        // Mixing both files at default levels shows the second track too.
+        let (m_src, m_out) = (tmp.path().join("m_src.mp4"), tmp.path().join("m_out.mp4"));
+        assert!(mix_audio_tracks(&two, &m_src).unwrap());
+        assert!(mix_audio_tracks(&leveled, &m_out).unwrap());
+        let (a, b) = (slice_rms(&decode(&m_src), 2), slice_rms(&decode(&m_out), 2));
+        assert!((b[1] / a[1] - 1.8).abs() < 0.1, "mic ratio ({b:?} vs {a:?})");
+        // The video samples are copied.
+        assert_eq!(video_frame(&two, 0.5).unwrap(), video_frame(&leveled, 0.5).unwrap());
+        // A .mov output is QuickTime.
+        let mov = tmp.path().join("leveled.mov");
+        assert!(level_audio_tracks(&two, &mov, &levels).unwrap());
+        assert_eq!(&std::fs::read(&mov).unwrap()[4..12], b"ftypqt  ");
+        assert_eq!(audio_track_count(&mov).unwrap(), 2);
+        // One track: nothing to level, nothing written.
+        let one = tmp.path().join("one.mp4");
+        write_tone_fixture(&one, &ToneFixture { tracks: 1, ..Default::default() }).unwrap();
+        let none = tmp.path().join("none.mp4");
+        assert!(!level_audio_tracks(&one, &none, &levels).unwrap());
+        assert!(!none.exists());
+        // Out-of-range levels are refused.
+        let bad = AudioMixConfig { system_audio_gain: 9.0, ..Default::default() };
+        assert!(level_audio_tracks(&two, &tmp.path().join("bad.mp4"), &bad).is_err());
     }
 
     #[test]

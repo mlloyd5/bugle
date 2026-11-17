@@ -6,6 +6,7 @@
 //! so the menu stays responsive, and the worker asks the main thread to show
 //! the selection overlay or pin windows through [`UiHost`].
 
+mod audio_menu;
 mod commands;
 mod editor_window;
 mod icon;
@@ -186,7 +187,15 @@ fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<N
             capture(engine, CaptureTarget::Screen { display: None })
         }
         Action::ScrollCapture => {
-            let Some(rect) = engine.select_area()? else { return Ok(None) };
+            let rect = if engine.config.screenshots.window_picker {
+                // Space switches to the window picker; a picked window
+                // scrolls its on-screen part, unless another window covers it.
+                let Some(picked) = picker::pick(proxy, picker::Mode::Area, true, picker::PICK_TIMEOUT)? else { return Ok(None) };
+                picker::scroll_rect(&picked)?
+            } else {
+                let Some(rect) = engine.select_area()? else { return Ok(None) };
+                rect
+            };
             let req = ScrollCaptureRequest {
                 rect,
                 max_frames: 40,
@@ -226,6 +235,7 @@ fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<N
                 microphone: false,
                 system_audio: engine.config.recordings.system_audio,
                 mix_audio: false,
+                // The engine's levels (the Audio Levels menu's) apply.
                 mix: Default::default(),
                 max_seconds: None,
                 highlight_clicks: false,
@@ -408,6 +418,7 @@ struct MenuItems {
     recent: Submenu,
     api: MenuItem,
     login: Option<login::LoginMenu>,
+    audio: audio_menu::AudioMenu,
 }
 
 /// Build the status menu from [`commands::MENU`]. `keys` maps entry names to
@@ -416,6 +427,10 @@ fn build_menu(config: &Config, keys: &HashMap<&'static str, String>) -> Result<M
     let menu = Menu::new();
     let recent = Submenu::with_id("recent", "Recent Captures", true);
     let login = login::LoginMenu::new();
+    let audio = audio_menu::AudioMenu::new(
+        config.recordings.mix,
+        audio_menu::requirement(&config.recordings, bugle_platform::sck_record_available()),
+    )?;
     let mut by_name: HashMap<&'static str, MenuItem> = HashMap::new();
     for slot in commands::MENU {
         match slot {
@@ -426,6 +441,7 @@ fn build_menu(config: &Config, keys: &HashMap<&'static str, String>) -> Result<M
                     menu.append(&l.item)?;
                 }
             }
+            Slot::AudioLevels => menu.append(&audio.submenu)?,
             Slot::Item(e) => {
                 let key = keys.get(e.name).map(String::as_str).or(e.menu_key);
                 let item = MenuItem::with_id(e.name, e.label, true, key.and_then(|k| k.parse::<Accelerator>().ok()));
@@ -444,6 +460,7 @@ fn build_menu(config: &Config, keys: &HashMap<&'static str, String>) -> Result<M
         menu,
         recent,
         login,
+        audio,
     };
     take("sync_latest")?.set_enabled(config.sync.has_destination());
     items.stop.set_enabled(false);
@@ -480,13 +497,13 @@ impl App {
 
     fn toast(&self, n: &Notice) {
         bugle_platform::toast_show(n.thumb.as_deref(), &n.title, &n.subtitle, n.open.as_deref(), 3.0);
-        notifications::post(&n.title, &n.subtitle, n.open.as_deref());
+        notifications::post(&n.title, &n.subtitle, n.open.as_deref(), n.thumb.as_deref());
     }
 
     fn toast_error(&self, msg: &str) {
         tracing::warn!("{msg}");
         bugle_platform::toast_show(None, "Bugle", msg, None, 5.0);
-        notifications::post("Bugle", msg, None);
+        notifications::post("Bugle", msg, None, None);
     }
 
     fn dispatch(&mut self, mut action: Action) {
@@ -517,6 +534,13 @@ impl App {
         }
         if id == login::MENU_ID {
             return self.toggle_login();
+        }
+        if let Some(change) = self.items.audio.handle(id) {
+            self.engine.set_recording_levels(self.items.audio.levels());
+            if let Err(e) = audio_menu::persist(&self.config_path, change) {
+                self.toast_error(&format!("Audio Levels: the change applies until Bugle quits but was not saved: {e:#}"));
+            }
+            return;
         }
         match commands::find(id) {
             Some(e) => self.run_command(e.command, control_flow),
@@ -579,7 +603,9 @@ impl App {
     fn on_done(&mut self, action: Action, result: Result<Option<Notice>, String>) {
         self.busy = false;
         match result {
-            Ok(Some(n)) if self.quick_show(action, &n) => notifications::post(&n.title, &n.subtitle, n.open.as_deref()),
+            Ok(Some(n)) if self.quick_show(action, &n) => {
+                notifications::post(&n.title, &n.subtitle, n.open.as_deref(), n.thumb.as_deref())
+            }
             Ok(Some(n)) => self.toast(&n),
             Ok(None) => {}
             Err(e) => self.toast_error(&format!("{action:?}: {e}")),

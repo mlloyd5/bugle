@@ -1,6 +1,8 @@
-//! Levels for the mixed audio track: per-source gain, optional ducking of
-//! system audio under the microphone, and a peak limiter that keeps the sum
-//! below full scale.
+//! Audio levels for recordings: per-source gain, optional ducking of system
+//! audio under the microphone, and a peak limiter that keeps the result
+//! below full scale. [`Mixer`] folds the sources into one track;
+//! [`Leveler`] applies the same levels to each source's own track when they
+//! are kept separate.
 //!
 //! The math is plain sample processing on interleaved `f32` buffers, so it is
 //! tested here on synthetic signals; the platform crate feeds it the decoded
@@ -25,11 +27,11 @@ const DETECT_RELEASE_MS: f32 = 60.0;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioMixConfig {
-    /// Microphone level in the mixed track: a linear factor on its default
-    /// share of the mix (`1/n` of `n` sources), so 1.0 = the default share.
+    /// Microphone level: in the mixed track a linear factor on its default
+    /// share of the mix (`1/n` of `n` sources), on its own track a factor on
+    /// the track as recorded; 1.0 = unchanged.
     pub microphone_gain: f32,
-    /// System-audio level in the mixed track: a linear factor on its default
-    /// share of the mix (`1/n` of `n` sources), so 1.0 = the default share.
+    /// System-audio level, on the same terms as `microphone_gain`.
     pub system_audio_gain: f32,
     /// Lower system audio while the microphone is active.
     pub ducking: bool,
@@ -84,6 +86,13 @@ impl AudioMixOverrides {
 }
 
 impl AudioMixConfig {
+    /// Whether these levels change the sources as recorded: a gain other
+    /// than 1, or ducking with an audible microphone. Separate tracks are
+    /// re-encoded only then.
+    pub fn changes_tracks(&self) -> bool {
+        self.microphone_gain != 1.0 || self.system_audio_gain != 1.0 || (self.ducking && self.microphone_gain > 0.0)
+    }
+
     /// These settings with `o` applied on top.
     pub fn with(mut self, o: &AudioMixOverrides) -> Self {
         if let Some(g) = o.microphone_gain {
@@ -273,6 +282,68 @@ impl Mixer {
     }
 }
 
+/// Applies the levels to each source's own track, for recordings whose
+/// audio stays in separate tracks. Same track order as [`Mixer`] (track 0
+/// system audio, track 1 the microphone, further tracks at unity), but
+/// without the `1/n` share: a gain of 1 leaves a track as recorded. System
+/// audio is ducked under the microphone as in the mix (keyed on the mic as
+/// recorded, off while `microphone_gain` is 0), and a track whose gain is
+/// above 1 gets its own peak limiter.
+#[derive(Debug, Clone)]
+pub struct Leveler {
+    channels: usize,
+    gains: Vec<f32>,
+    ducker: Option<Ducker>,
+    limiters: Vec<Option<Limiter>>,
+}
+
+impl Leveler {
+    pub fn new(cfg: &AudioMixConfig, tracks: usize, channels: usize, sample_rate: f32) -> Self {
+        let gains: Vec<f32> = (0..tracks)
+            .map(|i| match i {
+                SYSTEM_TRACK => cfg.system_audio_gain,
+                MIC_TRACK => cfg.microphone_gain,
+                _ => 1.0,
+            })
+            .collect();
+        let ducker = (cfg.ducking && tracks > MIC_TRACK && cfg.microphone_gain > 0.0).then(|| Ducker::new(cfg, sample_rate));
+        let limiters = gains.iter().map(|g| (*g > 1.0).then(|| Limiter::new(LIMIT_CEILING, sample_rate))).collect();
+        Self { channels: channels.max(1), gains, ducker, limiters }
+    }
+
+    /// Level `inputs` (one interleaved buffer per track, all of the same
+    /// length `len`) into `out`, which holds one run of `len` samples per
+    /// track, in track order. State carries over between calls, so tracks
+    /// may be fed in blocks of any size.
+    pub fn process(&mut self, inputs: &[&[f32]], out: &mut [f32]) {
+        let ch = self.channels;
+        let len = inputs.first().map_or(0, |i| i.len());
+        for f in 0..len / ch {
+            let at = f * ch;
+            let duck = match (&mut self.ducker, inputs.get(MIC_TRACK)) {
+                (Some(d), Some(mic)) => {
+                    let key = mic[at..at + ch].iter().fold(0.0f32, |m, s| m.max(clean(*s).abs()));
+                    d.next(key)
+                }
+                _ => 1.0,
+            };
+            for (t, input) in inputs.iter().enumerate() {
+                let Some(frame) = out.get_mut(t * len + at..t * len + at + ch) else { break };
+                let mut g = self.gains.get(t).copied().unwrap_or(1.0);
+                if t == SYSTEM_TRACK {
+                    g *= duck;
+                }
+                for (c, o) in frame.iter_mut().enumerate() {
+                    *o = g * clean(input[at + c]);
+                }
+                if let Some(Some(l)) = self.limiters.get_mut(t) {
+                    l.apply(frame);
+                }
+            }
+        }
+    }
+}
+
 /// Treat NaN and infinities as silence.
 fn clean(s: f32) -> f32 {
     if s.is_finite() {
@@ -364,6 +435,68 @@ mod tests {
         // Zero gain mutes the source.
         let muted = mix(&AudioMixConfig { system_audio_gain: 0.0, ..Default::default() }, &[&sys, &zero]);
         assert_eq!(peak(&muted), 0.0);
+    }
+
+    fn level(cfg: &AudioMixConfig, inputs: &[&[f32]]) -> Vec<Vec<f32>> {
+        let len = inputs[0].len();
+        let mut out = vec![0.0; len * inputs.len()];
+        Leveler::new(cfg, inputs.len(), 2, SR).process(inputs, &mut out);
+        out.chunks(len).map(<[f32]>::to_vec).collect()
+    }
+
+    #[test]
+    fn changes_tracks_only_for_audible_changes() {
+        assert!(!AudioMixConfig::default().changes_tracks());
+        assert!(AudioMixConfig { microphone_gain: 0.5, ..Default::default() }.changes_tracks());
+        assert!(AudioMixConfig { system_audio_gain: 2.0, ..Default::default() }.changes_tracks());
+        assert!(AudioMixConfig { ducking: true, ..Default::default() }.changes_tracks());
+        // Ducking under a muted mic does nothing, but the mute itself does.
+        assert!(AudioMixConfig { ducking: true, microphone_gain: 0.0, ..Default::default() }.changes_tracks());
+        assert!(!AudioMixConfig { ducking_amount_db: 30.0, ..Default::default() }.changes_tracks());
+    }
+
+    #[test]
+    fn leveler_scales_each_track_on_its_own() {
+        let sys = sine(440.0, 0.4, 0.2);
+        let mic = sine(660.0, 0.4, 0.2);
+        // Unity: the tracks come out as they went in.
+        let out = level(&AudioMixConfig::default(), &[&sys, &mic]);
+        assert_eq!(out, [sys.clone(), mic.clone()]);
+        let cfg = AudioMixConfig { system_audio_gain: 0.25, microphone_gain: 2.0, ..Default::default() };
+        let out = level(&cfg, &[&sys, &mic]);
+        for (o, s) in out[0].iter().zip(&sys) {
+            assert!((o - 0.25 * s).abs() < 1e-6);
+        }
+        for (o, m) in out[1].iter().zip(&mic) {
+            assert!((o - 2.0 * m).abs() < 1e-6);
+        }
+        // A third track is passed through.
+        let extra = sine(330.0, 0.3, 0.2);
+        let out = level(&cfg, &[&sys, &mic, &extra]);
+        assert_eq!(out[2], extra);
+    }
+
+    #[test]
+    fn leveler_ducks_system_audio_and_limits_loud_tracks() {
+        let sys = sine(220.0, 0.5, 0.5);
+        let mic = sine(1000.0, 0.5, 0.5);
+        let cfg = AudioMixConfig { ducking: true, ducking_amount_db: 12.0, ..Default::default() };
+        let out = level(&cfg, &[&sys, &mic]);
+        // Once the attack settles system audio sits 12 dB down; the mic is
+        // untouched.
+        let tail = sys.len() / 2;
+        let ratio = rms(&out[0][tail..]) / rms(&sys[tail..]);
+        assert!((ratio - db_to_linear(-12.0)).abs() < 0.01, "ducked ratio {ratio}");
+        assert_eq!(out[1], mic);
+        // A muted mic does not duck.
+        let out = level(&AudioMixConfig { microphone_gain: 0.0, ..cfg }, &[&sys, &mic]);
+        assert_eq!(out[0], sys);
+        assert_eq!(peak(&out[1]), 0.0);
+        // A full-scale track at 4x is limited on its own, not clipped.
+        let loud = sine(440.0, 1.0, 0.5);
+        let out = level(&AudioMixConfig { microphone_gain: 4.0, ..Default::default() }, &[&sys, &loud]);
+        assert!(peak(&out[1]) <= LIMIT_CEILING + 1e-6 && peak(&out[1]) > 0.9 * LIMIT_CEILING);
+        assert_eq!(out[0], sys, "the other track is not limited");
     }
 
     #[test]

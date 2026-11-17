@@ -12,6 +12,7 @@ pub type bugle_mix_fn =
         channels: i32,
         sample_rate: i32,
         out: *mut f32,
+        n_out: i32,
         frames: i32,
     ) -> i32;
 
@@ -134,6 +135,9 @@ extern "C" {
     pub fn bugle_select_rect_cancel();
     pub fn bugle_select_rect_switch();
     pub fn bugle_app_deactivate();
+    pub fn bugle_app_bootstrap();
+    pub fn bugle_run_loop_once(seconds: f64);
+    pub fn bugle_is_main_thread() -> i32;
     pub fn bugle_pin_image_show(png: *const u8, len: size_t, x: f64, y: f64, w: f64, h: f64, opacity: f64) -> i32;
     pub fn bugle_toast_show(
         png: *const u8,
@@ -151,6 +155,7 @@ extern "C" {
     pub fn bugle_mix_audio_tracks(
         in_path: *const c_char,
         out_path: *const c_char,
+        separate: i32,
         process: bugle_mix_fn,
         ctx: *mut c_void,
     ) -> i32;
