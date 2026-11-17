@@ -530,9 +530,13 @@ leaves the recording alone and
 shows the quick-access panel for the new file; the window stays open with
 your settings if the export fails. A recording without an event track can be
 trimmed and exported, with the zoom and pointer options greyed out. One video
-editor is open at a time. A GIF's frames are decoded once when it opens (scaled
-to the preview, and further if they would take over 256 MB), so seeking is
-instant; *Original* exports a GIF again.
+editor is open at a time. A GIF opens at once (its timeline is read from the
+frame headers); its frames are then decoded once in the background, scaled to
+the preview, so seeking is instant. The preview frames are kept within 256 MB:
+past that they are scaled down to no less than 640 px on the long edge, and
+beyond that only every second (third, ...) frame is shown while scrubbing a
+very long GIF. The export always uses every frame. *Original* exports a GIF
+again.
 Quit waits for a running export: it is refused until the export finishes.
 `bugle-app --smoke-test` opens it on a synthetic recording and drives it with
 synthetic events (exporting with `BUGLE_SMOKE_SAVE`).

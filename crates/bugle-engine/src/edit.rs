@@ -417,17 +417,25 @@ pub fn resolve_segments(
     duration: f64,
 ) -> std::result::Result<Vec<(f64, f64)>, BugleError> {
     let (s, e) = resolve_range(start, end, duration)?;
-    let abs = |v: f64| (if v < 0.0 { duration + v } else { v }).clamp(0.0, duration);
+    let abs = |v: f64| if v < 0.0 { duration + v } else { v };
     let mut removed = Vec::with_capacity(cuts.len());
     for c in cuts {
         if !c.start.is_finite() || !c.end.is_finite() {
             return Err(BugleError::Invalid("cut times must be finite numbers".into()));
         }
+        // Empty is judged before clamping, on the cut as given, so a cut
+        // wholly outside the source is a no-op rather than "empty".
         let (a, b) = (abs(c.start), abs(c.end));
         if b <= a {
-            return Err(BugleError::Invalid(format!("the cut {a:.2}s..{b:.2}s is empty (its start must be before its end)")));
+            return Err(BugleError::Invalid(format!(
+                "the cut {:.2}s..{:.2}s is empty (its start must be before its end)",
+                c.start, c.end
+            )));
         }
-        removed.push((a, b));
+        let (a, b) = (a.clamp(0.0, duration), b.clamp(0.0, duration));
+        if b > a {
+            removed.push((a, b));
+        }
     }
     removed.sort_by(|x, y| x.0.total_cmp(&y.0));
     let mut kept = Vec::new();
@@ -450,6 +458,26 @@ pub fn resolve_segments(
     }
     Ok(kept)
 }
+
+/// The parts an edit kept, for its history entry: each part up to
+/// [`LISTED_SEGMENTS`], else the outer range, the number of cuts and the
+/// length kept.
+fn describe_segments(segments: &[(f64, f64)]) -> String {
+    let span = |(a, b): &(f64, f64)| format!("{a:.2}s–{b:.2}s");
+    match segments {
+        [first, .., last] if segments.len() > LISTED_SEGMENTS => format!(
+            "{:.2}s–{:.2}s less {} cuts (kept {:.2}s)",
+            first.0,
+            last.1,
+            segments.len() - 1,
+            segments_total(segments)
+        ),
+        _ => segments.iter().map(span).collect::<Vec<_>>().join(" + "),
+    }
+}
+
+/// Kept parts listed one by one in a history entry; more are summarised.
+const LISTED_SEGMENTS: usize = 4;
 
 /// Length of the parts kept, in seconds.
 pub fn segments_total(segments: &[(f64, f64)]) -> f64 {
@@ -620,7 +648,11 @@ fn sample_times(start: f64, end: f64, fps: u32) -> Vec<(f64, f64)> {
 /// 100 ms, so the timeline does too.
 fn gif_delay_seconds(d: Delay) -> f64 {
     let (n, den) = d.numer_denom_ms();
-    let ms = n as f64 / den.max(1) as f64;
+    gif_ms_seconds(n as f64 / den.max(1) as f64)
+}
+
+/// [`gif_delay_seconds`] for a delay of `ms` milliseconds.
+fn gif_ms_seconds(ms: f64) -> f64 {
     if ms <= 10.0 {
         0.1
     } else {
@@ -656,7 +688,8 @@ fn for_each_gif_frame(path: &Path, mut visit: impl FnMut(RgbaImage, f64, f64) ->
     Ok(())
 }
 
-/// A GIF's timeline, from a streaming pass that keeps no frames.
+/// A GIF's timeline, from its frame headers alone: the pixels are neither
+/// decompressed nor composited, so this is cheap enough for the main thread.
 #[derive(Debug, Clone, Copy)]
 struct GifMeta {
     frames: usize,
@@ -667,13 +700,18 @@ struct GifMeta {
 
 impl GifMeta {
     fn read(path: &Path) -> Result<Self> {
+        // The canvas, checked against the limits a decode would apply.
         let (width, height) = gif_decoder(path)?.dimensions();
+        let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let mut opts = gif::DecodeOptions::new();
+        opts.skip_frame_decoding(true);
+        let mut decoder = opts.read_info(std::io::BufReader::new(file)).with_context(|| format!("decoding {}", path.display()))?;
         let mut m = GifMeta { frames: 0, duration: 0.0, width, height };
-        for_each_gif_frame(path, |_, _, d| {
+        while let Some(f) = decoder.next_frame_info().with_context(|| format!("decoding {}", path.display()))? {
+            // Delays are in hundredths of a second, as the decoder reads them.
             m.frames += 1;
-            m.duration += d;
-            Ok(true)
-        })?;
+            m.duration += gif_ms_seconds(f.delay as f64 * 10.0);
+        }
         if m.frames == 0 {
             return Err(BugleError::Invalid(format!("{} has no frames", path.display())).into());
         }
@@ -901,8 +939,9 @@ impl EditSource {
     }
 
     /// A frame reader for previews, decoding frames scaled to fit `max`
-    /// pixels. A GIF is decoded whole here (one streaming pass), its frames
-    /// scaled down further when needed to stay within [`GIF_PREVIEW_BUDGET`].
+    /// pixels. A GIF is decoded whole here (one streaming pass; call this off
+    /// the main thread), within [`GIF_PREVIEW_BUDGET`]: see
+    /// [`gif_preview_frames`].
     pub fn preview_frames(&self, max: (u32, u32)) -> Result<PreviewFrames> {
         if self.gif {
             return Ok(PreviewFrames::Gif(gif_preview_frames(&self.item.path, max, self.info.stored_samples.unwrap_or(1))?));
@@ -916,18 +955,33 @@ impl EditSource {
 /// Bytes a GIF's decoded preview frames may take together.
 pub const GIF_PREVIEW_BUDGET: u64 = 256 << 20;
 
-/// Every frame of a GIF with its start time, scaled to fit `max` and,
-/// across `frames` frames, [`GIF_PREVIEW_BUDGET`].
+/// A GIF's preview frames are not scaled below this long edge (pixels) to
+/// fit [`GIF_PREVIEW_BUDGET`]; frames are thinned out instead.
+pub const GIF_PREVIEW_MIN_SIDE: u32 = 640;
+
+/// The frames of a GIF with their start times, scaled to fit `max`, kept
+/// within [`GIF_PREVIEW_BUDGET`] across its `frames` frames: first by
+/// scaling down to a long edge of [`GIF_PREVIEW_MIN_SIDE`], then by keeping
+/// only every n-th frame (the preview holds the last kept frame until the
+/// next one). Exports always read every frame of the file.
 fn gif_preview_frames(path: &Path, max: (u32, u32), frames: u64) -> Result<Vec<(f64, RgbaImage)>> {
     let (w, h) = gif_decoder(path)?.dimensions();
     let (w, h) = (w.max(1) as f64, h.max(1) as f64);
-    let budget_px = (GIF_PREVIEW_BUDGET / 4 / frames.max(1)) as f64;
-    let scale = (max.0 as f64 / w).min(max.1 as f64 / h).min((budget_px / (w * h)).sqrt()).min(1.0);
+    let fit = (max.0 as f64 / w).min(max.1 as f64 / h).min(1.0);
+    let budget = (GIF_PREVIEW_BUDGET / 4 / frames.max(1)) as f64 / (w * h);
+    let floor = GIF_PREVIEW_MIN_SIDE as f64 / w.max(h);
+    let scale = fit.min(budget.sqrt().max(floor));
     let size = (((w * scale).round() as u32).max(1), ((h * scale).round() as u32).max(1));
+    let per_frame = size.0 as u64 * size.1 as u64 * 4;
+    let every = frames.max(1).div_ceil((GIF_PREVIEW_BUDGET / per_frame).max(1)) as usize;
     let mut out = Vec::new();
+    let mut i = 0;
     for_each_gif_frame(path, |img, t, _| {
-        let img = if img.dimensions() == size { img } else { image::imageops::resize(&img, size.0, size.1, image::imageops::FilterType::Triangle) };
-        out.push((t, img));
+        i += 1;
+        if (i - 1) % every == 0 {
+            let img = if img.dimensions() == size { img } else { image::imageops::resize(&img, size.0, size.1, image::imageops::FilterType::Triangle) };
+            out.push((t, img));
+        }
         Ok(true)
     })?;
     if out.is_empty() {
@@ -1157,8 +1211,7 @@ impl Engine {
         m.height = Some(h);
         m.duration_seconds = Some(duration);
         m.label = req.label.clone();
-        let span = |(a, b): &(f64, f64)| format!("{a:.2}s–{b:.2}s");
-        let mut what = format!("{}, preset {}", range.iter().map(span).collect::<Vec<_>>().join(" + "), req.preset);
+        let mut what = format!("{}, preset {}", describe_segments(&range), req.preset);
         if let Some(z) = req.zoom {
             what.push_str(&format!(", zoom {z}x on clicks"));
         }
@@ -1336,6 +1389,11 @@ mod tests {
             vec![(2.0, 4.0), (6.0, 7.0)]
         );
         assert_eq!(segs(Some(2.0), Some(8.0), &[cut(0.0, 1.0), cut(9.0, 10.0)]).unwrap(), vec![(2.0, 8.0)], "outside: no effect");
+        // Wholly past the end of the source: a no-op, not "empty".
+        assert_eq!(segs(None, None, &[cut(12.0, 14.0)]).unwrap(), vec![(0.0, 10.0)]);
+        assert_eq!(segs(None, None, &[cut(-15.0, -12.0), cut(9.0, 30.0)]).unwrap(), vec![(0.0, 9.0)]);
+        let err = segs(None, None, &[cut(14.0, 12.0)]).unwrap_err().to_string();
+        assert!(err.contains("14.00s..12.00s"), "the cut as given: {err}");
         // A sliver between two cuts is dropped.
         assert_eq!(segs(None, None, &[cut(1.0, 5.0), cut(5.005, 6.0)]).unwrap(), vec![(0.0, 1.0), (6.0, 10.0)]);
         for bad in [vec![cut(3.0, 3.0)], vec![cut(4.0, 2.0)], vec![cut(f64::NAN, 1.0)], vec![cut(0.0, 10.0)], vec![cut(-1.0, 20.0), cut(0.0, 9.5)]] {
@@ -1343,6 +1401,9 @@ mod tests {
         }
         assert!(segs(Some(2.0), Some(4.0), &[cut(1.0, 3.99)]).is_err(), "less than a minimum clip left");
         assert_eq!(segments_total(&[(0.0, 2.0), (3.0, 3.5)]), 2.5);
+        assert_eq!(describe_segments(&[(0.0, 2.0), (3.0, 3.5)]), "0.00s–2.00s + 3.00s–3.50s");
+        let many: Vec<(f64, f64)> = (0..6).map(|i| (i as f64, i as f64 + 0.5)).collect();
+        assert_eq!(describe_segments(&many), "0.00s–5.50s less 5 cuts (kept 3.00s)");
     }
 
     #[test]
@@ -1680,6 +1741,47 @@ mod tests {
         }
         assert_eq!(bugle_platform::video_info(&out).unwrap().stored_samples, Some(13));
 
+        // The same cuts, lossless: copied through the composition, the same
+        // frames on show, the footage back to each part's keyframe kept
+        // hidden in the file.
+        let out = dir.path().join("two-cuts-lossless.mp4");
+        let req = EditRequest {
+            source: path_str(&src),
+            start: Some(0.2),
+            cuts: vec![cut(0.5, 1.5), cut(2.0, 2.5)],
+            preset: ExportPreset::Lossless,
+            output: Some(path_str(&out)),
+            ..Default::default()
+        };
+        let m = engine.edit(&req).unwrap();
+        assert!((m.duration_seconds.unwrap() - 1.3).abs() < 0.05, "{:?}", m.duration_seconds);
+        let mut r = VideoFrameReader::open(&out, 0.0).unwrap();
+        for (t, c) in [(0.15, RED), (0.55, GREEN), (1.05, BLUE)] {
+            assert!(near(r.frame_at(t).unwrap().get_pixel(80, 60), c), "at {t}");
+        }
+        let stored = bugle_platform::video_info(&out).unwrap().stored_samples.unwrap();
+        assert!(stored > 13, "hidden footage before the parts: {stored}");
+
+        // The same cuts re-encoded at a set rate: 5 fps over the 1.3 s kept.
+        let out = dir.path().join("two-cuts-5fps.mp4");
+        let req = EditRequest {
+            source: path_str(&src),
+            start: Some(0.2),
+            cuts: vec![cut(0.5, 1.5), cut(2.0, 2.5)],
+            preset: ExportPreset::High,
+            fps: Some(5),
+            output: Some(path_str(&out)),
+            ..Default::default()
+        };
+        let m = engine.edit(&req).unwrap();
+        assert!((m.duration_seconds.unwrap() - 1.3).abs() < 0.1, "{:?}", m.duration_seconds);
+        let mut r = VideoFrameReader::open(&out, 0.0).unwrap();
+        for (t, c) in [(0.1, RED), (0.7, GREEN), (1.2, BLUE)] {
+            assert!(near(r.frame_at(t).unwrap().get_pixel(80, 60), c), "at {t}");
+        }
+        let stored = bugle_platform::video_info(&out).unwrap().stored_samples.unwrap();
+        assert!((6..=8).contains(&stored), "{stored}");
+
         // To GIF: the cut parts are left out of the timeline.
         let gif = dir.path().join("cuts.gif");
         let req = EditRequest {
@@ -1732,6 +1834,27 @@ mod tests {
         assert!((t.duration - 1.5).abs() < 1e-9);
         let clicks: Vec<f64> = t.clicks().map(|c| (c.0 * 1000.0).round() / 1000.0).collect();
         assert_eq!(clicks, vec![1.0]);
+
+        // Three audio tracks, two starting late: all kept, at the spliced
+        // length, whether copied, re-encoded or copied losslessly.
+        let multi = dir.path().join("multi.mp4");
+        let fixture = bugle_platform::ToneFixture { tracks: 3, seconds: 2.0, delay: 0.3, video: true, ..Default::default() };
+        bugle_platform::write_tone_fixture(&multi, &fixture).unwrap();
+        for preset in [ExportPreset::Original, ExportPreset::High, ExportPreset::Lossless] {
+            let out = dir.path().join(format!("multi-{preset}.mp4"));
+            let req = EditRequest {
+                source: path_str(&multi),
+                cuts: vec![cut(0.2, 0.6), cut(1.0, 1.4)],
+                preset,
+                output: Some(path_str(&out)),
+                ..Default::default()
+            };
+            let m = engine.edit(&req).unwrap();
+            assert!((m.duration_seconds.unwrap() - 1.2).abs() < 0.1, "{preset}: {:?}", m.duration_seconds);
+            assert_eq!(bugle_platform::audio_track_count(&out).unwrap(), 3, "{preset}");
+            let d = bugle_platform::media_duration(&out).unwrap();
+            assert!((d - 1.2).abs() < 0.15, "{preset}: {d}");
+        }
     }
 
     #[test]
@@ -2055,18 +2178,35 @@ mod tests {
     #[test]
     fn gif_previews_fit_the_memory_budget() {
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("big.gif");
-        let mut sink = create_gif_sink(&p).unwrap();
-        for i in 0..3 {
-            sink.push(solid(400, 300, [RED, GREEN, BLUE][i]), 0.1).unwrap();
-        }
-        sink.finish().unwrap();
-        // As if the GIF had so many frames that each may only take 1/4 of its pixels.
-        let frames = GIF_PREVIEW_BUDGET / (400 * 300);
-        let f = gif_preview_frames(&p, (4000, 4000), frames).unwrap();
-        assert_eq!(f.len(), 3);
-        assert_eq!(f[0].1.dimensions(), (200, 150));
-        assert!((f[2].0 - 0.2).abs() < 1e-9);
+        let gif = |name: &str, w, h| {
+            let p = dir.path().join(name);
+            let mut sink = create_gif_sink(&p).unwrap();
+            for c in [RED, GREEN, BLUE] {
+                sink.push(solid(w, h, c), 0.1).unwrap();
+            }
+            sink.finish().unwrap();
+            p
+        };
+        let starts = |f: &[(f64, RgbaImage)]| f.iter().map(|(t, _)| (t * 10.0).round() as u32).collect::<Vec<_>>();
+        let wide = gif("wide.gif", 1280, 800);
+        // As if the GIF had so many frames that each may only take 1/4 of
+        // its pixels: scaled to half, every frame kept.
+        let f = gif_preview_frames(&wide, (4000, 4000), GIF_PREVIEW_BUDGET / (1280 * 800)).unwrap();
+        assert_eq!(f[0].1.dimensions(), (640, 400));
+        assert_eq!(starts(&f), vec![0, 1, 2]);
+        // Twice as many: not scaled below the floor, every second frame kept.
+        let f = gif_preview_frames(&wide, (4000, 4000), 2 * GIF_PREVIEW_BUDGET / (1280 * 800)).unwrap();
+        assert_eq!(f[0].1.dimensions(), (GIF_PREVIEW_MIN_SIDE, 400));
+        assert_eq!(starts(&f), vec![0, 2], "every second frame");
+        // A canvas under the floor is never scaled for the budget.
+        let small = gif("small.gif", 400, 300);
+        let f = gif_preview_frames(&small, (4000, 4000), GIF_PREVIEW_BUDGET / (400 * 300)).unwrap();
+        assert_eq!(f[0].1.dimensions(), (400, 300));
+        assert_eq!(starts(&f), vec![0], "every fourth frame");
+        // The timeline itself comes from the frame headers.
+        let m = GifMeta::read(&wide).unwrap();
+        assert_eq!((m.frames, m.width, m.height), (3, 1280, 800));
+        assert!((m.duration - 0.3).abs() < 1e-9);
     }
 
     #[test]

@@ -292,14 +292,18 @@ impl VideoEditor {
                 VideoEditorCommand::PlayPause => {
                     // From the in point when the playhead is outside the
                     // clip or at its end; never inside a cut.
-                    if self.playhead < self.in_t || self.playhead >= self.out_t - self.step / 2.0 {
-                        self.playhead = self.in_t;
+                    let start = if self.playhead < self.in_t || self.playhead >= self.out_t - self.step / 2.0 {
+                        self.in_t
+                    } else {
+                        self.playhead
+                    };
+                    let from = self.skip_cuts(start);
+                    if from >= self.out_t - self.step / 2.0 {
+                        // The rest of the clip is cut: nothing to play, and
+                        // the playhead stays with the frame on show.
+                        return Effects::default();
                     }
-                    self.playhead = self.skip_cuts(self.playhead);
-                    if self.playhead >= self.out_t - self.step / 2.0 {
-                        // The rest of the clip is cut: nothing to play.
-                        return state;
-                    }
+                    self.playhead = from;
                     self.playing = Some(Play { origin_t: self.playhead, origin_at: now });
                     Effects { state: true, frame: Some(self.frame_now(now)), export: None }
                 }
@@ -737,6 +741,7 @@ mod tests {
         e.handle(E::Seek(5.0), t0);
         let fx = e.handle(E::Command(C::PlayPause), t0);
         assert!(!e.is_playing() && fx.frame.is_none());
+        assert_eq!(e.state().playhead, 5.0, "the playhead stays with the preview");
     }
 
     #[test]

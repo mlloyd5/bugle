@@ -261,13 +261,14 @@ recorder state machine, and exposes one method per user-facing action:
   the parts) next to its output; an effects edit removes any stale track of
   its output's name. A track whose window was resized is refused.
   `Engine::edit_source` opens a video or GIF for the menu-bar app's video
-  editor: its `VideoInfo` (for a GIF: canvas, mean rate and length from one
-  streaming pass), its track, `check` (the edit's own range, cut and option
+  editor: its `VideoInfo` (for a GIF: canvas, mean rate and length from the
+  frame headers, without decoding pixels), its track, `check` (the edit's own range, cut and option
   checks) and `effects` (the `Effects` the edit would build, from the same function),
   and `PreviewFrames`, an exact-time frame reader that decodes scaled-down
   frames and applies those effects, so the preview is the export's code. A
-  GIF's preview frames are decoded once up front, scaled to the preview box
-  and further to stay within 256 MB, and looked up by start time.
+  GIF's preview frames are decoded once on the preview thread, scaled to the
+  preview box, and looked up by start time; to stay within 256 MB they are
+  scaled down to a 640 px long edge at most, then thinned to every n-th frame.
 * `ocr` (Apple Vision or an AI provider, per request or `[ocr] engine`), `describe` (images or sampled video frames), `transcribe`
   (extracts the audio track first), `subtitles`, `annotate`, `pin`, `select_area`.
 * `sync` (`sync.rs`) — runs after every successful save (`save_image`, so
