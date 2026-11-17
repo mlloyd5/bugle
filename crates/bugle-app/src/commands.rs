@@ -45,6 +45,8 @@ pub enum Slot {
     /// when running from Bugle.app, with its state read from macOS; not
     /// bindable.
     OpenAtLogin,
+    /// The *Audio Levels* submenu (`audio_menu::AudioMenu`); not bindable.
+    AudioLevels,
 }
 
 const fn item(name: &'static str, label: &'static str, command: Command) -> Slot {
@@ -62,6 +64,7 @@ pub const MENU: &[Slot] = &[
     item("record_gif", "Record GIF", Command::Run(Action::RecordGif)),
     item("record_window", "Record Window", Command::Run(Action::RecordWindow)),
     item("stop_recording", "Stop Recording", Command::Run(Action::StopRecording)),
+    Slot::AudioLevels,
     Slot::Separator,
     item("annotate_latest", "Annotate Latest", Command::AnnotateLatest),
     item("edit_latest", "Edit Latest Recording", Command::EditLatest),
@@ -178,6 +181,7 @@ mod tests {
             assert!(entries().any(|e| e.command == c), "{c:?} has no menu entry");
         }
         assert_eq!(MENU.iter().filter(|s| matches!(s, Slot::Recent)).count(), 1);
+        assert_eq!(MENU.iter().filter(|s| matches!(s, Slot::AudioLevels)).count(), 1);
     }
 
     #[test]

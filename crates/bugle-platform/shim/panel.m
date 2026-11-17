@@ -1,13 +1,17 @@
-// Bugle quick-access panel.
+// Bugle quick-access panels.
 //
-// A non-activating floating panel shown by the menu-bar app after a capture:
-// the thumbnail, two lines of text, a row of buttons and a close button. The
+// Non-activating floating panels shown by the menu-bar app after a capture:
+// the thumbnail, two lines of text, a row of buttons and a close button. A
 // panel owns no policy: every click is reported to Rust through a callback and
-// the panel closes. Which buttons exist, what they do and when the panel times
+// the panel closes. Which buttons exist, what they do and when a panel times
 // out are decided by `bugle-app` (`quick_access.rs`).
 //
-// Main thread only; needs a running AppKit loop. One panel at a time: showing a
-// new one replaces the old one.
+// Several panels stack up: the newest sits in the corner and the older ones
+// move away from it (up from a bottom corner, down from a top one), sliding
+// back together when one closes. Rust names each panel by an id of its own
+// choosing; showing a panel with an id that is up replaces that panel.
+//
+// Main thread only; needs a running AppKit loop.
 
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
@@ -19,56 +23,141 @@ typedef void (*bugle_panel_free_t)(void *ctx);
 // Choice codes passed to the callback besides button indices (>= 0).
 enum { BUGLE_PANEL_CLOSE = -1, BUGLE_PANEL_THUMBNAIL = -2 };
 
-static NSPanel *g_panel = nil;
-static NSImageView *g_panel_thumb = nil;
-static bugle_panel_callback_t g_panel_cb = NULL;
-static bugle_panel_free_t g_panel_free = NULL;
-static void *g_panel_ctx = NULL;
+static const CGFloat kPanelHeight = 104;
+// Distance from the screen edges, and between stacked panels.
+static const CGFloat kPanelMargin = 16, kPanelGap = 8;
+
+@interface BuglePanelEntry : NSObject
+@property(nonatomic) uint64_t ident;
+@property(nonatomic, strong) NSPanel *panel;
+@property(nonatomic, strong) NSImageView *thumb;
+@property(nonatomic) bugle_panel_callback_t cb;
+@property(nonatomic) void *ctx;
+@property(nonatomic) bugle_panel_free_t freeCtx;
+@end
+@implementation BuglePanelEntry
+@end
+
+// The panels on screen, oldest first.
+static NSMutableArray<BuglePanelEntry *> *g_panels = nil;
 // Panels still fading out: off limits for clicks, and ordered out at once
 // when the app needs the screen clear (before a capture).
 static NSMutableArray<NSPanel *> *g_panel_fading = nil;
+// Set while a capture runs: the panels are ordered out but kept.
+static BOOL g_panels_hidden = NO;
+// Where the stack sits; the newest panel decides.
+static int32_t g_panel_corner = 0;
+static NSScreen *g_panel_screen = nil;
+
+static BuglePanelEntry *panel_by_id(uint64_t ident) {
+    for (BuglePanelEntry *e in g_panels) {
+        if (e.ident == ident) return e;
+    }
+    return nil;
+}
+
+/// The live panel a control belongs to; nil for one that is closing.
+static BuglePanelEntry *panel_by_window(NSWindow *w) {
+    if (!w) return nil;
+    for (BuglePanelEntry *e in g_panels) {
+        if (e.panel == w) return e;
+    }
+    return nil;
+}
 
 /// Release the Rust context exactly once.
-static void panel_release_ctx(void) {
-    void *ctx = g_panel_ctx;
-    bugle_panel_free_t f = g_panel_free;
-    g_panel_ctx = NULL;
-    g_panel_free = NULL;
-    g_panel_cb = NULL;
+static void panel_release_ctx(BuglePanelEntry *e) {
+    void *ctx = e.ctx;
+    bugle_panel_free_t f = e.freeCtx;
+    e.ctx = NULL;
+    e.freeCtx = NULL;
+    e.cb = NULL;
     if (ctx && f) f(ctx);
 }
 
-static void panel_close(BOOL animated) {
-    NSPanel *p = g_panel;
-    g_panel = nil;
-    g_panel_thumb = nil;
-    panel_release_ctx();
-    if (!animated) {
-        for (NSPanel *f in g_panel_fading) [f orderOut:nil];
-        [g_panel_fading removeAllObjects];
-        [p orderOut:nil];
-        return;
+static NSScreen *screen_under_mouse(void) {
+    NSPoint m = [NSEvent mouseLocation];
+    for (NSScreen *s in [NSScreen screens]) {
+        if (NSPointInRect(m, s.frame)) return s;
     }
-    if (!p) return;
-    p.ignoresMouseEvents = YES;
-    if (!g_panel_fading) g_panel_fading = [NSMutableArray array];
-    [g_panel_fading addObject:p];
-    [NSAnimationContext
-        runAnimationGroup:^(NSAnimationContext *ctx) {
-          ctx.duration = 0.2;
-          [p.animator setAlphaValue:0.0];
-        }
-        completionHandler:^{
-          [p orderOut:nil];
-          [g_panel_fading removeObject:p];
-        }];
+    return [NSScreen mainScreen];
 }
 
-/// Report a click, then close. The callback only queues an event on the Rust
-/// side, so it never re-enters the panel.
-static void panel_choose(int32_t choice) {
-    if (g_panel_cb && g_panel_ctx) g_panel_cb(g_panel_ctx, choice);
-    panel_close(YES);
+/// Frame of a panel `slot` places away from the corner (0: in the corner).
+static NSRect panel_slot(NSPanel *p, NSUInteger slot) {
+    NSScreen *screen = (g_panel_screen && [[NSScreen screens] containsObject:g_panel_screen]) ? g_panel_screen
+                                                                                              : screen_under_mouse();
+    NSRect vf = screen.visibleFrame;
+    CGFloat w = p.frame.size.width, h = p.frame.size.height;
+    BOOL left = g_panel_corner == 1 || g_panel_corner == 3, bottom = g_panel_corner == 2 || g_panel_corner == 3;
+    CGFloat step = (h + kPanelGap) * slot;
+    CGFloat x = left ? NSMinX(vf) + kPanelMargin : NSMaxX(vf) - w - kPanelMargin;
+    CGFloat y = bottom ? NSMinY(vf) + kPanelMargin + step : NSMaxY(vf) - h - kPanelMargin - step;
+    return NSMakeRect(x, y, w, h);
+}
+
+/// Put every panel in its place, the newest in the corner. `fresh` (just
+/// made) and hidden panels go there directly; the others slide.
+static void panel_layout(BuglePanelEntry *fresh) {
+    NSUInteger n = g_panels.count;
+    for (NSUInteger i = 0; i < n; i++) {
+        BuglePanelEntry *e = g_panels[i];
+        NSPanel *p = e.panel;
+        NSRect f = panel_slot(p, n - 1 - i);
+        if (NSEqualRects(p.frame, f)) continue;
+        if (e == fresh || g_panels_hidden || !p.isVisible) {
+            [p setFrame:f display:NO];
+        } else {
+            [NSAnimationContext runAnimationGroup:^(NSAnimationContext *c) {
+              c.duration = 0.2;
+              [p.animator setFrame:f display:YES];
+            }];
+        }
+    }
+}
+
+static void panel_close(BuglePanelEntry *e, BOOL animated) {
+    if (!e) return;
+    [g_panels removeObject:e];
+    panel_release_ctx(e);
+    NSPanel *p = e.panel;
+    e.panel = nil;
+    e.thumb = nil;
+    if (!animated || g_panels_hidden || !p.isVisible) {
+        [p orderOut:nil];
+    } else {
+        p.ignoresMouseEvents = YES;
+        if (!g_panel_fading) g_panel_fading = [NSMutableArray array];
+        [g_panel_fading addObject:p];
+        // The others slide into its slot while it fades: keep them above it.
+        for (BuglePanelEntry *o in g_panels) [o.panel orderFrontRegardless];
+        [NSAnimationContext
+            runAnimationGroup:^(NSAnimationContext *ctx) {
+              ctx.duration = 0.2;
+              [p.animator setAlphaValue:0.0];
+            }
+            completionHandler:^{
+              [p orderOut:nil];
+              [g_panel_fading removeObject:p];
+            }];
+    }
+    panel_layout(nil);
+}
+
+/// Order out the panels still fading, at once.
+static void panel_clear_fading(void) {
+    for (NSPanel *f in g_panel_fading) [f orderOut:nil];
+    [g_panel_fading removeAllObjects];
+}
+
+/// Report a click on the panel holding `w`, then close it. The callback only
+/// queues an event on the Rust side, so it never re-enters the panel. A
+/// click on a panel that is already closing reaches nobody.
+static void panel_choose(NSWindow *w, int32_t choice) {
+    BuglePanelEntry *e = panel_by_window(w);
+    if (!e) return;
+    if (e.cb && e.ctx) e.cb(e.ctx, choice);
+    panel_close(e, YES);
 }
 
 @interface BuglePanelWindow : NSPanel
@@ -90,30 +179,17 @@ static void panel_choose(int32_t choice) {
 @end
 @implementation BuglePanelThumb
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
-- (void)mouseDown:(NSEvent *)e {
-    // A click on a panel that is already closing must not reach the next one.
-    if (self.window == g_panel) panel_choose(BUGLE_PANEL_THUMBNAIL);
-}
+- (void)mouseDown:(NSEvent *)e { panel_choose(self.window, BUGLE_PANEL_THUMBNAIL); }
 - (void)resetCursorRects { [self addCursorRect:self.bounds cursor:[NSCursor pointingHandCursor]]; }
 @end
 
 @interface BuglePanelTarget : NSObject
 @end
 @implementation BuglePanelTarget
-- (void)clicked:(BuglePanelButton *)sender {
-    if (sender.window == g_panel) panel_choose(sender.choice);
-}
+- (void)clicked:(BuglePanelButton *)sender { panel_choose(sender.window, sender.choice); }
 @end
 
 static BuglePanelTarget *g_panel_target = nil;
-
-static NSScreen *screen_under_mouse(void) {
-    NSPoint m = [NSEvent mouseLocation];
-    for (NSScreen *s in [NSScreen screens]) {
-        if (NSPointInRect(m, s.frame)) return s;
-    }
-    return [NSScreen mainScreen];
-}
 
 static BuglePanelButton *make_button(NSString *title, NSString *symbol, int32_t choice) {
     BuglePanelButton *b = [[BuglePanelButton alloc] initWithFrame:NSZeroRect];
@@ -136,18 +212,29 @@ static BuglePanelButton *make_button(NSString *title, NSString *symbol, int32_t 
     return b;
 }
 
-int32_t bugle_panel_show(const uint8_t *png, size_t len, const char *title, const char *subtitle,
-                         const char *const *labels, int32_t n_labels, int32_t corner, bugle_panel_callback_t cb,
-                         void *ctx, bugle_panel_free_t free_ctx) {
+/// Show panel `ident` (non-zero) in front of the stack, replacing a panel
+/// with the same id. Returns 1, or 0 without taking `ctx` when the
+/// arguments are unusable. While the stack is hidden, the new panel joins it
+/// off screen and comes back with `bugle_panel_show_all`.
+int32_t bugle_panel_show(uint64_t ident, const uint8_t *png, size_t len, const char *title, const char *subtitle,
+                         const char *const *labels, int32_t n_labels, int32_t corner, bugle_panel_callback_t cb, void *ctx,
+                         bugle_panel_free_t free_ctx) {
     @autoreleasepool {
-        if (g_panel) panel_close(NO);
+        if (ident == 0 || !cb) return 0;
+        panel_close(panel_by_id(ident), NO);
         if (!g_panel_target) g_panel_target = [BuglePanelTarget new];
-        g_panel_cb = cb;
-        g_panel_ctx = ctx;
-        g_panel_free = free_ctx;
+        if (!g_panels) g_panels = [NSMutableArray array];
+        BuglePanelEntry *e = [BuglePanelEntry new];
+        e.ident = ident;
+        e.cb = cb;
+        e.ctx = ctx;
+        e.freeCtx = free_ctx;
+        // The newest panel decides where the stack is.
+        g_panel_corner = corner;
+        g_panel_screen = screen_under_mouse();
 
         NSImage *img = (png && len) ? [[NSImage alloc] initWithData:[NSData dataWithBytes:png length:len]] : nil;
-        const CGFloat pad = 10, thumbW = 128, height = 104, minWidth = 360, gap = 6;
+        const CGFloat pad = 10, thumbW = 128, height = kPanelHeight, minWidth = 360, gap = 6;
         CGFloat tx = pad + thumbW + pad;
 
         // Buttons first: their natural widths decide the panel width.
@@ -161,14 +248,8 @@ int32_t bugle_panel_show(const uint8_t *png, size_t len, const char *title, cons
         }
         CGFloat width = MAX(minWidth, tx + row + pad);
 
-        NSScreen *screen = screen_under_mouse();
-        NSRect vf = screen.visibleFrame;
-        BOOL left = corner == 1 || corner == 3, bottom = corner == 2 || corner == 3;
-        CGFloat x = left ? NSMinX(vf) + 16 : NSMaxX(vf) - width - 16;
-        CGFloat y = bottom ? NSMinY(vf) + 16 : NSMaxY(vf) - height - 16;
-
         BuglePanelWindow *panel =
-            [[BuglePanelWindow alloc] initWithContentRect:NSMakeRect(x, y, width, height)
+            [[BuglePanelWindow alloc] initWithContentRect:NSMakeRect(0, 0, width, height)
                                                 styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
                                                   backing:NSBackingStoreBuffered
                                                     defer:NO];
@@ -183,7 +264,7 @@ int32_t bugle_panel_show(const uint8_t *png, size_t len, const char *title, cons
         panel.hidesOnDeactivate = NO;
         panel.becomesKeyOnlyIfNeeded = YES;
         // Keep it out of screen captures where the window server honours this;
-        // the app also closes the panel before every capture it starts.
+        // the app also hides the panels before every capture it starts.
         panel.sharingType = NSWindowSharingNone;
         panel.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
 
@@ -205,7 +286,7 @@ int32_t bugle_panel_show(const uint8_t *png, size_t len, const char *title, cons
         iv.layer.backgroundColor = [[NSColor colorWithWhite:0 alpha:0.25] CGColor];
         iv.toolTip = @"Open";
         [root addSubview:iv];
-        g_panel_thumb = iv;
+        e.thumb = iv;
 
         BuglePanelButton *close = make_button(@"Close", @"xmark.circle.fill", BUGLE_PANEL_CLOSE);
         close.bordered = NO;
@@ -237,37 +318,85 @@ int32_t bugle_panel_show(const uint8_t *png, size_t len, const char *title, cons
         }
 
         panel.contentView = root;
+        e.panel = panel;
+        [g_panels addObject:e];
+        // The new panel goes in front: older panels slide away from the
+        // corner. While the stack is hidden (a recording or another capture
+        // is running) it joins the stack off screen and comes back with
+        // `bugle_panel_show_all`.
+        panel_layout(e);
+        if (g_panels_hidden) return 1;
         panel.alphaValue = 0.0;
         [panel orderFrontRegardless];
         [NSAnimationContext runAnimationGroup:^(NSAnimationContext *c) {
           c.duration = 0.15;
           [panel.animator setAlphaValue:1.0];
         }];
-        g_panel = panel;
         return 1;
     }
 }
 
-/// Swap the thumbnail (a sharper one arrives after the panel is up).
-void bugle_panel_set_image(const uint8_t *png, size_t len) {
+/// Swap panel `ident`'s thumbnail (a sharper one arrives after it is up).
+void bugle_panel_set_image(uint64_t ident, const uint8_t *png, size_t len) {
     @autoreleasepool {
-        if (!g_panel_thumb || !png || !len) return;
+        BuglePanelEntry *e = panel_by_id(ident);
+        if (!e.thumb || !png || !len) return;
         NSImage *img = [[NSImage alloc] initWithData:[NSData dataWithBytes:png length:len]];
-        if (img) g_panel_thumb.image = img;
+        if (img) e.thumb.image = img;
     }
 }
 
-void bugle_panel_dismiss(int32_t animated) {
+/// Close panel `ident` (fading out when `animated`) without reporting a
+/// click; the others close up behind it.
+void bugle_panel_dismiss(uint64_t ident, int32_t animated) {
     @autoreleasepool {
-        panel_close(animated != 0);
+        panel_close(panel_by_id(ident), animated != 0);
     }
 }
 
-int32_t bugle_panel_active(void) { return g_panel != nil ? 1 : 0; }
+/// Close every panel; when not `animated`, also the ones still fading.
+void bugle_panel_dismiss_all(int32_t animated) {
+    @autoreleasepool {
+        for (BuglePanelEntry *e in [g_panels copy]) panel_close(e, animated != 0);
+        if (!animated) panel_clear_fading();
+    }
+}
 
+/// Take every panel (and any still fading) off screen at once, keeping
+/// them, so a capture cannot contain them. `bugle_panel_show_all` brings
+/// them back; panels shown meanwhile stay off screen with the rest.
+void bugle_panel_hide_all(void) {
+    @autoreleasepool {
+        g_panels_hidden = YES;
+        for (BuglePanelEntry *e in g_panels) [e.panel orderOut:nil];
+        panel_clear_fading();
+    }
+}
+
+/// Bring back the panels hidden by `bugle_panel_hide_all`.
+void bugle_panel_show_all(void) {
+    @autoreleasepool {
+        if (!g_panels_hidden) return;
+        g_panels_hidden = NO;
+        panel_layout(nil);
+        for (BuglePanelEntry *e in g_panels) {
+            e.panel.alphaValue = 1.0;
+            [e.panel orderFrontRegardless];
+        }
+    }
+}
+
+/// How many panels are up (hidden ones included).
+int32_t bugle_panel_count(void) { return (int32_t)g_panels.count; }
+
+/// Whether the pointer is over any panel on screen.
 int32_t bugle_panel_hovered(void) {
-    if (!g_panel) return 0;
-    return NSPointInRect([NSEvent mouseLocation], g_panel.frame) ? 1 : 0;
+    if (g_panels_hidden) return 0;
+    NSPoint m = [NSEvent mouseLocation];
+    for (BuglePanelEntry *e in g_panels) {
+        if (NSPointInRect(m, e.panel.frame)) return 1;
+    }
+    return 0;
 }
 
 void bugle_reveal_path(const char *path) {

@@ -16,7 +16,11 @@
 // the edited image's pixel (0, 0) in the shown image (the origin); every
 // coordinate exchanged with Rust is in edited-image pixels.
 //
-// Main thread only; needs a running AppKit loop. One editor at a time.
+// Several editors can be open at once. `bugle_editor_open` returns a
+// positive id, and every other call names the editor by it; a call for an id
+// that is not (or no longer) open does nothing.
+//
+// Main thread only; needs a running AppKit loop.
 
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
@@ -67,7 +71,10 @@ static const CGFloat kZoomStops[] = {10, 25, 33, 50, 67, 100, 150, 200, 300, 400
 static const int kZoomStopCount = sizeof(kZoomStops) / sizeof(kZoomStops[0]);
 
 @class BugleEditor;
-static BugleEditor *g_editor = nil;
+// The open editors, oldest first.
+static NSMutableArray<BugleEditor *> *g_editors = nil;
+// The last id handed out; ids are never reused.
+static int32_t g_editor_last_id = 0;
 
 @interface BugleEditorCanvas : NSView
 @property(nonatomic, weak) BugleEditor *editor;
@@ -88,6 +95,7 @@ static BugleEditor *g_editor = nil;
 @end
 
 @interface BugleEditor : NSObject <NSWindowDelegate, NSTextFieldDelegate>
+@property(nonatomic) int32_t ident;
 @property(nonatomic, strong) BugleEditorWindow *window;
 @property(nonatomic, strong) NSScrollView *scroll;
 @property(nonatomic, strong) BugleEditorCanvas *canvas;
@@ -761,7 +769,7 @@ static NSUInteger line_count(NSString *s) {
     if (self.closing) return;
     self.closing = YES;
     __attribute__((objc_precise_lifetime)) BugleEditor *keep = self;
-    if (g_editor == self) g_editor = nil;
+    [g_editors removeObject:self];
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     NSWindow *w = self.window;
     if (w.attachedSheet) [w endSheet:w.attachedSheet];
@@ -772,8 +780,9 @@ static NSUInteger line_count(NSString *s) {
     self.cb = NULL;
     self.ctx = NULL;
     self.freeCtx = NULL;
-    // Hand keyboard focus back to the app the user came from.
-    [NSApp deactivate];
+    // Hand keyboard focus back to the app the user came from, unless another
+    // editor is still open (it takes the focus instead).
+    if (g_editors.count == 0) [NSApp deactivate];
     dispatch_async(dispatch_get_main_queue(), ^{
         if (ctx && f) f(ctx);
         (void)keep;
@@ -818,14 +827,14 @@ static NSPopUpButton *pull_down(CGFloat width) {
 /// and `tool_symbols` (SF Symbol names) describe the tool buttons, `colors`
 /// (0xRRGGBBAA) the swatches, `width_labels` the stroke sizes, `n_menus` the
 /// number of toolbar pull-down menus (filled by `bugle_editor_set_menu`).
-/// Returns 1, or 0 when an editor is already open (the context is not taken
-/// then).
+/// Returns the new editor's id (> 0), or 0 when the window could not be
+/// made (the context is not taken then).
 int32_t bugle_editor_open(const char *title, uint32_t img_w, uint32_t img_h, const char *const *tool_labels,
                           const char *const *tool_symbols, int32_t n_tools, const uint32_t *colors, int32_t n_colors,
                           const char *const *width_labels, int32_t n_widths, int32_t n_menus, bugle_editor_callback_t cb,
                           void *ctx, bugle_editor_free_t free_ctx) {
     @autoreleasepool {
-        if (g_editor || !cb || img_w == 0 || img_h == 0) return 0;
+        if (!cb || img_w == 0 || img_h == 0 || g_editor_last_id == INT32_MAX) return 0;
         NSApplication *app = [NSApplication sharedApplication];
         BugleEditor *e = [[BugleEditor alloc] init];
         e.cb = cb;
@@ -996,22 +1005,36 @@ int32_t bugle_editor_open(const char *title, uint32_t img_w, uint32_t img_h, con
 
         win.contentView = root;
         [win center];
-        g_editor = e;
+        // A second editor opens offset from the newest one, so neither hides
+        // the other.
+        BugleEditor *newest = g_editors.lastObject;
+        if (newest) [win cascadeTopLeftFromPoint:[newest.window cascadeTopLeftFromPoint:NSZeroPoint]];
+        if (!g_editors) g_editors = [NSMutableArray array];
+        e.ident = ++g_editor_last_id;
+        [g_editors addObject:e];
         [e layoutCanvas];
         [e updateZoomTitle];
         [win makeFirstResponder:canvas];
         [app activateIgnoringOtherApps:YES];
         [win makeKeyAndOrderFront:nil];
-        return 1;
+        return e.ident;
     }
+}
+
+/// The open editor with this id, or nil.
+static BugleEditor *editor_for(int32_t ident) {
+    for (BugleEditor *e in g_editors) {
+        if (e.ident == ident) return e;
+    }
+    return nil;
 }
 
 /// Replace the image on the canvas. `rgba` is copied (RGBA8, not
 /// premultiplied, `w * h * 4` bytes). (`origin_x`, `origin_y`) is where the
 /// edited image's pixel (0, 0) lies in this one.
-void bugle_editor_set_image(const uint8_t *rgba, uint32_t w, uint32_t h, double origin_x, double origin_y) {
+void bugle_editor_set_image(int32_t ident, const uint8_t *rgba, uint32_t w, uint32_t h, double origin_x, double origin_y) {
     @autoreleasepool {
-        BugleEditor *e = g_editor;
+        BugleEditor *e = editor_for(ident);
         if (!e || !rgba || w == 0 || h == 0) return;
         CFDataRef data = CFDataCreate(NULL, rgba, (CFIndex)w * h * 4);
         if (!data) return;
@@ -1051,9 +1074,9 @@ void bugle_editor_set_image(const uint8_t *rgba, uint32_t w, uint32_t h, double 
 /// primitives, each `kind, r, g, b, a, width, point_count` followed by
 /// `point_count` x, y pairs in image pixels (see the PRIM_* kinds; rect-like
 /// kinds take origin then size). `n == 0` clears it.
-void bugle_editor_set_overlay(const double *values, size_t n) {
+void bugle_editor_set_overlay(int32_t ident, const double *values, size_t n) {
     @autoreleasepool {
-        BugleEditor *e = g_editor;
+        BugleEditor *e = editor_for(ident);
         if (!e) return;
         e.overlay = (values && n) ? [NSData dataWithBytes:values length:n * sizeof(double)] : nil;
         // Only what is on screen: a zoomed canvas can be far larger.
@@ -1062,9 +1085,9 @@ void bugle_editor_set_overlay(const double *values, size_t n) {
 }
 
 /// Reflect the editor state in the toolbar and title bar.
-void bugle_editor_set_state(int32_t tool, int32_t color, int32_t width, int32_t can_undo, int32_t can_redo, int32_t dirty) {
+void bugle_editor_set_state(int32_t ident, int32_t tool, int32_t color, int32_t width, int32_t can_undo, int32_t can_redo, int32_t dirty) {
     @autoreleasepool {
-        BugleEditor *e = g_editor;
+        BugleEditor *e = editor_for(ident);
         if (!e) return;
         if (tool >= 0 && tool < e.tools.segmentCount) e.tools.selectedSegment = tool;
         if (width >= 0 && width < e.widths.segmentCount) e.widths.selectedSegment = width;
@@ -1090,9 +1113,9 @@ void bugle_editor_set_state(int32_t tool, int32_t color, int32_t width, int32_t 
 /// (`x` checked, `o` unchecked, `h` heading, `-` separator) and the title.
 /// Picking item i (counting every line) reports EV_MENU with
 /// `index << 16 | i`.
-void bugle_editor_set_menu(int32_t index, const char *title, const char *tip, const char *items, int32_t enabled) {
+void bugle_editor_set_menu(int32_t ident, int32_t index, const char *title, const char *tip, const char *items, int32_t enabled) {
     @autoreleasepool {
-        BugleEditor *e = g_editor;
+        BugleEditor *e = editor_for(ident);
         if (!e || index < 0 || index >= (int32_t)e.menus.count) return;
         NSPopUpButton *b = e.menus[index];
         NSMenu *m = [[NSMenu alloc] init];
@@ -1132,18 +1155,18 @@ void bugle_editor_set_menu(int32_t index, const char *title, const char *tip, co
 }
 
 /// Zoom as the keyboard shortcuts do (ZOOM_*).
-void bugle_editor_zoom(int32_t mode) {
+void bugle_editor_zoom(int32_t ident, int32_t mode) {
     @autoreleasepool {
-        [g_editor zoomStep:mode];
+        [editor_for(ident) zoomStep:mode];
     }
 }
 
 /// Put a text field on the canvas at image pixel (x, y) for typing a label
 /// `font_px` image pixels tall. The result arrives as one EV_TEXT event
 /// (empty text when the user cancels).
-void bugle_editor_begin_text(double x, double y, double font_px, const char *initial, uint32_t rgba) {
+void bugle_editor_begin_text(int32_t ident, double x, double y, double font_px, const char *initial, uint32_t rgba) {
     @autoreleasepool {
-        BugleEditor *e = g_editor;
+        BugleEditor *e = editor_for(ident);
         if (!e) return;
         NSColor *c = [NSColor colorWithSRGBRed:((rgba >> 24) & 0xFF) / 255.0
                                          green:((rgba >> 16) & 0xFF) / 255.0
@@ -1154,22 +1177,26 @@ void bugle_editor_begin_text(double x, double y, double font_px, const char *ini
 }
 
 /// While busy the window refuses to close (a save is being written).
-void bugle_editor_set_busy(int32_t busy) { g_editor.busy = busy != 0; }
+void bugle_editor_set_busy(int32_t ident, int32_t busy) { editor_for(ident).busy = busy != 0; }
 
 /// Close the editor without asking. Safe to call from inside the callback.
-void bugle_editor_close(void) {
+void bugle_editor_close(int32_t ident) {
     @autoreleasepool {
-        __attribute__((objc_precise_lifetime)) BugleEditor *e = g_editor;
+        __attribute__((objc_precise_lifetime)) BugleEditor *e = editor_for(ident);
         [e teardown];
     }
 }
 
-int32_t bugle_editor_active(void) { return g_editor ? 1 : 0; }
+/// Whether editor `ident` is open.
+int32_t bugle_editor_is_open(int32_t ident) { return editor_for(ident) ? 1 : 0; }
 
-/// Bring the open editor to the front.
-void bugle_editor_focus(void) {
+/// How many editors are open.
+int32_t bugle_editor_count(void) { return (int32_t)g_editors.count; }
+
+/// Bring editor `ident` to the front.
+void bugle_editor_focus(int32_t ident) {
     @autoreleasepool {
-        BugleEditor *e = g_editor;
+        BugleEditor *e = editor_for(ident);
         if (!e) return;
         [NSApp activateIgnoringOtherApps:YES];
         [e.window makeKeyAndOrderFront:nil];
@@ -1178,11 +1205,12 @@ void bugle_editor_focus(void) {
 
 /// Deliver an event to the callback as if it came from the window. For
 /// smoke tests, which cannot click.
-void bugle_editor_inject(int32_t kind, double x, double y, int32_t arg, const char *text) {
+void bugle_editor_inject(int32_t ident, int32_t kind, double x, double y, int32_t arg, const char *text) {
     @autoreleasepool {
+        BugleEditor *e = editor_for(ident);
         // Injected text stands for what the field would have reported: the
         // field goes, as it would have.
-        if (kind == EV_TEXT) [g_editor discardField];
-        [g_editor emit:kind x:x y:y arg:arg text:text];
+        if (kind == EV_TEXT) [e discardField];
+        [e emit:kind x:x y:y arg:arg text:text];
     }
 }

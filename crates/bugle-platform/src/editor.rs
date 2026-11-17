@@ -15,8 +15,11 @@
 //! edited image's pixel (0, 0) lies in it, and every coordinate in and out
 //! of the window stays in the edited image's pixels.
 //!
+//! Several editors can be open at once: [`editor_open`] returns an
+//! [`EditorId`] that every other call takes. A call for an editor that has
+//! closed does nothing.
+//!
 //! Every function here is main-thread only and needs a running AppKit loop.
-//! One editor at a time.
 
 use super::cstr;
 use anyhow::{bail, Result};
@@ -46,17 +49,28 @@ extern "C" {
         ctx: *mut c_void,
         free_ctx: RawFree,
     ) -> i32;
-    fn bugle_editor_set_image(rgba: *const u8, w: u32, h: u32, origin_x: f64, origin_y: f64);
-    fn bugle_editor_set_menu(index: i32, title: *const c_char, tip: *const c_char, items: *const c_char, enabled: i32);
-    fn bugle_editor_zoom(mode: i32);
-    fn bugle_editor_set_overlay(values: *const f64, n: usize);
-    fn bugle_editor_set_state(tool: i32, color: i32, width: i32, can_undo: i32, can_redo: i32, dirty: i32);
-    fn bugle_editor_begin_text(x: f64, y: f64, font_px: f64, initial: *const c_char, rgba: u32);
-    fn bugle_editor_set_busy(busy: i32);
-    fn bugle_editor_close();
-    fn bugle_editor_active() -> i32;
-    fn bugle_editor_focus();
-    fn bugle_editor_inject(kind: i32, x: f64, y: f64, arg: i32, text: *const c_char);
+    fn bugle_editor_set_image(id: i32, rgba: *const u8, w: u32, h: u32, origin_x: f64, origin_y: f64);
+    fn bugle_editor_set_menu(id: i32, index: i32, title: *const c_char, tip: *const c_char, items: *const c_char, enabled: i32);
+    fn bugle_editor_zoom(id: i32, mode: i32);
+    fn bugle_editor_set_overlay(id: i32, values: *const f64, n: usize);
+    fn bugle_editor_set_state(id: i32, tool: i32, color: i32, width: i32, can_undo: i32, can_redo: i32, dirty: i32);
+    fn bugle_editor_begin_text(id: i32, x: f64, y: f64, font_px: f64, initial: *const c_char, rgba: u32);
+    fn bugle_editor_set_busy(id: i32, busy: i32);
+    fn bugle_editor_close(id: i32);
+    fn bugle_editor_is_open(id: i32) -> i32;
+    fn bugle_editor_count() -> i32;
+    fn bugle_editor_focus(id: i32);
+    fn bugle_editor_inject(id: i32, kind: i32, x: f64, y: f64, arg: i32, text: *const c_char);
+}
+
+/// Names one editor window. Ids are never reused within a process, so a
+/// stale id only ever reaches nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EditorId(i32);
+
+impl EditorId {
+    /// No window: calls with it do nothing.
+    pub const NONE: Self = Self(0);
 }
 
 /// A toolbar or keyboard command.
@@ -304,8 +318,8 @@ unsafe extern "C" fn free(ctx: *mut c_void) {
 /// sizes, `menus` the number of toolbar menus (filled in with
 /// [`editor_set_menu`]). `handler` runs on the main thread for every event
 /// and is dropped
-/// when the window closes, however it closes. Fails when an editor is
-/// already open (see [`editor_active`]).
+/// when the window closes, however it closes. Other open editors stay open;
+/// the new window opens offset from the newest of them.
 pub fn editor_open(
     title: &str,
     size: (u32, u32),
@@ -314,7 +328,7 @@ pub fn editor_open(
     widths: &[&str],
     menus: usize,
     handler: impl FnMut(EditorEvent) + 'static,
-) -> Result<()> {
+) -> Result<EditorId> {
     let title = cstr(title)?;
     let strings = |v: Vec<&str>| v.into_iter().map(cstr).collect::<Result<Vec<CString>>>();
     let labels = strings(tools.iter().map(|t| t.label).collect())?;
@@ -325,7 +339,7 @@ pub fn editor_open(
     let packed: Vec<u32> = colors.iter().map(|c| u32::from_be_bytes(*c)).collect();
     let boxed: Box<Handler> = Box::new(RefCell::new(Box::new(handler)));
     let ctx = Box::into_raw(boxed) as *mut c_void;
-    let ok = unsafe {
+    let id = unsafe {
         bugle_editor_open(
             title.as_ptr(),
             size.0,
@@ -343,87 +357,91 @@ pub fn editor_open(
             free,
         )
     };
-    if ok != 1 {
+    if id <= 0 {
         // The shim did not take the context.
         drop(unsafe { Box::from_raw(ctx as *mut Handler) });
-        bail!("could not open the editor window (is one already open?)");
+        bail!("could not open the editor window");
     }
-    Ok(())
+    Ok(EditorId(id))
 }
 
 /// Show `img` on the canvas, with pixel (0, 0) of the edited image at
 /// `origin` in it (zero when `img` is the edited image itself). Pointer
-/// input, the overlay and the text field stay in edited-image pixels. No-op
-/// when no editor is open.
-pub fn editor_set_image(img: &RgbaImage, origin: Point) {
+/// input, the overlay and the text field stay in edited-image pixels.
+pub fn editor_set_image(id: EditorId, img: &RgbaImage, origin: Point) {
     let (x, y) = if origin.x.is_finite() && origin.y.is_finite() { (origin.x, origin.y) } else { (0.0, 0.0) };
-    unsafe { bugle_editor_set_image(img.as_raw().as_ptr(), img.width(), img.height(), x, y) }
+    unsafe { bugle_editor_set_image(id.0, img.as_raw().as_ptr(), img.width(), img.height(), x, y) }
 }
 
 /// Replace toolbar menu `index` (of the `menus` given to [`editor_open`]).
-pub fn editor_set_menu(index: usize, menu: &EditorMenu) {
+pub fn editor_set_menu(id: EditorId, index: usize, menu: &EditorMenu) {
     let c = |s: &str| CString::new(s.replace('\0', "")).unwrap_or_default();
     let (title, tip, items) = (c(&menu.title), c(&menu.tip), c(&menu.encode_items()));
     let index = i32::try_from(index).unwrap_or(-1);
-    unsafe { bugle_editor_set_menu(index, title.as_ptr(), tip.as_ptr(), items.as_ptr(), menu.enabled as i32) }
+    unsafe { bugle_editor_set_menu(id.0, index, title.as_ptr(), tip.as_ptr(), items.as_ptr(), menu.enabled as i32) }
 }
 
 /// Change the zoom as the keyboard shortcuts do.
-pub fn editor_zoom(zoom: EditorZoom) {
-    unsafe { bugle_editor_zoom(zoom as i32) }
+pub fn editor_zoom(id: EditorId, zoom: EditorZoom) {
+    unsafe { bugle_editor_zoom(id.0, zoom as i32) }
 }
 
 /// Replace what is drawn above the image; an empty slice clears it.
-pub fn editor_set_overlay(prims: &[EditorPrim]) {
+pub fn editor_set_overlay(id: EditorId, prims: &[EditorPrim]) {
     let mut values = Vec::new();
     for p in prims {
         p.encode(&mut values);
     }
-    unsafe { bugle_editor_set_overlay(values.as_ptr(), values.len()) }
+    unsafe { bugle_editor_set_overlay(id.0, values.as_ptr(), values.len()) }
 }
 
-pub fn editor_set_state(s: EditorState) {
+pub fn editor_set_state(id: EditorId, s: EditorState) {
     let i = |v: usize| i32::try_from(v).unwrap_or(-1);
-    unsafe { bugle_editor_set_state(i(s.tool), i(s.color), i(s.width), s.can_undo as i32, s.can_redo as i32, s.dirty as i32) }
+    unsafe { bugle_editor_set_state(id.0, i(s.tool), i(s.color), i(s.width), s.can_undo as i32, s.can_redo as i32, s.dirty as i32) }
 }
 
 /// Put a text field on the canvas at `at` for a label `font_px` image pixels
 /// tall, pre-filled with `initial`. The handler gets one
 /// [`EditorEvent::Text`] when the user is done. May be called from inside
 /// the handler.
-pub fn editor_begin_text(at: Point, font_px: f64, initial: &str, color: [u8; 4]) {
+pub fn editor_begin_text(id: EditorId, at: Point, font_px: f64, initial: &str, color: [u8; 4]) {
     let initial = CString::new(initial.replace('\0', "")).unwrap_or_default();
-    unsafe { bugle_editor_begin_text(at.x, at.y, font_px, initial.as_ptr(), u32::from_be_bytes(color)) }
+    unsafe { bugle_editor_begin_text(id.0, at.x, at.y, font_px, initial.as_ptr(), u32::from_be_bytes(color)) }
 }
 
 /// While busy (a save is running) the window refuses to close; the caller
 /// is expected to ignore input meanwhile.
-pub fn editor_set_busy(busy: bool) {
-    unsafe { bugle_editor_set_busy(busy as i32) }
+pub fn editor_set_busy(id: EditorId, busy: bool) {
+    unsafe { bugle_editor_set_busy(id.0, busy as i32) }
 }
 
 /// Close the editor without asking about unsaved changes. May be called
 /// from inside the handler, which is dropped on a later main-loop turn.
-pub fn editor_close() {
-    unsafe { bugle_editor_close() }
+pub fn editor_close(id: EditorId) {
+    unsafe { bugle_editor_close(id.0) }
 }
 
-/// Whether an editor window is open.
-pub fn editor_active() -> bool {
-    unsafe { bugle_editor_active() == 1 }
+/// Whether editor `id` is still open.
+pub fn editor_is_open(id: EditorId) -> bool {
+    unsafe { bugle_editor_is_open(id.0) == 1 }
 }
 
-/// Bring the open editor to the front.
-pub fn editor_focus() {
-    unsafe { bugle_editor_focus() }
+/// How many editor windows are open.
+pub fn editor_count() -> usize {
+    usize::try_from(unsafe { bugle_editor_count() }).unwrap_or(0)
+}
+
+/// Bring editor `id` to the front.
+pub fn editor_focus(id: EditorId) {
+    unsafe { bugle_editor_focus(id.0) }
 }
 
 /// Deliver `event` to the handler as if the window had reported it. For
 /// smoke tests, which cannot click. Not from inside the handler.
-pub fn editor_inject(event: &EditorEvent) {
+pub fn editor_inject(id: EditorId, event: &EditorEvent) {
     let (kind, x, y, arg, text) = event.to_raw();
     let text = text.map(|t| CString::new(t.replace('\0', "")).unwrap_or_default());
-    unsafe { bugle_editor_inject(kind, x, y, arg, text.as_ref().map_or(std::ptr::null(), |t| t.as_ptr())) }
+    unsafe { bugle_editor_inject(id.0, kind, x, y, arg, text.as_ref().map_or(std::ptr::null(), |t| t.as_ptr())) }
 }
 
 #[cfg(test)]

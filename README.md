@@ -34,7 +34,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | Pin to screen | Floating AppKit panel (drag, scroll-to-resize, Esc/double-click closes) | ✅ |
 | GIF recording | In-process frame grab loop + `image` GIF encoder | ✅ |
 | Video recording | `screencapture -v` (H.264 .mov → remuxed .mp4), microphone, click highlight | ✅ |
-| System audio in recordings | ScreenCaptureKit `SCStream` audio tap + `AVAssetWriter` (H.264 + AAC .mp4), microphone as a second track or mixed into one (`--mix-audio`) with per-source levels, optional ducking of system audio under the microphone and a peak limiter | ✅ (macOS 14+) |
+| System audio in recordings | ScreenCaptureKit `SCStream` audio tap + `AVAssetWriter` (H.264 + AAC .mp4), microphone as a second track or mixed into one (`--mix-audio`) with per-source levels (on either output), optional ducking of system audio under the microphone and a peak limiter | ✅ (macOS 14+) |
 | Describe image / video frames with a vision model | OpenAI-compatible, Ollama, Anthropic, command | ✅ |
 | Transcribe / subtitles (SRT, VTT) | whisper.cpp server, OpenAI-compatible, command | ✅ |
 | History | JSON-lines file, ids, delete | ✅ |
@@ -47,7 +47,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | Video editor | `bugle-app` window: preview, timeline with in/out handles, playback, zoom and pointer options, preset, export through the same edit pipeline | ✅ driven by synthetic events in `--smoke-test`; mouse and keyboard input not exercised |
 | `Bugle.app` bundle | `cargo xtask bundle` (hardened runtime, ad-hoc or Developer ID) | ✅ ad-hoc; Developer ID signing and notarization not yet exercised |
 | Disk image, universal binary | `cargo xtask dmg` (`hdiutil`, `/Applications` link), `--universal` (`lipo`) | ✅ DMG; universal needs both Rust targets installed |
-| System notifications | `UNUserNotificationCenter` from Bugle.app, alongside the toast (`[general] system_notifications`) | built; reading the authorization verified from the bundle, posting unverified |
+| System notifications | `UNUserNotificationCenter` from Bugle.app, alongside the toast (`[general] system_notifications`), with the capture's thumbnail attached | built; reading the authorization verified from the bundle, posting and the attached thumbnail unverified |
 | Open at Login | `SMAppService.mainAppService` | built, status read verified; registering not yet exercised |
 
 ## Build
@@ -187,14 +187,15 @@ credentials are missing or incomplete; any failing step fails the run.
 ## CLI
 
 ```bash
-bugle capture                      # drag an area (TTY) / main screen (non-TTY)
+bugle capture                      # drag an area (TTY; Space: pick a window) / main screen (non-TTY)
+bugle capture pick-window          # click a window in the window picker
 bugle capture screen --display 3
 bugle capture window --app Safari --no-shadow -c       # -c copies to clipboard
 bugle capture area --rect 100,100,800,600 -f jpeg -q 85 -o ~/Desktop/x.jpg
 bugle capture window --title "Lab power" --ocr --describe --pin
 bugle capture all                  # every display, stitched
 
-bugle scroll                       # drag the scrolling area, then keep the mouse over it
+bugle scroll                       # drag the scrolling area (Space: pick a window), then keep the mouse over it
 bugle scroll --rect 0,120,1200,800 --max-frames 60 --step -10
 
 bugle record start area --rect 0,30,1280,720 -f gif --fps 10 -s 8
@@ -311,7 +312,10 @@ menu bar and listens for global hotkeys. Everything it does goes through the sam
 history, and play the shutter sound when `general.shutter_sound` is on.
 
 Menu: Capture Area · Capture Window · Capture Screen ·
-Scrolling Capture · Record Video · Record GIF · Record Window · Stop Recording · Annotate Latest
+Scrolling Capture · Record Video · Record GIF · Record Window · Stop Recording · Audio Levels
+(microphone and system-audio level presets and ducking for the next recordings, saved to
+`[recordings]` in the config file; they apply when `microphone` and `system_audio` are both on
+under `[recordings]`, on macOS 14 or later, and the menu says so otherwise) · Annotate Latest
 (opens the markup editor) · Edit Latest Recording (opens the [video editor](#video-editor)) · OCR Latest (copies the text) · Pin Latest · Recent Captures (last five, click to open) ·
 Open History Folder · Start/Stop Agent API · Preferences… (opens the config
 file) · Open at Login (only when running from `Bugle.app`) · Quit. While recording, the status item shows `● m:ss`. Other actions
@@ -323,7 +327,8 @@ Notification Center (`UNUserNotificationCenter`), named and badged as Bugle:
 every finished menu or hotkey action (capture, recording, OCR, pin, sync —
 whether the quick-access panel or the toast shows it; clicking a saved file's
 notification opens it), a markup-editor save that falls back to the toast, and
-every error. Immediate feedback to a click in the panel or the editor (such as
+every error. A notice that has a thumbnail in the toast carries it in the
+notification too. Immediate feedback to a click in the panel or the editor (such as
 "Copied to clipboard") and the agent API's start message stay in-app only.
 macOS asks for permission at the first launch with the switch on. The panel or
 toast is shown either way: an unbundled `bugle-app`, a denied permission or
@@ -343,7 +348,12 @@ it is also the retry when the automatic sync failed. The panel never takes
 keyboard focus, so it has no keyboard shortcut: it goes away after any button,
 the × button, or `timeout_seconds`. It does not time out while the pointer is
 over it, and stays up to 2 s after the pointer leaves. Starting another capture
-or recording from the menu or a hotkey closes it first so it is not captured.
+or recording from the menu or a hotkey hides the panels while it runs, so they
+are not captured; when it is done they come back with the new capture's panel
+in the corner and the earlier ones stacked behind it, each with its own
+timeout (hovering any of them holds them all). Timeouts stop while the panels
+are hidden. Up to four panels stack; a
+fifth capture closes the oldest.
 Configure it in `[quick_access]`:
 
 ```toml
@@ -364,6 +374,8 @@ above the normal window layer are neither picked nor block the window under
 them. Set
 `[screenshots] window_picker = false` to capture the front-most window at once
 instead, as `bugle capture window` and the API do.
+`bugle capture pick-window` (and `bugle record start pick-window`) shows the
+same picker from a terminal.
 
 Space switches between the window picker and the area selection while either
 is up, so *Capture Area* and *Capture Window* are one gesture apart; the hint
@@ -371,11 +383,19 @@ at the bottom of the screen says which mode is on. In the area selection Space
 only works before you start dragging. *Record Video*, *Record GIF* and *Record
 Window* use the same pair of overlays: Record Window starts in the picker and
 records the window you click (MP4), the other two start in the area selection.
+*Scrolling Capture* starts in the area selection too; a picked window scrolls
+the part of it that is on screen. From a terminal, `bugle capture`, `bugle
+scroll` and `bugle record start` without a target offer the same Space toggle
+in their area selection, which then also closes after two minutes (with
+`window_picker = false` it waits as long as you like). Scrolling a picked
+window needs it in front: when another window covers part of it, Bugle says
+so instead of capturing.
 A picked window is recorded by id, the way `record_start` with a window target
 records it, not as the screen area under it. The two overlays together close after two minutes
 (each picker turn still after 30 seconds; never in the middle of a drag).
-With `window_picker = false` the menu items do without the picker: Space does
-nothing, Capture Area and the Record items use the plain area selection, and
+With `window_picker = false` the menu items (and the CLI's interactive
+selection) do without the picker: Space does nothing, Capture Area, Scrolling
+Capture and the Record items use the plain area selection, and
 *Record Window* records the front-most window at once. An API caller that asks
 for `pick_window` explicitly still gets the picker.
 
@@ -410,6 +430,7 @@ offers the window picker: a `capture` or `record_start` whose target is
 while one is open, or one within 3 seconds of the user dismissing the picker,
 is refused with HTTP 409 instead of queuing. `bugle serve` and `bugle mcp`
 cannot show the picker and answer with an error (HTTP 503) that says so.
+The CLI commands run in a terminal show it themselves (`pick-window` target).
 
 Screen Recording permission is requested on first launch (granted to the
 terminal or app that launched `bugle-app` when run from a shell, or to Bugle
@@ -454,7 +475,9 @@ corner do the same, and a zoomed image scrolls.
 `annotated`, named and synced like any other capture) and leaves the original
 alone; the quick-access panel then offers the copy. **Copy** (⌘C) puts the
 annotated image on the clipboard and keeps the window open. Closing with
-unsaved shapes asks first. One editor is open at a time.
+unsaved shapes asks first. Several editors can be open at once, each in a
+window of its own; annotating a capture that already has an editor open
+brings that window forward instead.
 
 What you see is what is saved: finished shapes are drawn by the same renderer
 as `bugle annotate`, and a saved document can use everything that command

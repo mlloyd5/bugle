@@ -97,7 +97,7 @@ curl -s -H "$H" -H 'content-type: application/json' \
 | `annotate` | `source`, `annotation`, `output`, `copy`, `inline_image` | `media` + image |
 | `annotate_schema` | – | example document |
 | `scroll_capture` | `rect`, `max_frames`, `step_lines`, `settle_ms`, `horizontal`, `output`, `inline_image` | `media`, `stats` |
-| `record_start` | `target`, `format` (mp4/mov/gif), `fps`, `microphone`, `system_audio`, `mix_audio`, `microphone_gain`, `system_audio_gain`, `ducking`, `ducking_amount_db` (levels of the mixed track; defaults from `[recordings]`), `max_seconds`, `highlight_clicks`, `cursor_events` (writes `<file>.events.json`), `hide_cursor` (pointer left out of the frames; implies `cursor_events`), `output`, `label` | status |
+| `record_start` | `target`, `format` (mp4/mov/gif), `fps`, `microphone`, `system_audio`, `mix_audio`, `microphone_gain`, `system_audio_gain`, `ducking`, `ducking_amount_db` (levels of the mixed track, or of each separate track without `mix_audio`; defaults from `[recordings]`), `max_seconds`, `highlight_clicks`, `cursor_events` (writes `<file>.events.json`), `hide_cursor` (pointer left out of the frames; implies `cursor_events`), `output`, `label` | status |
 | `record_stop` | – | `media` |
 | `record_status` | – | status |
 | `transcribe` | `source`, `provider`, `language` | `transcript`, `srt` |
@@ -140,7 +140,8 @@ drags a rectangle), `pick_window` and `all_screens`. `pick_window` (for
 app's hover-highlight picker, for when the agent cannot tell which window is
 meant. It works only when the Bugle menu-bar app serves the API (*Start Agent
 API* in its menu, or `bugle-app --serve`); `bugle serve` and `bugle mcp`
-answer with an error naming that, HTTP status 503. The usual `Host` and token
+answer with an error naming that, HTTP status 503. (The CLI run in a terminal,
+`bugle capture pick-window`, shows the picker itself.) The usual `Host` and token
 checks run first: with a token configured, a client without it never gets the
 overlay on screen; with the default (no token, loopback bind) any local
 process that can reach the port can raise it, as it can call every other

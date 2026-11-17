@@ -1,6 +1,6 @@
-//! Quick-access panel logic: which buttons a capture gets, which panel is
-//! current, what a click means, when the panel times out, and how each button
-//! maps onto the engine.
+//! Quick-access panel logic: which buttons a capture gets, which panels are
+//! up, what a click means, when a panel times out, and how each button maps
+//! onto the engine.
 //!
 //! Nothing here touches AppKit; `quick_panel.rs` is the windowing glue. The
 //! engine side is behind [`Backend`] so the dispatch can be tested with a
@@ -13,8 +13,11 @@ use bugle_platform::{Corner, PanelChoice};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// How long the panel stays up after the pointer leaves it, at most.
+/// How long the panels stay up after the pointer leaves them, at most.
 const HOVER_GRACE: Duration = Duration::from_secs(2);
+
+/// Panels stacked at most; a new capture past this closes the oldest.
+pub const MAX_PANELS: usize = 4;
 
 /// What a panel button (or the thumbnail / close button) does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +168,9 @@ pub enum QuickEvent {
     Thumb { generation: u64, png: Vec<u8> },
     /// An off-main-thread action finished.
     Finished { action: PanelAction, result: Result<Option<Feedback>, String> },
+    /// Smoke test: how many panels are up, as the state machine and as the
+    /// window layer count them.
+    Count(std::sync::mpsc::Sender<(usize, usize)>),
 }
 
 /// Something to toast after an action.
@@ -180,20 +186,28 @@ struct Shown {
     target: Target,
     actions: Vec<PanelAction>,
     deadline: Option<Instant>,
+    /// When it opened; one opened while the stack is hidden starts its clock
+    /// when the stack comes back.
+    opened: Instant,
 }
 
-/// The panel state machine. At most one panel is current; every click,
-/// timeout or replacement ends it.
+/// The panel state machine. Captures in a row stack their panels, up to
+/// [`MAX_PANELS`]; each one ends on its own click, its own timeout or when
+/// the stack overflows.
 #[derive(Debug)]
 pub struct QuickAccess {
     pub config: QuickAccessConfig,
     generation: u64,
-    shown: Option<Shown>,
+    /// The panels up, oldest first.
+    shown: Vec<Shown>,
+    /// Set while the stack is off screen for a capture or recording: the
+    /// clocks stop until it comes back.
+    hidden_since: Option<Instant>,
 }
 
 impl QuickAccess {
     pub fn new(config: QuickAccessConfig) -> Self {
-        Self { config, generation: 0, shown: None }
+        Self { config, generation: 0, shown: Vec::new(), hidden_since: None }
     }
 
     /// `None` (stay open) for 0, negative, non-finite or absurdly large values.
@@ -211,30 +225,38 @@ impl QuickAccess {
         self.config.enabled && has_thumbnail && path.is_some()
     }
 
-    /// Start a new panel (replacing any current one); returns its generation.
-    pub fn open(&mut self, target: Target, actions: Vec<PanelAction>, now: Instant) -> u64 {
+    /// Start a new panel on top of the stack. Returns its generation (never
+    /// 0) and the generations of the oldest panels it pushed out of the
+    /// stack, which should close.
+    pub fn open(&mut self, target: Target, actions: Vec<PanelAction>, now: Instant) -> (u64, Vec<u64>) {
         self.generation += 1;
         // An `Instant` that would overflow means "never": stay open.
         let deadline = self.timeout().and_then(|t| now.checked_add(t));
-        self.shown = Some(Shown { generation: self.generation, target, actions, deadline });
-        self.generation
+        self.shown.push(Shown { generation: self.generation, target, actions, deadline, opened: now });
+        let excess = self.shown.len().saturating_sub(MAX_PANELS);
+        let evicted = self.shown.drain(..excess).map(|s| s.generation).collect();
+        (self.generation, evicted)
     }
 
+    /// Whether panel `generation` is still up.
     pub fn is_current(&self, generation: u64) -> bool {
-        self.shown.as_ref().is_some_and(|s| s.generation == generation)
+        self.shown.iter().any(|s| s.generation == generation)
     }
 
     pub fn is_open(&self) -> bool {
-        self.shown.is_some()
+        !self.shown.is_empty()
     }
 
-    /// Map a click to the action and its target and end the panel. Clicks on
-    /// a panel that is no longer current are ignored.
+    /// How many panels are up.
+    pub fn count(&self) -> usize {
+        self.shown.len()
+    }
+
+    /// Map a click to the action and its target and end that panel; the
+    /// others stay. Clicks on a panel that has ended are ignored.
     pub fn on_choice(&mut self, generation: u64, choice: PanelChoice) -> Option<(PanelAction, Target)> {
-        if !self.is_current(generation) {
-            return None;
-        }
-        let shown = self.shown.take()?;
+        let i = self.shown.iter().position(|s| s.generation == generation)?;
+        let shown = self.shown.remove(i);
         let action = match choice {
             PanelChoice::Button(i) => *shown.actions.get(i)?,
             PanelChoice::Close => PanelAction::Dismiss,
@@ -243,30 +265,67 @@ impl QuickAccess {
         Some((action, shown.target))
     }
 
-    /// Advance the clock. The panel never closes while the pointer is over
-    /// it; once the pointer leaves it stays at least [`HOVER_GRACE`] longer
-    /// (or the whole timeout, if shorter). Hovering before the deadline does
-    /// not add time. Returns `true` when the panel timed out and should close.
-    pub fn tick(&mut self, now: Instant, hovered: bool) -> bool {
-        let grace = self.timeout().map(|t| t.min(HOVER_GRACE));
-        let Some(shown) = self.shown.as_mut() else { return false };
-        let Some(deadline) = shown.deadline else { return false };
-        if hovered {
-            if let Some(g) = grace {
-                shown.deadline = Some(now.checked_add(g).map_or(deadline, |d| deadline.max(d)));
-            }
-            return false;
-        }
-        if now >= deadline {
-            self.shown = None;
-            return true;
-        }
-        false
+    /// The stack went off screen (a capture or recording is starting). Its
+    /// timeouts stop until [`QuickAccess::show`]. Hiding twice keeps the
+    /// first time.
+    pub fn hide(&mut self, now: Instant) {
+        self.hidden_since.get_or_insert(now);
     }
 
-    /// The panel went away without a click we saw (e.g. the app replaced it).
-    pub fn forget(&mut self) {
-        self.shown = None;
+    /// The stack is back on screen: every deadline moves on by the time its
+    /// panel spent hidden, so each gets its whole timeout on screen. Returns
+    /// whether it was hidden.
+    pub fn show(&mut self, now: Instant) -> bool {
+        let Some(since) = self.hidden_since.take() else { return false };
+        for s in &mut self.shown {
+            let off = now.saturating_duration_since(since.max(s.opened));
+            if let Some(d) = s.deadline {
+                // Overflow means "never", as in `open`.
+                s.deadline = d.checked_add(off);
+            }
+        }
+        true
+    }
+
+    /// Whether the stack is off screen.
+    pub fn is_hidden(&self) -> bool {
+        self.hidden_since.is_some()
+    }
+
+    /// Advance the clock. Nothing closes while the stack is hidden. No panel closes while the pointer is over any of
+    /// the stack (so it never shifts under the pointer); once the pointer
+    /// leaves, each stays at least [`HOVER_GRACE`] longer (or its whole
+    /// timeout, if shorter). Hovering before a deadline does not add time.
+    /// Returns the generations of the panels that timed out and should close.
+    pub fn tick(&mut self, now: Instant, hovered: bool) -> Vec<u64> {
+        if self.is_hidden() {
+            return Vec::new();
+        }
+        if hovered {
+            if let Some(g) = self.timeout().map(|t| t.min(HOVER_GRACE)) {
+                for shown in &mut self.shown {
+                    if let Some(deadline) = shown.deadline {
+                        shown.deadline = Some(now.checked_add(g).map_or(deadline, |d| deadline.max(d)));
+                    }
+                }
+            }
+            return Vec::new();
+        }
+        let mut expired = Vec::new();
+        self.shown.retain(|s| {
+            let over = s.deadline.is_some_and(|d| now >= d);
+            if over {
+                expired.push(s.generation);
+            }
+            !over
+        });
+        expired
+    }
+
+    /// Panel `generation` went away without a click we saw (e.g. it could
+    /// not be shown).
+    pub fn forget(&mut self, generation: u64) {
+        self.shown.retain(|s| s.generation != generation);
     }
 }
 
@@ -406,7 +465,7 @@ mod tests {
     fn choices_map_to_actions_once() {
         let mut q = QuickAccess::new(cfg(8.0));
         let now = Instant::now();
-        let g = q.open(target(), actions_for(MediaKind::Screenshot, NO_SYNC), now);
+        let (g, _) = q.open(target(), actions_for(MediaKind::Screenshot, NO_SYNC), now);
         assert!(q.is_open());
         assert_eq!(q.on_choice(g + 1, PanelChoice::Button(0)), None, "stale generation");
         let (a, t) = q.on_choice(g, PanelChoice::Button(2)).unwrap();
@@ -415,25 +474,125 @@ mod tests {
         assert!(!q.is_open());
         assert_eq!(q.on_choice(g, PanelChoice::Button(0)), None, "panel already ended");
 
-        let g = q.open(target(), vec![PanelAction::Copy], now);
+        let (g, _) = q.open(target(), vec![PanelAction::Copy], now);
         assert_eq!(q.on_choice(g, PanelChoice::Button(5)), None, "out of range");
         assert!(!q.is_open() && !q.is_current(g), "an out-of-range click still ends the panel");
-        let g = q.open(target(), vec![PanelAction::Copy], now);
+        let (g, _) = q.open(target(), vec![PanelAction::Copy], now);
         assert_eq!(q.on_choice(g, PanelChoice::Close).unwrap().0, PanelAction::Dismiss);
-        let g = q.open(target(), vec![PanelAction::Copy], now);
+        let (g, _) = q.open(target(), vec![PanelAction::Copy], now);
         assert_eq!(q.on_choice(g, PanelChoice::Thumbnail).unwrap().0, PanelAction::Open);
     }
 
     #[test]
-    fn new_panel_replaces_old() {
+    fn captures_in_a_row_stack() {
         let mut q = QuickAccess::new(cfg(8.0));
         let now = Instant::now();
-        let g1 = q.open(target(), vec![PanelAction::Copy], now);
-        let g2 = q.open(target(), vec![PanelAction::Reveal], now);
-        assert!(g2 > g1);
-        assert!(!q.is_current(g1) && q.is_current(g2));
-        assert_eq!(q.on_choice(g1, PanelChoice::Button(0)), None);
-        assert_eq!(q.on_choice(g2, PanelChoice::Button(0)).unwrap().0, PanelAction::Reveal);
+        let other = Target { source: "def456".into(), ..target() };
+        let (g1, out1) = q.open(target(), vec![PanelAction::Copy], now);
+        let (g2, out2) = q.open(other.clone(), vec![PanelAction::Reveal], now);
+        assert!(g1 > 0 && g2 > g1);
+        assert!(out1.is_empty() && out2.is_empty(), "two panels fit");
+        assert!(q.is_current(g1) && q.is_current(g2));
+        assert_eq!(q.count(), 2);
+        // Each panel answers for its own capture.
+        assert_eq!(q.on_choice(g1, PanelChoice::Button(0)), Some((PanelAction::Copy, target())));
+        assert!(q.is_current(g2), "a click on one leaves the others");
+        assert_eq!(q.on_choice(g1, PanelChoice::Button(0)), None, "already ended");
+        assert_eq!(q.on_choice(g2, PanelChoice::Button(0)), Some((PanelAction::Reveal, other)));
+        assert!(!q.is_open());
+    }
+
+    #[test]
+    fn a_full_stack_pushes_out_the_oldest() {
+        let mut q = QuickAccess::new(cfg(8.0));
+        let now = Instant::now();
+        let gens: Vec<u64> = (0..MAX_PANELS)
+            .map(|_| {
+                let (g, out) = q.open(target(), vec![PanelAction::Copy], now);
+                assert!(out.is_empty());
+                g
+            })
+            .collect();
+        let (newest, out) = q.open(target(), vec![PanelAction::Copy], now);
+        assert_eq!(out, vec![gens[0]]);
+        assert_eq!(q.count(), MAX_PANELS);
+        assert!(!q.is_current(gens[0]) && q.is_current(gens[1]) && q.is_current(newest));
+        assert_eq!(q.on_choice(gens[0], PanelChoice::Close), None, "a pushed-out panel takes no clicks");
+    }
+
+    #[test]
+    fn stacked_panels_time_out_one_by_one() {
+        let mut q = QuickAccess::new(cfg(5.0));
+        let t0 = Instant::now();
+        let (g1, _) = q.open(target(), vec![PanelAction::Copy], t0);
+        let (g2, _) = q.open(target(), vec![PanelAction::Copy], t0 + Duration::from_secs(3));
+        assert_eq!(q.tick(t0 + Duration::from_secs(4), false), Vec::<u64>::new());
+        assert_eq!(q.tick(t0 + Duration::from_secs(5), false), vec![g1], "the older one first");
+        assert!(q.is_current(g2));
+        // Hovering the stack holds what is left, as for a single panel.
+        assert!(q.tick(t0 + Duration::from_secs(20), true).is_empty());
+        assert!(q.tick(t0 + Duration::from_millis(21_500), false).is_empty());
+        assert_eq!(q.tick(t0 + Duration::from_secs(22), false), vec![g2]);
+        assert!(!q.is_open());
+    }
+
+    #[test]
+    fn hovering_holds_the_whole_stack() {
+        let mut q = QuickAccess::new(cfg(5.0));
+        let t0 = Instant::now();
+        let (g1, _) = q.open(target(), vec![PanelAction::Copy], t0);
+        let (g2, _) = q.open(target(), vec![PanelAction::Copy], t0 + Duration::from_secs(1));
+        assert!(q.tick(t0 + Duration::from_secs(30), true).is_empty(), "nothing shifts under the pointer");
+        assert_eq!(q.count(), 2);
+        let mut out = q.tick(t0 + Duration::from_secs(32), false);
+        out.sort();
+        assert_eq!(out, vec![g1, g2], "both had run out; both close after the grace");
+    }
+
+    #[test]
+    fn hidden_panels_do_not_time_out() {
+        let mut q = QuickAccess::new(cfg(8.0));
+        let t0 = Instant::now();
+        let (g1, _) = q.open(target(), vec![PanelAction::Copy], t0);
+        // 3 s on screen, then a 60 s recording.
+        q.hide(t0 + Duration::from_secs(3));
+        assert!(q.is_hidden());
+        q.hide(t0 + Duration::from_secs(10)); // a second hide keeps the first time
+        assert!(q.tick(t0 + Duration::from_secs(40), false).is_empty(), "no clock while hidden");
+        // A capture saved while hidden (an editor save, say) joins the stack hidden.
+        let (g2, _) = q.open(target(), vec![PanelAction::Copy], t0 + Duration::from_secs(50));
+        assert!(q.tick(t0 + Duration::from_secs(62), false).is_empty());
+        let back = t0 + Duration::from_secs(63);
+        assert!(q.show(back));
+        assert!(!q.is_hidden() && !q.show(back), "showing twice is a no-op");
+        assert!(q.is_current(g1) && q.is_current(g2), "both come back");
+        // g1 had 5 s left; g2 all 8.
+        assert!(q.tick(back + Duration::from_millis(4_900), false).is_empty());
+        assert_eq!(q.tick(back + Duration::from_secs(5), false), vec![g1]);
+        assert!(q.tick(back + Duration::from_millis(7_900), false).is_empty());
+        assert_eq!(q.tick(back + Duration::from_secs(8), false), vec![g2]);
+    }
+
+    #[test]
+    fn hide_with_no_panels_is_harmless() {
+        let mut q = QuickAccess::new(cfg(8.0));
+        let t0 = Instant::now();
+        q.hide(t0);
+        let (g, _) = q.open(target(), vec![PanelAction::Copy], t0 + Duration::from_secs(1));
+        let back = t0 + Duration::from_secs(4);
+        q.show(back);
+        assert!(q.tick(back + Duration::from_millis(7_900), false).is_empty(), "clock starts on show");
+        assert_eq!(q.tick(back + Duration::from_secs(8), false), vec![g]);
+    }
+
+    #[test]
+    fn forgetting_one_panel_keeps_the_rest() {
+        let mut q = QuickAccess::new(cfg(8.0));
+        let now = Instant::now();
+        let (g1, _) = q.open(target(), vec![PanelAction::Copy], now);
+        let (g2, _) = q.open(target(), vec![PanelAction::Copy], now);
+        q.forget(g2);
+        assert!(q.is_current(g1) && !q.is_current(g2));
     }
 
     #[test]
@@ -441,15 +600,15 @@ mod tests {
         let mut q = QuickAccess::new(cfg(5.0));
         let t0 = Instant::now();
         q.open(target(), vec![PanelAction::Copy], t0);
-        assert!(!q.tick(t0 + Duration::from_secs(4), false));
+        assert!(q.tick(t0 + Duration::from_secs(4), false).is_empty());
         // Hovered past the deadline: stays up.
-        assert!(!q.tick(t0 + Duration::from_secs(6), true));
-        assert!(!q.tick(t0 + Duration::from_secs(30), true));
+        assert!(q.tick(t0 + Duration::from_secs(6), true).is_empty());
+        assert!(q.tick(t0 + Duration::from_secs(30), true).is_empty());
         // Pointer leaves: a short grace, then it closes.
-        assert!(!q.tick(t0 + Duration::from_millis(31_500), false));
-        assert!(q.tick(t0 + Duration::from_secs(33), false));
+        assert!(q.tick(t0 + Duration::from_millis(31_500), false).is_empty());
+        assert_eq!(q.tick(t0 + Duration::from_secs(33), false).len(), 1);
         assert!(!q.is_open());
-        assert!(!q.tick(t0 + Duration::from_secs(40), false), "nothing left to close");
+        assert!(q.tick(t0 + Duration::from_secs(40), false).is_empty(), "nothing left to close");
     }
 
     #[test]
@@ -457,9 +616,9 @@ mod tests {
         let mut q = QuickAccess::new(cfg(8.0));
         let t0 = Instant::now();
         q.open(target(), vec![PanelAction::Copy], t0);
-        assert!(!q.tick(t0 + Duration::from_secs(1), true));
-        assert!(!q.tick(t0 + Duration::from_secs(3), true));
-        assert!(q.tick(t0 + Duration::from_secs(8), false), "closes on the original deadline");
+        assert!(q.tick(t0 + Duration::from_secs(1), true).is_empty());
+        assert!(q.tick(t0 + Duration::from_secs(3), true).is_empty());
+        assert_eq!(q.tick(t0 + Duration::from_secs(8), false).len(), 1, "closes on the original deadline");
     }
 
     #[test]
@@ -467,10 +626,10 @@ mod tests {
         let mut q = QuickAccess::new(cfg(1.0));
         let t0 = Instant::now();
         q.open(target(), vec![PanelAction::Copy], t0);
-        assert!(!q.tick(t0 + Duration::from_millis(1_500), true), "hovered: stays");
+        assert!(q.tick(t0 + Duration::from_millis(1_500), true).is_empty(), "hovered: stays");
         // Grace is min(timeout, 2 s) = 1 s after the last hovered tick.
-        assert!(!q.tick(t0 + Duration::from_millis(2_400), false));
-        assert!(q.tick(t0 + Duration::from_millis(2_500), false));
+        assert!(q.tick(t0 + Duration::from_millis(2_400), false).is_empty());
+        assert_eq!(q.tick(t0 + Duration::from_millis(2_500), false).len(), 1);
     }
 
     #[test]
@@ -479,8 +638,8 @@ mod tests {
         for s in [1e19, 1e30, 1e300, f64::INFINITY, f64::NAN, -5.0] {
             let mut q = QuickAccess::new(cfg(s));
             q.open(target(), vec![PanelAction::Copy], t0);
-            assert!(!q.tick(t0 + Duration::from_secs(86_400 * 365), false), "{s}");
-            assert!(!q.tick(t0 + Duration::from_secs(10), true), "{s} hovered");
+            assert!(q.tick(t0 + Duration::from_secs(86_400 * 365), false).is_empty(), "{s}");
+            assert!(q.tick(t0 + Duration::from_secs(10), true).is_empty(), "{s} hovered");
             assert!(q.is_open(), "{s}");
         }
     }
@@ -490,7 +649,7 @@ mod tests {
         let mut q = QuickAccess::new(cfg(0.0));
         let t0 = Instant::now();
         q.open(target(), vec![PanelAction::Copy], t0);
-        assert!(!q.tick(t0 + Duration::from_secs(3600), false));
+        assert!(q.tick(t0 + Duration::from_secs(3600), false).is_empty());
         assert!(q.is_open());
     }
 

@@ -239,7 +239,7 @@ pub struct RecordRequest {
     /// Fold the microphone and system-audio tracks into one.
     #[serde(default)]
     pub mix_audio: bool,
-    /// Levels and ducking for the mixed track (`microphone_gain`,
+    /// Levels and ducking, mixed or separate tracks (`microphone_gain`,
     /// `system_audio_gain`, `ducking`, `ducking_amount_db`).
     #[serde(flatten)]
     pub mix: crate::audio_mix::AudioMixOverrides,
