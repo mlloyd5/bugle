@@ -346,6 +346,11 @@ int32_t bugle_video_editor_open(const char *title, double duration, uint32_t w, 
         time.textColor = NSColor.secondaryLabelColor;
         time.lineBreakMode = NSLineBreakByTruncatingTail;
         [time setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+        // Room for "0:00.00 / 0:00.00 · clip 0:00.00" (longer recordings
+        // grow it while the window has room).
+        [time.widthAnchor constraintGreaterThanOrEqualToConstant:
+                              ceil([@"00:00.00 / 00:00.00 · clip 00:00.00" sizeWithAttributes:@{NSFontAttributeName : time.font}].width) + 4]
+            .active = YES;
         e.timeLabel = time;
 
         e.inButton = vbutton(@"Set In", @"Start the clip at the playhead (I)", e, VCMD_MARK_IN);

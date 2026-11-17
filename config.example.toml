@@ -98,6 +98,7 @@ record = "cmd+shift+5"        # starts an MP4 recording, or stops the active one
 ocr_latest = "cmd+shift+2"
 pin_latest = "cmd+shift+p"
 # annotate_latest = "cmd+shift+e"   # markup editor for the newest screenshot
+# edit_latest = "cmd+shift+v"       # video editor for the newest recording
 # stop_recording = "cmd+shift+."
 # sync_latest = "ctrl+alt+s"
 # open_folder = "ctrl+alt+o"

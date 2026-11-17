@@ -47,7 +47,7 @@ type PreviewJob = (u64, Annotation);
 /// Run a render (or save) and turn a panic into an error, so a renderer bug
 /// can neither take down a worker thread that the window waits on nor
 /// unwind through the AppKit callback on the main thread.
-fn guarded<T>(what: &str, f: impl FnOnce() -> anyhow::Result<T>) -> Result<T, String> {
+pub(crate) fn guarded<T>(what: &str, f: impl FnOnce() -> anyhow::Result<T>) -> Result<T, String> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(r) => r.map_err(|e| format!("{e:#}")),
         Err(panic) => {

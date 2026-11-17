@@ -1,0 +1,421 @@
+//! Windowing glue for the video editor: opens the AppKit window for a
+//! recording, feeds its events to [`VideoEditor`], decodes preview frames
+//! (with the zoom and pointer effects the export would apply) on a preview
+//! thread, and runs the export (`Engine::edit`) off the main thread. The
+//! decisions live in `video_editor.rs`.
+
+use crate::editor_window::guarded;
+use crate::video_editor::{preset_label, Caps, Effects, FrameRequest, VideoEditor, PRESETS, ZOOMS};
+use crate::{file_name, saved_subtitle, App, AppEvent, Notice, Proxy};
+use bugle_engine::{EditRequest, EditSource, Engine};
+use bugle_platform::{VideoEditorCommand, VideoEditorEvent};
+use image::RgbaImage;
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Largest preview frame decoded, in pixels (the window shows it scaled to
+/// fit; 2x a large window on Retina).
+const PREVIEW_MAX: (u32, u32) = (1920, 1200);
+
+/// Video editor traffic on the main loop.
+pub(crate) enum VideoEditorMsg {
+    /// Open the video editor for a media id, `latest` or a file path.
+    Open(String),
+    /// A preview frame finished decoding on the preview thread.
+    Preview { generation: u64, seq: u64, t: f64, result: Result<RgbaImage, String> },
+    /// An export finished. On success the window `generation` closes.
+    Exported { generation: u64, result: Result<Notice, String> },
+    /// Smoke test: deliver an event as if the window had reported it.
+    Inject(VideoEditorEvent),
+    /// Smoke test: close without exporting.
+    Close,
+}
+
+thread_local! {
+    /// The open window's session, for results arriving on the loop. The
+    /// window's handler owns the session; this never keeps it alive.
+    static CURRENT: RefCell<Weak<RefCell<Session>>> = const { RefCell::new(Weak::new()) };
+}
+
+/// One frame to decode: its sequence number, time, when it may be shown
+/// (playback) and the effect options to render it with.
+struct PreviewJob {
+    seq: u64,
+    frame: FrameRequest,
+    zoom: Option<f64>,
+    smooth: bool,
+}
+
+/// The preview options effects were built for: zoom factor bits, smoothing.
+type EffectsKey = (Option<u64>, bool);
+
+fn toast_problem(msg: &str) {
+    tracing::warn!("video editor: {msg}");
+    bugle_platform::toast_show(None, "Edit Video", msg, None, 4.0);
+}
+
+/// Decode preview frames on a thread of their own. Only the newest waiting
+/// job is decoded; a job due later (playback) waits for its time unless a
+/// newer one replaces it. The effects are built once per option change,
+/// with the same code the export uses. The thread ends when the session
+/// (holding the sender) is dropped.
+fn spawn_preview(src: Arc<EditSource>, proxy: Proxy, generation: u64) -> Option<mpsc::Sender<PreviewJob>> {
+    let (tx, rx) = mpsc::channel::<PreviewJob>();
+    let spawned = std::thread::Builder::new().name("bugle-video-preview".into()).spawn(move || {
+        let mut frames = src.preview_frames(PREVIEW_MAX).map_err(|e| format!("{e:#}"));
+        // The effects for the options they were built for (zoom bits, smoothing).
+        let mut effects: Option<(EffectsKey, Option<bugle_engine::cursor_fx::Effects>)> = None;
+        'jobs: while let Ok(mut job) = rx.recv() {
+            loop {
+                while let Ok(newer) = rx.try_recv() {
+                    job = newer;
+                }
+                let wait = job.frame.at.saturating_duration_since(Instant::now());
+                if wait.is_zero() {
+                    break;
+                }
+                match rx.recv_timeout(wait) {
+                    Ok(newer) => job = newer,
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break 'jobs,
+                }
+            }
+            let key = (job.zoom.map(f64::to_bits), job.smooth);
+            if effects.as_ref().map(|e| e.0) != Some(key) {
+                let req = EditRequest { zoom: job.zoom, smooth_cursor: job.smooth, ..Default::default() };
+                effects = Some((key, src.effects(&req)));
+            }
+            let fx = effects.as_ref().and_then(|e| e.1.as_ref());
+            // Every job answers, error or not: playback waits for it.
+            let result = match frames.as_mut() {
+                Ok(f) => guarded("preview", || f.frame(job.frame.t, fx)),
+                Err(e) => Err(e.clone()),
+            };
+            proxy.send(AppEvent::VideoEditor(VideoEditorMsg::Preview { generation, seq: job.seq, t: job.frame.t, result }));
+        }
+    });
+    match spawned {
+        Ok(_) => Some(tx),
+        Err(e) => {
+            tracing::warn!("video editor: no preview thread ({e})");
+            None
+        }
+    }
+}
+
+/// One open video editor. Lives in the window's event handler and is
+/// dropped when the window closes.
+struct Session {
+    editor: VideoEditor,
+    src: Arc<EditSource>,
+    engine: Arc<Engine>,
+    proxy: Proxy,
+    generation: u64,
+    preview: Option<mpsc::Sender<PreviewJob>>,
+    /// The newest frame asked for; results for older ones are dropped.
+    seq: u64,
+    /// The last preview error toasted, so a failing decode is reported once.
+    last_error: Option<String>,
+}
+
+impl Session {
+    fn on_event(&mut self, event: VideoEditorEvent) {
+        let fx = self.editor.handle(event, Instant::now());
+        self.apply(fx);
+    }
+
+    fn apply(&mut self, fx: Effects) {
+        if let Some(f) = fx.frame {
+            self.request_frame(f);
+        }
+        if let Some(req) = fx.export {
+            self.export(req);
+        }
+        if fx.state {
+            bugle_platform::video_editor_set_state(&self.editor.state());
+        }
+    }
+
+    fn request_frame(&mut self, frame: FrameRequest) {
+        self.seq += 1;
+        let (zoom, smooth) = self.editor.options();
+        let job = PreviewJob { seq: self.seq, frame, zoom, smooth };
+        if let Some(tx) = &self.preview {
+            if tx.send(job).is_ok() {
+                return;
+            }
+            self.preview = None;
+        }
+        toast_problem("the preview is not available");
+    }
+
+    fn on_preview(&mut self, seq: u64, t: f64, result: Result<RgbaImage, String>) {
+        if seq != self.seq {
+            // A newer frame is on its way.
+            return;
+        }
+        match result {
+            Ok(img) => {
+                self.last_error = None;
+                bugle_platform::video_editor_set_frame(&img);
+            }
+            Err(e) => {
+                if self.last_error.as_ref() != Some(&e) {
+                    toast_problem(&format!("the frame at {} could not be shown: {e}", crate::video_editor::clock(t)));
+                }
+                self.last_error = Some(e);
+            }
+        }
+        // During playback: the next frame, and the playhead moves on.
+        if let Some(f) = self.editor.shown(t, Instant::now()) {
+            self.request_frame(f);
+            bugle_platform::video_editor_set_state(&self.editor.state());
+        }
+    }
+
+    /// Export the clip as a new history item. The window stays up (its
+    /// controls disabled) until the export succeeded, so a failure loses
+    /// nothing.
+    fn export(&mut self, req: EditRequest) {
+        if let Err(e) = self.src.check(&req) {
+            return toast_problem(&e.to_string());
+        }
+        self.editor.set_busy(true);
+        let (engine, proxy, generation) = (self.engine.clone(), self.proxy.clone(), self.generation);
+        tracing::info!("video editor: exporting {req:?}");
+        let spawned = std::thread::Builder::new().name("bugle-video-export".into()).spawn(move || {
+            // Always answers, so the window never stays busy.
+            let result = guarded("export", || engine.edit(&req)).map(|item| Notice {
+                title: format!("Edited recording saved ({:.1}s)", item.duration_seconds.unwrap_or(0.0)),
+                subtitle: saved_subtitle(&engine, &item),
+                thumb: thumbnail(&item),
+                open: Some(item.path.clone()),
+            });
+            proxy.send(AppEvent::VideoEditor(VideoEditorMsg::Exported { generation, result }));
+        });
+        if let Err(e) = spawned {
+            self.editor.set_busy(false);
+            toast_problem(&format!("could not start the export: {e}"));
+        }
+    }
+
+    fn export_failed(&mut self) {
+        self.editor.set_busy(false);
+        bugle_platform::video_editor_set_state(&self.editor.state());
+    }
+}
+
+/// A small thumbnail of an exported video or GIF, for the panel or toast.
+fn thumbnail(item: &bugle_core::MediaItem) -> Option<Vec<u8>> {
+    let img = match item.kind {
+        bugle_core::MediaKind::Video => bugle_platform::video_frame(&item.path, 0.0).ok(),
+        _ => image::open(&item.path).ok().map(|i| i.to_rgba8()),
+    };
+    img.and_then(|i| bugle_engine::encode_png_bounded(&i, 112).ok())
+}
+
+impl App {
+    /// The most recent video in the history, for *Edit Latest Recording*.
+    pub(crate) fn edit_latest_recording(&mut self) {
+        let recent = self.engine.history.recent(50).unwrap_or_default();
+        match recent.iter().find(|m| m.kind == bugle_core::MediaKind::Video && m.path.exists()) {
+            Some(m) => self.open_video_editor(&m.id.clone()),
+            None => self.toast_error("Edit Video: no video recording in the history yet"),
+        }
+    }
+
+    /// Open the video editor for a media id, `latest` or a video path. One
+    /// at a time: with one already open, that one comes forward.
+    pub(crate) fn open_video_editor(&mut self, source: &str) {
+        if bugle_platform::video_editor_active() {
+            bugle_platform::video_editor_focus();
+            return self.toast_error("Edit Video: finish or close the open video editor first");
+        }
+        let src = match self.engine.edit_source(source) {
+            Ok(s) => Arc::new(s),
+            Err(e) => return self.toast_error(&format!("Edit Video: {e:#}")),
+        };
+        if let Some(e) = &src.track_error {
+            tracing::warn!("video editor: ignoring the cursor event track: {e}");
+        }
+        self.video_editor_generation += 1;
+        let generation = self.video_editor_generation;
+        let caps = Caps { zoom: src.can_zoom(), smooth: src.can_smooth() };
+        let editor = VideoEditor::new(src.source.clone(), src.duration(), src.info.nominal_fps, caps);
+        let session = Rc::new(RefCell::new(Session {
+            editor,
+            preview: spawn_preview(src.clone(), self.proxy.clone(), generation),
+            src: src.clone(),
+            engine: self.engine.clone(),
+            proxy: self.proxy.clone(),
+            generation,
+            seq: 0,
+            last_error: None,
+        }));
+        let zoom_labels: Vec<&str> = ZOOMS.iter().map(|z| z.0).collect();
+        let preset_labels: Vec<&str> = PRESETS.iter().map(|p| preset_label(*p)).collect();
+        let handler = session.clone();
+        let opened = bugle_platform::video_editor_open(
+            &format!("Edit Video — {}", file_name(&src.item.path)),
+            src.duration(),
+            (src.info.width, src.info.height),
+            &zoom_labels,
+            &preset_labels,
+            move |event| match handler.try_borrow_mut() {
+                Ok(mut s) => s.on_event(event),
+                Err(_) => tracing::warn!("video editor: dropped re-entrant event {event:?}"),
+            },
+        );
+        if let Err(e) = opened {
+            return self.toast_error(&format!("Edit Video: {e:#}"));
+        }
+        CURRENT.with(|c| *c.borrow_mut() = Rc::downgrade(&session));
+        tracing::info!(
+            "video editor: opened {} ({:.2}s, {}×{}, zoom {}, smoothing {})",
+            file_name(&src.item.path),
+            src.duration(),
+            src.info.width,
+            src.info.height,
+            caps.zoom,
+            caps.smooth
+        );
+        let fx = session.borrow().editor.start(Instant::now());
+        session.borrow_mut().apply(fx);
+    }
+
+    pub(crate) fn on_video_editor(&mut self, msg: VideoEditorMsg) {
+        let current = || CURRENT.with(|c| c.borrow().upgrade());
+        match msg {
+            VideoEditorMsg::Open(source) => self.open_video_editor(&source),
+            VideoEditorMsg::Preview { generation, seq, t, result } => {
+                if let Some(session) = current() {
+                    match session.try_borrow_mut() {
+                        Ok(mut s) if s.generation == generation => s.on_preview(seq, t, result),
+                        // A window that has closed since.
+                        Ok(_) => {}
+                        // Never dropped (playback waits for it): try again
+                        // on the next turn.
+                        Err(_) => self.proxy.send(AppEvent::VideoEditor(VideoEditorMsg::Preview { generation, seq, t, result })),
+                    }
+                }
+            }
+            VideoEditorMsg::Exported { generation, result: Ok(n) } => {
+                if generation == self.video_editor_generation {
+                    bugle_platform::video_editor_close();
+                }
+                tracing::info!("video editor: exported {}", n.subtitle);
+                if !self.quick_show_notice(&n) {
+                    self.toast(&n);
+                }
+                self.refresh_recent();
+            }
+            VideoEditorMsg::Exported { generation, result: Err(e) } => {
+                // The window is still up with the work in it; let it go on.
+                if let Some(session) = current() {
+                    if let Ok(mut s) = session.try_borrow_mut() {
+                        if s.generation == generation {
+                            s.export_failed();
+                        }
+                    }
+                }
+                self.toast_error(&format!("Edit Video: could not export: {e}"));
+            }
+            VideoEditorMsg::Inject(event) => bugle_platform::video_editor_inject(event),
+            VideoEditorMsg::Close => bugle_platform::video_editor_close(),
+        }
+    }
+}
+
+/// `--smoke-test` step: write a synthetic 3-second recording (a moving
+/// gradient, 640x400 at 30 fps) with an event track (pointer hidden, two
+/// clicks) to the temp directory — not added to history — open it in the
+/// video editor, and drive it with injected events (nothing can click):
+/// seek, set the in and out points, zoom, smoothing, a preset, playback.
+/// The window is captured along the way (kept only with
+/// `BUGLE_SMOKE_KEEP`) and closed without exporting; with
+/// `BUGLE_SMOKE_SAVE` it exports instead, which writes to the configured
+/// `save_dir` and history: use a throwaway `--config`.
+pub(crate) fn smoke(proxy: &Proxy) {
+    let path = std::env::temp_dir().join("bugle-smoke-video-editor.mp4");
+    let side = bugle_core::EventTrack::sidecar_path(&path);
+    if let Err(e) = write_smoke_recording(&path, &side) {
+        eprintln!("smoke test: video editor skipped ({e:#})");
+        return;
+    }
+    let send = |e: VideoEditorEvent| proxy.send(AppEvent::VideoEditor(VideoEditorMsg::Inject(e)));
+    let command = |c: VideoEditorCommand| send(VideoEditorEvent::Command(c));
+    let snap = |name: &str| {
+        std::thread::sleep(Duration::from_millis(900));
+        let shot = bugle_platform::app_windows()
+            .ok()
+            .and_then(|ws| ws.into_iter().find(|w| w.title.starts_with("Edit Video")))
+            .and_then(|w| bugle_platform::capture_window(w.id, false, false).ok());
+        match shot {
+            Some(shot) if std::env::var_os("BUGLE_SMOKE_KEEP").is_some() => {
+                let out = std::env::temp_dir().join(format!("bugle-smoke-{name}.png"));
+                match shot.save(&out) {
+                    Ok(()) => eprintln!("smoke test: {name} → {}", out.display()),
+                    Err(e) => eprintln!("smoke test: {name} not kept ({e})"),
+                }
+            }
+            Some(shot) => eprintln!("smoke test: {name} {}×{}", shot.width(), shot.height()),
+            None => eprintln!("smoke test: {name} not found"),
+        }
+    };
+    proxy.send(AppEvent::VideoEditor(VideoEditorMsg::Open(path.display().to_string())));
+    std::thread::sleep(Duration::from_millis(700));
+    send(VideoEditorEvent::Seek(0.5));
+    command(VideoEditorCommand::MarkIn);
+    send(VideoEditorEvent::SetOut(2.6));
+    command(VideoEditorCommand::StepForward);
+    // Zoom 2x, at the first click.
+    send(VideoEditorEvent::Zoom(2));
+    send(VideoEditorEvent::Seek(1.0));
+    snap("video-editor-zoomed");
+    send(VideoEditorEvent::Smooth(false));
+    send(VideoEditorEvent::Preset(PRESETS.iter().position(|p| *p == bugle_engine::ExportPreset::P720).unwrap_or(0)));
+    command(VideoEditorCommand::PlayPause);
+    snap("video-editor-playing");
+    command(VideoEditorCommand::Escape);
+    if std::env::var_os("BUGLE_SMOKE_SAVE").is_some() {
+        // The window closes itself once the export is written.
+        command(VideoEditorCommand::Export);
+        std::thread::sleep(Duration::from_millis(5000));
+    }
+    proxy.send(AppEvent::VideoEditor(VideoEditorMsg::Close));
+    std::thread::sleep(Duration::from_millis(300));
+    for p in [&path, &side] {
+        if let Err(e) = std::fs::remove_file(p) {
+            eprintln!("smoke test: could not remove {} ({e})", p.display());
+        }
+    }
+}
+
+/// The smoke test's recording and its event track: 320x200 pt recorded at
+/// 2 px/pt with the pointer hidden, moving across, clicking twice.
+fn write_smoke_recording(path: &std::path::Path, side: &std::path::Path) -> anyhow::Result<()> {
+    use bugle_core::events::{CursorEvent, EventKind, MouseButton};
+    let (w, h, fps) = (640u32, 400u32, 30u32);
+    let mut writer = bugle_platform::VideoFrameWriter::create(path, w, h, fps, true)?;
+    for i in 0..3 * fps {
+        let shift = i * 4;
+        writer.append(&RgbaImage::from_fn(w, h, |x, y| {
+            image::Rgba([((x + shift) / 3 % 256) as u8, (y / 2) as u8, 140 + ((x / 40 + y / 40) % 2 * 60) as u8, 255])
+        }))?;
+    }
+    writer.finish()?;
+    let click = |t: f64, kind: EventKind, x: f64, y: f64| CursorEvent { t, kind, button: Some(MouseButton::Left), x, y };
+    let mut events: Vec<CursorEvent> =
+        (0..30).map(|i| CursorEvent::moved(i as f64 * 0.1, 20.0 + i as f64 * 9.0, 40.0 + i as f64 * 4.0)).collect();
+    events.push(click(1.0, EventKind::Down, 110.0, 80.0));
+    events.push(click(1.05, EventKind::Up, 110.0, 80.0));
+    events.push(click(2.0, EventKind::Down, 200.0, 120.0));
+    events.push(click(2.05, EventKind::Up, 200.0, 120.0));
+    events.sort_by(|a, b| a.t.total_cmp(&b.t));
+    let mut track = bugle_core::EventTrack::new(bugle_core::Rect::new(0.0, 0.0, 320.0, 200.0), false, 3.0, events);
+    track.fps = Some(fps as f64);
+    track.save(side)
+}

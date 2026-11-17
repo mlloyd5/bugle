@@ -812,7 +812,7 @@ impl Engine {
             return Err(BugleError::Invalid(format!("{} is not a video recording (.mp4, .mov or .m4v)", item.path.display())).into());
         }
         let info = bugle_platform::video_info(&item.path)?;
-        if !(info.end() > 0.0) || info.width == 0 || info.height == 0 {
+        if info.end().is_nan() || info.end() <= 0.0 || info.width == 0 || info.height == 0 {
             return Err(BugleError::Invalid(format!("{} has no video frames", item.path.display())).into());
         }
         let in_history = self.in_history(&item);
