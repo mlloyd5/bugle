@@ -32,7 +32,7 @@
 //! it is added to history (with the source as `parent` when the source is a
 //! history item).
 
-use crate::cursor_fx::{Effects, MAX_ZOOM};
+use crate::cursor_fx::{match_click_zooms, zoom_clicks, ClickZoom, Effects, MAX_ZOOM, MIN_ZOOM};
 use crate::Engine;
 use anyhow::{anyhow, Context, Result};
 use bugle_core::config::RecordingConfig;
@@ -210,6 +210,11 @@ pub struct EditRequest {
     /// recording's cursor event track.
     #[serde(default)]
     pub zoom: Option<f64>,
+    /// The zoom level of single clicks (by their time in the recording),
+    /// overriding `zoom` for them: 1 leaves a click out. With these, clicks
+    /// not named zoom to `zoom`, or not at all without it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub click_zooms: Vec<ClickZoom>,
     /// Draw the pointer along a smoothed path (recordings made with
     /// `hide_cursor`, which have an event track and no pointer in the frames).
     #[serde(default)]
@@ -219,7 +224,7 @@ pub struct EditRequest {
 impl EditRequest {
     /// Whether the edit needs the recording's event track.
     pub fn uses_events(&self) -> bool {
-        self.zoom.is_some() || self.smooth_cursor
+        self.zoom.is_some() || !self.click_zooms.is_empty() || self.smooth_cursor
     }
 }
 
@@ -227,7 +232,7 @@ impl EditRequest {
 /// when the request asks for none (a plain edit leaves the frames alone,
 /// even for a recording without the pointer in them).
 fn effects_for<'a>(req: &EditRequest, track: Option<&'a EventTrack>) -> Option<Effects<'a>> {
-    track.filter(|_| req.uses_events()).map(|t| Effects::new(t, req.zoom, req.smooth_cursor))
+    track.filter(|_| req.uses_events()).map(|t| Effects::with_click_zooms(t, req.zoom, &req.click_zooms, req.smooth_cursor))
 }
 
 /// The event track of a recording: for a history item, the one history
@@ -257,11 +262,19 @@ fn check_effects(req: &EditRequest, track: Option<&EventTrack>, source: &Path) -
             return Err(BugleError::Invalid(format!("zoom must be above 1 and at most {MAX_ZOOM} (got {z})")));
         }
     }
+    for c in &req.click_zooms {
+        if !(c.t.is_finite() && c.zoom.is_finite() && (MIN_ZOOM..=MAX_ZOOM).contains(&c.zoom)) {
+            return Err(BugleError::Invalid(format!(
+                "a click zoom needs a time and a zoom from 1 (off) to {MAX_ZOOM} (got {}s at {}x)",
+                c.t, c.zoom
+            )));
+        }
+    }
     if !req.uses_events() {
         return Ok(());
     }
     if req.preset == ExportPreset::Lossless {
-        return Err(BugleError::Invalid("zoom and smooth_cursor re-render the frames; use another preset than lossless".into()));
+        return Err(BugleError::Invalid("zoom, click_zooms and smooth_cursor re-render the frames; use another preset than lossless".into()));
     }
     let Some(track) = track else {
         return Err(BugleError::Invalid(format!(
@@ -279,6 +292,19 @@ fn check_effects(req: &EditRequest, track: Option<&EventTrack>, source: &Path) -
         return Err(BugleError::Invalid(
             "the recorded window was resized during the recording, so its pointer positions no longer match the frames".into(),
         ));
+    }
+    if !req.click_zooms.is_empty() {
+        let clicks: Vec<f64> = zoom_clicks(track).iter().map(|c| c.0).collect();
+        let matched = match_click_zooms(&clicks, &req.click_zooms);
+        if let Some((c, _)) = req.click_zooms.iter().zip(&matched).find(|(_, m)| m.is_none()) {
+            let list: Vec<String> = clicks.iter().map(|t| format!("{t:.2}")).collect();
+            return Err(BugleError::Invalid(format!(
+                "no click to zoom at {:.2}s (within {:.2}s); the recording's clicks are at: {}",
+                c.t,
+                crate::cursor_fx::CLICK_MATCH,
+                if list.is_empty() { "none".to_string() } else { list.join(", ") }
+            )));
+        }
     }
     Ok(())
 }
@@ -749,6 +775,20 @@ impl EditSource {
         self.track.as_ref().is_some_and(|t| !t.area_changed)
     }
 
+    /// The times of the clicks auto-zoom follows (what
+    /// [`EditRequest::click_zooms`] name); none when zooming is not possible.
+    pub fn zoom_clicks(&self) -> Vec<f64> {
+        self.track.as_ref().filter(|_| self.can_zoom()).map(|t| zoom_clicks(t).iter().map(|c| c.0).collect()).unwrap_or_default()
+    }
+
+    /// The audio's loudest level in each of `buckets` equal slices of the
+    /// video (every audio track mixed, full scale 1): the editor's timeline
+    /// waveform. `None` without audio. Decodes all of it: off the main
+    /// thread.
+    pub fn audio_peaks(&self, buckets: usize) -> Result<Option<Vec<f32>>> {
+        bugle_platform::audio_peaks(&self.item.path, self.duration(), buckets)
+    }
+
     /// Pointer smoothing is possible: zooming is, and the frames lack the
     /// pointer (`hide_cursor` recordings).
     pub fn can_smooth(&self) -> bool {
@@ -974,6 +1014,10 @@ impl Engine {
         let mut what = format!("{:.2}s–{:.2}s, preset {}", range.0, range.1, req.preset);
         if let Some(z) = req.zoom {
             what.push_str(&format!(", zoom {z}x on clicks"));
+        }
+        if !req.click_zooms.is_empty() {
+            let each: Vec<String> = req.click_zooms.iter().map(|c| format!("{:.2}s {}x", c.t, c.zoom)).collect();
+            what.push_str(&format!(", click zoom {}", each.join(", ")));
         }
         if req.smooth_cursor {
             what.push_str(", smoothed cursor");
@@ -1562,10 +1606,16 @@ mod tests {
             EditRequest { source: s.clone(), zoom: Some(f64::NAN), ..Default::default() },
             EditRequest { source: s.clone(), zoom: Some(2.0), preset: ExportPreset::Lossless, ..Default::default() },
             EditRequest { source: s.clone(), smooth_cursor: true, ..Default::default() },
+            EditRequest { source: s.clone(), click_zooms: vec![ClickZoom { t: 1.0, zoom: 5.0 }], ..Default::default() },
+            EditRequest { source: s.clone(), click_zooms: vec![ClickZoom { t: f64::NAN, zoom: 2.0 }], ..Default::default() },
+            EditRequest { source: s.clone(), click_zooms: vec![ClickZoom { t: 1.0, zoom: 2.0 }], preset: ExportPreset::Lossless, ..Default::default() },
         ] {
             let e = engine.edit(&req).unwrap_err();
             assert!(invalid(&e), "{req:?}: {e:#}");
         }
+        // A click zoom must name one of the recording's clicks.
+        let e = engine.edit(&EditRequest { source: s.clone(), click_zooms: vec![ClickZoom { t: 1.5, zoom: 2.0 }], ..Default::default() }).unwrap_err();
+        assert!(invalid(&e) && format!("{e:#}").contains("1.00"), "{e:#}");
         // A broken track is an error only when it is needed.
         std::fs::write(EventTrack::sidecar_path(&src), b"{}").unwrap();
         assert!(engine.edit(&EditRequest { source: s.clone(), zoom: Some(2.0), ..Default::default() }).is_err());
@@ -1662,6 +1712,18 @@ mod tests {
         assert!(near(at_click.get_pixel(3, 30), BLUE) && near(at_click.get_pixel(77, 30), BLUE));
         let unzoomed = frames.frame(1.05, None).unwrap();
         assert!(near(unzoomed.get_pixel(3, 30), RED));
+
+        // The click by itself: zoomed without a default level, or left out.
+        assert_eq!(es.zoom_clicks(), vec![1.0]);
+        let one = EditRequest { source: s.clone(), click_zooms: vec![ClickZoom { t: 1.0, zoom: 2.0 }], ..Default::default() };
+        es.check(&one).unwrap();
+        let at_click = frames.frame(1.05, es.effects(&one).as_ref()).unwrap();
+        assert!(near(at_click.get_pixel(3, 30), BLUE));
+        let off = EditRequest { click_zooms: vec![ClickZoom { t: 1.0, zoom: 1.0 }], ..zoom.clone() };
+        es.check(&off).unwrap();
+        let at_click = frames.frame(1.05, es.effects(&off).as_ref()).unwrap();
+        assert!(near(at_click.get_pixel(3, 30), RED), "that click is not zoomed");
+        assert_eq!(es.audio_peaks(10).unwrap(), None, "a silent movie has no waveform");
 
         // An unreadable track is reported, and refused only when needed.
         std::fs::write(EventTrack::sidecar_path(&src), b"{}").unwrap();

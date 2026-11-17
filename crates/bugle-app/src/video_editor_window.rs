@@ -1,13 +1,16 @@
 //! Windowing glue for the video editor: opens the AppKit window for a
 //! recording, feeds its events to [`VideoEditor`], decodes preview frames
 //! (with the zoom and pointer effects the export would apply) on a preview
-//! thread, and runs the export (`Engine::edit`) off the main thread. The
-//! decisions live in `video_editor.rs`.
+//! thread, reads the audio waveform for the timeline on a thread of its own,
+//! and runs the export (`Engine::edit`) off the main thread. The decisions
+//! live in `video_editor.rs`.
 
 use crate::editor_window::guarded;
-use crate::video_editor::{preset_label, Caps, Effects, FrameRequest, VideoEditor, PRESETS, ZOOMS};
+use crate::video_editor::{
+    preset_label, waveform_levels, Caps, Effects, FrameRequest, VideoEditor, CLICK_ZOOMS, PRESETS, WAVEFORM_BUCKETS, ZOOMS,
+};
 use crate::{file_name, saved_subtitle, App, AppEvent, Notice, Proxy};
-use bugle_engine::{EditRequest, EditSource, Engine};
+use bugle_engine::{ClickZoom, EditRequest, EditSource, Engine};
 use bugle_platform::{VideoEditorCommand, VideoEditorEvent};
 use image::RgbaImage;
 use std::cell::RefCell;
@@ -26,6 +29,8 @@ pub(crate) enum VideoEditorMsg {
     Open(String),
     /// A preview frame finished decoding on the preview thread.
     Preview { generation: u64, seq: u64, t: f64, result: Result<RgbaImage, String> },
+    /// The recording's audio peaks for the timeline (none without audio).
+    Waveform { generation: u64, peaks: Vec<f32> },
     /// An export finished. On success the window `generation` closes.
     Exported { generation: u64, result: Result<Notice, String> },
     /// Smoke test: deliver an event as if the window had reported it.
@@ -46,11 +51,13 @@ struct PreviewJob {
     seq: u64,
     frame: FrameRequest,
     zoom: Option<f64>,
+    click_zooms: Vec<ClickZoom>,
     smooth: bool,
 }
 
-/// The preview options effects were built for: zoom factor bits, smoothing.
-type EffectsKey = (Option<u64>, bool);
+/// The preview options effects were built for: zoom factor, click zooms,
+/// smoothing.
+type EffectsKey = (Option<f64>, Vec<ClickZoom>, bool);
 
 fn toast_problem(msg: &str) {
     tracing::warn!("video editor: {msg}");
@@ -66,7 +73,7 @@ fn spawn_preview(src: Arc<EditSource>, proxy: Proxy, generation: u64) -> Option<
     let (tx, rx) = mpsc::channel::<PreviewJob>();
     let spawned = std::thread::Builder::new().name("bugle-video-preview".into()).spawn(move || {
         let mut frames = src.preview_frames(PREVIEW_MAX).map_err(|e| format!("{e:#}"));
-        // The effects for the options they were built for (zoom bits, smoothing).
+        // The effects for the options they were built for.
         let mut effects: Option<(EffectsKey, Option<bugle_engine::cursor_fx::Effects>)> = None;
         'jobs: while let Ok(mut job) = rx.recv() {
             loop {
@@ -83,9 +90,9 @@ fn spawn_preview(src: Arc<EditSource>, proxy: Proxy, generation: u64) -> Option<
                     Err(mpsc::RecvTimeoutError::Disconnected) => break 'jobs,
                 }
             }
-            let key = (job.zoom.map(f64::to_bits), job.smooth);
-            if effects.as_ref().map(|e| e.0) != Some(key) {
-                let req = EditRequest { zoom: job.zoom, smooth_cursor: job.smooth, ..Default::default() };
+            let key = (job.zoom, job.click_zooms, job.smooth);
+            if effects.as_ref().map(|e| &e.0) != Some(&key) {
+                let req = EditRequest { zoom: key.0, click_zooms: key.1.clone(), smooth_cursor: key.2, ..Default::default() };
                 effects = Some((key, src.effects(&req)));
             }
             let fx = effects.as_ref().and_then(|e| e.1.as_ref());
@@ -103,6 +110,22 @@ fn spawn_preview(src: Arc<EditSource>, proxy: Proxy, generation: u64) -> Option<
             tracing::warn!("video editor: no preview thread ({e})");
             None
         }
+    }
+}
+
+/// Read the recording's audio peaks on a thread and send them to the loop
+/// (nothing for a recording without audio; a failure is only logged: the
+/// timeline is usable without a waveform).
+fn spawn_waveform(src: Arc<EditSource>, proxy: Proxy, generation: u64) {
+    let spawned = std::thread::Builder::new().name("bugle-video-waveform".into()).spawn(move || {
+        match guarded("waveform", || src.audio_peaks(WAVEFORM_BUCKETS)) {
+            Ok(Some(peaks)) => proxy.send(AppEvent::VideoEditor(VideoEditorMsg::Waveform { generation, peaks })),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("video editor: no waveform ({e})"),
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!("video editor: no waveform thread ({e})");
     }
 }
 
@@ -142,7 +165,7 @@ impl Session {
     fn request_frame(&mut self, frame: FrameRequest) {
         self.seq += 1;
         let (zoom, smooth) = self.editor.options();
-        let job = PreviewJob { seq: self.seq, frame, zoom, smooth };
+        let job = PreviewJob { seq: self.seq, frame, zoom, click_zooms: self.editor.click_zooms(), smooth };
         if let Some(tx) = &self.preview {
             if tx.send(job).is_ok() {
                 return;
@@ -240,7 +263,7 @@ impl App {
         self.video_editor_generation += 1;
         let generation = self.video_editor_generation;
         let caps = Caps { zoom: src.can_zoom(), smooth: src.can_smooth() };
-        let editor = VideoEditor::new(src.source.clone(), src.duration(), src.info.nominal_fps, caps);
+        let editor = VideoEditor::new(src.source.clone(), src.duration(), src.info.nominal_fps, caps, src.zoom_clicks());
         let session = Rc::new(RefCell::new(Session {
             editor,
             preview: spawn_preview(src.clone(), self.proxy.clone(), generation),
@@ -252,6 +275,7 @@ impl App {
             last_error: None,
         }));
         let zoom_labels: Vec<&str> = ZOOMS.iter().map(|z| z.0).collect();
+        let click_labels: Vec<&str> = CLICK_ZOOMS.iter().map(|z| z.0).collect();
         let preset_labels: Vec<&str> = PRESETS.iter().map(|p| preset_label(*p)).collect();
         let handler = session.clone();
         let opened = bugle_platform::video_editor_open(
@@ -259,6 +283,7 @@ impl App {
             src.duration(),
             (src.info.width, src.info.height),
             &zoom_labels,
+            &click_labels,
             &preset_labels,
             move |event| match handler.try_borrow_mut() {
                 Ok(mut s) => s.on_event(event),
@@ -269,6 +294,7 @@ impl App {
             return self.toast_error(&format!("Edit Video: {e:#}"));
         }
         CURRENT.with(|c| *c.borrow_mut() = Rc::downgrade(&session));
+        spawn_waveform(src.clone(), self.proxy.clone(), generation);
         tracing::info!(
             "video editor: opened {} ({:.2}s, {}×{}, zoom {}, smoothing {})",
             file_name(&src.item.path),
@@ -296,6 +322,12 @@ impl App {
                         // on the next turn.
                         Err(_) => self.proxy.send(AppEvent::VideoEditor(VideoEditorMsg::Preview { generation, seq, t, result })),
                     }
+                }
+            }
+            VideoEditorMsg::Waveform { generation, peaks } => {
+                // Only for the window it was read for.
+                if current().is_some_and(|s| s.try_borrow().is_ok_and(|s| s.generation == generation)) {
+                    bugle_platform::video_editor_set_waveform(&waveform_levels(&peaks));
                 }
             }
             VideoEditorMsg::Exported { generation, result: Ok(n) } => {
@@ -371,6 +403,10 @@ pub(crate) fn smoke(proxy: &Proxy) {
     send(VideoEditorEvent::Zoom(2));
     send(VideoEditorEvent::Seek(1.0));
     snap("video-editor-zoomed");
+    // The second click at 3x of its own.
+    send(VideoEditorEvent::Seek(2.0));
+    send(VideoEditorEvent::ClickZoom(CLICK_ZOOMS.iter().position(|z| z.1 == Some(3.0)).unwrap_or(0)));
+    snap("video-editor-click-zoom");
     send(VideoEditorEvent::Smooth(false));
     send(VideoEditorEvent::Preset(PRESETS.iter().position(|p| *p == bugle_engine::ExportPreset::P720).unwrap_or(0)));
     command(VideoEditorCommand::PlayPause);

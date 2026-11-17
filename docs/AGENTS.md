@@ -102,7 +102,7 @@ curl -s -H "$H" -H 'content-type: application/json' \
 | `record_status` | – | status |
 | `transcribe` | `source`, `provider`, `language` | `transcript`, `srt` |
 | `subtitles` | `source`, `format` (srt/vtt), `provider`, `language`, `output` | `path`, `segments`, `text` |
-| `edit_video` | `source`, `start`, `end` (seconds, negative = from the end), `preset` (original/lossless/high/hevc/1080p/720p/540p/gif/gif-small), `fps` (re-encodes video; resamples GIF), `max_size` (GIF long edge), `zoom` (factor above 1, at most 4: zoom in on clicks), `smooth_cursor` (draw a smoothed pointer; `hide_cursor` recordings), `output`, `label` | `media` (parent = source when it is a history item) |
+| `edit_video` | `source`, `start`, `end` (seconds, negative = from the end), `preset` (original/lossless/high/hevc/1080p/720p/540p/gif/gif-small), `fps` (re-encodes video; resamples GIF), `max_size` (GIF long edge), `zoom` (factor above 1, at most 4: zoom in on clicks), `click_zooms` (`[{"t": 4.2, "zoom": 3}]`: one click's level, by its time; overrides `zoom`, 1 leaves the click out), `smooth_cursor` (draw a smoothed pointer; `hide_cursor` recordings), `output`, `label` | `media` (parent = source when it is a history item) |
 | `complete` | `prompt`, `provider`, `system` | `text` |
 | `history` | `limit` | media list |
 | `get_media` | `source`, `inline_image`, `max_edge` | media (+ image) |
@@ -126,7 +126,9 @@ recoverable. One engine runs at most two edits at a time; a third is refused.
 400. They re-render every frame (at the recording's frame rate, at least 30
 fps), so `lossless` is refused with them and `original`/`high` encode H.264
 (`hevc`: HEVC); the audio tracks are copied back in untouched. Zoom follows
-clicks inside the recorded area only. The track is `<file>.events.json` (the
+clicks inside the recorded area only. `click_zooms` entries must each name one
+of those clicks (the nearest within 0.05 s), else the edit is a 400 that lists
+them; without `zoom` only the named clicks zoom. The track is `<file>.events.json` (the
 whole file name, so `clip.mp4` and `clip.mov` each have their own), and an
 effects edit's output has none.
 

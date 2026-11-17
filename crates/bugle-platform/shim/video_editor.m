@@ -1,15 +1,17 @@
 // Bugle video editor window.
 //
-// A preview of one frame above a timeline (the whole recording, the kept
-// range between the in and out handles, the playhead) and a control bar:
-// play/pause, the playhead time, Set In / Set Out, the zoom and pointer
-// options, the export preset and Export. The window owns no editing policy:
+// A preview of one frame above a timeline (the whole recording with its
+// audio waveform, the kept range between the in and out handles, the
+// playhead, a marker under each click auto-zoom follows) and a control bar:
+// play/pause, the playhead time, Set In / Set Out, the zoom, the zoom of the
+// click at the playhead and pointer options, the export preset and Export. The window owns no editing policy:
 // input is reported to Rust through a callback (times in seconds on the
 // video's timeline), and Rust answers by replacing the frame shown
 // (`bugle_video_editor_set_frame`) and the state of every control
 // (`bugle_video_editor_set_state`). The only thing the timeline does on its
 // own is move the dragged handle or playhead under the pointer until Rust's
-// answer arrives, so a drag never lags.
+// answer arrives, so a drag never lags, and snap the playhead onto a click
+// marker it is dropped next to.
 //
 // Keys: Space play/pause, I / O set in / out at the playhead, ← / → step
 // one frame, ↑ / Home go to the in point, ↓ / End go to the out point,
@@ -34,6 +36,7 @@ enum {
     VEV_ZOOM = 4,     // arg = zoom choice index
     VEV_SMOOTH = 5,   // arg = 0 / 1
     VEV_PRESET = 6,   // arg = preset index
+    VEV_CLICK_ZOOM = 7, // arg = click zoom choice index
 };
 enum {
     VCMD_PLAY_PAUSE = 0,
@@ -48,10 +51,13 @@ enum {
 };
 
 static const CGFloat kBarHeight = 48;
-static const CGFloat kTimelineHeight = 44;
+static const CGFloat kTimelineHeight = 64;
+static const CGFloat kTrackHeight = 32;
 static const CGFloat kTimelineInset = 16;
 // How close (points) to a handle a click must land to grab it.
 static const CGFloat kHandleGrab = 7;
+// How close (points) to a click marker the playhead snaps onto it.
+static const CGFloat kMarkerSnap = 5;
 
 @class BugleVideoEditor;
 static BugleVideoEditor *g_video_editor = nil;
@@ -63,6 +69,11 @@ typedef enum { DRAG_NONE, DRAG_PLAYHEAD, DRAG_IN, DRAG_OUT } DragKind;
 @property(nonatomic, weak) BugleVideoEditor *editor;
 @property(nonatomic) double duration, playhead, inPoint, outPoint;
 @property(nonatomic) DragKind drag;
+// Peak levels (float, 0..1) in equal slices of the recording; nil: none.
+@property(nonatomic, copy) NSData *waveform;
+// Click markers: times and zoom levels (double each), and the selected one.
+@property(nonatomic, copy) NSData *clickTimes, *clickLevels;
+@property(nonatomic) NSInteger selectedClick;
 @end
 
 @interface BugleVideoEditorWindow : NSWindow
@@ -77,6 +88,7 @@ typedef enum { DRAG_NONE, DRAG_PLAYHEAD, DRAG_IN, DRAG_OUT } DragKind;
 @property(nonatomic, strong) NSTextField *timeLabel;
 @property(nonatomic, strong) NSButton *inButton, *outButton;
 @property(nonatomic, strong) NSPopUpButton *zoomPopup;
+@property(nonatomic, strong) NSPopUpButton *clickPopup;
 @property(nonatomic, strong) NSButton *smoothBox;
 @property(nonatomic, strong) NSPopUpButton *presetPopup;
 @property(nonatomic, strong) NSButton *exportButton;
@@ -100,7 +112,7 @@ typedef enum { DRAG_NONE, DRAG_PLAYHEAD, DRAG_IN, DRAG_OUT } DragKind;
 
 - (NSRect)track {
     NSRect b = self.bounds;
-    return NSMakeRect(kTimelineInset, floor(NSMidY(b) - 9), MAX(1, NSWidth(b) - 2 * kTimelineInset), 18);
+    return NSMakeRect(kTimelineInset, floor(NSMidY(b) - kTrackHeight / 2), MAX(1, NSWidth(b) - 2 * kTimelineInset), kTrackHeight);
 }
 
 - (CGFloat)xFor:(double)t {
@@ -124,6 +136,24 @@ typedef enum { DRAG_NONE, DRAG_PLAYHEAD, DRAG_IN, DRAG_OUT } DragKind;
     NSRect kept = NSMakeRect(xi, NSMinY(r), MAX(0, xo - xi), NSHeight(r));
     [[NSColor.controlAccentColor colorWithAlphaComponent:0.45] setFill];
     NSRectFill(kept);
+    // Waveform: the loudest bucket under each point column, mirrored about
+    // the middle of the track.
+    NSUInteger nw = self.waveform.length / sizeof(float);
+    if (nw > 0) {
+        const float *peaks = self.waveform.bytes;
+        [[NSColor.labelColor colorWithAlphaComponent:0.4] setFill];
+        CGFloat mid = NSMidY(r), half = NSHeight(r) / 2 - 2;
+        NSInteger cols = (NSInteger)ceil(NSWidth(r));
+        for (NSInteger c = 0; c < cols; c++) {
+            NSUInteger a = (NSUInteger)((double)c / cols * nw), b = (NSUInteger)((double)(c + 1) / cols * nw);
+            if (b <= a) b = a + 1;
+            if (b > nw) b = nw;
+            float v = 0;
+            for (NSUInteger k = a; k < b; k++) v = fmaxf(v, peaks[k]);
+            CGFloat hgt = fmax(0.5, fmin(1.0, v) * half);
+            NSRectFillUsingOperation(NSMakeRect(NSMinX(r) + c, mid - hgt, 1, 2 * hgt), NSCompositingOperationSourceOver);
+        }
+    }
     [NSColor.controlAccentColor setStroke];
     NSBezierPath *frame = [NSBezierPath bezierPathWithRect:NSInsetRect(kept, 0.5, 0.5)];
     frame.lineWidth = 1;
@@ -138,6 +168,44 @@ typedef enum { DRAG_NONE, DRAG_PLAYHEAD, DRAG_IN, DRAG_OUT } DragKind;
     NSRectFill(NSMakeRect(xp - 1, NSMinY(r) - 8, 2, NSHeight(r) + 16));
     NSBezierPath *knob = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(xp - 5, NSMaxY(r) + 4, 10, 10)];
     [knob fill];
+    // Click markers under the track: a diamond each, filled when the click
+    // zooms, hollow when it is left out; the selected one larger.
+    NSUInteger nc = MIN(self.clickTimes.length, self.clickLevels.length) / sizeof(double);
+    const double *ct = self.clickTimes.bytes, *cl = self.clickLevels.bytes;
+    for (NSUInteger i = 0; i < nc; i++) {
+        BOOL sel = (NSInteger)i == self.selectedClick;
+        CGFloat x = round([self xFor:ct[i]]) + 0.5, s = sel ? 5 : 3.5, y = NSMinY(r) - 9;
+        NSBezierPath *d = [NSBezierPath bezierPath];
+        [d moveToPoint:NSMakePoint(x, y + s)];
+        [d lineToPoint:NSMakePoint(x + s, y)];
+        [d lineToPoint:NSMakePoint(x, y - s)];
+        [d lineToPoint:NSMakePoint(x - s, y)];
+        [d closePath];
+        NSColor *c = sel ? NSColor.labelColor : NSColor.controlAccentColor;
+        if (cl[i] > 1.0) {
+            [c setFill];
+            [d fill];
+        } else {
+            [c setStroke];
+            d.lineWidth = 1;
+            [d stroke];
+        }
+    }
+}
+
+/// `t`, or the time of a click marker within `kMarkerSnap` points of `x`.
+- (double)snap:(double)t x:(CGFloat)x {
+    NSUInteger nc = self.clickTimes.length / sizeof(double);
+    const double *ct = self.clickTimes.bytes;
+    CGFloat best = kMarkerSnap + 1;
+    for (NSUInteger i = 0; i < nc; i++) {
+        CGFloat d = fabs([self xFor:ct[i]] - x);
+        if (d <= kMarkerSnap && d < best) {
+            best = d;
+            t = ct[i];
+        }
+    }
+    return t;
 }
 
 - (void)report:(NSEvent *)event kind:(DragKind)kind {
@@ -157,6 +225,7 @@ typedef enum { DRAG_NONE, DRAG_PLAYHEAD, DRAG_IN, DRAG_OUT } DragKind;
             [e emit:VEV_OUT value:t arg:0];
             break;
         case DRAG_PLAYHEAD:
+            t = [self snap:t x:p.x];
             self.playhead = t;
             [e emit:VEV_SEEK value:t arg:0];
             break;
@@ -254,6 +323,7 @@ typedef enum { DRAG_NONE, DRAG_PLAYHEAD, DRAG_IN, DRAG_OUT } DragKind;
 - (void)command:(int32_t)cmd { [self emit:VEV_COMMAND value:0 arg:cmd]; }
 - (void)buttonCommand:(NSButton *)sender { [self command:(int32_t)sender.tag]; }
 - (void)zoomPicked:(NSPopUpButton *)sender { [self emit:VEV_ZOOM value:0 arg:(int32_t)sender.indexOfSelectedItem]; }
+- (void)clickZoomPicked:(NSPopUpButton *)sender { [self emit:VEV_CLICK_ZOOM value:0 arg:(int32_t)sender.indexOfSelectedItem]; }
 - (void)presetPicked:(NSPopUpButton *)sender { [self emit:VEV_PRESET value:0 arg:(int32_t)sender.indexOfSelectedItem]; }
 - (void)smoothToggled:(NSButton *)sender { [self emit:VEV_SMOOTH value:0 arg:sender.state == NSControlStateValueOn ? 1 : 0]; }
 
@@ -322,11 +392,12 @@ static NSPopUpButton *vpopup(const char *const *labels, int32_t n, BugleVideoEdi
 }
 
 /// Open the video editor for a recording `duration` seconds long whose
-/// frames are `w` x `h` pixels. `zoom_labels` and `preset_labels` fill the
-/// two pop-up menus. Returns 1, or 0 when a video editor is already open
+/// frames are `w` x `h` pixels. `zoom_labels`, `click_labels` and
+/// `preset_labels` fill the three pop-up menus. Returns 1, or 0 when a video editor is already open
 /// (the context is not taken then).
 int32_t bugle_video_editor_open(const char *title, double duration, uint32_t w, uint32_t h, const char *const *zoom_labels,
-                                int32_t n_zoom, const char *const *preset_labels, int32_t n_presets,
+                                int32_t n_zoom, const char *const *click_labels, int32_t n_click,
+                                const char *const *preset_labels, int32_t n_presets,
                                 bugle_video_editor_callback_t cb, void *ctx, bugle_video_editor_free_t free_ctx) {
     @autoreleasepool {
         if (g_video_editor || !cb || !(duration > 0) || w == 0 || h == 0) return 0;
@@ -364,6 +435,9 @@ int32_t bugle_video_editor_open(const char *title, double duration, uint32_t w, 
 
         NSTextField *zoomLabel = [NSTextField labelWithString:@"Zoom"];
         e.zoomPopup = vpopup(zoom_labels, n_zoom, e, @selector(zoomPicked:), @"Zoom in on clicks (needs a recording made with cursor events)");
+        NSTextField *clickLabel = [NSTextField labelWithString:@"Click"];
+        e.clickPopup = vpopup(click_labels, n_click, e, @selector(clickZoomPicked:),
+                              @"Zoom of the click at the playhead (the markers under the timeline)");
         e.smoothBox = [NSButton checkboxWithTitle:@"Smooth pointer" target:e action:@selector(smoothToggled:)];
         e.smoothBox.toolTip = @"Draw the pointer along a smoothed path (recordings made with the pointer hidden)";
         e.smoothBox.refusesFirstResponder = YES;
@@ -374,7 +448,8 @@ int32_t bugle_video_editor_open(const char *title, double duration, uint32_t w, 
         NSView *spacer = [[NSView alloc] initWithFrame:NSZeroRect];
         [spacer setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
         NSStackView *stack = [NSStackView stackViewWithViews:@[
-            playButton, time, e.inButton, e.outButton, spacer, zoomLabel, e.zoomPopup, e.smoothBox, e.presetPopup, e.exportButton
+            playButton, time, e.inButton, e.outButton, spacer, zoomLabel, e.zoomPopup, clickLabel, e.clickPopup, e.smoothBox,
+            e.presetPopup, e.exportButton
         ]];
         stack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
         stack.spacing = 8;
@@ -382,6 +457,7 @@ int32_t bugle_video_editor_open(const char *title, double duration, uint32_t w, 
         stack.edgeInsets = NSEdgeInsetsMake(0, 12, 0, 12);
         [stack setCustomSpacing:4 afterView:e.inButton];
         [stack setCustomSpacing:4 afterView:zoomLabel];
+        [stack setCustomSpacing:4 afterView:clickLabel];
         [stack setCustomSpacing:14 afterView:e.smoothBox];
         CGFloat minW = MAX(720, ceil(stack.fittingSize.width) + 40);
 
@@ -429,6 +505,7 @@ int32_t bugle_video_editor_open(const char *title, double duration, uint32_t w, 
         timeline.duration = duration;
         timeline.inPoint = 0;
         timeline.outPoint = duration;
+        timeline.selectedClick = -1;
         [root addSubview:timeline];
         e.timeline = timeline;
 
@@ -482,7 +559,7 @@ void bugle_video_editor_set_frame(const uint8_t *rgba, uint32_t w, uint32_t h) {
 /// and refuses to close.
 void bugle_video_editor_set_state(double playhead, double in_point, double out_point, int32_t playing, int32_t zoom,
                                   int32_t smooth, int32_t preset, int32_t can_zoom, int32_t can_smooth, int32_t busy,
-                                  const char *time_text) {
+                                  int32_t click_zoom, const char *time_text) {
     @autoreleasepool {
         BugleVideoEditor *e = g_video_editor;
         if (!e) return;
@@ -499,6 +576,8 @@ void bugle_video_editor_set_state(double playhead, double in_point, double out_p
         e.timeLabel.stringValue = vstr(time_text);
         if (zoom >= 0 && zoom < e.zoomPopup.numberOfItems) [e.zoomPopup selectItemAtIndex:zoom];
         if (preset >= 0 && preset < e.presetPopup.numberOfItems) [e.presetPopup selectItemAtIndex:preset];
+        BOOL onClick = click_zoom >= 0 && click_zoom < e.clickPopup.numberOfItems;
+        if (e.clickPopup.numberOfItems > 0) [e.clickPopup selectItemAtIndex:onClick ? click_zoom : 0];
         e.smoothBox.state = smooth ? NSControlStateValueOn : NSControlStateValueOff;
         e.busy = busy != 0;
         BOOL on = !e.busy;
@@ -506,10 +585,43 @@ void bugle_video_editor_set_state(double playhead, double in_point, double out_p
         e.inButton.enabled = on;
         e.outButton.enabled = on;
         e.zoomPopup.enabled = on && can_zoom;
+        e.clickPopup.enabled = on && can_zoom && onClick;
         e.smoothBox.enabled = on && can_smooth;
         e.presetPopup.enabled = on;
         e.exportButton.enabled = on;
         e.exportButton.title = e.busy ? @"Exporting…" : @"Export";
+    }
+}
+
+/// Replace the click markers: `n` times (seconds) and zoom levels (1: the
+/// click is left out), and the index of the selected one (-1: none).
+void bugle_video_editor_set_clicks(const double *times, const double *levels, int32_t n, int32_t selected) {
+    @autoreleasepool {
+        BugleVideoEditor *e = g_video_editor;
+        if (!e) return;
+        BugleTimeline *t = e.timeline;
+        BOOL some = n > 0 && times && levels;
+        NSData *ts = some ? [NSData dataWithBytes:times length:(NSUInteger)n * sizeof(double)] : nil;
+        NSData *ls = some ? [NSData dataWithBytes:levels length:(NSUInteger)n * sizeof(double)] : nil;
+        if ((ts == t.clickTimes || [ts isEqualToData:t.clickTimes]) && (ls == t.clickLevels || [ls isEqualToData:t.clickLevels]) &&
+            t.selectedClick == selected) {
+            return;
+        }
+        t.clickTimes = ts;
+        t.clickLevels = ls;
+        t.selectedClick = selected;
+        [t setNeedsDisplay:YES];
+    }
+}
+
+/// Draw `n` peak levels (0..1, equal slices of the recording) as the
+/// timeline's waveform; `n` 0 removes it. The levels are copied.
+void bugle_video_editor_set_waveform(const float *peaks, int32_t n) {
+    @autoreleasepool {
+        BugleVideoEditor *e = g_video_editor;
+        if (!e) return;
+        e.timeline.waveform = (n > 0 && peaks) ? [NSData dataWithBytes:peaks length:(NSUInteger)n * sizeof(float)] : nil;
+        [e.timeline setNeedsDisplay:YES];
     }
 }
 

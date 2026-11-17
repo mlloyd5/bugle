@@ -1,12 +1,14 @@
 //! Video editor window (`shim/video_editor.m`): a frame preview above a
-//! timeline (the recording, the kept range between the in and out handles,
-//! the playhead) and a control bar (play/pause, Set In / Set Out, zoom and
-//! pointer options, export preset, Export).
+//! timeline (the recording's audio waveform, the kept range between the in
+//! and out handles, the playhead, a marker under each click auto-zoom
+//! follows) and a control bar (play/pause, Set In / Set Out, zoom, the zoom
+//! of the click at the playhead and pointer options, export preset, Export).
 //!
 //! Like the markup editor window it is a view and nothing more: it reports
 //! input as [`VideoEditorEvent`]s, times in seconds on the video's
-//! timeline, and draws the frame ([`video_editor_set_frame`]) and control
-//! state ([`video_editor_set_state`]) it is given. What the input means,
+//! timeline, and draws the frame ([`video_editor_set_frame`]), control
+//! state ([`video_editor_set_state`]) and waveform
+//! ([`video_editor_set_waveform`]) it is given. What the input means,
 //! and which frame to show, is the caller's business.
 //!
 //! Every function here is main-thread only and needs a running AppKit loop.
@@ -23,6 +25,7 @@ type RawCallback = unsafe extern "C" fn(ctx: *mut c_void, kind: i32, value: f64,
 type RawFree = unsafe extern "C" fn(ctx: *mut c_void);
 
 extern "C" {
+    #[allow(clippy::too_many_arguments)]
     fn bugle_video_editor_open(
         title: *const c_char,
         duration: f64,
@@ -30,6 +33,8 @@ extern "C" {
         h: u32,
         zoom_labels: *const *const c_char,
         n_zoom: i32,
+        click_labels: *const *const c_char,
+        n_click: i32,
         preset_labels: *const *const c_char,
         n_presets: i32,
         cb: RawCallback,
@@ -49,8 +54,11 @@ extern "C" {
         can_zoom: i32,
         can_smooth: i32,
         busy: i32,
+        click_zoom: i32,
         time_text: *const c_char,
     );
+    fn bugle_video_editor_set_clicks(times: *const f64, levels: *const f64, n: i32, selected: i32);
+    fn bugle_video_editor_set_waveform(peaks: *const f32, n: i32);
     fn bugle_video_editor_close();
     fn bugle_video_editor_active() -> i32;
     fn bugle_video_editor_focus();
@@ -115,6 +123,9 @@ pub enum VideoEditorEvent {
     Smooth(bool),
     /// An export preset, by index into the `preset_labels` given at open.
     Preset(usize),
+    /// A zoom choice for the click at the playhead, by index into the
+    /// `click_labels` given at open.
+    ClickZoom(usize),
 }
 
 impl VideoEditorEvent {
@@ -128,6 +139,7 @@ impl VideoEditorEvent {
             4 => Self::Zoom(usize::try_from(arg).ok()?),
             5 => Self::Smooth(arg != 0),
             6 => Self::Preset(usize::try_from(arg).ok()?),
+            7 => Self::ClickZoom(usize::try_from(arg).ok()?),
             _ => return None,
         })
     }
@@ -142,6 +154,7 @@ impl VideoEditorEvent {
             Self::Zoom(i) => (4, 0.0, index(i)),
             Self::Smooth(on) => (5, 0.0, on as i32),
             Self::Preset(i) => (6, 0.0, index(i)),
+            Self::ClickZoom(i) => (7, 0.0, index(i)),
         }
     }
 }
@@ -164,8 +177,24 @@ pub struct VideoEditorState {
     /// An export is running: controls are disabled and the window cannot
     /// be closed.
     pub busy: bool,
+    /// The selected choice of the click menu, by index; `None` when no click
+    /// is at the playhead (the menu is disabled).
+    pub click_zoom: Option<usize>,
+    /// A marker under the timeline for each click auto-zoom follows.
+    pub clicks: Vec<ClickMarker>,
     /// The line next to the play button (times, clip length).
     pub time_text: String,
+}
+
+/// A click auto-zoom follows, as the timeline marks it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ClickMarker {
+    /// Seconds on the timeline.
+    pub t: f64,
+    /// Its zoom level (1: not zoomed, drawn hollow).
+    pub level: f64,
+    /// The click the click menu is about (highlighted).
+    pub selected: bool,
 }
 
 type Handler = RefCell<Box<dyn FnMut(VideoEditorEvent)>>;
@@ -190,7 +219,8 @@ unsafe extern "C" fn free(ctx: *mut c_void) {
 
 /// Open the video editor for a recording `duration` seconds long with
 /// frames of `size` pixels (used to size the window) and bring it to the
-/// front. `zoom_labels` and `presets` fill the two pop-up menus. `handler`
+/// front. `zoom_labels`, `click_labels` and `presets` fill the three
+/// pop-up menus. `handler`
 /// runs on the main thread for every event and is dropped when the window
 /// closes, however it closes. Fails when a video editor is already open
 /// (see [`video_editor_active`]).
@@ -199,6 +229,7 @@ pub fn video_editor_open(
     duration: f64,
     size: (u32, u32),
     zoom_labels: &[&str],
+    click_labels: &[&str],
     presets: &[&str],
     handler: impl FnMut(VideoEditorEvent) + 'static,
 ) -> Result<()> {
@@ -207,9 +238,9 @@ pub fn video_editor_open(
     }
     let title = cstr(title)?;
     let strings = |v: &[&str]| v.iter().map(|s| cstr(s)).collect::<Result<Vec<CString>>>();
-    let (zooms, preset_names) = (strings(zoom_labels)?, strings(presets)?);
+    let (zooms, clicks, preset_names) = (strings(zoom_labels)?, strings(click_labels)?, strings(presets)?);
     let ptrs = |v: &[CString]| v.iter().map(|c| c.as_ptr()).collect::<Vec<*const c_char>>();
-    let (zoom_ptrs, preset_ptrs) = (ptrs(&zooms), ptrs(&preset_names));
+    let (zoom_ptrs, click_ptrs, preset_ptrs) = (ptrs(&zooms), ptrs(&clicks), ptrs(&preset_names));
     let boxed: Box<Handler> = Box::new(RefCell::new(Box::new(handler)));
     let ctx = Box::into_raw(boxed) as *mut c_void;
     let ok = unsafe {
@@ -220,6 +251,8 @@ pub fn video_editor_open(
             size.1,
             zoom_ptrs.as_ptr(),
             zoom_ptrs.len() as i32,
+            click_ptrs.as_ptr(),
+            click_ptrs.len() as i32,
             preset_ptrs.as_ptr(),
             preset_ptrs.len() as i32,
             call,
@@ -244,6 +277,9 @@ pub fn video_editor_set_frame(img: &RgbaImage) {
 pub fn video_editor_set_state(s: &VideoEditorState) {
     let i = |v: usize| i32::try_from(v).unwrap_or(-1);
     let text = CString::new(s.time_text.replace('\0', "")).unwrap_or_default();
+    let times: Vec<f64> = s.clicks.iter().map(|c| c.t).collect();
+    let levels: Vec<f64> = s.clicks.iter().map(|c| c.level).collect();
+    let selected = s.clicks.iter().position(|c| c.selected).map_or(-1, i);
     unsafe {
         bugle_video_editor_set_state(
             s.playhead,
@@ -256,9 +292,19 @@ pub fn video_editor_set_state(s: &VideoEditorState) {
             s.can_zoom as i32,
             s.can_smooth as i32,
             s.busy as i32,
+            s.click_zoom.map_or(-1, i),
             text.as_ptr(),
-        )
+        );
+        bugle_video_editor_set_clicks(times.as_ptr(), levels.as_ptr(), i(times.len()), selected);
     }
+}
+
+/// Draw `peaks` (each 0..=1, equal slices of the whole recording, as
+/// loud as the timeline is tall at 1) as the timeline's waveform; empty
+/// removes it. No-op when no video editor is open.
+pub fn video_editor_set_waveform(peaks: &[f32]) {
+    let n = i32::try_from(peaks.len()).unwrap_or(0);
+    unsafe { bugle_video_editor_set_waveform(peaks.as_ptr(), n) }
 }
 
 /// Close the video editor. May be called from inside the handler, which is
@@ -298,6 +344,7 @@ mod tests {
             VideoEditorEvent::Smooth(true),
             VideoEditorEvent::Smooth(false),
             VideoEditorEvent::Preset(8),
+            VideoEditorEvent::ClickZoom(2),
         ];
         all.extend(VideoEditorCommand::ALL.map(VideoEditorEvent::Command));
         for e in all {
@@ -313,6 +360,7 @@ mod tests {
         assert_eq!(VideoEditorEvent::from_raw(3, 0.0, 42), None);
         assert_eq!(VideoEditorEvent::from_raw(4, 0.0, -1), None);
         assert_eq!(VideoEditorEvent::from_raw(6, 0.0, -3), None);
+        assert_eq!(VideoEditorEvent::from_raw(7, 0.0, -1), None);
         assert_eq!(VideoEditorEvent::from_raw(99, 0.0, 0), None);
     }
 }

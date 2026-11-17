@@ -1,5 +1,6 @@
 //! Video editor logic: the in and out points, the playhead and playback,
-//! the zoom, pointer and preset choices, and the [`EditRequest`] they make.
+//! the zoom (for all clicks and for single ones), pointer and preset
+//! choices, and the [`EditRequest`] they make.
 //!
 //! Nothing here touches AppKit or decodes a frame; `video_editor_window.rs`
 //! is the glue. [`VideoEditor::handle`] turns the window's events into
@@ -8,13 +9,31 @@
 //! export to run. The export itself is `Engine::edit`, the same pipeline as
 //! `bugle edit` and the `edit_video` action.
 
+use bugle_engine::cursor_fx::{ZOOM_HOLD, ZOOM_IN, ZOOM_OUT};
 use bugle_engine::edit::MIN_CLIP_SECONDS;
-use bugle_engine::{EditRequest, ExportPreset};
-use bugle_platform::{VideoEditorCommand, VideoEditorEvent, VideoEditorState};
+use bugle_engine::{ClickZoom, EditRequest, ExportPreset};
+use bugle_platform::{ClickMarker, VideoEditorCommand, VideoEditorEvent, VideoEditorState};
 use std::time::{Duration, Instant};
 
 /// The zoom menu: label and factor (`None`: no zoom).
 pub const ZOOMS: [(&str, Option<f64>); 5] = [("Off", None), ("1.5×", Some(1.5)), ("2×", Some(2.0)), ("2.5×", Some(2.5)), ("3×", Some(3.0))];
+
+/// The click menu (the zoom of the click at the playhead): label and level
+/// (`None`: as the zoom menu says; 1: this click is not zoomed).
+pub const CLICK_ZOOMS: [(&str, Option<f64>); 6] =
+    [("Default", None), ("Off", Some(1.0)), ("1.5×", Some(1.5)), ("2×", Some(2.0)), ("2.5×", Some(2.5)), ("3×", Some(3.0))];
+
+/// Buckets of the timeline waveform (more than a timeline is wide in pixels).
+pub const WAVEFORM_BUCKETS: usize = 4096;
+
+/// The timeline waveform for `peaks` (0..1): scaled so the loudest bucket
+/// fills the track, but a quiet recording (peaking under 0.1) is drawn no
+/// louder than ten times as loud, so near-silence stays flat.
+pub fn waveform_levels(peaks: &[f32]) -> Vec<f32> {
+    let max = peaks.iter().copied().filter(|v| v.is_finite()).fold(0.0f32, f32::max);
+    let k = 1.0 / max.max(0.1);
+    peaks.iter().map(|v| if v.is_finite() { (v * k).clamp(0.0, 1.0) } else { 0.0 }).collect()
+}
 
 /// The preset menu, in [`ExportPreset::ALL`] order.
 pub const PRESETS: [ExportPreset; 9] = ExportPreset::ALL;
@@ -80,6 +99,10 @@ pub struct VideoEditor {
     /// One frame, for ← and →.
     step: f64,
     caps: Caps,
+    /// The times of the clicks auto-zoom follows.
+    clicks: Vec<f64>,
+    /// Each click's choice in [`CLICK_ZOOMS`].
+    click_zoom: Vec<usize>,
     playhead: f64,
     in_t: f64,
     out_t: f64,
@@ -91,10 +114,12 @@ pub struct VideoEditor {
 }
 
 impl VideoEditor {
-    /// `fps` is the recording's nominal frame rate (for frame steps).
-    /// Smoothing starts on when it is possible: a recording made with the
-    /// pointer hidden shows no pointer at all without it (or zoom).
-    pub fn new(source: impl Into<String>, duration: f64, fps: f64, caps: Caps) -> Self {
+    /// `fps` is the recording's nominal frame rate (for frame steps);
+    /// `clicks` the times of the clicks auto-zoom follows, in order (none
+    /// without zoom). Smoothing starts on when it is possible: a recording
+    /// made with the pointer hidden shows no pointer at all without it (or
+    /// zoom).
+    pub fn new(source: impl Into<String>, duration: f64, fps: f64, caps: Caps, clicks: Vec<f64>) -> Self {
         let duration = if duration.is_finite() { duration.max(MIN_CLIP_SECONDS) } else { MIN_CLIP_SECONDS };
         let fps = if fps.is_finite() && fps >= 1.0 { fps.min(240.0) } else { 30.0 };
         Self {
@@ -102,6 +127,8 @@ impl VideoEditor {
             duration,
             step: 1.0 / fps,
             caps,
+            click_zoom: vec![0; if caps.zoom { clicks.len() } else { 0 }],
+            clicks: if caps.zoom { clicks } else { Vec::new() },
             playhead: 0.0,
             in_t: 0.0,
             out_t: duration,
@@ -142,9 +169,33 @@ impl VideoEditor {
     }
 
     /// The zoom factor and smoothing the preview renders with (the same
-    /// as the export's).
+    /// as the export's); see also [`VideoEditor::click_zooms`].
     pub fn options(&self) -> (Option<f64>, bool) {
         (ZOOMS.get(self.zoom).and_then(|z| z.1), self.smooth && self.caps.smooth)
+    }
+
+    /// The clicks whose zoom differs from the zoom menu's, with their level.
+    pub fn click_zooms(&self) -> Vec<ClickZoom> {
+        let default = self.options().0.unwrap_or(1.0);
+        self.clicks
+            .iter()
+            .zip(&self.click_zoom)
+            .filter_map(|(&t, &c)| CLICK_ZOOMS.get(c).and_then(|z| z.1).filter(|z| *z != default).map(|zoom| ClickZoom { t, zoom }))
+            .collect()
+    }
+
+    /// The level each click zooms to (1: not at all).
+    fn click_level(&self, i: usize) -> f64 {
+        let choice = self.click_zoom.get(i).and_then(|c| CLICK_ZOOMS.get(*c)).and_then(|z| z.1);
+        choice.or(self.options().0).unwrap_or(1.0)
+    }
+
+    /// The click the click menu is about: the one the view zooms for at the
+    /// playhead (the last whose ease-in has begun, until its zoom would be
+    /// over), whether or not it is zoomed.
+    pub fn selected_click(&self) -> Option<usize> {
+        let i = self.clicks.partition_point(|c| c - ZOOM_IN <= self.playhead).checked_sub(1)?;
+        (self.playhead <= self.clicks[i] + ZOOM_HOLD + ZOOM_OUT).then_some(i)
     }
 
     /// The first picture: the frame at the playhead.
@@ -255,17 +306,26 @@ impl VideoEditor {
                 }
                 self.rerender(now)
             }
+            VideoEditorEvent::ClickZoom(c) if c < CLICK_ZOOMS.len() && self.caps.zoom => {
+                let Some(i) = self.selected_click() else { return state };
+                self.click_zoom[i] = c;
+                if self.click_level(i) > 1.0 {
+                    self.leave_lossless();
+                }
+                self.rerender(now)
+            }
             VideoEditorEvent::Preset(i) if i < PRESETS.len() => {
                 self.preset = i;
-                if self.lossless() && (self.zoom != 0 || self.smooth) {
+                if self.lossless() && (self.zoom != 0 || self.smooth || self.click_zoom.iter().any(|c| *c != 0)) {
                     self.zoom = 0;
                     self.smooth = false;
+                    self.click_zoom.iter_mut().for_each(|c| *c = 0);
                     return self.rerender(now);
                 }
                 state
             }
             // A choice the window should not have offered: put it back.
-            VideoEditorEvent::Zoom(_) | VideoEditorEvent::Smooth(_) | VideoEditorEvent::Preset(_) => state,
+            VideoEditorEvent::Zoom(_) | VideoEditorEvent::Smooth(_) | VideoEditorEvent::Preset(_) | VideoEditorEvent::ClickZoom(_) => state,
         }
     }
 
@@ -311,6 +371,7 @@ impl VideoEditor {
             end: (self.out_t < self.duration - 1e-3).then_some(self.out_t),
             preset: PRESETS.get(self.preset).copied().unwrap_or_default(),
             zoom,
+            click_zooms: self.click_zooms(),
             smooth_cursor: smooth,
             ..Default::default()
         }
@@ -328,6 +389,10 @@ impl VideoEditor {
             can_zoom: self.caps.zoom,
             can_smooth: self.caps.smooth,
             busy: self.busy,
+            click_zoom: self.selected_click().map(|i| self.click_zoom[i]),
+            clicks: (0..self.clicks.len())
+                .map(|i| ClickMarker { t: self.clicks[i], level: self.click_level(i), selected: Some(i) == self.selected_click() })
+                .collect(),
             // The range itself is on the timeline; its length goes here.
             time_text: format!("{} / {} · clip {}", clock(self.playhead), clock(self.duration), clock(self.out_t - self.in_t)),
         }
@@ -354,7 +419,7 @@ mod tests {
     const ALL: Caps = Caps { zoom: true, smooth: true };
 
     fn editor(caps: Caps) -> VideoEditor {
-        VideoEditor::new("abc123", 10.0, 25.0, caps)
+        VideoEditor::new("abc123", 10.0, 25.0, caps, vec![2.0, 3.0, 8.0])
     }
 
     fn nothing(fx: &Effects) -> bool {
@@ -371,6 +436,7 @@ mod tests {
         let r = e.request();
         assert_eq!(r.source, "abc123");
         assert_eq!((r.start, r.end, r.zoom, r.smooth_cursor), (None, None, None, false));
+        assert!(r.click_zooms.is_empty());
         assert_eq!(r.preset, ExportPreset::Original);
         assert!(!r.uses_events(), "a plain trim keeps the frames");
     }
@@ -527,6 +593,65 @@ mod tests {
         e.handle(E::Preset(lossless), now);
         e.handle(E::Zoom(0), now);
         assert_eq!(e.request().preset, ExportPreset::Lossless, "zoom off keeps lossless");
+    }
+
+    #[test]
+    fn each_click_gets_its_own_zoom() {
+        let now = Instant::now();
+        let c = |name: &str| CLICK_ZOOMS.iter().position(|z| z.0 == name).unwrap();
+        let mut e = editor(Caps { zoom: true, smooth: false });
+        // Clicks at 2, 3 and 8 s. Before the first one eases in: none.
+        assert_eq!(e.state().click_zoom, None);
+        e.handle(E::ClickZoom(c("2×")), now);
+        assert!(e.click_zooms().is_empty(), "no click at the playhead: nothing changes");
+        // Easing in to the first click: it is the one the menu is about.
+        e.handle(E::Seek(2.0 - ZOOM_IN / 2.0), now);
+        let s = e.state();
+        assert_eq!(s.click_zoom, Some(0), "Default");
+        assert_eq!(s.clicks.iter().map(|m| m.selected).collect::<Vec<_>>(), vec![true, false, false]);
+        assert!(s.clicks.iter().all(|m| m.level == 1.0), "zoom off: no click zooms");
+        let fx = e.handle(E::ClickZoom(c("2.5×")), now);
+        assert!(fx.frame.is_some(), "the frame is drawn again with it");
+        assert_eq!(e.click_zooms(), vec![ClickZoom { t: 2.0, zoom: 2.5 }]);
+        assert!(e.request().uses_events() && e.request().zoom.is_none());
+        // Past its ease-in the second click is selected, and stays until its zoom is over.
+        e.handle(E::Seek(2.9), now);
+        assert_eq!(e.state().clicks.iter().position(|m| m.selected), Some(1));
+        e.handle(E::Seek(3.0 + ZOOM_HOLD + ZOOM_OUT + 0.1), now);
+        assert_eq!(e.selected_click(), None);
+        // With the zoom menu on, the others follow it; one can be left out.
+        e.handle(E::Zoom(2), now);
+        e.handle(E::Seek(8.0), now);
+        e.handle(E::ClickZoom(c("Off")), now);
+        assert_eq!(e.click_zooms(), vec![ClickZoom { t: 2.0, zoom: 2.5 }, ClickZoom { t: 8.0, zoom: 1.0 }]);
+        let levels: Vec<f64> = e.state().clicks.iter().map(|m| m.level).collect();
+        assert_eq!(levels, vec![2.5, 2.0, 1.0]);
+        // A click set to what the zoom menu says needs no override.
+        e.handle(E::ClickZoom(c("2×")), now);
+        assert_eq!(e.click_zooms().len(), 1);
+        // Lossless resets every click; a zoomed click leaves lossless.
+        let lossless = PRESETS.iter().position(|p| *p == ExportPreset::Lossless).unwrap();
+        e.handle(E::Preset(lossless), now);
+        assert!(e.click_zooms().is_empty() && !e.request().uses_events());
+        e.handle(E::ClickZoom(c("Off")), now);
+        assert_eq!(e.request().preset, ExportPreset::Lossless, "a click off keeps lossless");
+        assert!(!e.request().uses_events());
+        e.handle(E::ClickZoom(c("3×")), now);
+        assert_eq!(e.request().preset, ExportPreset::Original);
+        // Without zoom there are no clicks to choose.
+        let mut plain = VideoEditor::new("x", 10.0, 25.0, Caps::default(), vec![2.0]);
+        plain.handle(E::Seek(2.0), now);
+        plain.handle(E::ClickZoom(c("2×")), now);
+        assert!(plain.click_zooms().is_empty() && plain.state().clicks.is_empty() && plain.state().click_zoom.is_none());
+    }
+
+    #[test]
+    fn waveform_is_scaled_to_its_loudest_bucket() {
+        assert_eq!(waveform_levels(&[0.0, 0.25, 0.5]), vec![0.0, 0.5, 1.0]);
+        let quiet = waveform_levels(&[0.01, 0.05]);
+        assert!((quiet[0] - 0.1).abs() < 1e-6 && (quiet[1] - 0.5).abs() < 1e-6, "quiet stays quiet: {quiet:?}");
+        assert_eq!(waveform_levels(&[f32::NAN, 2.0]), vec![0.0, 1.0]);
+        assert!(waveform_levels(&[]).is_empty());
     }
 
     #[test]

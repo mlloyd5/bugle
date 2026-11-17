@@ -8,6 +8,9 @@
 //!   has zoomed out joins it, and the view pans to it over at most [`PAN`]
 //!   seconds, arriving as it happens. The visible rect keeps the frame's
 //!   aspect ratio, is centred on the click and is clamped to the frame.
+//!   Each click may have its own level ([`ClickZoom`]): the view eases in
+//!   to the first click's, changes level along with each pan, and a click
+//!   at 1x is left out.
 //! * **Cursor smoothing.** The pointer path is resampled at [`GRID_HZ`] and
 //!   convolved with a Gaussian ([`SMOOTH_SIGMA`] seconds), which removes
 //!   jitter and rounds off hand movements without lag (the filter is
@@ -24,6 +27,7 @@
 
 use bugle_core::events::EventTrack;
 use image::RgbaImage;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
 /// Zoom factors accepted by an edit.
@@ -59,6 +63,9 @@ fn lerp2(a: (f64, f64), b: (f64, f64), k: f64) -> (f64, f64) {
 pub struct ZoomSegment {
     /// `(t, x, y)` in track time and area points, in time order.
     pub clicks: Vec<(f64, f64, f64)>,
+    /// The zoom level of each click (above 1); the level changes between
+    /// two clicks of a run along with the pan.
+    pub levels: Vec<f64>,
 }
 
 impl ZoomSegment {
@@ -94,53 +101,114 @@ impl ZoomSegment {
         }
     }
 
-    /// The point the view centres on at `t`.
-    fn focus(&self, t: f64) -> (f64, f64) {
+    /// The point the view centres on at `t` and the zoom level it is
+    /// heading for: the click's before the first one, then each click's
+    /// from its time on, moving to the next one's during the pan to it.
+    fn focus(&self, t: f64) -> ((f64, f64), f64) {
         let c = &self.clicks;
         let i = c.partition_point(|k| k.0 <= t);
         if i == 0 {
-            return (c[0].1, c[0].2);
+            return ((c[0].1, c[0].2), self.levels[0]);
         }
-        let a = c[i - 1];
-        let Some(&b) = c.get(i) else { return (a.1, a.2) };
+        let (a, la) = (c[i - 1], self.levels[i - 1]);
+        let Some(&b) = c.get(i) else { return ((a.1, a.2), la) };
+        let lb = self.levels[i];
         let pan_start = a.0.max(b.0 - PAN);
         if t <= pan_start || b.0 <= pan_start {
-            return (a.1, a.2);
+            return ((a.1, a.2), la);
         }
-        lerp2((a.1, a.2), (b.1, b.2), smoothstep((t - pan_start) / (b.0 - pan_start)))
+        let k = smoothstep((t - pan_start) / (b.0 - pan_start));
+        (lerp2((a.1, a.2), (b.1, b.2), k), la + (lb - la) * k)
     }
 }
 
 /// Zoom level and focus over time, planned from a track's clicks.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZoomPlan {
-    pub factor: f64,
     pub segments: Vec<ZoomSegment>,
 }
 
 impl ZoomPlan {
-    /// `clicks` must be in time order.
+    /// Every click at `factor`. `clicks` must be in time order.
     pub fn new(clicks: impl IntoIterator<Item = (f64, f64, f64)>, factor: f64) -> Self {
+        Self::with_levels(clicks.into_iter().map(|c| (c, factor)))
+    }
+
+    /// Each click at its own level (clamped to [`MAX_ZOOM`]); a click at 1
+    /// or below is left out, as if it had not happened. `clicks` must be in
+    /// time order.
+    pub fn with_levels(clicks: impl IntoIterator<Item = ((f64, f64, f64), f64)>) -> Self {
         let mut segments: Vec<ZoomSegment> = Vec::new();
-        for c in clicks {
+        for (c, level) in clicks {
+            if level.is_nan() || level <= MIN_ZOOM {
+                continue;
+            }
+            let level = level.min(MAX_ZOOM);
             match segments.last_mut() {
                 // Still zoomed (or zooming out) when this one would start
                 // zooming in: stay in and pan.
-                Some(s) if c.0 - ZOOM_IN <= s.end() => s.clicks.push(c),
-                _ => segments.push(ZoomSegment { clicks: vec![c] }),
+                Some(s) if c.0 - ZOOM_IN <= s.end() => {
+                    s.clicks.push(c);
+                    s.levels.push(level);
+                }
+                _ => segments.push(ZoomSegment { clicks: vec![c], levels: vec![level] }),
             }
         }
-        Self { factor: factor.clamp(MIN_ZOOM, MAX_ZOOM), segments }
+        Self { segments }
     }
 
     /// Zoom level (1 = whole frame) and the focus point (area points) at `t`.
     pub fn at(&self, t: f64) -> (f64, Option<(f64, f64)>) {
         let i = self.segments.partition_point(|s| s.end() <= t);
         match self.segments.get(i) {
-            Some(s) if t > s.start() => (1.0 + (self.factor - 1.0) * s.amount(t), Some(s.focus(t))),
+            Some(s) if t > s.start() => {
+                let (focus, level) = s.focus(t);
+                (1.0 + (level - 1.0) * s.amount(t), Some(focus))
+            }
             _ => (1.0, None),
         }
     }
+}
+
+/// The zoom level of one click, overriding the edit's `zoom` for it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ClickZoom {
+    /// The click's time (seconds in the recording, as its event track has
+    /// it); matches the auto-zoom click within [`CLICK_MATCH`] seconds.
+    pub t: f64,
+    /// Zoom factor for this click, 1 (not zoomed) to [`MAX_ZOOM`].
+    pub zoom: f64,
+}
+
+/// How far (seconds) a [`ClickZoom`]'s time may be from its click.
+pub const CLICK_MATCH: f64 = 0.05;
+
+/// Which of `clicks` (times in order) each override names: the nearest
+/// click within [`CLICK_MATCH`], `None` for one that names no click.
+pub fn match_click_zooms(clicks: &[f64], overrides: &[ClickZoom]) -> Vec<Option<usize>> {
+    overrides
+        .iter()
+        .map(|o| {
+            let i = clicks.partition_point(|c| *c < o.t);
+            [i.checked_sub(1), Some(i)]
+                .into_iter()
+                .flatten()
+                .filter(|&j| j < clicks.len() && (clicks[j] - o.t).abs() <= CLICK_MATCH)
+                .min_by(|&a, &b| (clicks[a] - o.t).abs().total_cmp(&(clicks[b] - o.t).abs()))
+        })
+        .collect()
+}
+
+/// The level of each click: `zoom` (none: 1, not zoomed) unless an override
+/// names it (the last one wins).
+pub fn click_levels(clicks: &[f64], zoom: Option<f64>, overrides: &[ClickZoom]) -> Vec<f64> {
+    let mut levels = vec![zoom.unwrap_or(MIN_ZOOM); clicks.len()];
+    for (o, i) in overrides.iter().zip(match_click_zooms(clicks, overrides)) {
+        if let Some(i) = i {
+            levels[i] = o.zoom;
+        }
+    }
+    levels
 }
 
 /// The pointer path, raw or smoothed.
@@ -327,7 +395,19 @@ impl<'a> Effects<'a> {
     /// `zoom` is the factor (> 1 to zoom); `smooth` draws a smoothed pointer.
     /// A track whose frames lack the pointer always gets it drawn.
     pub fn new(track: &'a EventTrack, zoom: Option<f64>, smooth: bool) -> Self {
-        let zoom = zoom.filter(|z| *z > 1.0).map(|z| ZoomPlan::new(zoom_clicks(track), z));
+        Self::with_click_zooms(track, zoom, &[], smooth)
+    }
+
+    /// [`Effects::new`] with the zoom level of some clicks set on their own
+    /// (`click_zooms`; see [`click_levels`]): with them, clicks the
+    /// overrides do not name zoom to `zoom`, or not at all without it.
+    pub fn with_click_zooms(track: &'a EventTrack, zoom: Option<f64>, click_zooms: &[ClickZoom], smooth: bool) -> Self {
+        let zoom = zoom.filter(|z| *z > 1.0);
+        let zoom = (zoom.is_some() || !click_zooms.is_empty()).then(|| {
+            let clicks = zoom_clicks(track);
+            let times: Vec<f64> = clicks.iter().map(|c| c.0).collect();
+            ZoomPlan::with_levels(clicks.into_iter().zip(click_levels(&times, zoom, click_zooms)))
+        });
         let cursor = match (track.cursor_in_video, smooth) {
             (true, _) => None,
             (false, true) => Some(CursorPath::smoothed(track)),
@@ -423,7 +503,7 @@ mod tests {
         let out_mid = p.at(2.0 + ZOOM_HOLD + ZOOM_OUT / 2.0).0;
         assert!((out_mid - 1.5).abs() < 1e-9, "{out_mid}");
         // The factor is clamped.
-        assert_eq!(ZoomPlan::new(vec![click(1.0, 0.0, 0.0)], 9.0).factor, MAX_ZOOM);
+        assert_eq!(ZoomPlan::new(vec![click(1.0, 0.0, 0.0)], 9.0).segments[0].levels, vec![MAX_ZOOM]);
     }
 
     #[test]
@@ -447,6 +527,45 @@ mod tests {
         let end = 1.0 + ZOOM_HOLD + ZOOM_OUT;
         assert_eq!(ZoomPlan::new(vec![click(1.0, 0.0, 0.0), click(end + ZOOM_IN, 0.0, 0.0)], 2.0).segments.len(), 1);
         assert_eq!(ZoomPlan::new(vec![click(1.0, 0.0, 0.0), click(end + ZOOM_IN + 0.01, 0.0, 0.0)], 2.0).segments.len(), 2);
+    }
+
+    #[test]
+    fn each_click_zooms_to_its_own_level() {
+        // A run of two clicks at 2x then 3x, a click left out (1x), and a
+        // lone click at 1.5x.
+        let p = ZoomPlan::with_levels(vec![
+            (click(1.0, 10.0, 10.0), 2.0),
+            (click(3.0, 90.0, 40.0), 3.0),
+            (click(8.0, 0.0, 0.0), 1.0),
+            (click(20.0, 50.0, 25.0), 1.5),
+        ]);
+        assert_eq!(p.segments.len(), 2, "the 1x click is no zoom segment");
+        assert_eq!(p.at(1.0).0, 2.0);
+        assert!((p.at(1.0 - ZOOM_IN / 2.0).0 - 1.5).abs() < 1e-9, "eases in to the first click's level");
+        // Holds the first level until the pan, changes with it, arrives on time.
+        assert_eq!(p.at(3.0 - PAN).0, 2.0);
+        assert!((p.at(3.0 - PAN / 2.0).0 - 2.5).abs() < 1e-9);
+        assert_eq!(p.at(3.0).0, 3.0);
+        assert_eq!(p.at(3.0 + ZOOM_HOLD).0, 3.0, "holds the last click's level");
+        assert_eq!(p.at(8.0), (1.0, None));
+        assert_eq!(p.at(20.0), (1.5, Some((50.0, 25.0))));
+        // Levels above the maximum are clamped; NaN is no zoom.
+        let p = ZoomPlan::with_levels(vec![(click(1.0, 0.0, 0.0), 9.0), (click(9.0, 0.0, 0.0), f64::NAN)]);
+        assert_eq!(p.segments.len(), 1);
+        assert_eq!(p.at(1.0).0, MAX_ZOOM);
+    }
+
+    #[test]
+    fn click_zooms_name_the_nearest_click() {
+        let clicks = [1.0, 1.04, 3.0];
+        let o = |t: f64, zoom: f64| ClickZoom { t, zoom };
+        let m = match_click_zooms(&clicks, &[o(1.03, 2.0), o(0.96, 2.0), o(3.05, 2.0), o(2.0, 2.0), o(3.06, 2.0), o(-1.0, 2.0)]);
+        assert_eq!(m, vec![Some(1), Some(0), Some(2), None, None, None]);
+        assert_eq!(match_click_zooms(&[], &[o(1.0, 2.0)]), vec![None]);
+        // Without a default level only the named clicks zoom; the last
+        // override of a click wins.
+        assert_eq!(click_levels(&clicks, None, &[o(3.0, 2.5)]), vec![1.0, 1.0, 2.5]);
+        assert_eq!(click_levels(&clicks, Some(2.0), &[o(1.0, 1.0), o(1.0, 3.0), o(9.0, 4.0)]), vec![3.0, 2.0, 2.0]);
     }
 
     #[test]
@@ -540,6 +659,11 @@ mod tests {
         let out = fx.apply(&frame, 1.0);
         assert!(out.pixels().all(|p| p[2] == 255 && p[0] == 0), "zoomed into the blue half");
         assert!(matches!(fx.apply(&frame, 9.0), Cow::Borrowed(_)), "zoomed out again: the frame as is");
+        // The click's own level, without a default one; or that click off.
+        let one = Effects::with_click_zooms(&t, None, &[ClickZoom { t: 1.0, zoom: 2.0 }], false);
+        assert!(one.apply(&frame, 1.0).pixels().all(|p| p[2] == 255 && p[0] == 0));
+        let off = Effects::with_click_zooms(&t, Some(2.0), &[ClickZoom { t: 1.02, zoom: 1.0 }], false);
+        assert!(matches!(off.apply(&frame, 1.0), Cow::Borrowed(_)), "that click is not zoomed");
 
         // Without the pointer in the frames it is drawn, scaled with the zoom.
         let t = track(vec![CursorEvent::moved(0.0, 75.0, 25.0), down(1.0, 75.0, 25.0)], false);

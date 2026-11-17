@@ -60,11 +60,12 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `pin_image_blocking`, `pin_image_show` | floating borderless window, drag/resize/close; blocking or fire-and-forget |
 | `toast_show` | non-activating `NSPanel` with `NSVisualEffectView`, thumbnail + two lines, fades out |
 | `editor_open` (`shim/editor.m`) | markup editor windows, several at once, each named by the `EditorId` `editor_open` returns: toolbar with pull-down menus, canvas in an `NSScrollView` (fit, zoom stops, pinch, ⌘+/⌘−/⌘1/⌘0), multi-line label text field, unsaved-changes sheet; reports input in edited-image pixels through a callback and draws the image (told where the edited image's origin lies in it), overlay primitives and menus it is handed |
-| `video_editor_open` (`shim/video_editor.m`) | video editor window: `NSImageView` preview, a timeline view (kept range, in/out handles, playhead; drags move locally until Rust answers), control bar (play, Set In/Out, zoom and preset pop-ups, smoothing check box, Export); reports input as times in seconds through a callback and shows the frame and control state it is handed |
+| `video_editor_open` (`shim/video_editor.m`) | video editor window: `NSImageView` preview, a timeline view (audio waveform, kept range, in/out handles, playhead, click markers; drags move locally until Rust answers, the playhead snaps onto a marker), control bar (play, Set In/Out, zoom, click-zoom and preset pop-ups, smoothing check box, Export); reports input as times in seconds through a callback and shows the frame, control state, markers and waveform it is handed |
 | `panel_show` (`shim/panel.m`) | quick-access panels: non-activating, never-key `NSPanel`s, thumbnail, buttons, close, each named by an id the caller picks; several stack in the corner (newest nearest it) and close up when one goes; `panel_hide_all` / `panel_show_all` take them off screen during a capture; reports clicks through a callback |
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
 | `export_audio_m4a`, `export_mp4`, `export_mov`, `video_frame`, `media_duration` | `AVAssetExportSession`, `AVAssetImageGenerator` |
+| `audio_peaks` | one `AVAssetReaderAudioMixOutput` over every enabled audio track (mono float PCM at 8 kHz), the loudest sample per equal time bucket, stopping at the given duration (the video editor's waveform) |
 | `mix_audio_tracks(_with)`, `level_audio_tracks`, `audio_track_count`, `video_track_count` | one `AVAssetReaderAudioMixOutput` per audio track (float PCM) → Rust mix callback (`bugle_core::audio_mix`) → `AVAssetWriter` (one AAC track, or one per source when leveling), video samples copied on their own timescale |
 | `export_video`, `video_info`, `video_sync_at`, `VideoFrameReader`, `VideoFrameWriter` | `AVAssetExportSession` with `timeRange`/preset, an `AVMutableVideoComposition` on every re-encode (`frameDuration` + `sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid` for a new frame rate), bounded wait + `cancelExport`; `AVSampleCursor` (stored samples, sync sample at a cut); one reusable `AVAssetImageGenerator` (`maximumSize` for scaled previews); `AVAssetWriter` + pixel-buffer adaptor (H.264 or HEVC) |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
@@ -230,6 +231,9 @@ recorder state machine, and exposes one method per user-facing action:
   click, hold 1.5 s past the last click of a run, ease out; a click before
   the view is back at 1x joins the run and the view pans to it, arriving as
   it happens), the visible rect keeps the frame's aspect and stays inside it,
+  `click_zooms` set single clicks' levels by their time (nearest click within
+  0.05 s, else refused; 1 leaves a click out; without `zoom` only these
+  clicks zoom) and the level changes along with each pan within a run,
   and frames are cropped and scaled with a fixed-point bilinear sampler
   (taps computed once per row and column; frames with nothing to apply pass
   through without a copy). Smoothing
@@ -505,7 +509,10 @@ drives it through `editor_inject` and `editor_zoom`.
 The video editor follows the same split. `video_editor.rs` is the
 platform-free part: `VideoEditor::handle` turns the window's events into the
 in and out points (a minimum clip apart; a mark that passes the other end
-resets it), the playhead, the zoom, smoothing and preset choices, and answers
+resets it), the playhead, the zoom, the zoom of the click at the playhead
+(the last whose ease-in has begun, until its zoom is over; the request
+carries only the clicks that differ from the zoom menu), smoothing and
+preset choices, and answers
 with `Effects` (refresh the controls, a frame to show, an `EditRequest` to
 export). Playback is a chain of frame requests: each shown frame asks for the
 next at the time real time has reached, at most `PLAY_FPS` a second, due at
@@ -514,6 +521,9 @@ the glue: it opens `Engine::edit_source`, decodes frames on a per-window
 preview thread (only the newest waiting job; a job due later waits unless a
 newer one replaces it; effects rebuilt only when the options change) and
 sends each result back by sequence number, so a stale frame is dropped.
+A second thread reads `EditSource::audio_peaks` once (4096 buckets) and
+sends them back by window generation; the window draws them scaled to the
+loudest bucket (`waveform_levels`) across the timeline track.
 Export checks the request with `EditSource::check`, then runs
 `Engine::edit` on a thread with the window's controls disabled; success
 closes the window and shows the quick-access panel for the new file, and a
@@ -527,8 +537,7 @@ Bugle is a standalone app; this is the backlog, roughly in the order it would
 earn its keep.
 
 * **Video editor extras** — opening GIFs in the video editor (the headless
-  `edit` trims them), several cuts in one export, an audio waveform on the
-  timeline, and a choice of zoom level per click.
+  `edit` trims them) and several cuts in one export.
 * **Audio mixing extras** — per-source levels and ducking work on the mixed
   track and on the separate tracks, and are set from the menu-bar app; still
   open: free-form levels and the ducking amount in the app (it offers presets

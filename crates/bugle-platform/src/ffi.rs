@@ -153,6 +153,7 @@ extern "C" {
     pub fn bugle_export_mp4(in_path: *const c_char, out_path: *const c_char) -> i32;
     pub fn bugle_export_mov(in_path: *const c_char, out_path: *const c_char) -> i32;
     pub fn bugle_audio_track_count(path: *const c_char) -> i32;
+    pub fn bugle_audio_peaks(path: *const c_char, duration: f64, out: *mut f32, n: i32) -> i32;
     pub fn bugle_mix_audio_tracks(
         in_path: *const c_char,
         out_path: *const c_char,
