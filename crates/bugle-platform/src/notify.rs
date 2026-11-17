@@ -15,7 +15,12 @@ extern "C" {
     fn bugle_notify_start(request: c_int) -> c_int;
     fn bugle_notify_state() -> c_int;
     fn bugle_notify_refresh();
-    fn bugle_notify_post(title: *const c_char, body: *const c_char, open: *const c_char) -> c_int;
+    fn bugle_notify_post(
+        title: *const c_char,
+        body: *const c_char,
+        open: *const c_char,
+        thumbnail: *const c_char,
+    ) -> c_int;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +74,13 @@ pub fn refresh() {
 
 /// Posts a notification if authorized; clicking it opens `open`. Returns
 /// whether it was handed to the notification center.
-pub fn post(title: &str, body: &str, open: Option<&Path>) -> bool {
+///
+/// `thumbnail` is a PNG shown as the notification's attachment. The
+/// notification center *moves* an attachment's file into its own store, so
+/// pass a throwaway copy, never the capture itself. When the post is skipped
+/// (`false`) the copy is left for the caller; once handed over it is moved,
+/// or removed by the shim if it cannot be attached or the request fails.
+pub fn post(title: &str, body: &str, open: Option<&Path>, thumbnail: Option<&Path>) -> bool {
     if state() != NotifyState::Authorized {
         return false;
     }
@@ -77,7 +88,9 @@ pub fn post(title: &str, body: &str, open: Option<&Path>) -> bool {
     let title = cstr(title);
     let body = cstr(body);
     let open = open.map(|p| cstr(&p.to_string_lossy()));
-    let rc = unsafe { bugle_notify_post(title.as_ptr(), body.as_ptr(), open.as_ref().map_or(std::ptr::null(), |o| o.as_ptr())) };
+    let thumbnail = thumbnail.map(|p| cstr(&p.to_string_lossy()));
+    let ptr = |c: &Option<CString>| c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+    let rc = unsafe { bugle_notify_post(title.as_ptr(), body.as_ptr(), ptr(&open), ptr(&thumbnail)) };
     rc == 1
 }
 
@@ -100,7 +113,7 @@ mod tests {
         // posting is a no-op.
         assert_eq!(start(true), NotifyState::Unavailable);
         assert_ne!(state(), NotifyState::Authorized);
-        assert!(!post("Bugle", "test", None));
+        assert!(!post("Bugle", "test", None, None));
         refresh();
     }
 }
