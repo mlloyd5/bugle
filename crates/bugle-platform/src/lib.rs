@@ -359,10 +359,12 @@ pub fn window_frame(window_id: u32) -> Option<Rect> {
     (unsafe { ffi::bugle_window_frame(window_id, &mut x, &mut y, &mut w, &mut h) } == 0).then_some(Rect { x, y, w, h })
 }
 
-/// Whether child process `pid` has exited. Does not reap it, so its
-/// `std::process::Child` can still be waited on.
+/// Whether child process `pid` is no longer running: it exited (not
+/// reaped by this call, so its `std::process::Child` can still be waited
+/// on), or it is no longer waitable at all because its owner already reaped
+/// it. Only "still running" answers `false`.
 pub fn child_exited(pid: u32) -> bool {
-    unsafe { ffi::bugle_child_exited(pid as i32) == 1 }
+    unsafe { ffi::bugle_child_exited(pid as i32) != 0 }
 }
 
 pub fn clipboard_write_png(png: &[u8]) -> Result<()> {
@@ -1061,6 +1063,11 @@ mod tests {
         assert!(child_exited(child.id()));
         // Not reaped: the owner still gets the status.
         assert!(child.try_wait().unwrap().unwrap().success());
+        // Once the owner has reaped it, it still counts as exited.
+        assert!(child_exited(child.id()));
+        let mut quick = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        quick.wait().unwrap();
+        assert!(child_exited(quick.id()), "reaped before the first check");
     }
 
     #[test]

@@ -214,7 +214,9 @@ Zoom and pointer smoothing: a recording made with `--cursor-events` (or
 `<file>.events.json` (`clip.mp4` → `clip.mp4.events.json`): the pointer
 position and the mouse buttons, polled 60 times a second (a press shorter than
 one poll, about 16 ms, can be missed), in points relative to the recorded area,
-on the video's timeline (placed on it to within about one frame). `bugle edit
+on the video's timeline (placed on it to within about one frame; with
+`backend = "auto"` such recordings use the ScreenCaptureKit recorder, whose
+clock the track shares). `bugle edit
 --zoom` (2x) or `--zoom=FACTOR` uses it to ease in on each click inside the
 recorded area (fully zoomed as it happens, held 1.5 s after the last of a run of
 clicks, then eased out; nearby clicks pan from one to the next; the click that

@@ -35,7 +35,7 @@ hide_cursor = false       # leave the pointer out of the frames (stream backend;
                           # cursor_events; `bugle edit --smooth-cursor` draws it back)
 retina = true
 # auto: ScreenCaptureKit (SCStream + AVAssetWriter, H.264 + AAC .mp4) when system
-#       audio is requested, otherwise `screencapture -v`
+#       audio, hide_cursor or cursor_events is requested, otherwise `screencapture -v`
 # stream | system: always use that recorder
 backend = "auto"
 

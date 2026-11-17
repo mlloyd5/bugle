@@ -249,7 +249,7 @@ pub struct ScrollArgs {
 #[derive(Subcommand, Debug)]
 pub enum RecordCmd {
     /// Start a recording; blocks until Ctrl-C (or --seconds).
-    Start(RecordArgs),
+    Start(Box<RecordArgs>),
     /// Explains how to stop a recording: Ctrl-C in the `record start`
     /// terminal, or the `record_stop` action of a running API/MCP server.
     Stop,

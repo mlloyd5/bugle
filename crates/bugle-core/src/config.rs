@@ -60,8 +60,9 @@ pub struct ScreenshotConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordingBackend {
-    /// ScreenCaptureKit when system audio is requested (and available),
-    /// otherwise `screencapture -v`.
+    /// ScreenCaptureKit when system audio, a hidden pointer or a cursor
+    /// event track is requested (and it is available), otherwise
+    /// `screencapture -v`.
     #[default]
     Auto,
     /// Always the in-process ScreenCaptureKit + AVAssetWriter recorder.

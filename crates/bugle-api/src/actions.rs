@@ -142,7 +142,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "record_start",
-            description: "Start a screen recording (mp4/mov via screencapture or, with system_audio, the ScreenCaptureKit recorder; gif via a frame grab loop). Only one recording at a time.",
+            description: "Start a screen recording (mp4/mov via screencapture or, with system_audio, hide_cursor or cursor_events, the ScreenCaptureKit recorder; gif via a frame grab loop). Only one recording at a time.",
             input_schema: json!({
                 "type":"object",
                 "properties":{

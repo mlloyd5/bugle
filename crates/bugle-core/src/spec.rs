@@ -242,7 +242,7 @@ pub struct RecordRequest {
     #[serde(default)]
     pub highlight_clicks: bool,
     /// Log pointer moves and clicks to an event track next to the
-    /// recording (`clip.events.json`), for auto-zoom and cursor smoothing
+    /// recording (`clip.mp4.events.json`), for auto-zoom and cursor smoothing
     /// in `edit`.
     #[serde(default)]
     pub cursor_events: bool,

@@ -109,8 +109,9 @@ recorder state machine, and exposes one method per user-facing action:
   new strip, repeat until the frame stops changing.
 * `record_start/stop` — GIF: a thread grabbing frames at N fps, encoded on stop.
   Video: `screencapture -v` as a child process, stopped with SIGINT, remuxed to MP4
-  with `AVAssetExportSession` passthrough — or, when system audio is requested
-  (`recordings.backend = "auto"`) or always (`"stream"`), the in-process
+  with `AVAssetExportSession` passthrough — or, when system audio, `hide_cursor`
+  or `cursor_events` is requested (`recordings.backend = "auto"`) or always
+  (`"stream"`), the in-process
   ScreenCaptureKit recorder: one `SCStream` delivers screen and system-audio
   sample buffers, `AVAssetWriter` encodes them to H.264 + AAC straight into the
   `.mp4` (a `.mov` request is remuxed afterwards). The microphone is an
@@ -138,12 +139,17 @@ recorder state machine, and exposes one method per user-facing action:
   by where its time 0 is: the stream recorder's writer session start (the
   same clock), the GIF loop's per-frame grab times (frame `k` shown at
   `k / fps`, so grabs that fall behind are accounted for), or for the system
-  recorder the moment it was interrupted, or exited by itself at its `-V`
-  deadline (watched with `waitid(WNOWAIT)`), minus the video track's length.
-  None of it depends on how long finalising takes. Measured against a window
-  flashing at known host times, changes appear in the frames 15–50 ms after
-  the time the track gives them (display latency plus one frame), for all
-  three recorders. For a window recording the pointer is logged relative to
+  recorder (used for event tracks only with `backend = "system"` or without
+  ScreenCaptureKit, since `auto` picks the stream recorder for them) an
+  estimate: the moment it was interrupted, or exited by itself at its `-V`
+  deadline (watched with `waitid(WNOWAIT)`; a child already reaped by its
+  owner counts as exited), minus the video track's length. The log stops
+  before the file is finalised, and none of it depends on how long that
+  takes. Measured against a window flashing at known host times, changes
+  appear in the frames this long after the time the track gives them
+  (display latency plus up to one frame): stream recorder 19–68 ms (5 runs),
+  system recorder stopping itself at `-V` 36–70 ms (10 runs), GIF −27 to
+  +11 ms. For a window recording the pointer is logged relative to
   the window's current origin (the recorders follow the window), a resize
   sets `area_changed`, and the system recorder is given `-o` so its frames
   are the window frame without the shadow. `hide_cursor` sets

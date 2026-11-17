@@ -6,7 +6,7 @@
 //!   in-process ScreenCaptureKit recorder (`SCStream` + `AVAssetWriter`,
 //!   H.264 + AAC straight to .mp4, click highlight on macOS 15+) which is the
 //!   only one that can capture system audio. `recording.backend` picks between them; `auto` uses
-//!   ScreenCaptureKit whenever system audio is requested.
+//!   ScreenCaptureKit whenever system audio, a hidden pointer or a cursor event track is requested.
 
 use crate::event_log::{EventLog, VideoClock};
 use crate::Engine;
@@ -498,7 +498,7 @@ impl Engine {
                         if system_audio && !sck_available {
                             tracing::warn!("system audio needs the ScreenCaptureKit recorder (macOS 14+); recording without it");
                         }
-                        (system_audio || hide_cursor) && sck_available
+                        (system_audio || hide_cursor || cursor_events) && sck_available
                     }
                 };
                 if hide_cursor && !use_sck {
@@ -625,8 +625,13 @@ impl Engine {
         active.poll();
         let duration = active.elapsed_seconds();
         let auto_stop = active.max_seconds.is_some();
-        // When the system recorder was interrupted (its movie ends then).
-        let mut interrupted_at = None;
+        // When the system recorder's movie ended, if the event log (stopped
+        // here, before anything is finalised) cannot have seen it: the
+        // moment it was interrupted, or seen to exit while waited for.
+        let mut video_ended_at = None;
+        if let Some(log) = active.events.as_mut() {
+            log.stop();
+        }
         let kind = match &mut active.backend {
             Backend::Gif { stop, handle, .. } => {
                 stop.store(true, Ordering::Relaxed);
@@ -649,16 +654,17 @@ impl Engine {
                 // few seconds to finalise before interrupting it.
                 let mut exited = child.try_wait()?.is_some();
                 if !exited && auto_stop {
-                    for _ in 0..40 {
-                        std::thread::sleep(Duration::from_millis(100));
+                    for _ in 0..400 {
+                        std::thread::sleep(Duration::from_millis(10));
                         if child.try_wait()?.is_some() {
                             exited = true;
+                            video_ended_at = Some(bugle_platform::host_time_now());
                             break;
                         }
                     }
                 }
                 if !exited {
-                    interrupted_at = Some(bugle_platform::host_time_now());
+                    video_ended_at = Some(bugle_platform::host_time_now());
                     unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
                 }
                 let status = child.wait()?;
@@ -719,7 +725,7 @@ impl Engine {
         if let Some(log) = active.events.take() {
             // The video track's length (an audio track may run longer).
             let video_seconds = bugle_platform::video_info(&active.output).map(|i| i.end()).ok().filter(|d| d.is_finite() && *d > 0.0);
-            let track = log.finish(video_seconds.or(m.duration_seconds).unwrap_or(duration), interrupted_at);
+            let track = log.finish(video_seconds.or(m.duration_seconds).unwrap_or(duration), video_ended_at);
             let path = EventTrack::sidecar_path(&active.output);
             match track.save(&path) {
                 Ok(()) => m.events = Some(path),

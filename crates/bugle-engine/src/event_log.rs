@@ -12,12 +12,17 @@
 //! * the GIF recorder stamps every frame it grabs, so frame `k` (shown from
 //!   `k / fps`) maps to the moment it was grabbed, even when grabs fall
 //!   behind the frame rate;
-//! * the system recorder (`screencapture -v`, a child process) reports
-//!   nothing, but its movie ends when it is interrupted, or when it exits by
-//!   itself at its deadline (the log thread watches for that without reaping
-//!   it), so the start is that end minus the video track's duration.
+//! * the system recorder (`screencapture -v`, a child process, only used
+//!   for event tracks when the stream recorder is unavailable or
+//!   `backend = "system"`) reports nothing. Its movie ends about when it is
+//!   interrupted, or when it exits by itself at its deadline (the log thread
+//!   watches for that; a child its owner already reaped counts as exited),
+//!   so the start is taken as that end minus the video track's duration.
+//!   That is an estimate: a self-stopped child's exit also includes its own
+//!   flush.
 //!
-//! None of this depends on how long finalising the file takes. Events before
+//! The log stops before the file is finalised, and none of this depends on
+//! how long finalising takes. Events before
 //! the video starts collapse into the starting position; events after it
 //! ends are dropped.
 //!
@@ -134,6 +139,8 @@ pub fn place_events(events: Vec<CursorEvent>, duration: f64) -> Vec<CursorEvent>
 #[derive(Default)]
 struct Logged {
     started: f64,
+    /// When the log stopped polling.
+    stopped: f64,
     events: Vec<CursorEvent>,
     child_exited_at: Option<f64>,
     area_changed: bool,
@@ -148,6 +155,8 @@ pub struct EventLog {
     stop: Arc<AtomicBool>,
     child: Arc<AtomicU32>,
     handle: Option<std::thread::JoinHandle<Logged>>,
+    /// What the thread logged, once stopped.
+    logged: Option<Logged>,
 }
 
 impl EventLog {
@@ -189,10 +198,11 @@ impl EventLog {
                     next = now;
                 }
             }
+            log.stopped = bugle_platform::host_time_now();
             log.events = s.events;
             log
         })?;
-        Ok(Self { area, cursor_in_video: true, fps: None, clock: VideoClock::EndAligned, stop, child, handle: Some(handle) })
+        Ok(Self { area, cursor_in_video: true, fps: None, clock: VideoClock::EndAligned, stop, child, handle: Some(handle), logged: None })
     }
 
     /// Say how the video is timed, whether its frames show the pointer and
@@ -208,12 +218,22 @@ impl EventLog {
         self.child.store(pid, Ordering::Relaxed);
     }
 
-    /// Stop logging and build the track for a video whose track lasts
-    /// `video_seconds`. `stopped_at` is the host time the recorder was told
-    /// to stop (only used for [`VideoClock::EndAligned`]).
-    pub fn finish(mut self, video_seconds: f64, stopped_at: Option<f64>) -> EventTrack {
+    /// Stop polling (before the recording is finalised, which can take a
+    /// while). Idempotent.
+    pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        let log = self.handle.take().and_then(|h| h.join().ok()).unwrap_or_default();
+        if let Some(h) = self.handle.take() {
+            self.logged = Some(h.join().unwrap_or_default());
+        }
+    }
+
+    /// Stop logging (if not yet) and build the track for a video whose track
+    /// lasts `video_seconds`. `stopped_at` is when the system recorder was
+    /// interrupted, or seen to exit after the log stopped (only used for
+    /// [`VideoClock::EndAligned`]).
+    pub fn finish(mut self, video_seconds: f64, stopped_at: Option<f64>) -> EventTrack {
+        self.stop();
+        let log = self.logged.take().unwrap_or_default();
         let (to_video, duration): (Box<dyn Fn(f64) -> f64>, f64) = match &self.clock {
             VideoClock::StartsAt(s) => {
                 let s = *s;
@@ -227,12 +247,11 @@ impl EventLog {
             }
             VideoClock::EndAligned => {
                 // Interrupted: the video ends then; otherwise it ended when
-                // the child exited by itself. Unknown: assume it started
-                // with the log.
-                let start = match stopped_at.or(log.child_exited_at) {
-                    Some(end) => end - video_seconds,
-                    None => log.started,
-                };
+                // the child exited by itself, as the log saw (to within a
+                // poll, plus the child's own flush). Neither: it exited
+                // between the log's last poll and the stop.
+                let end = stopped_at.or(log.child_exited_at).unwrap_or(log.stopped);
+                let start = end - video_seconds;
                 (Box::new(move |t| t - start), video_seconds)
             }
         };
@@ -315,8 +334,17 @@ mod tests {
 
     fn fake_log(events: Vec<CursorEvent>, clock: VideoClock, exited: Option<f64>) -> EventLog {
         let stop = Arc::new(AtomicBool::new(false));
-        let handle = std::thread::spawn(move || Logged { started: 1000.0, events, child_exited_at: exited, area_changed: false });
-        EventLog { area: Rect::new(0.0, 0.0, 10.0, 10.0), cursor_in_video: true, fps: Some(30.0), clock, stop, child: Default::default(), handle: Some(handle) }
+        let handle = std::thread::spawn(move || Logged { started: 1000.0, stopped: 1010.0, events, child_exited_at: exited, area_changed: false });
+        EventLog {
+            area: Rect::new(0.0, 0.0, 10.0, 10.0),
+            cursor_in_video: true,
+            fps: Some(30.0),
+            clock,
+            stop,
+            child: Default::default(),
+            handle: Some(handle),
+            logged: None,
+        }
     }
 
     #[test]
@@ -339,6 +367,25 @@ mod tests {
         assert!((t.duration - 2.0).abs() < 1e-9, "20 frames at 10 fps");
         assert!((t.clicks().next().unwrap().0 - 1.0).abs() < 1e-9);
         assert_eq!(t.events[0], CursorEvent::moved(0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn a_child_reaped_before_the_log_polls_still_counts_as_exited() {
+        let mut log = EventLog::start(Rect::new(0.0, 0.0, 10.0, 10.0), None).unwrap();
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        // The owner reaps it (as `record_status` does) before the log sees it.
+        child.wait().unwrap();
+        let reaped = bugle_platform::host_time_now();
+        log.watch_child(child.id());
+        std::thread::sleep(Duration::from_millis(100));
+        log.stop();
+        let at = log.logged.as_ref().unwrap().child_exited_at.expect("exit noticed");
+        assert!(at >= reaped && at - reaped < 0.1, "{}", at - reaped);
+        // So the video ends there, not at the start of the log.
+        let down = CursorEvent { t: at - 0.5, kind: EventKind::Down, button: Some(MouseButton::Left), x: 1.0, y: 1.0 };
+        log.logged.as_mut().unwrap().events.push(down);
+        let t = log.finish(2.0, None);
+        assert!((t.clicks().next().unwrap().0 - 1.5).abs() < 1e-9);
     }
 
     #[test]
