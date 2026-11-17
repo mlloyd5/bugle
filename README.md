@@ -313,7 +313,8 @@ history, and play the shutter sound when `general.shutter_sound` is on.
 
 Menu: Capture Area · Capture Window · Capture Screen ·
 Scrolling Capture · Record Video · Record GIF · Record Window · Stop Recording · Audio Levels
-(microphone and system-audio level presets and ducking for the next recordings, saved to
+(microphone and system-audio levels, ducking and its amount for the next recordings, each a preset
+or a custom value typed in with *Custom…*, saved to
 `[recordings]` in the config file; they apply when `microphone` and `system_audio` are both on
 under `[recordings]`, on macOS 14 or later, and the menu says so otherwise) · Annotate Latest
 (opens the markup editor) · Edit Latest Recording (opens the [video editor](#video-editor)) · OCR Latest (copies the text) · Pin Latest · Recent Captures (last five, click to open) ·

@@ -116,6 +116,8 @@ enum AppEvent {
     QuickAccess(quick_access::QuickEvent),
     Editor(editor_window::EditorMsg),
     VideoEditor(video_editor_window::VideoEditorMsg),
+    /// The answer to an *Audio Levels* prompt (`None`: cancelled).
+    AudioPrompt(audio_menu::Field, Option<String>),
     Quit,
 }
 
@@ -549,12 +551,18 @@ impl App {
         if id == login::MENU_ID {
             return self.toggle_login();
         }
-        if let Some(change) = self.items.audio.handle(id) {
-            self.engine.set_recording_levels(self.items.audio.levels());
-            if let Err(e) = audio_menu::persist(&self.config_path, change) {
-                self.toast_error(&format!("Audio Levels: the change applies until Bugle quits but was not saved: {e:#}"));
+        match self.items.audio.click(id) {
+            Some(audio_menu::Step::Changed(change)) => return self.audio_changed(change),
+            Some(audio_menu::Step::Ask(field, p)) => {
+                // Not modal: the answer comes back as an `AudioPrompt` event,
+                // and the event loop keeps running meanwhile. A prompt that is
+                // already open is brought to the front instead.
+                let proxy = self.proxy.clone();
+                let done = move |text| proxy.send(AppEvent::AudioPrompt(field, text));
+                bugle_platform::prompt_text(&p.title, &p.message, &p.initial, done);
+                return;
             }
-            return;
+            None => {}
         }
         match commands::find(id) {
             Some(e) => self.run_command(e.command, control_flow),
@@ -563,6 +571,24 @@ impl App {
     }
 
     /// *Open at Login* was clicked (not a [`Command`]: it has no hotkey).
+    /// The answer to an *Audio Levels* prompt (`None`: cancelled).
+    fn on_audio_prompt(&mut self, field: audio_menu::Field, text: Option<String>) {
+        tracing::info!("audio prompt for {field:?} answered: {}", if text.is_some() { "OK" } else { "cancelled" });
+        match self.items.audio.answer(field, text.as_deref()) {
+            audio_menu::Outcome::Changed(change) => self.audio_changed(change),
+            audio_menu::Outcome::Invalid(e) => self.toast_error(&format!("Audio Levels: {e}")),
+            audio_menu::Outcome::Cancelled => {}
+        }
+    }
+
+    /// Hand the menu's new levels to the engine and save `change`.
+    fn audio_changed(&mut self, change: audio_menu::Change) {
+        self.engine.set_recording_levels(self.items.audio.levels());
+        if let Err(e) = audio_menu::persist(&self.config_path, change) {
+            self.toast_error(&format!("Audio Levels: the change applies until Bugle quits but was not saved: {e:#}"));
+        }
+    }
+
     fn toggle_login(&mut self) {
         match self.items.login.as_mut().map(login::LoginMenu::toggle) {
             Some(Ok(Some(msg))) => self.toast_error(&msg),
@@ -909,6 +935,7 @@ fn main() -> Result<()> {
                 AppEvent::QuickAccess(e) => app.on_quick(e),
                 AppEvent::Editor(m) => app.on_editor(m),
                 AppEvent::VideoEditor(m) => app.on_video_editor(m),
+                AppEvent::AudioPrompt(field, text) => app.on_audio_prompt(field, text),
                 AppEvent::Quit => app.quit(control_flow),
             },
             Event::LoopDestroyed => {
@@ -958,10 +985,38 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
         quick_panel::smoke(&proxy);
         editor_window::smoke(&proxy);
         video_editor_window::smoke(&proxy);
+        smoke_audio_prompt(&proxy);
         std::thread::sleep(Duration::from_millis(1500));
         proxy.send(AppEvent::Quit);
     });
     t0
+}
+
+/// `--smoke-test` step: open the *Audio Levels* prompt from its menu item,
+/// click the item again (the open prompt comes to the front, no second one
+/// opens), and cancel it, so nothing is written to the config.
+fn smoke_audio_prompt(proxy: &Proxy) {
+    let click = || proxy.send(AppEvent::Menu(MenuId("audio:mic:custom".into())));
+    let open = || {
+        bugle_platform::app_windows().map(|ws| ws.iter().filter(|w| w.title == "Microphone Level").count()).unwrap_or(0)
+    };
+    click();
+    std::thread::sleep(Duration::from_millis(600));
+    click();
+    std::thread::sleep(Duration::from_millis(600));
+    eprintln!(
+        "smoke test: audio prompt windows open: {} (want 1), key window {:?}",
+        open(),
+        bugle_platform::key_window_title()
+    );
+    bugle_platform::prompt_answer(None);
+    std::thread::sleep(Duration::from_millis(600));
+    // No editor is open, so the focus goes back to the app the user was in.
+    eprintln!(
+        "smoke test: audio prompt windows after cancel: {} (want 0), key window {:?} (want None)",
+        open(),
+        bugle_platform::key_window_title()
+    );
 }
 
 #[cfg(test)]
