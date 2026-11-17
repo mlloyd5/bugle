@@ -456,7 +456,8 @@ fn clamp_rect(img: &RgbaImage, r: &Rect) -> Option<(u32, u32, u32, u32)> {
     let y0 = r.y.floor().max(0.0) as u32;
     let x1 = (r.right().ceil().max(0.0) as u32).min(img.width());
     let y1 = (r.bottom().ceil().max(0.0) as u32).min(img.height());
-    (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0))
+    // Lazily: a rect starting past the edge has x0 > x1.
+    (x1 > x0 && y1 > y0).then(|| (x0, y0, x1 - x0, y1 - y0))
 }
 
 /// Multiply the pixels under `r` by `c`, mixed in with strength `alpha`
@@ -1082,6 +1083,36 @@ mod tests {
         let t = std::time::Instant::now();
         let out = r.render(&img, &doc).unwrap();
         eprintln!("5120x2880 with canvas: {:?} → {}x{}", t.elapsed(), out.width(), out.height());
+    }
+
+    #[test]
+    fn shapes_past_the_cropped_edge_draw_nothing() {
+        // An editor keeps shapes in original pixels and translates them by
+        // the crop, so after cropping they routinely start past the right or
+        // bottom edge (or before the top-left one).
+        let img = RgbaImage::from_pixel(800, 600, Rgba([240, 240, 240, 255]));
+        let rect = |x: f64, y: f64| serde_json::json!({"x":x,"y":y,"w":120,"h":80});
+        for (x, y) in [(500.0, 100.0), (100.0, 450.0), (500.0, 450.0), (-300.0, -300.0)] {
+            let doc: Annotation = serde_json::from_value(serde_json::json!({
+                "crop": {"x":0,"y":0,"w":400,"h":300},
+                "shapes": [
+                    {"type":"highlight","rect":rect(x, y)},
+                    {"type":"redact","rect":rect(x, y),"mode":"pixelate"},
+                    {"type":"redact","rect":rect(x, y),"mode":"blur"},
+                    {"type":"redact","rect":rect(x, y),"mode":"black_out"},
+                    {"type":"redact","rect":rect(x, y),"mode":"secure_blur"},
+                    {"type":"spotlight","rect":rect(x, y),"dim":0.5},
+                    {"type":"rectangle","rect":rect(x, y),"fill":"#FF000080"},
+                    {"type":"ellipse","rect":rect(x, y)},
+                    {"type":"arrow","from":{"x":x,"y":y},"to":{"x":x + 100.0,"y":y + 50.0}},
+                    {"type":"text","at":{"x":x,"y":y},"text":"off\nside","background":"#000000"},
+                    {"type":"counter","at":{"x":x,"y":y}}
+                ]
+            }))
+            .unwrap();
+            let out = render(&img, &doc).unwrap();
+            assert_eq!(out.dimensions(), (400, 300), "({x}, {y})");
+        }
     }
 
     #[test]
