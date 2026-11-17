@@ -218,9 +218,16 @@ pub struct EditRequest {
 
 impl EditRequest {
     /// Whether the edit needs the recording's event track.
-    fn uses_events(&self) -> bool {
+    pub fn uses_events(&self) -> bool {
         self.zoom.is_some() || self.smooth_cursor
     }
+}
+
+/// The effects an edit applies to every frame: `None` without a track or
+/// when the request asks for none (a plain edit leaves the frames alone,
+/// even for a recording without the pointer in them).
+fn effects_for<'a>(req: &EditRequest, track: Option<&'a EventTrack>) -> Option<Effects<'a>> {
+    track.filter(|_| req.uses_events()).map(|t| Effects::new(t, req.zoom, req.smooth_cursor))
 }
 
 /// The event track of a recording: for a history item, the one history
@@ -712,7 +719,112 @@ impl Drop for EditSlot<'_> {
     }
 }
 
+/// A video opened for interactive editing (the menu-bar app's video editor):
+/// what it is, how long, and its event track. Previews and the export go
+/// through the same code as [`Engine::edit`]: [`EditSource::effects`]
+/// builds the effects an edit with the same options would apply, and
+/// [`EditSource::check`] refuses what the edit would refuse.
+pub struct EditSource {
+    pub item: MediaItem,
+    /// The `source` that names exactly this file: its history id when it is
+    /// in history (`latest` may change meanwhile), else its path.
+    pub source: String,
+    /// Frame size (pixels), nominal frame rate and the video track's range.
+    pub info: bugle_platform::VideoInfo,
+    /// The cursor event track, when the recording has a readable one.
+    pub track: Option<EventTrack>,
+    /// Why a track that exists could not be read.
+    pub track_error: Option<String>,
+}
+
+impl EditSource {
+    /// End of the video track, the latest time an edit can end at.
+    pub fn duration(&self) -> f64 {
+        self.info.end()
+    }
+
+    /// Zoom on clicks is possible: there is a track and the recorded area
+    /// kept its size.
+    pub fn can_zoom(&self) -> bool {
+        self.track.as_ref().is_some_and(|t| !t.area_changed)
+    }
+
+    /// Pointer smoothing is possible: zooming is, and the frames lack the
+    /// pointer (`hide_cursor` recordings).
+    pub fn can_smooth(&self) -> bool {
+        self.can_zoom() && self.track.as_ref().is_some_and(|t| !t.cursor_in_video)
+    }
+
+    /// Refuse the event-track options of `req` as [`Engine::edit`] would.
+    pub fn check(&self, req: &EditRequest) -> std::result::Result<(), BugleError> {
+        if req.uses_events() {
+            if let Some(e) = &self.track_error {
+                return Err(BugleError::Invalid(format!("the cursor event track could not be read: {e}")));
+            }
+        }
+        check_effects(req, self.track.as_ref(), &self.item.path)
+    }
+
+    /// The effects [`Engine::edit`] applies for `req`'s options (`None`:
+    /// frames are kept as they are). Check the request first.
+    pub fn effects(&self, req: &EditRequest) -> Option<Effects<'_>> {
+        effects_for(req, self.track.as_ref())
+    }
+
+    /// A frame reader for previews, decoding frames scaled to fit `max`
+    /// pixels.
+    pub fn preview_frames(&self, max: (u32, u32)) -> Result<PreviewFrames> {
+        let mut reader = VideoFrameReader::open(&self.item.path, 0.0)?;
+        reader.set_max_size(max.0, max.1);
+        Ok(PreviewFrames { reader })
+    }
+}
+
+/// Decodes preview frames of an [`EditSource`] at any time, scaled down.
+pub struct PreviewFrames {
+    reader: VideoFrameReader,
+}
+
+impl PreviewFrames {
+    /// The frame shown at `t` (seconds), exactly (no snapping to a nearby
+    /// keyframe), with `fx` applied at `t` as an export would. Positions
+    /// map by frame size, so the effects are the same at preview size.
+    pub fn frame(&mut self, t: f64, fx: Option<&Effects>) -> Result<RgbaImage> {
+        let frame = self.reader.frame_at(t)?;
+        Ok(match fx.map(|fx| fx.apply(&frame, t)) {
+            Some(std::borrow::Cow::Owned(o)) => o,
+            _ => frame,
+        })
+    }
+}
+
 impl Engine {
+    /// Whether `item` is a record in this engine's history.
+    fn in_history(&self, item: &MediaItem) -> bool {
+        self.history.all().map(|all| all.iter().any(|m| m.id == item.id)).unwrap_or(false)
+    }
+
+    /// Open a video (media id, `latest` or path) for interactive editing.
+    /// GIFs and other media are refused.
+    pub fn edit_source(&self, source: &str) -> Result<EditSource> {
+        let item = self.resolve_media(source)?;
+        if source_kind(&item.path) != Some(MediaKind::Video) {
+            return Err(BugleError::Invalid(format!("{} is not a video recording (.mp4, .mov or .m4v)", item.path.display())).into());
+        }
+        let info = bugle_platform::video_info(&item.path)?;
+        if !(info.end() > 0.0) || info.width == 0 || info.height == 0 {
+            return Err(BugleError::Invalid(format!("{} has no video frames", item.path.display())).into());
+        }
+        let in_history = self.in_history(&item);
+        let (track, track_error) = match event_track_of(&item, in_history) {
+            Some(Ok(t)) => (Some(t), None),
+            Some(Err(e)) => (None, Some(format!("{e:#}"))),
+            None => (None, None),
+        };
+        let source = if in_history { item.id.clone() } else { item.path.display().to_string() };
+        Ok(EditSource { item, source, info, track, track_error })
+    }
+
     /// Trim a recording and export it with a preset, as a new history item.
     /// See the module docs for the pipelines.
     pub fn edit(&self, req: &EditRequest) -> Result<MediaItem> {
@@ -726,7 +838,7 @@ impl Engine {
         if kind == MediaKind::Gif && req.preset == ExportPreset::Lossless {
             return Err(BugleError::Invalid("preset lossless applies to video sources; GIF cuts are always exact".into()).into());
         }
-        let in_history = self.history.all().map(|all| all.iter().any(|m| m.id == src.id)).unwrap_or(false);
+        let in_history = self.in_history(&src);
         let track = match event_track_of(&src, in_history) {
             Some(Ok(t)) => Some(t),
             Some(Err(e)) if req.uses_events() => return Err(e),
@@ -737,7 +849,7 @@ impl Engine {
             None => None,
         };
         check_effects(req, track.as_ref(), &src.path)?;
-        let fx = track.as_ref().filter(|_| req.uses_events()).map(|t| Effects::new(t, req.zoom, req.smooth_cursor));
+        let fx = effects_for(req, track.as_ref());
         let apply = |f: RgbaImage, t: f64| {
             let rendered = fx.as_ref().and_then(|fx| match fx.apply(&f, t) {
                 std::borrow::Cow::Owned(o) => Some(o),
@@ -1510,6 +1622,57 @@ mod tests {
         // ... which the next edit picks up through history.
         let m2 = engine.edit(&EditRequest { source: m.id.clone(), zoom: Some(2.0), ..Default::default() }).unwrap();
         assert_eq!(m2.parent.as_deref(), Some(m.id.as_str()));
+    }
+
+    #[test]
+    fn editor_source_previews_what_the_edit_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        let src = split_movie(dir.path());
+        let s = path_str(&src);
+
+        // No track: plain trims only, no effects in the preview.
+        let es = engine.edit_source(&s).unwrap();
+        assert_eq!(es.source, s, "a loose file is named by its path");
+        assert!((es.duration() - 2.0).abs() < 0.05, "{}", es.duration());
+        assert_eq!((es.info.width, es.info.height), (160, 120));
+        assert!(!es.can_zoom() && !es.can_smooth());
+        let zoom = EditRequest { source: s.clone(), zoom: Some(2.0), ..Default::default() };
+        assert!(matches!(es.check(&zoom), Err(BugleError::Invalid(_))));
+        assert!(es.effects(&zoom).is_none());
+
+        // With a track (pointer in the frames): zoom, but no smoothing.
+        let track = EventTrack::new(bugle_core::Rect::new(0.0, 0.0, 80.0, 60.0), true, 2.0, vec![click_at(1.0, 60.0, 30.0)]);
+        track.save(&EventTrack::sidecar_path(&src)).unwrap();
+        let es = engine.edit_source(&s).unwrap();
+        assert!(es.can_zoom() && !es.can_smooth());
+        es.check(&zoom).unwrap();
+        let smooth = EditRequest { source: s.clone(), smooth_cursor: true, ..Default::default() };
+        assert!(es.check(&smooth).is_err(), "the edit refuses it too");
+        let plain = EditRequest { source: s.clone(), ..Default::default() };
+        assert!(es.effects(&plain).is_none(), "a plain edit leaves frames alone");
+
+        // Previews are scaled, and zoomed exactly where the export is.
+        let mut frames = es.preview_frames((80, 80)).unwrap();
+        let fx = es.effects(&zoom);
+        let before = frames.frame(0.15, fx.as_ref()).unwrap();
+        assert_eq!(before.dimensions(), (80, 60));
+        assert!(near(before.get_pixel(10, 30), RED) && near(before.get_pixel(70, 30), BLUE));
+        let at_click = frames.frame(1.05, fx.as_ref()).unwrap();
+        assert!(near(at_click.get_pixel(3, 30), BLUE) && near(at_click.get_pixel(77, 30), BLUE));
+        let unzoomed = frames.frame(1.05, None).unwrap();
+        assert!(near(unzoomed.get_pixel(3, 30), RED));
+
+        // An unreadable track is reported, and refused only when needed.
+        std::fs::write(EventTrack::sidecar_path(&src), b"{}").unwrap();
+        let es = engine.edit_source(&s).unwrap();
+        assert!(es.track.is_none() && es.track_error.is_some());
+        assert!(es.check(&zoom).is_err());
+        es.check(&plain).unwrap();
+
+        // Only videos open.
+        let gif = fixture_gif(dir.path());
+        assert!(engine.edit_source(&path_str(&gif)).is_err_and(|e| invalid(&e)));
     }
 
     #[test]

@@ -7,6 +7,7 @@ fn main() {
     println!("cargo:rerun-if-changed=shim/login_item.m");
     println!("cargo:rerun-if-changed=shim/editor.m");
     println!("cargo:rerun-if-changed=shim/notify.m");
+    println!("cargo:rerun-if-changed=shim/video_editor.m");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
@@ -20,6 +21,7 @@ fn main() {
         .file("shim/login_item.m")
         .file("shim/editor.m")
         .file("shim/notify.m")
+        .file("shim/video_editor.m")
         .flag("-fobjc-arc")
         .flag("-mmacosx-version-min=13.0")
         .flag("-Wno-deprecated-declarations")

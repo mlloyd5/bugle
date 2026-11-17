@@ -1720,6 +1720,16 @@ bugle_image_t bugle_frames_at(void *handle, double seconds) {
     }
 }
 
+/// Decode frames scaled down to fit `max_w` x `max_h` pixels (aspect kept;
+/// 0 x 0 for full size). Much cheaper than scaling full frames afterwards.
+void bugle_frames_set_max_size(void *handle, uint32_t max_w, uint32_t max_h) {
+    if (!handle) return;
+    @autoreleasepool {
+        AVAssetImageGenerator *gen = (__bridge AVAssetImageGenerator *)handle;
+        gen.maximumSize = CGSizeMake(max_w, max_h);
+    }
+}
+
 void bugle_frames_close(void *handle) {
     if (!handle) return;
     @autoreleasepool {
