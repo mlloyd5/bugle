@@ -344,7 +344,8 @@ over it, and stays up to 2 s after the pointer leaves. Starting another capture
 or recording from the menu or a hotkey hides the panels while it runs, so they
 are not captured; when it is done they come back with the new capture's panel
 in the corner and the earlier ones stacked behind it, each with its own
-timeout (hovering any of them holds them all). Up to four panels stack; a
+timeout (hovering any of them holds them all). Timeouts stop while the panels
+are hidden. Up to four panels stack; a
 fifth capture closes the oldest.
 Configure it in `[quick_access]`:
 

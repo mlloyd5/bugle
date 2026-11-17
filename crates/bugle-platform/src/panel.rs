@@ -78,7 +78,8 @@ type Handler = Box<dyn FnMut(PanelChoice)>;
 /// Show panel `id` (non-zero) on the screen under the pointer, in the corner,
 /// with the panels already up moving one place away from it (all of them on
 /// that screen and corner). A panel already up with the same `id` is
-/// replaced; panels hidden by [`panel_hide_all`] come back. `on_choice` runs
+/// replaced. While the stack is hidden by [`panel_hide_all`] the new panel
+/// joins it off screen and comes back with [`panel_show_all`]. `on_choice` runs
 /// on the main thread for at most one click; it is dropped when the panel
 /// closes for any reason.
 pub fn panel_show(
@@ -146,8 +147,7 @@ pub fn panel_dismiss_all(animated: bool) {
 
 /// Take every panel off screen at once, including ones still fading out, so
 /// the next screen capture cannot contain them. They stay up as far as the
-/// caller is concerned: [`panel_show_all`] or the next [`panel_show`] brings
-/// them back. Hidden panels never count as hovered.
+/// caller is concerned, until [`panel_show_all`] brings them back. Hidden panels never count as hovered.
 pub fn panel_hide_all() {
     unsafe { bugle_panel_hide_all() }
 }

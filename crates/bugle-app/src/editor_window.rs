@@ -360,7 +360,7 @@ impl App {
     /// a window of its own. Several editors can be open at once; one already
     /// open on the same capture comes forward instead of a second one.
     pub(crate) fn open_editor(&mut self, source: &str) {
-        let (item, base) = match self.engine.load_image(source) {
+        let item = match self.engine.resolve_media(source) {
             Ok(v) => v,
             Err(e) => return self.toast_error(&format!("Annotate: {e:#}")),
         };
@@ -370,10 +370,15 @@ impl App {
             Ok(Some(_)) => item.id.clone(),
             _ => item.path.display().to_string(),
         };
+        // Check before decoding: bringing an open editor forward needs no pixels.
         if let Some(window) = open_window_for(&source) {
             tracing::info!("editor: {} is already open", file_name(&item.path));
             return bugle_platform::editor_focus(window);
         }
+        let (item, base) = match self.engine.load_image(&source) {
+            Ok(v) => v,
+            Err(e) => return self.toast_error(&format!("Annotate: {e:#}")),
+        };
         self.editor_generation += 1;
         let generation = self.editor_generation;
         let size = base.dimensions();

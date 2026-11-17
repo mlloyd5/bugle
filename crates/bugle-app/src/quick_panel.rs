@@ -68,15 +68,20 @@ impl App {
         if self.quick.is_open() {
             tracing::debug!("quick access: hiding {} panel(s) during {action:?}", self.quick.count());
         }
+        self.quick.hide(Instant::now());
         bugle_platform::panel_hide_all();
     }
 
     /// An action finished: bring back the panels hidden for it, unless a
-    /// recording is still running (it would record them).
+    /// recording is still running (it would record them) or another capture
+    /// is in flight. Their timeouts pick up where they stopped.
     pub(crate) fn quick_after_action(&mut self) {
-        if !self.is_recording() {
-            bugle_platform::panel_show_all();
+        if self.is_recording() || self.busy {
+            return;
         }
+        self.quick.show(Instant::now());
+        // A no-op when nothing is hidden.
+        bugle_platform::panel_show_all();
     }
 
     /// Show the panel for a finished action. `false` means the caller should
@@ -124,6 +129,9 @@ impl App {
             self.quick.forget(generation);
             return false;
         }
+        // While the stack is hidden the new panel joins it off screen; it
+        // comes back with the others once nothing is grabbing the screen.
+        self.quick_after_action();
         tracing::info!("quick access: panel {generation} for {} with {labels:?}", file_name(&target.path));
         spawn_sharper_thumb(self.proxy.clone(), generation, target);
         true

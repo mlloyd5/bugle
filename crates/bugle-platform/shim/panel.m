@@ -129,6 +129,8 @@ static void panel_close(BuglePanelEntry *e, BOOL animated) {
         p.ignoresMouseEvents = YES;
         if (!g_panel_fading) g_panel_fading = [NSMutableArray array];
         [g_panel_fading addObject:p];
+        // The others slide into its slot while it fades: keep them above it.
+        for (BuglePanelEntry *o in g_panels) [o.panel orderFrontRegardless];
         [NSAnimationContext
             runAnimationGroup:^(NSAnimationContext *ctx) {
               ctx.duration = 0.2;
@@ -317,15 +319,12 @@ int32_t bugle_panel_show(uint64_t ident, const uint8_t *png, size_t len, const c
         panel.contentView = root;
         e.panel = panel;
         [g_panels addObject:e];
-        // A capture that ended brings the stack back with the new panel in
-        // front: older panels slide away from the corner.
-        g_panels_hidden = NO;
+        // The new panel goes in front: older panels slide away from the
+        // corner. While the stack is hidden (a recording or another capture
+        // is running) it joins the stack off screen and comes back with
+        // `bugle_panel_show_all`.
         panel_layout(e);
-        for (BuglePanelEntry *o in g_panels) {
-            if (o == e || o.panel.isVisible) continue;
-            o.panel.alphaValue = 1.0;
-            [o.panel orderFrontRegardless];
-        }
+        if (g_panels_hidden) return 1;
         panel.alphaValue = 0.0;
         [panel orderFrontRegardless];
         [NSAnimationContext runAnimationGroup:^(NSAnimationContext *c) {
@@ -363,8 +362,8 @@ void bugle_panel_dismiss_all(int32_t animated) {
 }
 
 /// Take every panel (and any still fading) off screen at once, keeping
-/// them, so a capture cannot contain them. `bugle_panel_show_all` or the
-/// next `bugle_panel_show` brings them back.
+/// them, so a capture cannot contain them. `bugle_panel_show_all` brings
+/// them back; panels shown meanwhile stay off screen with the rest.
 void bugle_panel_hide_all(void) {
     @autoreleasepool {
         g_panels_hidden = YES;

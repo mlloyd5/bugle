@@ -179,6 +179,9 @@ struct Shown {
     target: Target,
     actions: Vec<PanelAction>,
     deadline: Option<Instant>,
+    /// When it opened; one opened while the stack is hidden starts its clock
+    /// when the stack comes back.
+    opened: Instant,
 }
 
 /// The panel state machine. Captures in a row stack their panels, up to
@@ -190,11 +193,14 @@ pub struct QuickAccess {
     generation: u64,
     /// The panels up, oldest first.
     shown: Vec<Shown>,
+    /// Set while the stack is off screen for a capture or recording: the
+    /// clocks stop until it comes back.
+    hidden_since: Option<Instant>,
 }
 
 impl QuickAccess {
     pub fn new(config: QuickAccessConfig) -> Self {
-        Self { config, generation: 0, shown: Vec::new() }
+        Self { config, generation: 0, shown: Vec::new(), hidden_since: None }
     }
 
     /// `None` (stay open) for 0, negative, non-finite or absurdly large values.
@@ -219,7 +225,7 @@ impl QuickAccess {
         self.generation += 1;
         // An `Instant` that would overflow means "never": stay open.
         let deadline = self.timeout().and_then(|t| now.checked_add(t));
-        self.shown.push(Shown { generation: self.generation, target, actions, deadline });
+        self.shown.push(Shown { generation: self.generation, target, actions, deadline, opened: now });
         let excess = self.shown.len().saturating_sub(MAX_PANELS);
         let evicted = self.shown.drain(..excess).map(|s| s.generation).collect();
         (self.generation, evicted)
@@ -252,12 +258,42 @@ impl QuickAccess {
         Some((action, shown.target))
     }
 
-    /// Advance the clock. No panel closes while the pointer is over any of
+    /// The stack went off screen (a capture or recording is starting). Its
+    /// timeouts stop until [`QuickAccess::show`]. Hiding twice keeps the
+    /// first time.
+    pub fn hide(&mut self, now: Instant) {
+        self.hidden_since.get_or_insert(now);
+    }
+
+    /// The stack is back on screen: every deadline moves on by the time its
+    /// panel spent hidden, so each gets its whole timeout on screen. Returns
+    /// whether it was hidden.
+    pub fn show(&mut self, now: Instant) -> bool {
+        let Some(since) = self.hidden_since.take() else { return false };
+        for s in &mut self.shown {
+            let off = now.saturating_duration_since(since.max(s.opened));
+            if let Some(d) = s.deadline {
+                // Overflow means "never", as in `open`.
+                s.deadline = d.checked_add(off);
+            }
+        }
+        true
+    }
+
+    /// Whether the stack is off screen.
+    pub fn is_hidden(&self) -> bool {
+        self.hidden_since.is_some()
+    }
+
+    /// Advance the clock. Nothing closes while the stack is hidden. No panel closes while the pointer is over any of
     /// the stack (so it never shifts under the pointer); once the pointer
     /// leaves, each stays at least [`HOVER_GRACE`] longer (or its whole
     /// timeout, if shorter). Hovering before a deadline does not add time.
     /// Returns the generations of the panels that timed out and should close.
     pub fn tick(&mut self, now: Instant, hovered: bool) -> Vec<u64> {
+        if self.is_hidden() {
+            return Vec::new();
+        }
         if hovered {
             if let Some(g) = self.timeout().map(|t| t.min(HOVER_GRACE)) {
                 for shown in &mut self.shown {
@@ -500,6 +536,42 @@ mod tests {
         let mut out = q.tick(t0 + Duration::from_secs(32), false);
         out.sort();
         assert_eq!(out, vec![g1, g2], "both had run out; both close after the grace");
+    }
+
+    #[test]
+    fn hidden_panels_do_not_time_out() {
+        let mut q = QuickAccess::new(cfg(8.0));
+        let t0 = Instant::now();
+        let (g1, _) = q.open(target(), vec![PanelAction::Copy], t0);
+        // 3 s on screen, then a 60 s recording.
+        q.hide(t0 + Duration::from_secs(3));
+        assert!(q.is_hidden());
+        q.hide(t0 + Duration::from_secs(10)); // a second hide keeps the first time
+        assert!(q.tick(t0 + Duration::from_secs(40), false).is_empty(), "no clock while hidden");
+        // A capture saved while hidden (an editor save, say) joins the stack hidden.
+        let (g2, _) = q.open(target(), vec![PanelAction::Copy], t0 + Duration::from_secs(50));
+        assert!(q.tick(t0 + Duration::from_secs(62), false).is_empty());
+        let back = t0 + Duration::from_secs(63);
+        assert!(q.show(back));
+        assert!(!q.is_hidden() && !q.show(back), "showing twice is a no-op");
+        assert!(q.is_current(g1) && q.is_current(g2), "both come back");
+        // g1 had 5 s left; g2 all 8.
+        assert!(q.tick(back + Duration::from_millis(4_900), false).is_empty());
+        assert_eq!(q.tick(back + Duration::from_secs(5), false), vec![g1]);
+        assert!(q.tick(back + Duration::from_millis(7_900), false).is_empty());
+        assert_eq!(q.tick(back + Duration::from_secs(8), false), vec![g2]);
+    }
+
+    #[test]
+    fn hide_with_no_panels_is_harmless() {
+        let mut q = QuickAccess::new(cfg(8.0));
+        let t0 = Instant::now();
+        q.hide(t0);
+        let (g, _) = q.open(target(), vec![PanelAction::Copy], t0 + Duration::from_secs(1));
+        let back = t0 + Duration::from_secs(4);
+        q.show(back);
+        assert!(q.tick(back + Duration::from_millis(7_900), false).is_empty(), "clock starts on show");
+        assert_eq!(q.tick(back + Duration::from_secs(8), false), vec![g]);
     }
 
     #[test]
