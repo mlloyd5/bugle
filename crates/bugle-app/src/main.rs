@@ -549,12 +549,18 @@ impl App {
         if id == login::MENU_ID {
             return self.toggle_login();
         }
-        if let Some(change) = self.items.audio.handle(id) {
-            self.engine.set_recording_levels(self.items.audio.levels());
-            if let Err(e) = audio_menu::persist(&self.config_path, change) {
-                self.toast_error(&format!("Audio Levels: the change applies until Bugle quits but was not saved: {e:#}"));
+        let ask = |p: &audio_menu::Prompt| bugle_platform::prompt_text(&p.title, &p.message, &p.initial);
+        match self.items.audio.handle(id, ask) {
+            Some(audio_menu::Outcome::Changed(change)) => {
+                self.engine.set_recording_levels(self.items.audio.levels());
+                if let Err(e) = audio_menu::persist(&self.config_path, change) {
+                    self.toast_error(&format!("Audio Levels: the change applies until Bugle quits but was not saved: {e:#}"));
+                }
+                return;
             }
-            return;
+            Some(audio_menu::Outcome::Invalid(e)) => return self.toast_error(&format!("Audio Levels: {e}")),
+            Some(audio_menu::Outcome::Cancelled) => return,
+            None => {}
         }
         match commands::find(id) {
             Some(e) => self.run_command(e.command, control_flow),
