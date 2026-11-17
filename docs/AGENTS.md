@@ -102,7 +102,7 @@ curl -s -H "$H" -H 'content-type: application/json' \
 | `record_status` | – | status (`audio_levels` while capturing audio, see below) |
 | `transcribe` | `source`, `provider`, `language` | `transcript`, `srt` |
 | `subtitles` | `source`, `format` (srt/vtt), `provider`, `language`, `output` | `path`, `segments`, `text` |
-| `edit_video` | `source`, `start`, `end` (seconds, negative = from the end), `preset` (original/lossless/high/hevc/1080p/720p/540p/gif/gif-small), `fps` (re-encodes video; resamples GIF), `max_size` (GIF long edge), `zoom` (factor above 1, at most 4: zoom in on clicks), `smooth_cursor` (draw a smoothed pointer; `hide_cursor` recordings), `output`, `label` | `media` (parent = source when it is a history item) |
+| `edit_video` | `source`, `start`, `end` (seconds, negative = from the end), `cuts` (`[{start, end}]` ranges to remove; the rest is joined), `preset` (original/lossless/high/hevc/1080p/720p/540p/gif/gif-small), `fps` (re-encodes video; resamples GIF), `max_size` (GIF long edge), `zoom` (factor above 1, at most 4: zoom in on clicks), `smooth_cursor` (draw a smoothed pointer; `hide_cursor` recordings), `output`, `label` | `media` (parent = source when it is a history item) |
 | `complete` | `prompt`, `provider`, `system` | `text` |
 | `history` | `limit` | media list |
 | `get_media` | `source`, `inline_image`, `max_edge` | media (+ image) |
@@ -120,6 +120,14 @@ file. `lossless` always copies: faster and without quality loss, but a cut
 between keyframes keeps up to one keyframe interval (2 s for Bugle's own
 recordings) before the start in the file, hidden by an edit list and
 recoverable. One engine runs at most two edits at a time; a third is refused.
+
+`cuts` removes several ranges in one export: each `{start, end}` is in
+seconds (negative = from the end), cuts may overlap or reach outside
+`start..end`, and the parts left (kept parts under 10 ms are dropped) are
+joined back to back, audio included. `original` copies only when every kept
+part starts on a keyframe. Cuts that leave less than 0.05 s are a 400. A GIF
+frame a cut splits keeps the part shown on each side. A plain edit with cuts
+writes the event track spliced the same way.
 
 `zoom` and `smooth_cursor` read the recording's event track (made by
 `record_start` with `cursor_events` or `hide_cursor`); without one they are a

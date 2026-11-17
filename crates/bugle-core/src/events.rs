@@ -208,6 +208,19 @@ impl EventTrack {
         events.extend(self.events.iter().filter(|e| e.t > start && e.t <= end).map(|e| CursorEvent { t: e.t - start, ..*e }));
         Self { events, duration: (end - start).max(0.0), ..self.clone() }
     }
+
+    /// The parts of the track inside each of `segments` (in order, not
+    /// overlapping), placed back to back from 0 as an edit with cuts plays
+    /// them; each part starts with a `move` to the position there.
+    pub fn spliced(&self, segments: &[(f64, f64)]) -> Self {
+        let mut events = Vec::new();
+        let mut at = 0.0;
+        for &(start, end) in segments {
+            events.extend(self.trimmed(start, end).events.into_iter().map(|e| CursorEvent { t: e.t + at, ..e }));
+            at += (end - start).max(0.0);
+        }
+        Self { events, duration: at, ..self.clone() }
+    }
 }
 
 #[cfg(test)]
@@ -307,5 +320,19 @@ mod tests {
         assert_eq!(times, vec![0.0, 0.02, 0.11]);
         assert_eq!(cut.area, t.area);
         assert!(!cut.cursor_in_video);
+    }
+
+    #[test]
+    fn splicing_places_the_parts_back_to_back() {
+        let t = EventTrack::parse(SAMPLE).unwrap();
+        let s = t.spliced(&[(0.5, 1.0), (1.5, 1.7)]);
+        assert!((s.duration - 0.7).abs() < 1e-9);
+        let times: Vec<f64> = s.events.iter().map(|e| (e.t * 100.0).round() / 100.0).collect();
+        // A seed move and the move at 1.0; then the second part from 0.5.
+        assert_eq!(times, vec![0.0, 0.5, 0.5, 0.52, 0.61]);
+        assert_eq!(s.events[2], CursorEvent::moved(0.5, 700.0, 100.0));
+        assert_eq!(s.clicks().count(), 1);
+        let one = t.spliced(&[(1.5, 1.7)]);
+        assert_eq!(one.events, t.trimmed(1.5, 1.7).events);
     }
 }

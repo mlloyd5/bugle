@@ -163,7 +163,8 @@ int32_t bugle_fixture_audio_level(int32_t format, int32_t channels, int32_t inte
 double bugle_media_duration(const char *path);
 bugle_image_t bugle_video_frame(const char *path, double seconds);
 
-// Editing. `bugle_export_video` exports [start, end) seconds of a movie with an
+// Editing. `bugle_export_video` exports `n_ranges` [start, end) ranges of a
+// movie (pairs of seconds, in order; several are spliced back to back) with an
 // AVAssetExportSession preset (0 passthrough, 1 highest quality H.264, 2 HEVC,
 // 3 1920x1080, 4 1280x720, 5 960x540) to .mp4 (`mp4` != 0) or .mov; `fps` > 0
 // resamples through a video composition (refused with passthrough). Waits at
@@ -179,7 +180,7 @@ typedef struct {
 } bugle_video_info_t;
 int32_t bugle_video_info(const char *path, bugle_video_info_t *out);
 int32_t bugle_video_sync_at(const char *path, double seconds);   // 1 when a cut there needs no re-encode
-int32_t bugle_export_video(const char *in_path, const char *out_path, double start, double end, int32_t preset,
+int32_t bugle_export_video(const char *in_path, const char *out_path, const double *ranges, int32_t n_ranges, int32_t preset,
                            int32_t mp4, int32_t fps, double timeout);
 void *bugle_frames_open(const char *path, double tolerance);
 bugle_image_t bugle_frames_at(void *handle, double seconds);
@@ -195,10 +196,11 @@ void bugle_writer_cancel(void *handle);      // discards the file and releases t
 void *bugle_seq_open(const char *path, double start, double end);
 bugle_image_t bugle_seq_next(void *handle, double *pts);
 void bugle_seq_close(void *handle);
-// Video track of `video_path` + audio of `audio_path` over [start, end),
-// copied into one movie. 0 ok, 1 nothing written (no audio there), -1 error.
-int32_t bugle_mux_audio(const char *video_path, const char *audio_path, double start, double end, const char *out_path,
-                        int32_t mp4, double timeout);
+// Video track of `video_path` + audio of `audio_path` over `n_ranges`
+// [start, end) ranges (pairs of seconds, spliced back to back), copied into
+// one movie. 0 ok, 1 nothing written (no audio there), -1 error.
+int32_t bugle_mux_audio(const char *video_path, const char *audio_path, const double *ranges, int32_t n_ranges,
+                        const char *out_path, int32_t mp4, double timeout);
 void bugle_play_sound(const char *name);
 void bugle_open_path(const char *path);
 

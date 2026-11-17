@@ -200,8 +200,8 @@ extern "C" {
     pub fn bugle_export_video(
         in_path: *const c_char,
         out_path: *const c_char,
-        start: f64,
-        end: f64,
+        ranges: *const f64,
+        n_ranges: i32,
         preset: i32,
         mp4: i32,
         fps: i32,
@@ -221,8 +221,8 @@ extern "C" {
     pub fn bugle_mux_audio(
         video_path: *const c_char,
         audio_path: *const c_char,
-        start: f64,
-        end: f64,
+        ranges: *const f64,
+        n_ranges: i32,
         out_path: *const c_char,
         mp4: i32,
         timeout: f64,

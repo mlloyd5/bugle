@@ -40,6 +40,8 @@ serde_json = "1"
 toml = "0.8"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "tiff"] }
 imageproc = "0.25"
+# Frame headers only, for a GIF's timeline without decoding its pixels.
+gif = "0.14"
 ab_glyph = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }

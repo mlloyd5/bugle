@@ -1,9 +1,10 @@
 // Bugle video editor window.
 //
 // A preview of one frame above a timeline (the whole recording, the kept
-// range between the in and out handles, the playhead) and a control bar:
-// play/pause, the playhead time, Set In / Set Out, the zoom and pointer
-// options, the export preset and Export. The window owns no editing policy:
+// range between the in and out handles, the cuts struck out of it, the
+// playhead) and a control bar: play/pause, the playhead time, Set In /
+// Set Out, Cut / Restore, the zoom and pointer options, the export preset
+// and Export. The window owns no editing policy:
 // input is reported to Rust through a callback (times in seconds on the
 // video's timeline), and Rust answers by replacing the frame shown
 // (`bugle_video_editor_set_frame`) and the state of every control
@@ -11,9 +12,11 @@
 // own is move the dragged handle or playhead under the pointer until Rust's
 // answer arrives, so a drag never lags.
 //
-// Keys: Space play/pause, I / O set in / out at the playhead, ← / → step
-// one frame, ↑ / Home go to the in point, ↓ / End go to the out point,
-// Esc pauses, ⌘E exports, ⌘W closes.
+// Keys: Space play/pause, I / O set in / out at the playhead, C starts or
+// ends a cut at the playhead, Delete restores the cut under the playhead
+// (or drops the one being marked), ← / → step one frame, ↑ / Home go to the
+// in point, ↓ / End go to the out point, Esc pauses (or drops a cut being
+// marked), ⌘E exports, ⌘W closes.
 //
 // Main thread only; needs a running AppKit loop. One video editor at a time.
 
@@ -45,6 +48,8 @@ enum {
     VCMD_ESCAPE = 6,
     VCMD_GO_IN = 7,
     VCMD_GO_OUT = 8,
+    VCMD_CUT = 9,
+    VCMD_UNCUT = 10,
 };
 
 static const CGFloat kBarHeight = 48;
@@ -62,6 +67,9 @@ typedef enum { DRAG_NONE, DRAG_PLAYHEAD, DRAG_IN, DRAG_OUT } DragKind;
 @interface BugleTimeline : NSView
 @property(nonatomic, weak) BugleVideoEditor *editor;
 @property(nonatomic) double duration, playhead, inPoint, outPoint;
+// Removed ranges as pairs of seconds; NAN when no cut is being marked.
+@property(nonatomic, copy) NSData *cuts;
+@property(nonatomic) double cutMark;
 @property(nonatomic) DragKind drag;
 @end
 
@@ -76,6 +84,7 @@ typedef enum { DRAG_NONE, DRAG_PLAYHEAD, DRAG_IN, DRAG_OUT } DragKind;
 @property(nonatomic, strong) NSButton *playButton;
 @property(nonatomic, strong) NSTextField *timeLabel;
 @property(nonatomic, strong) NSButton *inButton, *outButton;
+@property(nonatomic, strong) NSButton *cutButton, *uncutButton;
 @property(nonatomic, strong) NSPopUpButton *zoomPopup;
 @property(nonatomic, strong) NSButton *smoothBox;
 @property(nonatomic, strong) NSPopUpButton *presetPopup;
@@ -128,6 +137,34 @@ typedef enum { DRAG_NONE, DRAG_PLAYHEAD, DRAG_IN, DRAG_OUT } DragKind;
     NSBezierPath *frame = [NSBezierPath bezierPathWithRect:NSInsetRect(kept, 0.5, 0.5)];
     frame.lineWidth = 1;
     [frame stroke];
+    // Cuts: darkened and struck through with diagonal lines.
+    const double *cuts = self.cuts.bytes;
+    NSUInteger n = self.cuts.length / (2 * sizeof(double));
+    for (NSUInteger i = 0; i < n; i++) {
+        CGFloat xa = [self xFor:cuts[2 * i]], xb = [self xFor:cuts[2 * i + 1]];
+        NSRect cut = NSMakeRect(xa, NSMinY(r), MAX(1, xb - xa), NSHeight(r));
+        [[NSColor colorWithWhite:0.05 alpha:0.6] setFill];
+        NSRectFill(cut);
+        [NSGraphicsContext saveGraphicsState];
+        NSRectClip(cut);
+        NSBezierPath *hatch = [NSBezierPath bezierPath];
+        for (CGFloat x = xa - NSHeight(r); x < xb; x += 6) {
+            [hatch moveToPoint:NSMakePoint(x, NSMinY(r))];
+            [hatch lineToPoint:NSMakePoint(x + NSHeight(r), NSMaxY(r))];
+        }
+        hatch.lineWidth = 1;
+        [[NSColor.systemRedColor colorWithAlphaComponent:0.7] setStroke];
+        [hatch stroke];
+        [NSGraphicsContext restoreGraphicsState];
+    }
+    // A cut being marked: from the mark to the playhead.
+    if (isfinite(self.cutMark)) {
+        CGFloat xm = [self xFor:self.cutMark], xp = [self xFor:self.playhead];
+        [[NSColor.systemRedColor colorWithAlphaComponent:0.35] setFill];
+        NSRectFillUsingOperation(NSMakeRect(MIN(xm, xp), NSMinY(r), MAX(1, fabs(xp - xm)), NSHeight(r)), NSCompositingOperationSourceOver);
+        [NSColor.systemRedColor setFill];
+        NSRectFill(NSMakeRect(round(xm) - 1, NSMinY(r) - 3, 2, NSHeight(r) + 6));
+    }
     // Handles: a tab on the outside of each end of the kept range.
     [NSColor.controlAccentColor setFill];
     NSRectFill(NSMakeRect(xi - 5, NSMinY(r) - 3, 5, NSHeight(r) + 6));
@@ -203,6 +240,9 @@ typedef enum { DRAG_NONE, DRAG_PLAYHEAD, DRAG_IN, DRAG_OUT } DragKind;
         case ' ': cmd = VCMD_PLAY_PAUSE; break;
         case 'i': cmd = VCMD_MARK_IN; break;
         case 'o': cmd = VCMD_MARK_OUT; break;
+        case 'c': cmd = VCMD_CUT; break;
+        case 127:
+        case NSDeleteFunctionKey: cmd = VCMD_UNCUT; break;
         case NSLeftArrowFunctionKey: cmd = VCMD_STEP_BACK; break;
         case NSRightArrowFunctionKey: cmd = VCMD_STEP_FORWARD; break;
         case NSUpArrowFunctionKey:
@@ -361,6 +401,8 @@ int32_t bugle_video_editor_open(const char *title, double duration, uint32_t w, 
 
         e.inButton = vbutton(@"Set In", @"Start the clip at the playhead (I)", e, VCMD_MARK_IN);
         e.outButton = vbutton(@"Set Out", @"End the clip at the playhead (O)", e, VCMD_MARK_OUT);
+        e.cutButton = vbutton(@"Cut", @"Start a cut at the playhead; press again to end it and remove the part between (C)", e, VCMD_CUT);
+        e.uncutButton = vbutton(@"Restore", @"Restore the cut under the playhead, or drop the cut being marked (Delete)", e, VCMD_UNCUT);
 
         NSTextField *zoomLabel = [NSTextField labelWithString:@"Zoom"];
         e.zoomPopup = vpopup(zoom_labels, n_zoom, e, @selector(zoomPicked:), @"Zoom in on clicks (needs a recording made with cursor events)");
@@ -374,13 +416,15 @@ int32_t bugle_video_editor_open(const char *title, double duration, uint32_t w, 
         NSView *spacer = [[NSView alloc] initWithFrame:NSZeroRect];
         [spacer setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
         NSStackView *stack = [NSStackView stackViewWithViews:@[
-            playButton, time, e.inButton, e.outButton, spacer, zoomLabel, e.zoomPopup, e.smoothBox, e.presetPopup, e.exportButton
+            playButton, time, e.inButton, e.outButton, e.cutButton, e.uncutButton, spacer, zoomLabel, e.zoomPopup, e.smoothBox,
+            e.presetPopup, e.exportButton
         ]];
         stack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
         stack.spacing = 8;
         stack.distribution = NSStackViewDistributionFill;
         stack.edgeInsets = NSEdgeInsetsMake(0, 12, 0, 12);
         [stack setCustomSpacing:4 afterView:e.inButton];
+        [stack setCustomSpacing:4 afterView:e.cutButton];
         [stack setCustomSpacing:4 afterView:zoomLabel];
         [stack setCustomSpacing:14 afterView:e.smoothBox];
         CGFloat minW = MAX(720, ceil(stack.fittingSize.width) + 40);
@@ -429,6 +473,7 @@ int32_t bugle_video_editor_open(const char *title, double duration, uint32_t w, 
         timeline.duration = duration;
         timeline.inPoint = 0;
         timeline.outPoint = duration;
+        timeline.cutMark = NAN;
         [root addSubview:timeline];
         e.timeline = timeline;
 
@@ -477,12 +522,13 @@ void bugle_video_editor_set_frame(const uint8_t *rgba, uint32_t w, uint32_t h) {
     }
 }
 
-/// Replace the state of every control. `time_text` is the line next to the
-/// play button. A busy window (an export is running) disables its controls
+/// Replace the state of every control. `cuts` holds `n_cuts` removed ranges
+/// as pairs of seconds; `cut_mark` is where a cut being marked starts (NAN:
+/// none). `time_text` is the line next to the play button. A busy window (an export is running) disables its controls
 /// and refuses to close.
-void bugle_video_editor_set_state(double playhead, double in_point, double out_point, int32_t playing, int32_t zoom,
-                                  int32_t smooth, int32_t preset, int32_t can_zoom, int32_t can_smooth, int32_t busy,
-                                  const char *time_text) {
+void bugle_video_editor_set_state(double playhead, double in_point, double out_point, const double *cuts, int32_t n_cuts,
+                                  double cut_mark, int32_t can_uncut, int32_t playing, int32_t zoom, int32_t smooth,
+                                  int32_t preset, int32_t can_zoom, int32_t can_smooth, int32_t busy, const char *time_text) {
     @autoreleasepool {
         BugleVideoEditor *e = g_video_editor;
         if (!e) return;
@@ -491,6 +537,8 @@ void bugle_video_editor_set_state(double playhead, double in_point, double out_p
         if (t.drag != DRAG_PLAYHEAD) t.playhead = playhead;
         if (t.drag != DRAG_IN) t.inPoint = in_point;
         if (t.drag != DRAG_OUT) t.outPoint = out_point;
+        t.cuts = (cuts && n_cuts > 0) ? [NSData dataWithBytes:cuts length:(NSUInteger)n_cuts * 2 * sizeof(double)] : nil;
+        t.cutMark = cut_mark;
         [t setNeedsDisplay:YES];
         NSString *symbol = playing ? @"pause.fill" : @"play.fill";
         NSImage *img = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:playing ? @"Pause" : @"Play"];
@@ -505,6 +553,9 @@ void bugle_video_editor_set_state(double playhead, double in_point, double out_p
         e.playButton.enabled = on;
         e.inButton.enabled = on;
         e.outButton.enabled = on;
+        e.cutButton.enabled = on;
+        e.cutButton.title = isfinite(cut_mark) ? @"End Cut" : @"Cut";
+        e.uncutButton.enabled = on && can_uncut;
         e.zoomPopup.enabled = on && can_zoom;
         e.smoothBox.enabled = on && can_smooth;
         e.presetPopup.enabled = on;
