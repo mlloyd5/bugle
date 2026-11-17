@@ -12,6 +12,7 @@ pub type bugle_mix_fn =
         channels: i32,
         sample_rate: i32,
         out: *mut f32,
+        n_out: i32,
         frames: i32,
     ) -> i32;
 
@@ -154,6 +155,7 @@ extern "C" {
     pub fn bugle_mix_audio_tracks(
         in_path: *const c_char,
         out_path: *const c_char,
+        separate: i32,
         process: bugle_mix_fn,
         ctx: *mut c_void,
     ) -> i32;

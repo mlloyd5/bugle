@@ -6,6 +6,7 @@
 //! so the menu stays responsive, and the worker asks the main thread to show
 //! the selection overlay or pin windows through [`UiHost`].
 
+mod audio_menu;
 mod commands;
 mod editor_window;
 mod icon;
@@ -234,6 +235,7 @@ fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<N
                 microphone: false,
                 system_audio: engine.config.recordings.system_audio,
                 mix_audio: false,
+                // The engine's levels (the Audio Levels menu's) apply.
                 mix: Default::default(),
                 max_seconds: None,
                 highlight_clicks: false,
@@ -416,6 +418,7 @@ struct MenuItems {
     recent: Submenu,
     api: MenuItem,
     login: Option<login::LoginMenu>,
+    audio: audio_menu::AudioMenu,
 }
 
 /// Build the status menu from [`commands::MENU`]. `keys` maps entry names to
@@ -424,6 +427,10 @@ fn build_menu(config: &Config, keys: &HashMap<&'static str, String>) -> Result<M
     let menu = Menu::new();
     let recent = Submenu::with_id("recent", "Recent Captures", true);
     let login = login::LoginMenu::new();
+    let audio = audio_menu::AudioMenu::new(
+        config.recordings.mix,
+        audio_menu::requirement(&config.recordings, bugle_platform::sck_record_available()),
+    )?;
     let mut by_name: HashMap<&'static str, MenuItem> = HashMap::new();
     for slot in commands::MENU {
         match slot {
@@ -434,6 +441,7 @@ fn build_menu(config: &Config, keys: &HashMap<&'static str, String>) -> Result<M
                     menu.append(&l.item)?;
                 }
             }
+            Slot::AudioLevels => menu.append(&audio.submenu)?,
             Slot::Item(e) => {
                 let key = keys.get(e.name).map(String::as_str).or(e.menu_key);
                 let item = MenuItem::with_id(e.name, e.label, true, key.and_then(|k| k.parse::<Accelerator>().ok()));
@@ -452,6 +460,7 @@ fn build_menu(config: &Config, keys: &HashMap<&'static str, String>) -> Result<M
         menu,
         recent,
         login,
+        audio,
     };
     take("sync_latest")?.set_enabled(config.sync.has_destination());
     items.stop.set_enabled(false);
@@ -525,6 +534,13 @@ impl App {
         }
         if id == login::MENU_ID {
             return self.toggle_login();
+        }
+        if let Some(change) = self.items.audio.handle(id) {
+            self.engine.set_recording_levels(self.items.audio.levels());
+            if let Err(e) = audio_menu::persist(&self.config_path, change) {
+                self.toast_error(&format!("Audio Levels: the change applies until Bugle quits but was not saved: {e:#}"));
+            }
+            return;
         }
         match commands::find(id) {
             Some(e) => self.run_command(e.command, control_flow),

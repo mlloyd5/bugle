@@ -117,14 +117,17 @@ int32_t bugle_export_audio_m4a(const char *in_path, const char *out_path);
 int32_t bugle_export_mp4(const char *in_path, const char *out_path);
 int32_t bugle_export_mov(const char *in_path, const char *out_path);
 int32_t bugle_audio_track_count(const char *path);
-// Mixes one block of aligned audio at `sample_rate`: `tracks[i]` holds
-// `frames` interleaved frames of `channels` floats for track i; writes as
-// many into `out`. Non-zero aborts the mix.
+// Processes one block of aligned audio at `sample_rate`: `tracks[i]` holds
+// `frames` interleaved frames of `channels` floats for track i; writes
+// `n_out` runs of as many frames into `out`, one after the other (output
+// track k at `out + k * frames * channels`). Non-zero aborts.
 typedef int32_t (*bugle_mix_fn)(void *ctx, const float *const *tracks, int32_t n_tracks, int32_t channels,
-                                int32_t sample_rate, float *out, int32_t frames);
-// Fold all audio tracks into one AAC track through `process` (video copied
-// as is). 0 on success, 1 (nothing written) with fewer than two audio tracks.
-int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, bugle_mix_fn process, void *ctx);
+                                int32_t sample_rate, float *out, int32_t n_out, int32_t frames);
+// Re-encode all audio tracks through `process` (video copied as is): into
+// one AAC track, or with `separate` into one AAC track per source track.
+// 0 on success, 1 (nothing written) with fewer than two audio tracks.
+int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, int32_t separate, bugle_mix_fn process,
+                               void *ctx);
 int32_t bugle_video_track_count(const char *path);
 
 // Test fixtures (shim/fixtures.m, its own object file: nothing in the app

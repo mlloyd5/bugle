@@ -36,6 +36,9 @@ const SCREENCAPTURE_STARTUP: Duration = Duration::from_millis(300);
 #[derive(Default)]
 pub struct RecorderState {
     inner: Mutex<Option<Active>>,
+    /// Levels set with [`Engine::set_recording_levels`] since launch, in
+    /// place of the `[recordings]` ones.
+    levels: Mutex<Option<AudioMixConfig>>,
 }
 
 struct Active {
@@ -67,8 +70,9 @@ enum Backend {
     Video { child: std::process::Child, wants_mp4: bool },
     /// ScreenCaptureKit stream written by AVAssetWriter. Always produces an
     /// MP4; a `.mov` request is remuxed afterwards. `rec` is `None` once
-    /// stopped. `mix_audio` holds the levels when the tracks are mixed.
-    Sck { rec: Option<SckRecorder>, wants_mov: bool, mix_audio: Option<AudioMixConfig> },
+    /// stopped. `audio` says what happens to the audio tracks on stop, at
+    /// which levels.
+    Sck { rec: Option<SckRecorder>, wants_mov: bool, audio: Option<(AudioPass, AudioMixConfig)> },
 }
 
 impl Backend {
@@ -243,34 +247,92 @@ fn keep_raw_after_failed_export(tmp: &Path, output: &Path, ext: &str, e: anyhow:
     }
 }
 
-/// Levels for the mixed track when `req` (or the config) asks for one: the
-/// `[recordings]` levels with the request's overrides on top. Levels given
-/// without mixing do nothing, which is worth a warning; out-of-range levels
-/// are an invalid request.
-fn mix_levels(cfg: &RecordingConfig, req: &RecordRequest) -> Result<Option<AudioMixConfig>> {
-    let mixing = req.mix_audio || cfg.mix_audio;
-    if !mixing {
-        if !req.mix.is_empty() {
-            tracing::warn!("audio levels and ducking apply to the mixed track; they are ignored without mix_audio");
+/// The post-pass a stream recording's audio tracks get on stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioPass {
+    /// Fold the tracks into one at the recording's levels (`mix_audio`).
+    Mix,
+    /// Keep the tracks separate and apply the levels to each.
+    Level,
+}
+
+impl AudioPass {
+    fn verb(self) -> &'static str {
+        match self {
+            AudioPass::Mix => "mixing",
+            AudioPass::Level => "leveling",
+        }
+    }
+
+    /// What the recording keeps when the pass does not run.
+    fn fallback(self) -> &'static str {
+        match self {
+            AudioPass::Mix => "keeping them separate",
+            AudioPass::Level => "keeping them as recorded",
+        }
+    }
+
+    /// The platform call for this pass, at `levels`.
+    fn run(self, src: &Path, dst: &Path, levels: &AudioMixConfig) -> Result<bool> {
+        match self {
+            AudioPass::Mix => bugle_platform::mix_audio_tracks_with(src, dst, levels),
+            AudioPass::Level => bugle_platform::level_audio_tracks(src, dst, levels),
+        }
+    }
+}
+
+/// What happens to the audio tracks of a video recording, and at which
+/// levels: `base` (the engine's [`Engine::recording_levels`]) with the
+/// request's overrides on top. With `mix_audio` (request or config) the
+/// tracks are mixed; otherwise they stay separate and are re-encoded only
+/// when the levels change them (a gain other than 1, or ducking) and the
+/// recording has both tracks to level (`both_tracks`). Out-of-range levels
+/// that would be used are an invalid request; levels a recording cannot use
+/// are dropped without being checked.
+fn audio_pass(cfg: &RecordingConfig, base: &AudioMixConfig, req: &RecordRequest, both_tracks: bool) -> Result<Option<(AudioPass, AudioMixConfig)>> {
+    let levels = base.with(&req.mix);
+    let invalid = |e: String| BugleError::Invalid(format!("audio levels: {e}"));
+    if req.mix_audio || cfg.mix_audio {
+        levels.validate().map_err(invalid)?;
+        if !both_tracks {
+            tracing::warn!("mix_audio has nothing to mix: it needs both the microphone and system audio, recorded by the ScreenCaptureKit recorder");
+        }
+        return Ok(Some((AudioPass::Mix, levels)));
+    }
+    if !levels.changes_tracks() {
+        return Ok(None);
+    }
+    if !both_tracks {
+        // Levels from the config or the menu are routine; a request that
+        // asks for them is worth a warning.
+        let why = "audio levels need both the microphone and system audio, recorded by the ScreenCaptureKit recorder; recording without them";
+        if req.mix.is_empty() {
+            tracing::debug!("{why}");
+        } else {
+            tracing::warn!("{why}");
         }
         return Ok(None);
     }
-    let levels = cfg.mix.with(&req.mix);
-    levels.validate().map_err(|e| BugleError::Invalid(format!("audio mix: {e}")))?;
-    Ok(Some(levels))
+    levels.validate().map_err(invalid)?;
+    Ok(Some((AudioPass::Level, levels)))
 }
 
-/// The audio mixer: `bugle_platform::mix_audio_tracks_with` at the
-/// recording's levels (a parameter so the tests can make it fail).
+/// The audio post-pass: [`AudioPass::run`] at the recording's levels (a
+/// parameter so the tests can make it fail).
 type MixFn<'a> = &'a dyn Fn(&Path, &Path) -> Result<bool>;
 
-/// Check that `mixed`, a mix of `src`, is complete before it replaces
-/// anything: one audio track, as many video tracks as `src`, and the same
-/// duration give or take half a second (or 2%).
-fn check_mixed_copy(src: &Path, mixed: &Path) -> Result<()> {
+/// Check that `mixed`, the output of `pass` over `src`, is complete before
+/// it replaces anything: one audio track for a mix (as many as `src` when
+/// leveling), as many video tracks as `src`, and the same duration give or
+/// take half a second (or 2%).
+fn check_mixed_copy(src: &Path, mixed: &Path, pass: AudioPass) -> Result<()> {
+    let want = match pass {
+        AudioPass::Mix => 1,
+        AudioPass::Level => bugle_platform::audio_track_count(src)?,
+    };
     let audio = bugle_platform::audio_track_count(mixed)?;
-    if audio != 1 {
-        bail!("the mixed copy has {audio} audio tracks");
+    if audio != want {
+        bail!("the {} copy has {audio} audio tracks instead of {want}", pass.verb());
     }
     let (v0, v1) = (bugle_platform::video_track_count(src)?, bugle_platform::video_track_count(mixed)?);
     if v0 != v1 {
@@ -283,27 +345,27 @@ fn check_mixed_copy(src: &Path, mixed: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Mix the audio tracks of `src` into `dst` and check the result. Returns
-/// whether `dst` now holds a good mix; on failure `dst` is removed and the
-/// reason logged (`src` is never touched). With fewer than two audio tracks
-/// nothing is written.
-fn mix_into(src: &Path, dst: &Path, mix: MixFn) -> bool {
+/// Run `pass` over the audio tracks of `src` into `dst` and check the
+/// result. Returns whether `dst` now holds a good copy; on failure `dst` is
+/// removed and the reason logged (`src` is never touched). With fewer than
+/// two audio tracks nothing is written.
+fn mix_into(src: &Path, dst: &Path, pass: AudioPass, mix: MixFn) -> bool {
     let result = mix(src, dst).and_then(|mixed| {
         if mixed {
-            check_mixed_copy(src, dst)?;
+            check_mixed_copy(src, dst, pass)?;
         }
         Ok(mixed)
     });
     match result {
         Ok(mixed) => {
             if !mixed {
-                tracing::info!("mix_audio: the recording has fewer than two audio tracks; nothing to mix");
+                tracing::info!("{} the audio: the recording has fewer than two audio tracks; nothing to do", pass.verb());
             }
             mixed
         }
         Err(e) => {
             let _ = std::fs::remove_file(dst);
-            tracing::warn!("mixing the audio tracks failed; keeping them separate: {e:#}");
+            tracing::warn!("{} the audio tracks failed; {}: {e:#}", pass.verb(), pass.fallback());
             false
         }
     }
@@ -327,23 +389,23 @@ fn reserve_mix_temp(path: &Path) -> std::io::Result<PathBuf> {
     Err(last.unwrap_or_else(|| std::io::Error::other("no free temp name")))
 }
 
-/// Fold the audio tracks of the finished recording at `path` into one,
-/// replacing the file once the mixed copy has been checked. Needs free
-/// space for a second copy while it runs. With fewer than two tracks there
-/// is nothing to do; any failure is logged and leaves the recording as it
-/// was. Returns whether the file was replaced.
-fn mix_audio_in_place(path: &Path, mix: MixFn) -> bool {
+/// Run `pass` over the audio tracks of the finished recording at `path`,
+/// replacing the file once the new copy has been checked. Needs free space
+/// for a second copy while it runs. With fewer than two tracks there is
+/// nothing to do; any failure is logged and leaves the recording as it was.
+/// Returns whether the file was replaced.
+fn mix_audio_in_place(path: &Path, pass: AudioPass, mix: MixFn) -> bool {
     let tmp = match reserve_mix_temp(path) {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!("mixing the audio tracks failed (no temp file next to the recording: {e}); keeping them separate");
+            tracing::warn!("{} the audio tracks failed (no temp file next to the recording: {e}); {}", pass.verb(), pass.fallback());
             return false;
         }
     };
-    if mix_into(path, &tmp, mix) {
+    if mix_into(path, &tmp, pass, mix) {
         match std::fs::rename(&tmp, path) {
             Ok(()) => return true,
-            Err(e) => tracing::warn!("replacing the recording with its mixed copy failed; keeping separate audio tracks: {e}"),
+            Err(e) => tracing::warn!("replacing the recording with its {} copy failed; {}: {e}", pass.verb(), pass.fallback()),
         }
     }
     let _ = std::fs::remove_file(&tmp);
@@ -351,17 +413,17 @@ fn mix_audio_in_place(path: &Path, mix: MixFn) -> bool {
 }
 
 /// Turn the stream recorder's MP4 at `written` into the final `output`:
-/// mix the audio tracks if asked, and for a `.mov` request write QuickTime
-/// (straight from the mixer when it ran, otherwise by remuxing). `written`
-/// is removed once it is no longer needed.
-fn finish_stream_file(written: &Path, output: &Path, wants_mov: bool, mix_audio: bool, mix: MixFn) -> Result<()> {
+/// mix or level the audio tracks if asked (`pass`), and for a `.mov` request
+/// write QuickTime (straight from the pass when it ran, otherwise by
+/// remuxing). `written` is removed once it is no longer needed.
+fn finish_stream_file(written: &Path, output: &Path, wants_mov: bool, pass: Option<AudioPass>, mix: MixFn) -> Result<()> {
     if !wants_mov {
-        if mix_audio {
-            mix_audio_in_place(written, mix);
+        if let Some(pass) = pass {
+            mix_audio_in_place(written, pass, mix);
         }
         return Ok(());
     }
-    if !(mix_audio && mix_into(written, output, mix)) {
+    if !pass.is_some_and(|pass| mix_into(written, output, pass, mix)) {
         if let Err(e) = bugle_platform::export_mov(written, output) {
             return Err(keep_raw_after_failed_export(written, output, "mp4", e));
         }
@@ -381,6 +443,21 @@ fn child_stderr(child: &mut std::process::Child) -> String {
 }
 
 impl Engine {
+    /// The microphone and system-audio levels video recordings use, before
+    /// a request's own overrides: the `[recordings]` levels from the config,
+    /// or the ones last given to [`Engine::set_recording_levels`].
+    pub fn recording_levels(&self) -> AudioMixConfig {
+        let set = *self.recorder_state.levels.lock().unwrap_or_else(|e| e.into_inner());
+        set.unwrap_or(self.config.recordings.mix)
+    }
+
+    /// Use `levels` for the recordings started from now on, whoever starts
+    /// them (the app's Audio Levels menu, its agent API). Not written to the
+    /// config file; that is up to the caller.
+    pub fn set_recording_levels(&self, levels: AudioMixConfig) {
+        *self.recorder_state.levels.lock().unwrap_or_else(|e| e.into_inner()) = Some(levels);
+    }
+
     pub fn record_status(&self) -> RecordingStatus {
         let mut g = self.recorder_state.inner.lock().unwrap();
         match g.as_mut() {
@@ -508,7 +585,6 @@ impl Engine {
                 let output = self.output_path(req.output.as_deref(), if wants_mp4 { "mp4" } else { "mov" }, &vars);
                 let microphone = req.microphone || self.config.recordings.microphone;
                 let system_audio = req.system_audio || self.config.recordings.system_audio;
-                let mix_audio = mix_levels(&self.config.recordings, req)?;
                 let highlight_clicks = req.highlight_clicks || self.config.recordings.highlight_clicks;
                 let sck_available = bugle_platform::sck_record_available();
                 let use_sck = match self.config.recordings.backend {
@@ -530,11 +606,8 @@ impl Engine {
                     tracing::warn!("hide_cursor needs the ScreenCaptureKit recorder (macOS 14+); the pointer stays in the frames");
                     cursor_hidden = false;
                 }
-                if mix_audio.is_some() && !(use_sck && microphone && system_audio) {
-                    tracing::warn!(
-                        "mix_audio has nothing to mix: it needs both the microphone and system audio, recorded by the ScreenCaptureKit recorder"
-                    );
-                }
+                let both_tracks = use_sck && microphone && system_audio;
+                let audio = audio_pass(&self.config.recordings, &self.recording_levels(), req, both_tracks)?;
                 if use_sck {
                     // AVAssetWriter writes the MP4 container directly; a .mov
                     // request is remuxed on stop.
@@ -554,7 +627,7 @@ impl Engine {
                     if let Some(w) = rec.warnings() {
                         tracing::warn!("{w}");
                     }
-                    (output, Backend::Sck { rec: Some(rec), wants_mov: !wants_mp4, mix_audio })
+                    (output, Backend::Sck { rec: Some(rec), wants_mov: !wants_mp4, audio })
                 } else {
                     let tmp_mov = if wants_mp4 { temp_path(&output, "mov") } else { output.clone() };
                     let mut cmd = std::process::Command::new("/usr/sbin/screencapture");
@@ -716,8 +789,8 @@ impl Engine {
                 }
                 MediaKind::Video
             }
-            Backend::Sck { rec, wants_mov, mix_audio } => {
-                let (wants_mov, mix_audio) = (*wants_mov, *mix_audio);
+            Backend::Sck { rec, wants_mov, audio } => {
+                let (wants_mov, audio) = (*wants_mov, *audio);
                 let rec = rec.take().ok_or_else(|| anyhow!("recorder already stopped"))?;
                 // The file AVAssetWriter writes: the output itself, or a
                 // temp MP4 when a .mov was asked for.
@@ -735,9 +808,9 @@ impl Engine {
                     let _ = std::fs::remove_file(&written);
                     bail!("no frames were captured");
                 }
-                let levels = mix_audio.unwrap_or_default();
-                let mix = |src: &Path, dst: &Path| bugle_platform::mix_audio_tracks_with(src, dst, &levels);
-                finish_stream_file(&written, &active.output, wants_mov, mix_audio.is_some(), &mix)?;
+                let (pass, levels) = (audio.map(|(p, _)| p), audio.map(|(_, l)| l).unwrap_or_default());
+                let mix = |src: &Path, dst: &Path| pass.unwrap_or(AudioPass::Mix).run(src, dst, &levels);
+                finish_stream_file(&written, &active.output, wants_mov, pass, &mix)?;
                 MediaKind::Video
             }
         };
@@ -1000,7 +1073,7 @@ mod tests {
 
     #[test]
     fn sck_deadline_counts_as_finished_and_elapsed_is_capped() {
-        let mut a = active(Backend::Sck { rec: None, wants_mov: false, mix_audio: None }, PathBuf::from("/nonexistent/x.mp4"), Some(0.01));
+        let mut a = active(Backend::Sck { rec: None, wants_mov: false, audio: None }, PathBuf::from("/nonexistent/x.mp4"), Some(0.01));
         a.started -= Duration::from_secs(3);
         assert_eq!(a.poll(), RecordingState::Finishing);
         assert_eq!(a.elapsed_seconds(), 0.01);
@@ -1060,25 +1133,69 @@ mod tests {
     }
 
     #[test]
-    fn mix_levels_merge_config_and_request() {
+    fn audio_pass_merges_config_and_request() {
         let mut cfg = RecordingConfig::default();
-        cfg.mix.system_audio_gain = 0.5;
         let mut req = RecordRequest::default();
-        // No mixing: no levels, whatever the request says.
+        let pass = |cfg: &RecordingConfig, req: &RecordRequest, both| audio_pass(cfg, &cfg.mix, req, both);
+        // Default levels, no mixing: the tracks are left as recorded.
+        assert_eq!(pass(&cfg, &req, true).unwrap(), None);
+        req.mix.ducking_amount_db = Some(20.0);
+        assert_eq!(pass(&cfg, &req, true).unwrap(), None, "a duck amount alone changes nothing");
+        // Levels without mixing: the separate tracks are leveled.
+        cfg.mix.system_audio_gain = 0.5;
         req.mix.microphone_gain = Some(2.0);
-        assert_eq!(mix_levels(&cfg, &req).unwrap(), None);
+        let (p, l) = pass(&cfg, &req, true).unwrap().unwrap();
+        assert_eq!(p, AudioPass::Level);
+        assert_eq!((l.microphone_gain, l.system_audio_gain, l.ducking), (2.0, 0.5, false));
+        // ...but only when the recording has both tracks.
+        assert_eq!(pass(&cfg, &req, false).unwrap(), None);
+        // The base levels (the menu's) replace the config's.
+        let base = AudioMixConfig { system_audio_gain: 0.25, ducking: true, ..Default::default() };
+        let (_, l) = audio_pass(&cfg, &base, &req, true).unwrap().unwrap();
+        assert_eq!((l.microphone_gain, l.system_audio_gain, l.ducking), (2.0, 0.25, true));
         // Mixing from the request or the config: config levels, request on top.
         req.mix_audio = true;
-        let l = mix_levels(&cfg, &req).unwrap().unwrap();
+        let (p, l) = pass(&cfg, &req, true).unwrap().unwrap();
+        assert_eq!(p, AudioPass::Mix);
         assert_eq!((l.microphone_gain, l.system_audio_gain, l.ducking), (2.0, 0.5, false));
+        assert_eq!(pass(&cfg, &req, false).unwrap().unwrap().0, AudioPass::Mix, "mixing is kept; stop finds one track");
         req.mix_audio = false;
         cfg.mix_audio = true;
         req.mix.ducking = Some(true);
-        assert!(mix_levels(&cfg, &req).unwrap().unwrap().ducking);
-        // Out of range is an invalid request.
+        assert!(pass(&cfg, &req, true).unwrap().unwrap().1.ducking);
+        // Mixing runs at default levels too.
+        let plain = RecordingConfig { mix_audio: true, ..Default::default() };
+        assert_eq!(pass(&plain, &RecordRequest::default(), true).unwrap(), Some((AudioPass::Mix, AudioMixConfig::default())));
+        // Out of range is an invalid request when the levels would be used:
+        // always for a mix, for leveling when there are two tracks.
         req.mix.microphone_gain = Some(100.0);
-        let e = mix_levels(&cfg, &req).unwrap_err();
-        assert!(matches!(e.downcast_ref::<BugleError>(), Some(BugleError::Invalid(_))), "{e}");
+        for (mix, both) in [(true, true), (true, false), (false, true)] {
+            cfg.mix_audio = mix;
+            let e = pass(&cfg, &req, both).unwrap_err();
+            assert!(matches!(e.downcast_ref::<BugleError>(), Some(BugleError::Invalid(_))), "{mix} {both}: {e}");
+        }
+        cfg.mix_audio = false;
+        assert_eq!(pass(&cfg, &req, false).unwrap(), None);
+    }
+
+    #[test]
+    fn bad_config_gain_does_not_block_a_recording_without_both_tracks() {
+        // A hand-edited config with an out-of-range gain and no mix_audio:
+        // a recording with no audio (or one track) starts as before.
+        let cfg = RecordingConfig { mix: AudioMixConfig { microphone_gain: 9.0, ..Default::default() }, ..Default::default() };
+        assert!(cfg.mix.validate().is_err());
+        assert_eq!(audio_pass(&cfg, &cfg.mix, &RecordRequest::default(), false).unwrap(), None);
+    }
+
+    #[test]
+    fn recording_levels_default_to_the_config_and_can_be_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_in(tmp.path());
+        engine.config.recordings.mix.system_audio_gain = 0.5;
+        assert_eq!(engine.recording_levels().system_audio_gain, 0.5);
+        let set = AudioMixConfig { microphone_gain: 2.0, ducking: true, ..Default::default() };
+        engine.set_recording_levels(set);
+        assert_eq!(engine.recording_levels(), set);
     }
 
     use bugle_platform::{audio_track_count, mix_audio_tracks, video_track_count, write_tone_fixture, ToneFixture};
@@ -1102,7 +1219,7 @@ mod tests {
         // Files that a predictable temp name could have clobbered.
         std::fs::write(tmp.path().join("clip.mix.mp4"), b"keep me").unwrap();
         std::fs::write(tmp.path().join("clip.rec.mix.mp4"), b"keep me too").unwrap();
-        assert!(mix_audio_in_place(&rec, &mix_audio_tracks));
+        assert!(mix_audio_in_place(&rec, AudioPass::Mix, &mix_audio_tracks));
         assert_eq!(audio_track_count(&rec).unwrap(), 1);
         assert_eq!(video_track_count(&rec).unwrap(), 1);
         assert_eq!(std::fs::read(tmp.path().join("clip.mix.mp4")).unwrap(), b"keep me");
@@ -1111,7 +1228,7 @@ mod tests {
 
         // One track now: nothing to do, file and folder untouched.
         let before = std::fs::read(&rec).unwrap();
-        assert!(!mix_audio_in_place(&rec, &mix_audio_tracks));
+        assert!(!mix_audio_in_place(&rec, AudioPass::Mix, &mix_audio_tracks));
         assert_eq!(std::fs::read(&rec).unwrap(), before);
         assert_eq!(dir_names(tmp.path()).len(), 3);
     }
@@ -1127,7 +1244,7 @@ mod tests {
         std::fs::write(&rec, &full[..full.len() / 2]).unwrap();
         assert_eq!(audio_track_count(&rec).unwrap(), 2, "fixture must keep its track headers");
         let before = std::fs::read(&rec).unwrap();
-        assert!(!mix_audio_in_place(&rec, &mix_audio_tracks));
+        assert!(!mix_audio_in_place(&rec, AudioPass::Mix, &mix_audio_tracks));
         assert_eq!(std::fs::read(&rec).unwrap(), before);
         assert_eq!(dir_names(tmp.path()), ["cut.mp4"]);
 
@@ -1139,7 +1256,7 @@ mod tests {
             std::fs::write(dst, b"partial")?;
             bail!("encoder exploded")
         };
-        assert!(!mix_audio_in_place(&rec, &failing));
+        assert!(!mix_audio_in_place(&rec, AudioPass::Mix, &failing));
         assert_eq!(std::fs::read(&rec).unwrap(), before);
         assert_eq!(dir_names(tmp.path()), ["clip.mp4", "cut.mp4"]);
 
@@ -1149,7 +1266,7 @@ mod tests {
             write_tone_fixture(dst, &ToneFixture { tracks: 1, seconds: 1.0, ..Default::default() })?;
             Ok(true)
         };
-        assert!(!mix_audio_in_place(&rec, &no_video));
+        assert!(!mix_audio_in_place(&rec, AudioPass::Mix, &no_video));
         assert_eq!(std::fs::read(&rec).unwrap(), before);
         assert_eq!(dir_names(tmp.path()), ["clip.mp4", "cut.mp4"]);
     }
@@ -1170,7 +1287,7 @@ mod tests {
             std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o555))?;
             Ok(r)
         };
-        let replaced = mix_audio_in_place(&rec, &mix_then_lock);
+        let replaced = mix_audio_in_place(&rec, AudioPass::Mix, &mix_then_lock);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(!replaced);
         assert_eq!(std::fs::read(&rec).unwrap(), before);
@@ -1183,7 +1300,7 @@ mod tests {
         let out = tmp.path().join("clip.mov");
         let written = temp_path(&out, "mp4");
         two_tracks_with_video(&written);
-        finish_stream_file(&written, &out, true, true, &mix_audio_tracks).unwrap();
+        finish_stream_file(&written, &out, true, Some(AudioPass::Mix), &mix_audio_tracks).unwrap();
         assert!(!written.exists());
         assert_eq!(&std::fs::read(&out).unwrap()[4..12], b"ftypqt  ");
         assert_eq!(audio_track_count(&out).unwrap(), 1);
@@ -1192,7 +1309,7 @@ mod tests {
         // A failed mix falls back to the plain remux with both tracks.
         two_tracks_with_video(&written);
         let failing = |_: &Path, _: &Path| -> Result<bool> { bail!("no") };
-        finish_stream_file(&written, &out, true, true, &failing).unwrap();
+        finish_stream_file(&written, &out, true, Some(AudioPass::Mix), &failing).unwrap();
         assert!(!written.exists());
         assert_eq!(&std::fs::read(&out).unwrap()[4..12], b"ftypqt  ");
         assert_eq!(audio_track_count(&out).unwrap(), 2);
@@ -1201,8 +1318,36 @@ mod tests {
         let mp4 = tmp.path().join("plain.mp4");
         two_tracks_with_video(&mp4);
         let before = std::fs::read(&mp4).unwrap();
-        finish_stream_file(&mp4, &mp4, false, false, &mix_audio_tracks).unwrap();
+        finish_stream_file(&mp4, &mp4, false, None, &mix_audio_tracks).unwrap();
         assert_eq!(std::fs::read(&mp4).unwrap(), before);
+    }
+
+    #[test]
+    fn leveling_keeps_both_tracks_in_mp4_and_mov() {
+        let levels = AudioMixConfig { microphone_gain: 0.5, ducking: true, ..Default::default() };
+        let level = |src: &Path, dst: &Path| AudioPass::Level.run(src, dst, &levels);
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = tmp.path().join("clip.mp4");
+        two_tracks_with_video(&rec);
+        let before = std::fs::read(&rec).unwrap();
+        finish_stream_file(&rec, &rec, false, Some(AudioPass::Level), &level).unwrap();
+        assert_ne!(std::fs::read(&rec).unwrap(), before, "re-encoded in place");
+        assert_eq!(audio_track_count(&rec).unwrap(), 2);
+        assert_eq!(video_track_count(&rec).unwrap(), 1);
+        assert_eq!(dir_names(tmp.path()), ["clip.mp4"]);
+
+        let out = tmp.path().join("clip.mov");
+        let written = temp_path(&out, "mp4");
+        two_tracks_with_video(&written);
+        finish_stream_file(&written, &out, true, Some(AudioPass::Level), &level).unwrap();
+        assert!(!written.exists());
+        assert_eq!(&std::fs::read(&out).unwrap()[4..12], b"ftypqt  ");
+        assert_eq!(audio_track_count(&out).unwrap(), 2);
+
+        // A leveled copy that lost a track is rejected.
+        let before = std::fs::read(&rec).unwrap();
+        assert!(!mix_audio_in_place(&rec, AudioPass::Level, &mix_audio_tracks));
+        assert_eq!(std::fs::read(&rec).unwrap(), before);
     }
 
     #[test]

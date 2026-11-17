@@ -64,7 +64,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
 | `export_audio_m4a`, `export_mp4`, `export_mov`, `video_frame`, `media_duration` | `AVAssetExportSession`, `AVAssetImageGenerator` |
-| `mix_audio_tracks(_with)`, `audio_track_count`, `video_track_count` | one `AVAssetReaderAudioMixOutput` per audio track (float PCM) → Rust mix callback (`bugle_core::audio_mix`) → `AVAssetWriter` (AAC), video samples copied on their own timescale |
+| `mix_audio_tracks(_with)`, `level_audio_tracks`, `audio_track_count`, `video_track_count` | one `AVAssetReaderAudioMixOutput` per audio track (float PCM) → Rust mix callback (`bugle_core::audio_mix`) → `AVAssetWriter` (one AAC track, or one per source when leveling), video samples copied on their own timescale |
 | `export_video`, `video_info`, `video_sync_at`, `VideoFrameReader`, `VideoFrameWriter` | `AVAssetExportSession` with `timeRange`/preset, an `AVMutableVideoComposition` on every re-encode (`frameDuration` + `sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid` for a new frame rate), bounded wait + `cancelExport`; `AVSampleCursor` (stored samples, sync sample at a cut); one reusable `AVAssetImageGenerator`; `AVAssetWriter` + pixel-buffer adaptor (H.264 or HEVC) |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
 | `login_item::{in_app_bundle, status, set_enabled}` | `SMAppService.mainAppService` (`shim/login_item.m`, ServiceManagement) |
@@ -147,10 +147,23 @@ recorder state machine, and exposes one method per user-facing action:
   overshoot slightly) catches what the gains push past full scale. Levels come
   from `[recordings]` with per-recording overrides (`--mic-gain`,
   `--system-gain`, `--duck` / `--no-duck`, `--duck-amount`; the same names as
-  action arguments) and only apply to the mixed track. Out-of-range
+  action arguments). Without `mix_audio` the same levels apply to the two
+  separate tracks (`AudioPass::Level`): when they change the sources (a gain
+  other than 1, or ducking with an audible microphone) the same post-pass
+  runs with `separate`, `bugle_core::audio_mix::Leveler` scales each track on
+  its own (gain 1 = as recorded, no `1/n` share), ducks track 0 under track 1
+  and limits any track above gain 1 on its own, and the shim encodes one AAC
+  track per source in order; the checked copy must keep every audio track.
+  The audio pumps share one serial queue and pull from per-track queues that
+  `process` fills one block at a time. At the default levels the recording
+  is left as written. Out-of-range
   `[recordings]` levels are logged when the engine loads the config; starting
-  a mixed recording with out-of-range levels (config or request) is an
-  invalid request. The audio is
+  a recording that would use out-of-range levels (config or request) is an
+  invalid request: always with `mix_audio`, and for leveling only when the
+  recording gets both tracks (`audio_pass` decides after the backend, so a
+  bad gain does not block a recording without audio). The levels a recording
+  starts from are `Engine::recording_levels`: `[recordings]`, or whatever
+  `Engine::set_recording_levels` set since launch. The audio is
   re-encoded (a second AAC generation) while video samples and frame times are
   copied. The mix runs during stop, writes a uniquely named hidden copy next to
   the recording (so it needs free space equal to the recording) and replaces the
@@ -340,7 +353,15 @@ When the process runs from `Bugle.app`, an *Open at Login* check item
 (`login.rs`) registers the bundle with `SMAppService`. Its check mark is
 re-read on the periodic tick (every 5 s) and set only for an enabled item; a
 pending approval is shown in the title, and clicking it then opens System
-Settings → Login Items. With `[general] system_notifications`,
+Settings → Login Items. The *Audio Levels* submenu (`audio_menu.rs`) offers
+level presets for the microphone and system audio and a ducking toggle; a
+click applies to the next recordings, from the menu, hotkeys or the in-app
+API alike (`Engine::set_recording_levels`), and is written back to
+`[recordings]` with `toml_edit`, replacing only that key so the rest of the
+file and its comments stay put (through a temp file and a rename, following
+a symlinked config). Levels need both a microphone and a system-audio
+track; when `[recordings]` (microphone, system_audio, backend) or the macOS
+version rule that out, a disabled first line says what is missing. With `[general] system_notifications`,
 `notifications.rs` also posts to Notification Center from `App::toast` /
 `toast_error` and from `on_done` when the quick-access panel takes the
 toast's place (direct `toast_show` feedback to panel and editor clicks does
@@ -473,8 +494,9 @@ earn its keep.
 * **Video editor extras** — an editing window on top of the headless `edit`
   pipeline (trim, zoom and pointer options with a preview).
 * **Audio mixing extras** — per-source levels and ducking work on the mixed
-  track; still open: levels for the two-track (unmixed) output, and setting
-  them from the menu-bar app instead of the config file.
+  track and on the separate tracks, and are set from the menu-bar app; still
+  open: free-form levels and the ducking amount in the app (it offers presets
+  and an on/off toggle), and a live level meter while recording.
 * **Markup editor extras** — opening a second editor (the window shim keeps
   one editor today). Also: keep the quick-access panel's thumbnails stacked
   when several captures arrive in a row.
