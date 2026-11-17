@@ -22,9 +22,11 @@ window_shadow = true      # keep the window drop shadow in window captures
 downscale_retina = false  # save at 1x points instead of 2x pixels
 # bugle-app Capture Window: hover to highlight a window, click to capture it.
 # Space switches between the picker and the area selection (Capture Area,
-# Capture Window, Record Video/GIF/Window).
-# false = capture the front-most window at once (the CLI and API always do,
-# unless an API caller asks for target kind "pick_window").
+# Capture Window, Scrolling Capture, Record Video/GIF/Window, and the CLI's
+# interactive `bugle capture` / `bugle scroll` / `bugle record start`).
+# false = capture the front-most window at once and drop the Space toggle
+# (`bugle capture window` and the API always take the front-most window,
+# unless asked for target kind "pick_window").
 window_picker = true
 
 [recordings]

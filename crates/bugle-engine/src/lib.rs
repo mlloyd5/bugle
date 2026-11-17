@@ -8,6 +8,7 @@ pub mod capture;
 pub mod cursor_fx;
 pub mod edit;
 mod event_log;
+pub mod pick;
 pub mod record;
 pub mod scroll;
 pub mod stitch;
@@ -48,8 +49,9 @@ pub trait UiHost: Send + Sync {
 }
 
 /// Why a `pick_window` target fails outside the menu-bar app.
-pub const NO_UI_HOST_PICK: &str = "target kind=pick_window needs the Bugle menu-bar app: start the Agent API from its \
-     menu (or `bugle-app --serve`) instead of `bugle serve` / `bugle mcp`, or pass a window id from list_windows";
+pub const NO_UI_HOST_PICK: &str = "target kind=pick_window needs the Bugle menu-bar app or a terminal: start the Agent API \
+     from its menu (or `bugle-app --serve`) instead of `bugle serve` / `bugle mcp`, run `bugle capture pick-window`, or pass \
+     a window id from list_windows";
 
 pub struct Engine {
     pub config: Config,
@@ -480,20 +482,51 @@ impl Engine {
     }
 
     /// Let the user click a window with the UI host's picker (the menu-bar
-    /// app). Fails with [`BugleError::NoUiHost`] when no host is installed,
+    /// app), or, on the main thread of a process that shows its overlays
+    /// in-process (the CLI), with a picker that runs its own event loop.
+    /// Fails with [`BugleError::NoUiHost`] when neither is available,
     /// [`BugleError::Cancelled`] when the user cancels.
     pub fn pick_window(&self) -> Result<WindowInfo> {
-        let host = self.ui_host.as_ref().ok_or_else(|| BugleError::NoUiHost(NO_UI_HOST_PICK.into()))?;
-        host.pick_window()?.ok_or_else(|| BugleError::Cancelled.into())
+        let picked = if let Some(host) = &self.ui_host {
+            host.pick_window()?
+        } else if self.main_thread_ui {
+            match pick::run_blocking(pick::Mode::Window, false, pick::PICK_TIMEOUT)? {
+                Some(pick::Picked::Window(w)) => Some(w),
+                // Without the switch the session never shows the area overlay.
+                Some(pick::Picked::Area(_)) | None => None,
+            }
+        } else {
+            return Err(BugleError::NoUiHost(NO_UI_HOST_PICK.into()).into());
+        };
+        picked.ok_or_else(|| BugleError::Cancelled.into())
     }
 
-    /// Refuse a `pick_window` target up front when there is no UI host, so
+    /// Refuse a `pick_window` target up front when there is no picker, so
     /// the caller hears why before any permission prompt or delay.
     pub fn check_target_host(&self, target: &bugle_core::CaptureTarget) -> Result<()> {
-        if *target == bugle_core::CaptureTarget::PickWindow && self.ui_host.is_none() {
+        let in_process = self.main_thread_ui && bugle_platform::is_main_thread();
+        if *target == bugle_core::CaptureTarget::PickWindow && self.ui_host.is_none() && !in_process {
             return Err(BugleError::NoUiHost(NO_UI_HOST_PICK.into()).into());
         }
         Ok(())
+    }
+
+    /// Whether interactive selections offer the Space toggle to the window
+    /// picker in this process: `[screenshots] window_picker` is on and the
+    /// overlays run in-process on this (main) thread. The menu-bar app runs
+    /// its sessions through its own host instead.
+    fn in_process_picker(&self) -> bool {
+        self.main_thread_ui && self.ui_host.is_none() && self.config.screenshots.window_picker && bugle_platform::is_main_thread()
+    }
+
+    /// Interactive selection of an area, or of a window after Space, where
+    /// [`Engine::in_process_picker`] allows it; otherwise plain
+    /// [`Engine::select_area`]. `None` when the user cancels.
+    pub fn select_area_or_window(&self) -> Result<Option<pick::Picked>> {
+        if self.in_process_picker() {
+            return pick::run_blocking(pick::Mode::Area, true, pick::PICK_TIMEOUT);
+        }
+        Ok(self.select_area()?.map(pick::Picked::Area))
     }
 
     /// Interactive rectangle selection.
@@ -794,6 +827,33 @@ mod tests {
         }
     }
 
+    /// A host whose area selection answers with a fixed rect.
+    struct AreaHost(Rect);
+
+    impl UiHost for AreaHost {
+        fn select_area(&self) -> Result<Option<Rect>> {
+            Ok(Some(self.0))
+        }
+        fn pin(&self, _: Vec<u8>, _: Option<Rect>, _: f64) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn select_area_or_window_falls_back_to_the_plain_selection() {
+        let (_dir, mut engine) = temp_engine();
+        let r = Rect::new(10.0, 20.0, 300.0, 200.0);
+        engine.ui_host = Some(Arc::new(AreaHost(r)));
+        // A host runs its own sessions: no in-process Space toggle.
+        assert!(engine.config.screenshots.window_picker);
+        assert!(matches!(engine.select_area_or_window().unwrap(), Some(pick::Picked::Area(a)) if a == r));
+        engine.config.screenshots.window_picker = false;
+        assert!(matches!(engine.select_area_or_window().unwrap(), Some(pick::Picked::Area(a)) if a == r));
+        // The host cancelling is `None`.
+        engine.ui_host = Some(Arc::new(FakeHost(None)));
+        assert!(engine.select_area_or_window().unwrap().is_none());
+    }
+
     /// A host that only implements the required methods.
     struct OldHost;
 
@@ -817,6 +877,20 @@ mod tests {
         assert!(is_no_host(&e), "{e:#}");
         let msg = format!("{e:#}");
         assert!(msg.contains("menu-bar app") && msg.contains("list_windows"), "{msg}");
+    }
+
+    #[test]
+    fn in_process_overlays_offer_the_picker_on_the_main_thread_only() {
+        let (_dir, mut engine) = temp_engine();
+        let target = bugle_core::CaptureTarget::PickWindow;
+        assert!(is_no_host(&engine.check_target_host(&target).unwrap_err()));
+        // The CLI shows its overlays in-process, but on the main thread
+        // only: off it (tests run on worker threads) the target is refused
+        // up front and the picker refuses without showing anything.
+        engine.main_thread_ui = true;
+        assert!(is_no_host(&engine.check_target_host(&target).unwrap_err()));
+        assert!(is_no_host(&engine.pick_window().unwrap_err()));
+        assert!(!engine.in_process_picker(), "no Space toggle off the main thread");
     }
 
     #[test]

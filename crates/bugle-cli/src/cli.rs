@@ -129,9 +129,14 @@ pub enum Cmd {
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 pub enum TargetKind {
     Screen,
+    /// A window by id, title or app; the front-most one without them.
     Window,
     Area,
+    /// Drag an area; with `[screenshots] window_picker`, Space switches to
+    /// the window picker and back.
     Interactive,
+    /// Click a window in the window picker.
+    PickWindow,
     All,
 }
 
@@ -180,6 +185,7 @@ impl TargetArgs {
                     .ok_or_else(|| anyhow!("bad --rect; expected x,y,w,h"))?,
             },
             TargetKind::Interactive => CaptureTarget::Interactive,
+            TargetKind::PickWindow => CaptureTarget::PickWindow,
             TargetKind::All => CaptureTarget::AllScreens,
         })
     }
@@ -226,7 +232,8 @@ pub struct CaptureArgs {
 
 #[derive(Args, Debug)]
 pub struct ScrollArgs {
-    /// Rect `x,y,w,h` to scroll; omitted = drag to select.
+    /// Rect `x,y,w,h` to scroll; omitted = drag to select (Space: pick a
+    /// window instead, with `[screenshots] window_picker`).
     #[arg(long, short = 'r')]
     pub rect: Option<String>,
     #[arg(long, default_value_t = 40)]
@@ -589,7 +596,13 @@ pub async fn run(cli: Cli) -> Result<()> {
         Cmd::Scroll(a) => {
             let rect = match a.rect {
                 Some(r) => parse_rect(&r)?,
-                None => engine.select_area()?.ok_or(BugleError::Cancelled)?,
+                // Space picks a whole window instead (`[screenshots]
+                // window_picker`); its on-screen part is scrolled, unless
+                // another window covers it.
+                None => {
+                    let picked = engine.select_area_or_window()?.ok_or(BugleError::Cancelled)?;
+                    bugle_engine::pick::scroll_rect(&picked)?
+                }
             };
             bugle_engine::capture::validate_rect(&rect)?;
             if a.delay > 0.0 {
@@ -1033,6 +1046,23 @@ fn redact_secrets(v: &mut toml::Value, in_headers: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_window_is_a_target_kind() {
+        let cli = Cli::try_parse_from(["bugle", "capture", "pick-window", "--delay", "2"]).unwrap();
+        match cli.cmd {
+            Cmd::Capture(a) => {
+                assert_eq!(a.target.resolve(false).unwrap(), CaptureTarget::PickWindow);
+                assert_eq!(a.delay, Some(2.0));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["bugle", "record", "start", "pick-window"]).unwrap();
+        match cli.cmd {
+            Cmd::Record { cmd: RecordCmd::Start(a) } => assert_eq!(a.target.resolve(false).unwrap(), CaptureTarget::PickWindow),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 
     #[test]
     fn negative_scroll_step_parses() {

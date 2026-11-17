@@ -509,10 +509,12 @@ impl Engine {
                 let w = self.resolve_window(*id, title.as_deref(), owner.as_deref())?;
                 (w.frame, Some(w))
             }
-            CaptureTarget::Interactive => {
-                let r = self.select_area()?.ok_or(BugleError::Cancelled)?;
-                (r, None)
-            }
+            // Space switches to the window picker where the selection runs
+            // in-process (a terminal); see `Engine::select_area_or_window`.
+            CaptureTarget::Interactive => match self.select_area_or_window()?.ok_or(BugleError::Cancelled)? {
+                crate::pick::Picked::Area(r) => (r, None),
+                crate::pick::Picked::Window(w) => (w.frame, Some(w)),
+            },
             CaptureTarget::PickWindow => {
                 let w = self.pick_window()?;
                 (w.frame, Some(w))
