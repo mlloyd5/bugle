@@ -37,7 +37,8 @@ mix_audio = false         # one audio track instead of microphone + system audio
                           # (re-encodes the audio after stop; each source at 1/2
                           # times its gain below; needs free space equal to the
                           # recording)
-# Audio levels (also settable from the menu-bar app's Audio Levels menu). Gains
+# Audio levels (also settable from the menu-bar app's Audio Levels menu). They
+# apply only to recordings with both microphone and system audio. Gains
 # are linear factors, 0 to 8. Mixed (mix_audio): on each source's default share
 # of the mix (1/2 with two sources), so 1.0 = the default share; with any gain
 # above 1 a peak limiter keeps the sum from clipping. Separate tracks: on each

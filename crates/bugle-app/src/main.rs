@@ -227,8 +227,8 @@ fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<N
                 microphone: false,
                 system_audio: engine.config.recordings.system_audio,
                 mix_audio: false,
-                // Levels picked in the Audio Levels menu since launch.
-                mix: audio_menu::overrides(),
+                // The engine's levels (the Audio Levels menu's) apply.
+                mix: Default::default(),
                 max_seconds: None,
                 highlight_clicks: false,
                 cursor_events: false,
@@ -419,7 +419,10 @@ fn build_menu(config: &Config, keys: &HashMap<&'static str, String>) -> Result<M
     let menu = Menu::new();
     let recent = Submenu::with_id("recent", "Recent Captures", true);
     let login = login::LoginMenu::new();
-    let audio = audio_menu::AudioMenu::new(config.recordings.mix)?;
+    let audio = audio_menu::AudioMenu::new(
+        config.recordings.mix,
+        audio_menu::requirement(&config.recordings, bugle_platform::sck_record_available()),
+    )?;
     let mut by_name: HashMap<&'static str, MenuItem> = HashMap::new();
     for slot in commands::MENU {
         match slot {
@@ -525,6 +528,7 @@ impl App {
             return self.toggle_login();
         }
         if let Some(change) = self.items.audio.handle(id) {
+            self.engine.set_recording_levels(self.items.audio.levels());
             if let Err(e) = audio_menu::persist(&self.config_path, change) {
                 self.toast_error(&format!("Audio Levels: the change applies until Bugle quits but was not saved: {e:#}"));
             }

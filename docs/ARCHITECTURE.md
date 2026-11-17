@@ -159,7 +159,11 @@ recorder state machine, and exposes one method per user-facing action:
   is left as written. Out-of-range
   `[recordings]` levels are logged when the engine loads the config; starting
   a recording that would use out-of-range levels (config or request) is an
-  invalid request. The audio is
+  invalid request: always with `mix_audio`, and for leveling only when the
+  recording gets both tracks (`audio_pass` decides after the backend, so a
+  bad gain does not block a recording without audio). The levels a recording
+  starts from are `Engine::recording_levels`: `[recordings]`, or whatever
+  `Engine::set_recording_levels` set since launch. The audio is
   re-encoded (a second AAC generation) while video samples and frame times are
   copied. The mix runs during stop, writes a uniquely named hidden copy next to
   the recording (so it needs free space equal to the recording) and replaces the
@@ -336,10 +340,13 @@ re-read on the periodic tick (every 5 s) and set only for an enabled item; a
 pending approval is shown in the title, and clicking it then opens System
 Settings → Login Items. The *Audio Levels* submenu (`audio_menu.rs`) offers
 level presets for the microphone and system audio and a ducking toggle; a
-click applies to the next recordings (passed as `RecordRequest` overrides of
-the levels the engine loaded) and is written back to `[recordings]` with
-`toml_edit`, replacing only that key so the rest of the file and its comments
-stay put. With `[general] system_notifications`,
+click applies to the next recordings, from the menu, hotkeys or the in-app
+API alike (`Engine::set_recording_levels`), and is written back to
+`[recordings]` with `toml_edit`, replacing only that key so the rest of the
+file and its comments stay put (through a temp file and a rename, following
+a symlinked config). Levels need both a microphone and a system-audio
+track; when `[recordings]` (microphone, system_audio, backend) or the macOS
+version rule that out, a disabled first line says what is missing. With `[general] system_notifications`,
 `notifications.rs` also posts to Notification Center from `App::toast` /
 `toast_error` and from `on_done` when the quick-access panel takes the
 toast's place (direct `toast_show` feedback to panel and editor clicks does

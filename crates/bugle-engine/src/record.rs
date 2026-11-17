@@ -36,6 +36,9 @@ const SCREENCAPTURE_STARTUP: Duration = Duration::from_millis(300);
 #[derive(Default)]
 pub struct RecorderState {
     inner: Mutex<Option<Active>>,
+    /// Levels set with [`Engine::set_recording_levels`] since launch, in
+    /// place of the `[recordings]` ones.
+    levels: Mutex<Option<AudioMixConfig>>,
 }
 
 struct Active {
@@ -279,22 +282,39 @@ impl AudioPass {
 }
 
 /// What happens to the audio tracks of a video recording, and at which
-/// levels: the `[recordings]` levels with the request's overrides on top.
-/// With `mix_audio` (request or config) the tracks are mixed; otherwise they
-/// stay separate and are re-encoded only when the levels change them (a gain
-/// other than 1, or ducking). Out-of-range levels that would be used are an
-/// invalid request.
-fn audio_pass(cfg: &RecordingConfig, req: &RecordRequest) -> Result<Option<(AudioPass, AudioMixConfig)>> {
-    let levels = cfg.mix.with(&req.mix);
-    let pass = if req.mix_audio || cfg.mix_audio {
-        AudioPass::Mix
-    } else if levels.changes_tracks() {
-        AudioPass::Level
-    } else {
+/// levels: `base` (the engine's [`Engine::recording_levels`]) with the
+/// request's overrides on top. With `mix_audio` (request or config) the
+/// tracks are mixed; otherwise they stay separate and are re-encoded only
+/// when the levels change them (a gain other than 1, or ducking) and the
+/// recording has both tracks to level (`both_tracks`). Out-of-range levels
+/// that would be used are an invalid request; levels a recording cannot use
+/// are dropped without being checked.
+fn audio_pass(cfg: &RecordingConfig, base: &AudioMixConfig, req: &RecordRequest, both_tracks: bool) -> Result<Option<(AudioPass, AudioMixConfig)>> {
+    let levels = base.with(&req.mix);
+    let invalid = |e: String| BugleError::Invalid(format!("audio levels: {e}"));
+    if req.mix_audio || cfg.mix_audio {
+        levels.validate().map_err(invalid)?;
+        if !both_tracks {
+            tracing::warn!("mix_audio has nothing to mix: it needs both the microphone and system audio, recorded by the ScreenCaptureKit recorder");
+        }
+        return Ok(Some((AudioPass::Mix, levels)));
+    }
+    if !levels.changes_tracks() {
         return Ok(None);
-    };
-    levels.validate().map_err(|e| BugleError::Invalid(format!("audio levels: {e}")))?;
-    Ok(Some((pass, levels)))
+    }
+    if !both_tracks {
+        // Levels from the config or the menu are routine; a request that
+        // asks for them is worth a warning.
+        let why = "audio levels need both the microphone and system audio, recorded by the ScreenCaptureKit recorder; recording without them";
+        if req.mix.is_empty() {
+            tracing::debug!("{why}");
+        } else {
+            tracing::warn!("{why}");
+        }
+        return Ok(None);
+    }
+    levels.validate().map_err(invalid)?;
+    Ok(Some((AudioPass::Level, levels)))
 }
 
 /// The audio post-pass: [`AudioPass::run`] at the recording's levels (a
@@ -423,6 +443,21 @@ fn child_stderr(child: &mut std::process::Child) -> String {
 }
 
 impl Engine {
+    /// The microphone and system-audio levels video recordings use, before
+    /// a request's own overrides: the `[recordings]` levels from the config,
+    /// or the ones last given to [`Engine::set_recording_levels`].
+    pub fn recording_levels(&self) -> AudioMixConfig {
+        let set = *self.recorder_state.levels.lock().unwrap_or_else(|e| e.into_inner());
+        set.unwrap_or(self.config.recordings.mix)
+    }
+
+    /// Use `levels` for the recordings started from now on, whoever starts
+    /// them (the app's Audio Levels menu, its agent API). Not written to the
+    /// config file; that is up to the caller.
+    pub fn set_recording_levels(&self, levels: AudioMixConfig) {
+        *self.recorder_state.levels.lock().unwrap_or_else(|e| e.into_inner()) = Some(levels);
+    }
+
     pub fn record_status(&self) -> RecordingStatus {
         let mut g = self.recorder_state.inner.lock().unwrap();
         match g.as_mut() {
@@ -548,7 +583,6 @@ impl Engine {
                 let output = self.output_path(req.output.as_deref(), if wants_mp4 { "mp4" } else { "mov" }, &vars);
                 let microphone = req.microphone || self.config.recordings.microphone;
                 let system_audio = req.system_audio || self.config.recordings.system_audio;
-                let mut audio = audio_pass(&self.config.recordings, req)?;
                 let highlight_clicks = req.highlight_clicks || self.config.recordings.highlight_clicks;
                 let sck_available = bugle_platform::sck_record_available();
                 let use_sck = match self.config.recordings.backend {
@@ -571,23 +605,7 @@ impl Engine {
                     cursor_hidden = false;
                 }
                 let both_tracks = use_sck && microphone && system_audio;
-                match audio {
-                    Some((AudioPass::Mix, _)) if !both_tracks => tracing::warn!(
-                        "mix_audio has nothing to mix: it needs both the microphone and system audio, recorded by the ScreenCaptureKit recorder"
-                    ),
-                    Some((AudioPass::Level, _)) if !both_tracks => {
-                        // Levels from the config alone are routine; a request
-                        // that asks for them is worth a warning.
-                        let why = "audio levels need both the microphone and system audio, recorded by the ScreenCaptureKit recorder; recording without them";
-                        if req.mix.is_empty() {
-                            tracing::debug!("{why}");
-                        } else {
-                            tracing::warn!("{why}");
-                        }
-                        audio = None;
-                    }
-                    _ => {}
-                }
+                let audio = audio_pass(&self.config.recordings, &self.recording_levels(), req, both_tracks)?;
                 if use_sck {
                     // AVAssetWriter writes the MP4 container directly; a .mov
                     // request is remuxed on stop.
@@ -1116,35 +1134,66 @@ mod tests {
     fn audio_pass_merges_config_and_request() {
         let mut cfg = RecordingConfig::default();
         let mut req = RecordRequest::default();
+        let pass = |cfg: &RecordingConfig, req: &RecordRequest, both| audio_pass(cfg, &cfg.mix, req, both);
         // Default levels, no mixing: the tracks are left as recorded.
-        assert_eq!(audio_pass(&cfg, &req).unwrap(), None);
+        assert_eq!(pass(&cfg, &req, true).unwrap(), None);
         req.mix.ducking_amount_db = Some(20.0);
-        assert_eq!(audio_pass(&cfg, &req).unwrap(), None, "a duck amount alone changes nothing");
+        assert_eq!(pass(&cfg, &req, true).unwrap(), None, "a duck amount alone changes nothing");
         // Levels without mixing: the separate tracks are leveled.
         cfg.mix.system_audio_gain = 0.5;
         req.mix.microphone_gain = Some(2.0);
-        let (pass, l) = audio_pass(&cfg, &req).unwrap().unwrap();
-        assert_eq!(pass, AudioPass::Level);
+        let (p, l) = pass(&cfg, &req, true).unwrap().unwrap();
+        assert_eq!(p, AudioPass::Level);
         assert_eq!((l.microphone_gain, l.system_audio_gain, l.ducking), (2.0, 0.5, false));
+        // ...but only when the recording has both tracks.
+        assert_eq!(pass(&cfg, &req, false).unwrap(), None);
+        // The base levels (the menu's) replace the config's.
+        let base = AudioMixConfig { system_audio_gain: 0.25, ducking: true, ..Default::default() };
+        let (_, l) = audio_pass(&cfg, &base, &req, true).unwrap().unwrap();
+        assert_eq!((l.microphone_gain, l.system_audio_gain, l.ducking), (2.0, 0.25, true));
         // Mixing from the request or the config: config levels, request on top.
         req.mix_audio = true;
-        let (pass, l) = audio_pass(&cfg, &req).unwrap().unwrap();
-        assert_eq!(pass, AudioPass::Mix);
+        let (p, l) = pass(&cfg, &req, true).unwrap().unwrap();
+        assert_eq!(p, AudioPass::Mix);
         assert_eq!((l.microphone_gain, l.system_audio_gain, l.ducking), (2.0, 0.5, false));
+        assert_eq!(pass(&cfg, &req, false).unwrap().unwrap().0, AudioPass::Mix, "mixing is kept; stop finds one track");
         req.mix_audio = false;
         cfg.mix_audio = true;
         req.mix.ducking = Some(true);
-        assert!(audio_pass(&cfg, &req).unwrap().unwrap().1.ducking);
+        assert!(pass(&cfg, &req, true).unwrap().unwrap().1.ducking);
         // Mixing runs at default levels too.
         let plain = RecordingConfig { mix_audio: true, ..Default::default() };
-        assert_eq!(audio_pass(&plain, &RecordRequest::default()).unwrap(), Some((AudioPass::Mix, AudioMixConfig::default())));
-        // Out of range is an invalid request, mixed or not.
+        assert_eq!(pass(&plain, &RecordRequest::default(), true).unwrap(), Some((AudioPass::Mix, AudioMixConfig::default())));
+        // Out of range is an invalid request when the levels would be used:
+        // always for a mix, for leveling when there are two tracks.
         req.mix.microphone_gain = Some(100.0);
-        for mix in [true, false] {
+        for (mix, both) in [(true, true), (true, false), (false, true)] {
             cfg.mix_audio = mix;
-            let e = audio_pass(&cfg, &req).unwrap_err();
-            assert!(matches!(e.downcast_ref::<BugleError>(), Some(BugleError::Invalid(_))), "{e}");
+            let e = pass(&cfg, &req, both).unwrap_err();
+            assert!(matches!(e.downcast_ref::<BugleError>(), Some(BugleError::Invalid(_))), "{mix} {both}: {e}");
         }
+        cfg.mix_audio = false;
+        assert_eq!(pass(&cfg, &req, false).unwrap(), None);
+    }
+
+    #[test]
+    fn bad_config_gain_does_not_block_a_recording_without_both_tracks() {
+        // A hand-edited config with an out-of-range gain and no mix_audio:
+        // a recording with no audio (or one track) starts as before.
+        let cfg = RecordingConfig { mix: AudioMixConfig { microphone_gain: 9.0, ..Default::default() }, ..Default::default() };
+        assert!(cfg.mix.validate().is_err());
+        assert_eq!(audio_pass(&cfg, &cfg.mix, &RecordRequest::default(), false).unwrap(), None);
+    }
+
+    #[test]
+    fn recording_levels_default_to_the_config_and_can_be_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_in(tmp.path());
+        engine.config.recordings.mix.system_audio_gain = 0.5;
+        assert_eq!(engine.recording_levels().system_audio_gain, 0.5);
+        let set = AudioMixConfig { microphone_gain: 2.0, ducking: true, ..Default::default() };
+        engine.set_recording_levels(set);
+        assert_eq!(engine.recording_levels(), set);
     }
 
     use bugle_platform::{audio_track_count, mix_audio_tracks, video_track_count, write_tone_fixture, ToneFixture};
