@@ -83,7 +83,7 @@ pub fn actions_for(kind: MediaKind, sync: SyncState) -> Vec<PanelAction> {
         v.push(PanelAction::Annotate);
         v.push(PanelAction::Pin);
     }
-    if kind == MediaKind::Video {
+    if matches!(kind, MediaKind::Video | MediaKind::Gif) {
         v.push(PanelAction::Edit);
     }
     if sync.destination && !sync.synced {
@@ -398,7 +398,7 @@ mod tests {
         assert_eq!(actions_for(MediaKind::Video, NO_SYNC), vec![Copy, Edit, Reveal]);
         let pending = SyncState { destination: true, synced: false };
         assert_eq!(actions_for(MediaKind::Screenshot, pending), vec![Copy, Annotate, Pin, Sync, Reveal]);
-        assert_eq!(actions_for(MediaKind::Gif, pending), vec![Copy, Sync, Reveal]);
+        assert_eq!(actions_for(MediaKind::Gif, pending), vec![Copy, Edit, Sync, Reveal]);
         assert_eq!(actions_for(MediaKind::Video, pending), vec![Copy, Edit, Sync, Reveal]);
         let done = SyncState { destination: true, synced: true };
         assert!(!actions_for(MediaKind::Screenshot, done).contains(&Sync), "already at the destination");

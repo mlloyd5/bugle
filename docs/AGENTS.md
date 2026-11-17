@@ -99,10 +99,10 @@ curl -s -H "$H" -H 'content-type: application/json' \
 | `scroll_capture` | `rect`, `max_frames`, `step_lines`, `settle_ms`, `horizontal`, `output`, `inline_image` | `media`, `stats` |
 | `record_start` | `target`, `format` (mp4/mov/gif), `fps`, `microphone`, `system_audio`, `mix_audio`, `microphone_gain`, `system_audio_gain`, `ducking`, `ducking_amount_db` (levels of the mixed track, or of each separate track without `mix_audio`; defaults from `[recordings]`), `max_seconds`, `highlight_clicks`, `cursor_events` (writes `<file>.events.json`), `hide_cursor` (pointer left out of the frames; implies `cursor_events`), `output`, `label` | status |
 | `record_stop` | – | `media` |
-| `record_status` | – | status |
+| `record_status` | – | status (`audio_levels` while capturing audio, see below) |
 | `transcribe` | `source`, `provider`, `language` | `transcript`, `srt` |
 | `subtitles` | `source`, `format` (srt/vtt), `provider`, `language`, `output` | `path`, `segments`, `text` |
-| `edit_video` | `source`, `start`, `end` (seconds, negative = from the end), `preset` (original/lossless/high/hevc/1080p/720p/540p/gif/gif-small), `fps` (re-encodes video; resamples GIF), `max_size` (GIF long edge), `zoom` (factor above 1, at most 4: zoom in on clicks), `click_zooms` (`[{"t": 4.2, "zoom": 3}]`: one click's level, by its time; overrides `zoom`, 1 leaves the click out), `smooth_cursor` (draw a smoothed pointer; `hide_cursor` recordings), `output`, `label` | `media` (parent = source when it is a history item) |
+| `edit_video` | `source`, `start`, `end` (seconds, negative = from the end), `cuts` (`[{start, end}]` ranges to remove; the rest is joined), `preset` (original/lossless/high/hevc/1080p/720p/540p/gif/gif-small), `fps` (re-encodes video; resamples GIF), `max_size` (GIF long edge), `zoom` (factor above 1, at most 4: zoom in on clicks), `click_zooms` (`[{"t": 4.2, "zoom": 3}]`: one click's level, by its time; overrides `zoom`, 1 leaves the click out), `smooth_cursor` (draw a smoothed pointer; `hide_cursor` recordings), `output`, `label` | `media` (parent = source when it is a history item) |
 | `complete` | `prompt`, `provider`, `system` | `text` |
 | `history` | `limit` | media list |
 | `get_media` | `source`, `inline_image`, `max_edge` | media (+ image) |
@@ -121,6 +121,14 @@ between keyframes keeps up to one keyframe interval (2 s for Bugle's own
 recordings) before the start in the file, hidden by an edit list and
 recoverable. One engine runs at most two edits at a time; a third is refused.
 
+`cuts` removes several ranges in one export: each `{start, end}` is in
+seconds (negative = from the end), cuts may overlap or reach outside
+`start..end`, and the parts left (kept parts under 10 ms are dropped) are
+joined back to back, audio included. `original` copies only when every kept
+part starts on a keyframe. Cuts that leave less than 0.05 s are a 400. A GIF
+frame a cut splits keeps the part shown on each side. A plain edit with cuts
+writes the event track spliced the same way.
+
 `zoom` and `smooth_cursor` read the recording's event track (made by
 `record_start` with `cursor_events` or `hide_cursor`); without one they are a
 400. They re-render every frame (at the recording's frame rate, at least 30
@@ -128,9 +136,23 @@ fps), so `lossless` is refused with them and `original`/`high` encode H.264
 (`hevc`: HEVC); the audio tracks are copied back in untouched. Zoom follows
 clicks inside the recorded area only. `click_zooms` entries must each name one
 of those clicks (the nearest within 0.05 s), else the edit is a 400 that lists
-them; without `zoom` only the named clicks zoom. The track is `<file>.events.json` (the
+them; without `zoom` only the named clicks zoom. `click_zooms` times are on the
+source recording's timeline, even when `cuts` are present. The track is `<file>.events.json` (the
 whole file name, so `clip.mp4` and `clip.mov` each have their own), and an
 effects edit's output has none.
+
+While a recording captures audio with the ScreenCaptureKit recorder (system
+audio and/or the microphone), `record_status` (and the status
+`record_start` returns) carries `audio_levels`:
+`{"microphone": {"peak_db": -18.2, "rms_db": -31.0}, "system_audio": null}`.
+Values are dBFS (0 = full scale), floored at -100 for silence, measured as
+recorded (before `microphone_gain`, `system_audio_gain` and ducking). The peak
+falls at 20 dB/s once the signal drops and the RMS is averaged over 0.3 s, so
+polling a few times a second is enough. A source the recording does not
+capture (a microphone that could not be opened, or one whose sample format
+the meter cannot read) is `null`; the field is
+absent when idle, finishing, recording a GIF, or on the `screencapture`
+recorder, which does not report levels.
 
 `source` accepts a media id (or prefix), `latest`, or a file path.
 Target coordinates are screen points (top-left origin); annotation and OCR

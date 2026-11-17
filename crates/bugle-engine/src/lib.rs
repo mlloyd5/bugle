@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 
 pub use capture::CaptureOutcome;
 pub use cursor_fx::ClickZoom;
-pub use edit::{EditRequest, EditSource, ExportPreset, PreviewFrames};
+pub use edit::{Cut, EditRequest, EditSource, ExportPreset, PreviewFrames};
 pub use record::RecorderState;
 pub use sync::SyncReport;
 

@@ -400,6 +400,10 @@ pub struct EditArgs {
     /// End time, same forms as --start (`-2` drops the last two seconds).
     #[arg(long, short = 'e', allow_hyphen_values = true)]
     pub end: Option<String>,
+    /// Remove a range: `START..END`, same time forms (`--cut 12..15 --cut 1:02..1:05`).
+    /// Repeat for several cuts; the parts left are joined in one export.
+    #[arg(long = "cut", allow_hyphen_values = true, value_name = "START..END")]
+    pub cuts: Vec<String>,
     /// Export preset (see --list-presets). `original` re-encodes a cut that does not
     /// start on a keyframe so nothing before it stays in the file; `lossless` never does.
     #[arg(long, short = 'p', default_value = "original")]
@@ -780,6 +784,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 source: a.source,
                 start: a.start.as_deref().map(bugle_engine::edit::parse_time).transpose()?,
                 end: a.end.as_deref().map(bugle_engine::edit::parse_time).transpose()?,
+                cuts: a.cuts.iter().map(|c| bugle_engine::edit::parse_cut(c)).collect::<Result<_, _>>()?,
                 preset: a.preset.parse()?,
                 fps: a.fps,
                 max_size: a.max_size,

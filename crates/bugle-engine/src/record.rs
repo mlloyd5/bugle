@@ -11,6 +11,7 @@
 use crate::event_log::{EventLog, VideoClock};
 use crate::Engine;
 use anyhow::{anyhow, bail, Context, Result};
+use bugle_core::audio_level::AudioLevels;
 use bugle_core::audio_mix::AudioMixConfig;
 use bugle_core::config::{RecordingBackend, RecordingConfig};
 use bugle_platform::{SckRecordOptions, SckRecorder};
@@ -163,9 +164,19 @@ impl Active {
         }
     }
 
+    /// Live levels of the audio sources while the stream recorder captures
+    /// any; the other recorders do not measure them.
+    fn audio_levels(&self) -> Option<AudioLevels> {
+        match &self.backend {
+            Backend::Sck { rec: Some(rec), .. } => Some(rec.audio_levels()).filter(|l| !l.is_empty()),
+            _ => None,
+        }
+    }
+
     fn status(&mut self) -> RecordingStatus {
         let state = self.poll();
         RecordingStatus {
+            audio_levels: if state == RecordingState::Active { self.audio_levels() } else { None },
             state,
             format: Some(self.format),
             started_at: Some(self.started_at),
@@ -461,7 +472,15 @@ impl Engine {
     pub fn record_status(&self) -> RecordingStatus {
         let mut g = self.recorder_state.inner.lock().unwrap();
         match g.as_mut() {
-            None => RecordingStatus { state: RecordingState::Idle, format: None, started_at: None, elapsed_seconds: 0.0, frames: 0, output: None },
+            None => RecordingStatus {
+                state: RecordingState::Idle,
+                format: None,
+                started_at: None,
+                elapsed_seconds: 0.0,
+                frames: 0,
+                output: None,
+                audio_levels: None,
+            },
             Some(a) => a.status(),
         }
     }

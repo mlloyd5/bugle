@@ -60,7 +60,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `pin_image_blocking`, `pin_image_show` | floating borderless window, drag/resize/close; blocking or fire-and-forget |
 | `toast_show` | non-activating `NSPanel` with `NSVisualEffectView`, thumbnail + two lines, fades out |
 | `editor_open` (`shim/editor.m`) | markup editor windows, several at once, each named by the `EditorId` `editor_open` returns: toolbar with pull-down menus, canvas in an `NSScrollView` (fit, zoom stops, pinch, ⌘+/⌘−/⌘1/⌘0), multi-line label text field, unsaved-changes sheet; reports input in edited-image pixels through a callback and draws the image (told where the edited image's origin lies in it), overlay primitives and menus it is handed |
-| `video_editor_open` (`shim/video_editor.m`) | video editor window: `NSImageView` preview, a timeline view (audio waveform, kept range, in/out handles, playhead, click markers; drags move locally until Rust answers, a click (not a drag) snaps the playhead onto a marker), control bar (play, Set In/Out, zoom, click-zoom and preset pop-ups, smoothing check box, Export); reports input as times in seconds through a callback and shows the frame, control state, markers and waveform it is handed |
+| `video_editor_open` (`shim/video_editor.m`) | video editor window: `NSImageView` preview, a timeline view (audio waveform, kept range, in/out handles, struck-out cuts and the cut being marked, playhead, click markers; drags move locally until Rust answers, a click (not a drag) snaps the playhead onto a marker), control bar (play, Set In/Out, Cut/Restore, zoom, click-zoom and preset pop-ups, smoothing check box, Export); reports input as times in seconds through a callback and shows the frame, control state, markers and waveform it is handed |
 | `panel_show` (`shim/panel.m`) | quick-access panels: non-activating, never-key `NSPanel`s, thumbnail, buttons, close, each named by an id the caller picks; several stack in the corner (newest nearest it) and close up when one goes; `panel_hide_all` / `panel_show_all` take them off screen during a capture; reports clicks through a callback |
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
@@ -70,6 +70,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `export_video`, `video_info`, `video_sync_at`, `VideoFrameReader`, `VideoFrameWriter` | `AVAssetExportSession` with `timeRange`/preset, an `AVMutableVideoComposition` on every re-encode (`frameDuration` + `sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid` for a new frame rate), bounded wait + `cancelExport`; `AVSampleCursor` (stored samples, sync sample at a cut); one reusable `AVAssetImageGenerator` (`maximumSize` for scaled previews); `AVAssetWriter` + pixel-buffer adaptor (H.264 or HEVC) |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
 | `login_item::{in_app_bundle, status, set_enabled}` | `SMAppService.mainAppService` (`shim/login_item.m`, ServiceManagement) |
+| `prompt_text`, `prompt_active`, `prompt_answer` | A non-modal `NSPanel` with a text field and OK/Cancel (`shim/prompt.m`): returns at once and reports the answer through a callback, one prompt at a time (a second open brings the first to the front); the panel maps ⌘A/C/V/X/Z itself (no Edit menu) and hands the focus on like the editors (`bugle_editor_window_closed`) when it closes |
 | `notify::{start, state, refresh, post}` | `UNUserNotificationCenter` (`shim/notify.m`, UserNotifications): delegate (banner while active, click opens the file), `requestAuthorizationWithOptions` or `getNotificationSettings`, `addNotificationRequest` with an optional `UNNotificationAttachment` (a PNG copy it consumes); nothing is called outside an app bundle |
 
 Window shadows: ScreenCaptureKit clips single-window screenshots to the window
@@ -165,7 +166,21 @@ recorder state machine, and exposes one method per user-facing action:
   recording gets both tracks (`audio_pass` decides after the backend, so a
   bad gain does not block a recording without audio). The levels a recording
   starts from are `Engine::recording_levels`: `[recordings]`, or whatever
-  `Engine::set_recording_levels` set since launch. The audio is
+  `Engine::set_recording_levels` set since launch. While the stream recorder
+  runs, each audio buffer (system audio on the stream's queue, the microphone
+  on its capture queue) is also measured before it is written: its peak and
+  mean square update a per-source meter in the shim (peak falling at 20 dB/s,
+  mean square averaged with a 0.3 s time constant; a buffer's samples count
+  for its own duration, so the average decays only over time no buffer
+  covers), read without resetting it, so the menu bar and API callers see the
+  same values. The ballistics (`bugle_level_add`/`bugle_level_at`) are plain C
+  functions that tests drive with explicit times, and a test checks their
+  constants against `bugle_core::audio_level`'s. A source whose buffers the
+  meter cannot read (big-endian, 24-bit packed, unsigned) is reported absent,
+  not silent.
+  `SckRecorder::audio_levels` turns them into `bugle_core::audio_level`
+  (dBFS, floored at -100), and `record_status` reports them as
+  `audio_levels` while the recording is active. The audio is
   re-encoded (a second AAC generation) while video samples and frame times are
   copied. The mix runs during stop, writes a uniquely named hidden copy next to
   the recording (so it needs free space equal to the recording) and replaces the
@@ -202,11 +217,16 @@ recorder state machine, and exposes one method per user-facing action:
   pointer (it draws it without `-C`), so the track then says
   `cursor_in_video`.
 * `edit` (`edit.rs`) — trims a recording (`start`/`end` seconds, negative from
-  the end, measured on the video track) and exports it with a preset. Video →
-  video is one `AVAssetExportSession` over the time range, audio kept.
-  `original` copies samples only when the cut starts on a sync sample (checked
-  with an `AVSampleCursor`); otherwise it re-encodes, because a copied cut
-  between keyframes keeps the frames back to the previous keyframe in the file
+  the end, measured on the video track), removes `cuts` inside that range and
+  exports it with a preset. `resolve_segments` turns range and cuts into the
+  kept parts (sorted, merged, parts under 10 ms dropped, at least 0.05 s in
+  all); every pipeline plays them back to back. Video → video is one
+  `AVAssetExportSession` over the time range, audio kept; several parts are
+  first spliced into an `AVMutableComposition` (video and each enabled audio
+  track, range by range), which is exported whole.
+  `original` copies samples only when every part starts on a sync sample
+  (checked with an `AVSampleCursor`); otherwise it re-encodes, because a
+  copied cut between keyframes keeps the frames back to the previous keyframe in the file
   behind an edit list. `lossless` always copies and says so. Every re-encode
   renders through a video composition, which stores only frames inside the
   range (an export without one also starts at the earlier keyframe) and is how
@@ -215,9 +235,12 @@ recorder state machine, and exposes one method per user-facing action:
   second of output, and an engine runs at most two edits at once. Video → GIF
   decodes frames exactly (zero tolerance, so the cut never bleeds to a keyframe
   outside it) in the middle of each output frame interval, holding the last
-  frame if the track ends early. GIF sources are streamed twice (timeline, then
+  frame if the track ends early. Resampling lays the output frames over the
+  joined parts (`segment_samples`) and maps each back to the source time it
+  shows. GIF sources are streamed twice (timeline, then
   frames) under decoder size/allocation limits, never held whole: GIF → GIF is
-  a frame-exact cut (edge delays shortened) unless a rate is given; GIF → video
+  a frame-exact cut (edge delays shortened; a frame a cut splits is written
+  once per part it shows in) unless a rate is given; GIF → video
   resamples to a constant rate for `AVAssetWriter` (HEVC for `hevc`). GIF delays
   are written in centiseconds with the rounding error carried forward (minimum
   2 cs), and the recorded duration is what was written. The `gif` preset uses
@@ -243,22 +266,28 @@ recorder state machine, and exposes one method per user-facing action:
   scaled with the zoom. Positions map to pixels by the frame size over the
   area size, so any preset works. Video → video renders through
   `SequentialFrameReader` → effects → `VideoFrameWriter` (each output frame
-  shows the source frame on screen at its midpoint) at the requested rate,
-  else the recording's (`fps` in the track), else the nominal rate but at
+  shows the source frame on screen at its midpoint; one reader per kept
+  part) at the requested rate, else the recording's (`fps` in the track), else the nominal rate but at
   least 30 and at most 60 (variable-rate stream recordings of a still screen
   store a few frames a second); `original`/`high` encode H.264, `hevc` HEVC.
   Reader and writer are tagged BT.709 so small frames do not shift colour
   from one generation to the next. Rendering is cancelled on the export
-  deadline, and `mux_audio` copies the source's audio tracks over the same
-  range back in untouched; the GIF pipelines apply the effects to the frames
-  they already decode. A plain edit of a recording with a track writes the
-  trimmed track next to its output; an effects edit removes any stale track
-  of its output's name. A track whose window was resized is refused.
-  `Engine::edit_source` opens a video for the menu-bar app's video editor:
-  its `VideoInfo`, its track, `check` (the edit's own option checks) and
-  `effects` (the `Effects` the edit would build, from the same function),
+  deadline, and `mux_audio_ranges` copies the source's audio tracks over the
+  same parts back in untouched; the GIF pipelines apply the effects to the
+  frames they already decode. Effects are computed on the source timeline, so
+  a cut changes no zoom or pointer frame it keeps. A plain edit of a
+  recording with a track writes the trimmed track (`EventTrack::spliced` over
+  the parts) next to its output; an effects edit removes any stale track of
+  its output's name. A track whose window was resized is refused.
+  `Engine::edit_source` opens a video or GIF for the menu-bar app's video
+  editor: its `VideoInfo` (for a GIF: canvas, mean rate and length from the
+  frame headers, without decoding pixels), its track, `check` (the edit's own range, cut and option
+  checks) and `effects` (the `Effects` the edit would build, from the same function),
   and `PreviewFrames`, an exact-time frame reader that decodes scaled-down
-  frames and applies those effects, so the preview is the export's code.
+  frames and applies those effects, so the preview is the export's code. A
+  GIF's preview frames are decoded once on the preview thread, scaled to the
+  preview box, and looked up by start time; to stay within 256 MB they are
+  scaled down to a 640 px long edge at most, then thinned to every n-th frame.
 * `ocr` (Apple Vision or an AI provider, per request or `[ocr] engine`), `describe` (images or sampled video frames), `transcribe`
   (extracts the audio track first), `subtitles`, `annotate`, `pin`, `select_area`.
 * `sync` (`sync.rs`) — runs after every successful save (`save_image`, so
@@ -359,13 +388,29 @@ the overlay calls back. The agent API can be started from the menu on a tokio
 runtime thread (`http::serve_with_shutdown`) and shares the same `Engine`, so API
 callers get the in-app overlay too. Feedback is a transient toast (`toast_show`)
 plus the shutter sound; the status item title shows `● m:ss` while recording.
+With audio levels in the record status, `level_meter.rs` appends one block
+glyph per source to that title and inserts a disabled line per source under
+*Stop Recording* (bar, `!` near full scale, peak dB padded with figure spaces
+so the line keeps its width); while a recording reports levels, the event loop
+wakes every 100 ms instead of every second to redraw them, and the title and
+recording entries are set only when they change.
 When the process runs from `Bugle.app`, an *Open at Login* check item
 (`login.rs`) registers the bundle with `SMAppService`. Its check mark is
 re-read on the periodic tick (every 5 s) and set only for an enabled item; a
 pending approval is shown in the title, and clicking it then opens System
 Settings → Login Items. The *Audio Levels* submenu (`audio_menu.rs`) offers
-level presets for the microphone and system audio and a ducking toggle; a
-click applies to the next recordings, from the menu, hotkeys or the in-app
+level presets for the microphone and system audio, a ducking toggle and
+ducking-amount presets in dB, each list ending in *Custom…*, which asks for a
+free-form value in a prompt (`bugle_platform::prompt_text`, a small panel
+with a text field in `shim/prompt.m`; percent 0 to 800 or dB 0 to 60, kept
+to one decimal, anything else refused with a toast); a value that is not a
+preset checks *Custom (value)…*. The prompt is not modal: `on_menu` opens it
+and returns, and the answer arrives later as an `AppEvent::AudioPrompt`, so
+hotkeys (Stop Recording too), menu clicks and worker results go on while it
+is open; clicking *Custom…* again brings the open prompt to the front.
+`--smoke-test` clicks the microphone's *Custom…* twice, checks one prompt
+opened, cancels it (nothing is saved) and checks Bugle let go of the focus. A
+change applies to the next recordings, from the menu, hotkeys or the in-app
 API alike (`Engine::set_recording_levels`), and is written back to
 `[recordings]` with `toml_edit`, replacing only that key so the rest of the
 file and its comments stay put (through a temp file and a rename, following
@@ -509,15 +554,18 @@ drives it through `editor_inject` and `editor_zoom`.
 The video editor follows the same split. `video_editor.rs` is the
 platform-free part: `VideoEditor::handle` turns the window's events into the
 in and out points (a minimum clip apart; a mark that passes the other end
-resets it), the playhead, the zoom, the zoom of the click at the playhead
+resets it), the cuts (*Cut* marks a start at the playhead and the next *Cut*
+ends it there; touching cuts merge; *Restore* removes the one under the
+playhead), the playhead, the zoom, the zoom of the click at the playhead
 (the last whose ease-in has begun, until its zoom is over; the request
 carries only the clicks that differ from the zoom menu), smoothing and
-preset choices, and answers
+preset choices (a GIF's menu has no lossless preset), and answers
 with `Effects` (refresh the controls, a frame to show, an `EditRequest` to
 export). Playback is a chain of frame requests: each shown frame asks for the
 next at the time real time has reached, at most `PLAY_FPS` a second, due at
-its wall-clock time, and the out point stops it. `video_editor_window.rs` is
-the glue: it opens `Engine::edit_source`, decodes frames on a per-window
+its wall-clock time; a frame due inside a cut jumps to the cut's end and
+restarts the real-time clock there, and the out point stops it.
+`video_editor_window.rs` is the glue: it opens `Engine::edit_source`, decodes frames on a per-window
 preview thread (only the newest waiting job; a job due later waits unless a
 newer one replaces it; effects rebuilt only when the options change) and
 sends each result back by sequence number, so a stale frame is dropped.
@@ -531,8 +579,8 @@ press of a double-click can be chosen too.
 Export checks the request with `EditSource::check`, then runs
 `Engine::edit` on a thread with the window's controls disabled; success
 closes the window and shows the quick-access panel for the new file, and a
-failure re-enables it. The panel's **Edit** button (videos) and *Edit Latest
-Recording* (`edit_latest`) open it; `--smoke-test` writes a synthetic
+failure re-enables it. The panel's **Edit** button (videos and GIFs) and
+*Edit Latest Recording* (`edit_latest`) open it; `--smoke-test` writes a synthetic
 recording with an event track and drives it through `video_editor_inject`.
 
 ## Feature ideas
@@ -540,10 +588,4 @@ recording with an event track and drives it through `video_editor_inject`.
 Bugle is a standalone app; this is the backlog, roughly in the order it would
 earn its keep.
 
-* **Video editor extras** — opening GIFs in the video editor (the headless
-  `edit` trims them) and several cuts in one export.
-* **Audio mixing extras** — per-source levels and ducking work on the mixed
-  track and on the separate tracks, and are set from the menu-bar app; still
-  open: free-form levels and the ducking amount in the app (it offers presets
-  and an on/off toggle), and a live level meter while recording.
 * **Packaging extras** — the final bundle id.

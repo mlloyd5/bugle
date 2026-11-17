@@ -172,7 +172,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "record_status",
-            description: "Report whether a recording is running, for how long, and how many frames were captured.",
+            description: "Report whether a recording is running, for how long, and how many frames were captured. While a recording captures audio (system audio or microphone on the ScreenCaptureKit recorder), audio_levels gives each source's current peak_db and rms_db (dBFS, -100 = silence, before gain/ducking; null for a source not recorded).",
             input_schema: json!({"type":"object","properties":{}}),
         },
         ToolSpec {
@@ -203,13 +203,14 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_video",
-            description: "Trim a recording (video or GIF) and export it with a preset: original (same format; copied when the cut starts on a keyframe, otherwise re-encoded so nothing before the cut stays in the file), lossless (always copied; may keep up to one keyframe interval before the cut in the file, hidden), high, hevc, 1080p, 720p, 540p, gif, gif-small. Times are seconds; negative counts from the end. Saves a new media item (parent = the source when it is a history item). Recordings made with cursor_events (or hide_cursor) can be auto-zoomed on clicks (zoom, or a level per click with click_zooms) and, with hide_cursor, get a smoothed pointer drawn in (smooth_cursor).",
+            description: "Trim a recording (video or GIF) and export it with a preset: original (same format; copied when the cut starts on a keyframe, otherwise re-encoded so nothing before the cut stays in the file), lossless (always copied; may keep up to one keyframe interval before the cut in the file, hidden), high, hevc, 1080p, 720p, 540p, gif, gif-small. Times are seconds; negative counts from the end. cuts removes several ranges in one export (the parts left are joined). Saves a new media item (parent = the source when it is a history item). Recordings made with cursor_events (or hide_cursor) can be auto-zoomed on clicks (zoom, or a level per click with click_zooms) and, with hide_cursor, get a smoothed pointer drawn in (smooth_cursor).",
             input_schema: json!({
                 "type":"object",
                 "properties":{
                     "source":{"type":"string","default":"latest"},
                     "start":{"type":"number","description":"seconds; negative = from the end"},
                     "end":{"type":"number","description":"seconds; negative = from the end (-2 drops the last two seconds)"},
+                    "cuts":{"type":"array","description":"ranges to remove inside start..end; the parts left are joined back to back (may overlap; must leave at least 0.05 s)","items":{"type":"object","properties":{"start":{"type":"number","description":"seconds; negative = from the end"},"end":{"type":"number","description":"seconds; negative = from the end"}},"required":["start","end"]}},
                     "preset":{"type":"string","enum":bugle_engine::ExportPreset::ALL.iter().map(|p| p.name()).collect::<Vec<_>>(),"default":"original"},
                     "fps":{"type":"integer","description":"output frame rate: re-encodes a video (not with lossless), resamples a GIF"},
                     "max_size":{"type":"integer","description":"long edge of GIF output in pixels"},
@@ -525,6 +526,13 @@ pub(crate) mod tests {
         assert_eq!(out.json["media"]["parent"], json!(id));
         let err = run(&engine, "edit_video", json!({"source": src, "preset": "lossless"})).await.err().unwrap();
         assert_eq!(status_for(&err), 400);
+        // Several cuts in one export; cutting everything is a 400.
+        let out = run(&engine, "edit_video", json!({"source": src, "cuts": [{"start": 0.1, "end": 0.2}, {"start": -0.1, "end": 0.4}]})).await.unwrap();
+        assert_eq!(out.json["media"]["duration_seconds"], 0.2);
+        let err = run(&engine, "edit_video", json!({"source": src, "cuts": [{"start": 0, "end": 0.4}]})).await.err().unwrap();
+        assert_eq!(status_for(&err), 400);
+        let err = run(&engine, "edit_video", json!({"source": src, "cuts": [{"start": 0.1}]})).await.err().unwrap();
+        assert_eq!(status_for(&err), 400, "a cut needs both ends");
 
         // zoom needs the recording's event track: a 400 without one.
         let err = run(&engine, "edit_video", json!({"source": src, "zoom": 2})).await.err().unwrap();
@@ -551,6 +559,7 @@ pub(crate) mod tests {
         let names = spec.input_schema["properties"]["preset"]["enum"].as_array().unwrap().len();
         assert_eq!(names, bugle_engine::ExportPreset::ALL.len());
         assert!(spec.description.contains("lossless"));
+        assert_eq!(spec.input_schema["properties"]["cuts"]["items"]["required"], json!(["start", "end"]));
         // A bad preset is a 400, not a 500.
         let err = serde_json::from_value::<bugle_engine::EditRequest>(json!({"preset":"4k"})).map_err(anyhow::Error::from).unwrap_err();
         assert_eq!(status_for(&err), 400);

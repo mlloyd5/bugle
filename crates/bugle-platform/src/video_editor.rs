@@ -1,8 +1,9 @@
 //! Video editor window (`shim/video_editor.m`): a frame preview above a
 //! timeline (the recording's audio waveform, the kept range between the in
-//! and out handles, the playhead, a marker under each click auto-zoom
-//! follows) and a control bar (play/pause, Set In / Set Out, zoom, the zoom
-//! of the click at the playhead and pointer options, export preset, Export).
+//! and out handles, the cuts, the playhead, a marker under each click
+//! auto-zoom follows) and a control bar (play/pause, Set In / Set Out,
+//! Cut / Restore, zoom, the zoom of the click at the playhead and pointer
+//! options, export preset, Export).
 //!
 //! Like the markup editor window it is a view and nothing more: it reports
 //! input as [`VideoEditorEvent`]s, times in seconds on the video's
@@ -47,6 +48,10 @@ extern "C" {
         playhead: f64,
         in_point: f64,
         out_point: f64,
+        cuts: *const f64,
+        n_cuts: i32,
+        cut_mark: f64,
+        can_uncut: i32,
         playing: i32,
         zoom: i32,
         smooth: i32,
@@ -86,10 +91,15 @@ pub enum VideoEditorCommand {
     GoIn = 7,
     /// ↓ or End: to the out point.
     GoOut = 8,
+    /// Cut or C: start a cut at the playhead, or end the one started.
+    Cut = 9,
+    /// Restore or Delete: drop the cut being marked, else restore the cut
+    /// under the playhead.
+    Uncut = 10,
 }
 
 impl VideoEditorCommand {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 11] = [
         Self::PlayPause,
         Self::MarkIn,
         Self::MarkOut,
@@ -99,6 +109,8 @@ impl VideoEditorCommand {
         Self::Escape,
         Self::GoIn,
         Self::GoOut,
+        Self::Cut,
+        Self::Uncut,
     ];
 
     fn from_raw(arg: i32) -> Option<Self> {
@@ -165,6 +177,13 @@ pub struct VideoEditorState {
     pub playhead: f64,
     pub in_point: f64,
     pub out_point: f64,
+    /// Removed ranges, drawn struck out on the timeline.
+    pub cuts: Vec<(f64, f64)>,
+    /// Where a cut being marked starts (it runs to the playhead).
+    pub cut_mark: Option<f64>,
+    /// *Restore* has something to do (a cut being marked, or a cut under
+    /// the playhead).
+    pub can_uncut: bool,
     pub playing: bool,
     /// Selected zoom choice and preset, by index.
     pub zoom: usize,
@@ -277,6 +296,7 @@ pub fn video_editor_set_frame(img: &RgbaImage) {
 pub fn video_editor_set_state(s: &VideoEditorState) {
     let i = |v: usize| i32::try_from(v).unwrap_or(-1);
     let text = CString::new(s.time_text.replace('\0', "")).unwrap_or_default();
+    let cuts: Vec<f64> = s.cuts.iter().flat_map(|&(a, b)| [a, b]).collect();
     let times: Vec<f64> = s.clicks.iter().map(|c| c.t).collect();
     let levels: Vec<f64> = s.clicks.iter().map(|c| c.level).collect();
     let selected = s.clicks.iter().position(|c| c.selected).map_or(-1, i);
@@ -285,6 +305,10 @@ pub fn video_editor_set_state(s: &VideoEditorState) {
             s.playhead,
             s.in_point,
             s.out_point,
+            cuts.as_ptr(),
+            i(s.cuts.len()),
+            s.cut_mark.unwrap_or(f64::NAN),
+            s.can_uncut as i32,
             s.playing as i32,
             i(s.zoom),
             s.smooth as i32,

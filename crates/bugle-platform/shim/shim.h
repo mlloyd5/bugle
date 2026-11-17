@@ -158,10 +158,18 @@ int32_t bugle_video_track_count(const char *path);
 // success.
 char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double seconds, double amplitude, int32_t overlap,
                                 double delay, int32_t video);
+// Builds an audio sample buffer of `frames` frames at `rate` Hz from
+// `samples` (channel-major floats, `channels` blocks of `frames`), interleaved
+// or not, in `format` (0 float32, 1 int16, 2 float64, 3 int32, 4 big-endian
+// int16), and measures it with bugle_audio_buffer_stats. 0 on success with the
+// peak, RMS and duration in seconds in `out[3]`; -1 when it cannot be measured.
+int32_t bugle_fixture_audio_level(int32_t format, int32_t channels, int32_t interleaved, const float *samples,
+                                  int32_t frames, double rate, double *out);
 double bugle_media_duration(const char *path);
 bugle_image_t bugle_video_frame(const char *path, double seconds);
 
-// Editing. `bugle_export_video` exports [start, end) seconds of a movie with an
+// Editing. `bugle_export_video` exports `n_ranges` [start, end) ranges of a
+// movie (pairs of seconds, in order; several are spliced back to back) with an
 // AVAssetExportSession preset (0 passthrough, 1 highest quality H.264, 2 HEVC,
 // 3 1920x1080, 4 1280x720, 5 960x540) to .mp4 (`mp4` != 0) or .mov; `fps` > 0
 // resamples through a video composition (refused with passthrough). Waits at
@@ -177,7 +185,7 @@ typedef struct {
 } bugle_video_info_t;
 int32_t bugle_video_info(const char *path, bugle_video_info_t *out);
 int32_t bugle_video_sync_at(const char *path, double seconds);   // 1 when a cut there needs no re-encode
-int32_t bugle_export_video(const char *in_path, const char *out_path, double start, double end, int32_t preset,
+int32_t bugle_export_video(const char *in_path, const char *out_path, const double *ranges, int32_t n_ranges, int32_t preset,
                            int32_t mp4, int32_t fps, double timeout);
 void *bugle_frames_open(const char *path, double tolerance);
 bugle_image_t bugle_frames_at(void *handle, double seconds);
@@ -193,10 +201,11 @@ void bugle_writer_cancel(void *handle);      // discards the file and releases t
 void *bugle_seq_open(const char *path, double start, double end);
 bugle_image_t bugle_seq_next(void *handle, double *pts);
 void bugle_seq_close(void *handle);
-// Video track of `video_path` + audio of `audio_path` over [start, end),
-// copied into one movie. 0 ok, 1 nothing written (no audio there), -1 error.
-int32_t bugle_mux_audio(const char *video_path, const char *audio_path, double start, double end, const char *out_path,
-                        int32_t mp4, double timeout);
+// Video track of `video_path` + audio of `audio_path` over `n_ranges`
+// [start, end) ranges (pairs of seconds, spliced back to back), copied into
+// one movie. 0 ok, 1 nothing written (no audio there), -1 error.
+int32_t bugle_mux_audio(const char *video_path, const char *audio_path, const double *ranges, int32_t n_ranges,
+                        const char *out_path, int32_t mp4, double timeout);
 void bugle_play_sound(const char *name);
 void bugle_open_path(const char *path);
 
@@ -210,6 +219,31 @@ void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t wi
                              int32_t system_audio, int32_t microphone, int32_t show_cursor, int32_t show_clicks,
                              double max_seconds, const char *out_path);
 int64_t bugle_sck_record_frames(void *handle);
+// Current levels, linear (1.0 = full scale): out[4] = system peak, system RMS,
+// microphone peak, microphone RMS. Returns which sources are recorded:
+// 1 = system audio, 2 = microphone.
+int32_t bugle_sck_record_levels(void *handle, float *out);
+// One source's meter state (shim.m, "Live level"). Linear magnitudes, host
+// seconds. Exposed so tests can drive the ballistics with explicit times.
+typedef struct {
+    int32_t seen;          // a buffer has been measured
+    int32_t unreadable;    // the last buffer was in a format the meter cannot read
+    double updated;        // when the last buffer arrived
+    double covers;         // seconds of audio the last buffer still stands for
+    double peak;           // held peak, 1.0 = full scale
+    double mean_square;    // averaged mean square
+} bugle_level_t;
+// Adds a buffer's peak and mean square, `seconds` long, arriving at `now`.
+void bugle_level_add(bugle_level_t *level, double now, double peak, double mean_square, double seconds);
+// `level` as read at `now` (decayed; `level` is unchanged).
+bugle_level_t bugle_level_at(const bugle_level_t *level, double now);
+// out[2] = peak fall (dB/s), RMS time constant (s).
+void bugle_level_constants(double *out);
+// Peak magnitude, sum of squares, sample count and duration of a linear-PCM
+// CMSampleBufferRef (float32/float64/int16/int32, interleaved or not), as the
+// recorder's level meter measures it. 1 on success, 0 for other formats.
+int32_t bugle_audio_buffer_stats(const void *sample_buffer, double *peak, double *sum_squares, size_t *count,
+                                 double *seconds);
 // Host-clock time (seconds) of the movie's time 0; NaN before it starts.
 double bugle_sck_record_session_start(void *handle);
 char *bugle_sck_record_warnings(void *handle);   // malloc'd, NULL when none

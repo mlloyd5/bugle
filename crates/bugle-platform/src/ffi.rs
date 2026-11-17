@@ -16,6 +16,20 @@ pub type bugle_mix_fn =
         frames: i32,
     ) -> i32;
 
+/// See `bugle_level_t` in `shim.h`. Only the tests drive the meter
+/// ballistics from Rust; the recorder keeps its state in the shim.
+#[cfg(test)]
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct bugle_level_t {
+    pub seen: i32,
+    pub unreadable: i32,
+    pub updated: f64,
+    pub covers: f64,
+    pub peak: f64,
+    pub mean_square: f64,
+}
+
 #[repr(C)]
 #[derive(Default)]
 pub struct bugle_video_info_t {
@@ -171,6 +185,15 @@ extern "C" {
         delay: f64,
         video: i32,
     ) -> *mut c_char;
+    pub fn bugle_fixture_audio_level(
+        format: i32,
+        channels: i32,
+        interleaved: i32,
+        samples: *const f32,
+        frames: i32,
+        rate: f64,
+        out: *mut f64,
+    ) -> i32;
     pub fn bugle_media_duration(path: *const c_char) -> f64;
     pub fn bugle_video_frame(path: *const c_char, seconds: f64) -> bugle_image_t;
     pub fn bugle_video_info(path: *const c_char, out: *mut bugle_video_info_t) -> i32;
@@ -178,8 +201,8 @@ extern "C" {
     pub fn bugle_export_video(
         in_path: *const c_char,
         out_path: *const c_char,
-        start: f64,
-        end: f64,
+        ranges: *const f64,
+        n_ranges: i32,
         preset: i32,
         mp4: i32,
         fps: i32,
@@ -199,8 +222,8 @@ extern "C" {
     pub fn bugle_mux_audio(
         video_path: *const c_char,
         audio_path: *const c_char,
-        start: f64,
-        end: f64,
+        ranges: *const f64,
+        n_ranges: i32,
         out_path: *const c_char,
         mp4: i32,
         timeout: f64,
@@ -225,7 +248,16 @@ extern "C" {
         out_path: *const c_char,
     ) -> *mut c_void;
     pub fn bugle_sck_record_frames(handle: *mut c_void) -> i64;
+    pub fn bugle_sck_record_levels(handle: *mut c_void, out: *mut f32) -> i32;
     pub fn bugle_sck_record_session_start(handle: *mut c_void) -> f64;
     pub fn bugle_sck_record_warnings(handle: *mut c_void) -> *mut c_char;
     pub fn bugle_sck_record_stop(handle: *mut c_void) -> i32;
+}
+
+// The level meter's ballistics, for tests (see `bugle_level_t`).
+#[cfg(test)]
+extern "C" {
+    pub fn bugle_level_add(level: *mut bugle_level_t, now: f64, peak: f64, mean_square: f64, seconds: f64);
+    pub fn bugle_level_at(level: *const bugle_level_t, now: f64) -> bugle_level_t;
+    pub fn bugle_level_constants(out: *mut f64);
 }

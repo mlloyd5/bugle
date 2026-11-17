@@ -1,6 +1,7 @@
-//! Video editor logic: the in and out points, the playhead and playback,
-//! the zoom (for all clicks and for single ones), pointer and preset
-//! choices, and the [`EditRequest`] they make.
+//! Video editor logic: the in and out points, the cuts, the playhead and
+//! playback, the zoom (for all clicks and for single ones), pointer and
+//! preset choices, and the [`EditRequest`] they make. The recording is a
+//! video or a GIF.
 //!
 //! Nothing here touches AppKit or decodes a frame; `video_editor_window.rs`
 //! is the glue. [`VideoEditor::handle`] turns the window's events into
@@ -11,7 +12,7 @@
 
 use bugle_engine::cursor_fx::{ZOOM_HOLD, ZOOM_IN, ZOOM_OUT};
 use bugle_engine::edit::MIN_CLIP_SECONDS;
-use bugle_engine::{ClickZoom, EditRequest, ExportPreset};
+use bugle_engine::{ClickZoom, Cut, EditRequest, ExportPreset};
 use bugle_platform::{ClickMarker, VideoEditorCommand, VideoEditorEvent, VideoEditorState};
 use std::time::{Duration, Instant};
 
@@ -35,8 +36,17 @@ pub fn waveform_levels(peaks: &[f32]) -> Vec<f32> {
     peaks.iter().map(|v| if v.is_finite() { (v * k).clamp(0.0, 1.0) } else { 0.0 }).collect()
 }
 
-/// The preset menu, in [`ExportPreset::ALL`] order.
+/// The preset menu for a video, in [`ExportPreset::ALL`] order.
 pub const PRESETS: [ExportPreset; 9] = ExportPreset::ALL;
+
+/// The preset menu for a recording: a GIF has no lossless copy (its cuts
+/// are always exact).
+pub fn presets_for(gif: bool) -> Vec<ExportPreset> {
+    PRESETS.into_iter().filter(|p| !(gif && *p == ExportPreset::Lossless)).collect()
+}
+
+/// Shortest cut the editor makes, in seconds (a shorter one is a slip).
+pub const MIN_CUT_SECONDS: f64 = 0.02;
 
 /// Frames per second the preview plays at, at most (fewer when decoding
 /// cannot keep up: playback stays in real time and skips frames).
@@ -57,13 +67,15 @@ pub fn preset_label(p: ExportPreset) -> &'static str {
     }
 }
 
-/// What the recording's event track allows.
+/// What the recording allows: its event track, and its format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Caps {
     /// Zoom on clicks (there is a usable event track).
     pub zoom: bool,
     /// Smooth the pointer (and the frames lack it: `hide_cursor`).
     pub smooth: bool,
+    /// The recording is a GIF (no lossless preset).
+    pub gif: bool,
 }
 
 /// A frame to show: the one at `t`, on screen no earlier than `at`.
@@ -106,8 +118,13 @@ pub struct VideoEditor {
     playhead: f64,
     in_t: f64,
     out_t: f64,
+    /// Ranges removed from the clip: sorted, apart from each other.
+    cuts: Vec<(f64, f64)>,
+    /// Where a cut being marked starts (the playhead ends it).
+    cut_mark: Option<f64>,
     zoom: usize,
     smooth: bool,
+    presets: Vec<ExportPreset>,
     preset: usize,
     playing: Option<Play>,
     busy: bool,
@@ -132,8 +149,11 @@ impl VideoEditor {
             playhead: 0.0,
             in_t: 0.0,
             out_t: duration,
+            cuts: Vec::new(),
+            cut_mark: None,
             zoom: 0,
             smooth: caps.smooth,
+            presets: presets_for(caps.gif),
             preset: 0,
             playing: None,
             busy: false,
@@ -153,6 +173,16 @@ impl VideoEditor {
     #[cfg(test)]
     fn range(&self) -> (f64, f64) {
         (self.in_t, self.out_t)
+    }
+
+    #[cfg(test)]
+    fn cuts(&self) -> &[(f64, f64)] {
+        &self.cuts
+    }
+
+    /// The preset menu, in order.
+    pub fn presets(&self) -> &[ExportPreset] {
+        &self.presets
     }
 
     /// Whether an export is running.
@@ -243,6 +273,59 @@ impl VideoEditor {
         }
     }
 
+    /// Start a cut at the playhead, or end the one started: the range
+    /// between the mark and the playhead (either way round) is removed,
+    /// merged with any cut it touches.
+    fn mark_cut(&mut self) {
+        let Some(mark) = self.cut_mark.take() else {
+            self.cut_mark = Some(self.playhead);
+            return;
+        };
+        let (mut a, mut b) = (mark.min(self.playhead), mark.max(self.playhead));
+        if b - a < MIN_CUT_SECONDS {
+            return;
+        }
+        self.cuts.retain(|&(x, y)| {
+            let touches = x <= b && y >= a;
+            if touches {
+                a = a.min(x);
+                b = b.max(y);
+            }
+            !touches
+        });
+        let at = self.cuts.partition_point(|c| c.0 < a);
+        self.cuts.insert(at, (a, b));
+    }
+
+    /// The cut the playhead is in (ends included).
+    fn cut_at(&self, t: f64) -> Option<usize> {
+        self.cuts.iter().position(|&(a, b)| a <= t && t <= b)
+    }
+
+    /// Drop the cut being marked, else restore the cut under the playhead.
+    fn uncut(&mut self) {
+        if self.cut_mark.take().is_none() {
+            if let Some(i) = self.cut_at(self.playhead) {
+                self.cuts.remove(i);
+            }
+        }
+    }
+
+    /// Where playback continues from `t`: past the end of a cut it is in.
+    fn skip_cuts(&self, t: f64) -> f64 {
+        self.cuts.iter().find(|&&(a, b)| a <= t && t < b).map_or(t, |c| c.1)
+    }
+
+    /// The cuts inside the clip, clipped to it.
+    fn cuts_in_clip(&self) -> impl Iterator<Item = (f64, f64)> + '_ {
+        self.cuts.iter().map(|&(a, b)| (a.max(self.in_t), b.min(self.out_t))).filter(|(a, b)| b > a)
+    }
+
+    /// Length of the exported clip: in to out, less the cuts.
+    fn kept(&self) -> f64 {
+        (self.out_t - self.in_t) - self.cuts_in_clip().map(|(a, b)| b - a).sum::<f64>()
+    }
+
     pub fn handle(&mut self, event: VideoEditorEvent, now: Instant) -> Effects {
         if self.busy {
             return Effects::default();
@@ -267,10 +350,19 @@ impl VideoEditor {
                 }
                 VideoEditorCommand::PlayPause => {
                     // From the in point when the playhead is outside the
-                    // clip or at its end.
-                    if self.playhead < self.in_t || self.playhead >= self.out_t - self.step / 2.0 {
-                        self.playhead = self.in_t;
+                    // clip or at its end; never inside a cut.
+                    let start = if self.playhead < self.in_t || self.playhead >= self.out_t - self.step / 2.0 {
+                        self.in_t
+                    } else {
+                        self.playhead
+                    };
+                    let from = self.skip_cuts(start);
+                    if from >= self.out_t - self.step / 2.0 {
+                        // The rest of the clip is cut: nothing to play, and
+                        // the playhead stays with the frame on show.
+                        return Effects::default();
                     }
+                    self.playhead = from;
                     self.playing = Some(Play { origin_t: self.playhead, origin_at: now });
                     Effects { state: true, frame: Some(self.frame_now(now)), export: None }
                 }
@@ -280,6 +372,14 @@ impl VideoEditor {
                 }
                 VideoEditorCommand::MarkOut => {
                     self.mark_out(self.playhead);
+                    state
+                }
+                VideoEditorCommand::Cut => {
+                    self.mark_cut();
+                    state
+                }
+                VideoEditorCommand::Uncut => {
+                    self.uncut();
                     state
                 }
                 VideoEditorCommand::Export => {
@@ -292,6 +392,10 @@ impl VideoEditor {
                 VideoEditorCommand::GoOut => self.seek(self.out_t, now),
                 VideoEditorCommand::Escape if self.playing.is_some() => {
                     self.playing = None;
+                    state
+                }
+                VideoEditorCommand::Escape if self.cut_mark.is_some() => {
+                    self.cut_mark = None;
                     state
                 }
                 VideoEditorCommand::Escape => Effects::default(),
@@ -322,7 +426,7 @@ impl VideoEditor {
                 }
                 self.rerender(now)
             }
-            VideoEditorEvent::Preset(i) if i < PRESETS.len() => {
+                        VideoEditorEvent::Preset(i) if i < self.presets.len() => {
                 self.preset = i;
                 if self.lossless() && (self.zoom != 0 || self.smooth || self.click_zoom.iter().any(|c| *c != 0)) {
                     self.zoom = 0;
@@ -338,7 +442,7 @@ impl VideoEditor {
     }
 
     fn lossless(&self) -> bool {
-        PRESETS.get(self.preset) == Some(&ExportPreset::Lossless)
+        self.presets.get(self.preset) == Some(&ExportPreset::Lossless)
     }
 
     fn leave_lossless(&mut self) {
@@ -355,11 +459,19 @@ impl VideoEditor {
 
     /// A frame asked for at `t` is on screen at `now`. During playback,
     /// the next one: where real time has got to, but at most [`PLAY_FPS`]
-    /// frames a second; at the out point playback stops on its last frame.
+    /// frames a second; a cut is jumped over (real time starts again at
+    /// its end, as the export plays it); at the out point playback stops on
+    /// its last frame.
     pub fn shown(&mut self, t: f64, now: Instant) -> Option<FrameRequest> {
-        let play = self.playing?;
+        let mut play = self.playing?;
         let real = play.origin_t + now.saturating_duration_since(play.origin_at).as_secs_f64();
-        let next = real.max(t + 1.0 / PLAY_FPS);
+        let mut next = real.max(t + 1.0 / PLAY_FPS);
+        let skipped = self.skip_cuts(next);
+        if skipped != next {
+            next = skipped;
+            play = Play { origin_t: next, origin_at: now };
+            self.playing = Some(play);
+        }
         if next >= self.out_t {
             self.playing = None;
             self.playhead = self.out_t;
@@ -370,14 +482,16 @@ impl VideoEditor {
         Some(FrameRequest { t: self.frame_time(next), at })
     }
 
-    /// The export as an edit request: only the trimmed ends are given.
+    /// The export as an edit request: only the trimmed ends are given, and
+    /// the cuts inside the clip.
     pub fn request(&self) -> EditRequest {
         let (zoom, smooth) = self.options();
         EditRequest {
             source: self.source.clone(),
             start: (self.in_t > 1e-3).then_some(self.in_t),
             end: (self.out_t < self.duration - 1e-3).then_some(self.out_t),
-            preset: PRESETS.get(self.preset).copied().unwrap_or_default(),
+            cuts: self.cuts_in_clip().map(|(start, end)| Cut { start, end }).collect(),
+            preset: self.presets.get(self.preset).copied().unwrap_or_default(),
             zoom,
             click_zooms: self.click_zooms(),
             smooth_cursor: smooth,
@@ -390,6 +504,9 @@ impl VideoEditor {
             playhead: self.playhead,
             in_point: self.in_t,
             out_point: self.out_t,
+            cuts: self.cuts.clone(),
+            cut_mark: self.cut_mark,
+            can_uncut: self.cut_mark.is_some() || self.cut_at(self.playhead).is_some(),
             playing: self.playing.is_some(),
             zoom: self.zoom,
             preset: self.preset,
@@ -402,7 +519,7 @@ impl VideoEditor {
                 .map(|i| ClickMarker { t: self.clicks[i], level: self.click_level(i), selected: Some(i) == self.selected_click() })
                 .collect(),
             // The range itself is on the timeline; its length goes here.
-            time_text: format!("{} / {} · clip {}", clock(self.playhead), clock(self.duration), clock(self.out_t - self.in_t)),
+            time_text: format!("{} / {} · clip {}", clock(self.playhead), clock(self.duration), clock(self.kept())),
         }
     }
 }
@@ -424,7 +541,7 @@ mod tests {
     use VideoEditorCommand as C;
     use VideoEditorEvent as E;
 
-    const ALL: Caps = Caps { zoom: true, smooth: true };
+    const ALL: Caps = Caps { zoom: true, smooth: true, gif: false };
 
     fn editor(caps: Caps) -> VideoEditor {
         VideoEditor::new("abc123", 10.0, 25.0, caps, vec![2.0, 3.0, 8.0])
@@ -445,6 +562,7 @@ mod tests {
         assert_eq!(r.source, "abc123");
         assert_eq!((r.start, r.end, r.zoom, r.smooth_cursor), (None, None, None, false));
         assert!(r.click_zooms.is_empty());
+        assert!(r.cuts.is_empty());
         assert_eq!(r.preset, ExportPreset::Original);
         assert!(!r.uses_events(), "a plain trim keeps the frames");
     }
@@ -559,7 +677,7 @@ mod tests {
         assert_eq!(plain.options(), (None, false), "no track: nothing to apply");
         assert!(!plain.state().can_zoom && !plain.state().can_smooth);
 
-        let pointer_in_video = Caps { zoom: true, smooth: false };
+        let pointer_in_video = Caps { zoom: true, smooth: false, gif: false };
         let mut e = editor(pointer_in_video);
         assert_eq!(e.options(), (None, false), "smoothing starts off");
         let fx = e.handle(E::Zoom(2), now);
@@ -607,7 +725,7 @@ mod tests {
     fn each_click_gets_its_own_zoom() {
         let now = Instant::now();
         let c = |name: &str| CLICK_ZOOMS.iter().position(|z| z.0 == name).unwrap();
-        let mut e = editor(Caps { zoom: true, smooth: false });
+        let mut e = editor(Caps { zoom: true, smooth: false, gif: false });
         // Clicks at 2, 3 and 8 s. Before the first one eases in: none.
         assert_eq!(e.state().click_zoom, None);
         e.handle(E::ClickZoom(c("2×")), now);
@@ -659,13 +777,13 @@ mod tests {
         let c = |name: &str| CLICK_ZOOMS.iter().position(|z| z.0 == name).unwrap();
         let selected = |e: &VideoEditor| e.state().clicks.iter().position(|m| m.selected);
         // The fixture's clicks, each from its own marker.
-        let mut e = editor(Caps { zoom: true, smooth: false });
+        let mut e = editor(Caps { zoom: true, smooth: false, gif: false });
         for (i, t) in [2.0, 3.0, 8.0].into_iter().enumerate() {
             e.handle(E::Seek(t), now);
             assert_eq!(selected(&e), Some(i), "playhead on {t}");
         }
         // A double-click: the second press is within the first's ease-in.
-        let mut e = VideoEditor::new("x", 10.0, 25.0, Caps { zoom: true, smooth: false }, vec![2.0, 2.3]);
+        let mut e = VideoEditor::new("x", 10.0, 25.0, Caps { zoom: true, smooth: false, gif: false }, vec![2.0, 2.3]);
         e.handle(E::Seek(2.0), now);
         assert_eq!(selected(&e), Some(0));
         e.handle(E::ClickZoom(c("2×")), now);
@@ -696,11 +814,108 @@ mod tests {
         e.handle(E::Command(C::PlayPause), now);
         e.set_busy(true);
         assert!(!e.is_playing() && e.state().busy && e.busy());
-        for ev in [E::Seek(3.0), E::Command(C::MarkIn), E::Command(C::Export), E::Zoom(1), E::Preset(3)] {
+        for ev in [E::Seek(3.0), E::Command(C::MarkIn), E::Command(C::Cut), E::Command(C::Export), E::Zoom(1), E::Preset(3)] {
             assert!(nothing(&e.handle(ev, now)), "{ev:?}");
         }
         e.set_busy(false);
         assert!(e.handle(E::Seek(3.0), now).frame.is_some());
+    }
+
+    #[test]
+    fn cuts_are_marked_merged_and_restored() {
+        let mut e = editor(Caps::default());
+        let now = Instant::now();
+        // Start at 2, end at 3 (or the other way round).
+        e.handle(E::Seek(2.0), now);
+        e.handle(E::Command(C::Cut), now);
+        assert_eq!(e.state().cut_mark, Some(2.0));
+        assert!(e.state().can_uncut, "a cut being marked can be dropped");
+        e.handle(E::Seek(3.0), now);
+        e.handle(E::Command(C::Cut), now);
+        e.handle(E::Seek(6.0), now);
+        e.handle(E::Command(C::Cut), now);
+        e.handle(E::Seek(5.0), now);
+        e.handle(E::Command(C::Cut), now);
+        assert_eq!(e.cuts(), &[(2.0, 3.0), (5.0, 6.0)]);
+        assert_eq!(e.state().cut_mark, None);
+        assert_eq!(e.state().time_text, "0:05.00 / 0:10.00 · clip 0:08.00");
+        // A cut over the gap merges all three.
+        e.handle(E::Seek(2.5), now);
+        e.handle(E::Command(C::Cut), now);
+        e.handle(E::Seek(5.5), now);
+        e.handle(E::Command(C::Cut), now);
+        assert_eq!(e.cuts(), &[(2.0, 6.0)]);
+        // Too short a cut is a slip; Esc drops a mark.
+        e.handle(E::Command(C::Cut), now);
+        e.handle(E::Command(C::Cut), now);
+        e.handle(E::Seek(8.0), now);
+        e.handle(E::Command(C::Cut), now);
+        assert!(e.handle(E::Command(C::Escape), now).state);
+        assert_eq!((e.cuts(), e.state().cut_mark), (&[(2.0, 6.0)][..], None));
+        // The request carries the cuts inside the clip, clipped to it.
+        e.handle(E::Seek(8.0), now);
+        e.handle(E::Command(C::Cut), now);
+        e.handle(E::Seek(9.0), now);
+        e.handle(E::Command(C::Cut), now);
+        e.handle(E::SetOut(8.5), now);
+        e.handle(E::SetIn(1.0), now);
+        let r = e.request();
+        assert_eq!(r.cuts, vec![Cut { start: 2.0, end: 6.0 }, Cut { start: 8.0, end: 8.5 }]);
+        assert_eq!((r.start, r.end), (Some(1.0), Some(8.5)));
+        // Restore the cut under the playhead; elsewhere nothing happens.
+        e.handle(E::Seek(7.0), now);
+        assert!(!e.state().can_uncut);
+        e.handle(E::Command(C::Uncut), now);
+        e.handle(E::Seek(4.0), now);
+        assert!(e.state().can_uncut);
+        e.handle(E::Command(C::Uncut), now);
+        assert_eq!(e.cuts(), &[(8.0, 9.0)]);
+    }
+
+    #[test]
+    fn playback_jumps_over_cuts() {
+        let mut e = editor(Caps::default());
+        let t0 = Instant::now();
+        e.handle(E::Seek(1.0), t0);
+        e.handle(E::Command(C::Cut), t0);
+        e.handle(E::Seek(2.0), t0);
+        e.handle(E::Command(C::Cut), t0);
+        // Starting inside a cut starts after it.
+        e.handle(E::Seek(1.5), t0);
+        let fx = e.handle(E::Command(C::PlayPause), t0);
+        assert_eq!(fx.frame.unwrap().t, 2.0);
+        e.handle(E::Command(C::PlayPause), t0);
+        // Playing into the cut continues at its end, in real time from there.
+        e.handle(E::Seek(0.9), t0);
+        e.handle(E::Command(C::PlayPause), t0);
+        let at = t0 + Duration::from_millis(150);
+        let next = e.shown(0.9, at).unwrap();
+        assert_eq!((next.t, next.at), (2.0, at));
+        let later = e.shown(2.0, at + Duration::from_millis(500)).unwrap();
+        assert!(close(later.t, 2.5), "{}", later.t);
+        // A clip whose rest is all cut does not play.
+        e.handle(E::Seek(2.0), t0);
+        e.handle(E::Command(C::Cut), t0);
+        e.handle(E::Seek(10.0), t0);
+        e.handle(E::Command(C::Cut), t0);
+        e.handle(E::Seek(5.0), t0);
+        let fx = e.handle(E::Command(C::PlayPause), t0);
+        assert!(!e.is_playing() && fx.frame.is_none());
+        assert_eq!(e.state().playhead, 5.0, "the playhead stays with the preview");
+    }
+
+    #[test]
+    fn gifs_have_no_lossless_preset() {
+        let now = Instant::now();
+        let mut e = editor(Caps { gif: true, ..Caps::default() });
+        assert!(!e.presets().contains(&ExportPreset::Lossless));
+        assert_eq!(e.presets().len(), PRESETS.len() - 1);
+        let gif = e.presets().iter().position(|p| *p == ExportPreset::Gif).unwrap();
+        e.handle(E::Preset(gif), now);
+        assert_eq!(e.request().preset, ExportPreset::Gif);
+        e.handle(E::Preset(e.presets().len()), now);
+        assert_eq!(e.request().preset, ExportPreset::Gif, "out of range ignored");
+        assert_eq!(editor(Caps::default()).presets(), &PRESETS[..]);
     }
 
     #[test]
