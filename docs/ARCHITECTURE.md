@@ -59,8 +59,8 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `select_rect_begin_ex`, `select_rect_switch` | the selection overlay with an optional timeout and a Space "switch" result (not while dragging); a switch from either overlay leaves Bugle active so the other can open at once |
 | `pin_image_blocking`, `pin_image_show` | floating borderless window, drag/resize/close; blocking or fire-and-forget |
 | `toast_show` | non-activating `NSPanel` with `NSVisualEffectView`, thumbnail + two lines, fades out |
-| `editor_open` (`shim/editor.m`) | markup editor window: toolbar with pull-down menus, canvas in an `NSScrollView` (fit, zoom stops, pinch, ⌘+/⌘−/⌘1/⌘0), multi-line label text field, unsaved-changes sheet; reports input in edited-image pixels through a callback and draws the image (told where the edited image's origin lies in it), overlay primitives and menus it is handed |
-| `panel_show` (`shim/panel.m`) | quick-access panel: non-activating, never-key `NSPanel`, thumbnail, buttons, close; reports clicks through a callback |
+| `editor_open` (`shim/editor.m`) | markup editor windows, several at once, each named by the `EditorId` `editor_open` returns: toolbar with pull-down menus, canvas in an `NSScrollView` (fit, zoom stops, pinch, ⌘+/⌘−/⌘1/⌘0), multi-line label text field, unsaved-changes sheet; reports input in edited-image pixels through a callback and draws the image (told where the edited image's origin lies in it), overlay primitives and menus it is handed |
+| `panel_show` (`shim/panel.m`) | quick-access panels: non-activating, never-key `NSPanel`s, thumbnail, buttons, close, each named by an id the caller picks; several stack in the corner (newest nearest it) and close up when one goes; `panel_hide_all` / `panel_show_all` take them off screen during a capture; reports clicks through a callback |
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
 | `export_audio_m4a`, `export_mp4`, `export_mov`, `video_frame`, `media_duration` | `AVAssetExportSession`, `AVAssetImageGenerator` |
@@ -442,12 +442,17 @@ the new image is renamed over the old one (never deleted first).
 
 After a capture the app shows the quick-access panel instead of the toast
 (`[quick_access]`, on by default). `quick_access.rs` is the platform-free part:
-which buttons a media kind gets, the current panel generation (stale clicks are
-ignored), the timeout (paused while hovered, checked on the loop tick) and
+which buttons a media kind gets, the panels up (captures in a row stack up to
+`MAX_PANELS`, the oldest pushed out past it; each panel's generation is its
+id in the shim, and clicks on an ended one are ignored), each panel's timeout
+(held for the whole stack while any panel is hovered, checked on the loop
+tick) and
 `perform`, which maps each button onto the engine through a `Backend` trait —
 Copy → `Engine::copy_media`, Pin → `Engine::pin`, Sync → `Engine::sync_media`,
 Annotate → the markup editor (or open in `annotate_app`), Reveal → Finder. `quick_panel.rs` is the glue:
-it shows the panel, turns clicks into `AppEvent::QuickAccess`, runs blocking
+it shows the panels, hides them while a capture or recording runs and brings
+them back once it is done (`quick_before_action` / `quick_after_action`),
+turns clicks into `AppEvent::QuickAccess`, runs blocking
 actions on a short-lived thread (Pin must, since its `UiHost` request
 round-trips through the main thread) and swaps in a sharper thumbnail rendered
 off the main thread.
@@ -481,6 +486,11 @@ on a later turn, so nothing it does in reply to Rust calls back into Rust.
 Zoomed in, a new picture of another size or origin is scrolled so the image
 stays put under the pointer, and the zoom is capped so the canvas stays
 within 8192 points.
+Several editors can be open at once. Each `Session` lives in its window's
+handler and knows its `EditorId`; a thread-local registry maps editor
+generations to sessions (weakly, so a closed window drops out by itself) and
+routes preview and save results to their own window. Opening a capture that
+already has a window brings that one forward.
 Save runs `Engine::apply_annotations` on a thread and the window closes only
 once it succeeded; `shim/editor.m` frees the Rust handler on a later
 main-loop turn, so closing from inside the callback is safe. `--smoke-test`
@@ -497,7 +507,4 @@ earn its keep.
   track and on the separate tracks, and are set from the menu-bar app; still
   open: free-form levels and the ducking amount in the app (it offers presets
   and an on/off toggle), and a live level meter while recording.
-* **Markup editor extras** — opening a second editor (the window shim keeps
-  one editor today). Also: keep the quick-access panel's thumbnails stacked
-  when several captures arrive in a row.
 * **Packaging extras** — the final bundle id.

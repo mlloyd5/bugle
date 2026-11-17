@@ -15,8 +15,8 @@ pub use picker::{window_pick_active, window_pick_begin, window_pick_cancel, wind
 mod panel;
 #[cfg(target_os = "macos")]
 pub use panel::{
-    open_with, panel_active, panel_clear, panel_dismiss, panel_hovered, panel_set_image, panel_show, reveal_path, Corner, Opened,
-    PanelChoice,
+    open_with, panel_count, panel_dismiss, panel_dismiss_all, panel_hide_all, panel_hovered, panel_set_image, panel_show,
+    panel_show_all, reveal_path, Corner, Opened, PanelChoice,
 };
 #[cfg(target_os = "macos")]
 pub mod login_item;
@@ -26,9 +26,9 @@ pub mod notify;
 mod editor;
 #[cfg(target_os = "macos")]
 pub use editor::{
-    editor_active, editor_begin_text, editor_close, editor_focus, editor_inject, editor_open, editor_set_busy, editor_set_image,
-    editor_set_menu, editor_set_overlay, editor_set_state, editor_zoom, EditorCommand, EditorEvent, EditorMenu, EditorMenuItem,
-    EditorPrim, EditorState, EditorTool, EditorZoom,
+    editor_begin_text, editor_close, editor_count, editor_focus, editor_inject, editor_is_open, editor_open, editor_set_busy,
+    editor_set_image, editor_set_menu, editor_set_overlay, editor_set_state, editor_zoom, EditorCommand, EditorEvent, EditorId,
+    EditorMenu, EditorMenuItem, EditorPrim, EditorState, EditorTool, EditorZoom,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
