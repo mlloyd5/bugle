@@ -140,7 +140,8 @@ drags a rectangle), `pick_window` and `all_screens`. `pick_window` (for
 app's hover-highlight picker, for when the agent cannot tell which window is
 meant. It works only when the Bugle menu-bar app serves the API (*Start Agent
 API* in its menu, or `bugle-app --serve`); `bugle serve` and `bugle mcp`
-answer with an error naming that, HTTP status 503. The usual `Host` and token
+answer with an error naming that, HTTP status 503. (The CLI run in a terminal,
+`bugle capture pick-window`, shows the picker itself.) The usual `Host` and token
 checks run first: with a token configured, a client without it never gets the
 overlay on screen; with the default (no token, loopback bind) any local
 process that can reach the port can raise it, as it can call every other

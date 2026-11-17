@@ -278,6 +278,14 @@ JSON-RPC server implementing `initialize`, `ping`, `tools/list`, `tools/call`.
 
 ### `bugle-cli`
 Clap front end. Runs the tokio runtime on the main thread so AppKit overlays work.
+The non-blocking overlays (window picker, switchable area selection) need an
+event loop that the caller can step out of, so `pick::run_blocking` bootstraps
+`NSApplication` once (`app_bootstrap`: accessory policy, `finishLaunching`)
+and pumps `run_loop_once` in 50 ms slices until the session answers. That is
+what `pick_window` targets (`bugle capture pick-window`) and, with
+`[screenshots] window_picker`, the Space toggle of every interactive selection
+(`Engine::select_area_or_window`: `bugle capture`, `bugle scroll`, `bugle
+record start`) use; off the main thread it refuses with `NoUiHost`.
 
 ### `bugle-app`
 The menu-bar app. `tao` owns the main thread and the AppKit run loop (activation
@@ -309,10 +317,16 @@ main thread opens the next overlay from the previous one's final callback.
 each picker turn keeps the 30 s timeout and a whole session closes after two
 minutes (an area phase never times out mid-drag). A switch leaves Bugle active
 for the next overlay; if none follows, the session deactivates Bugle itself. `[screenshots] window_picker = false` restores the immediate
-front-most capture (and plain area selection), which the CLI always uses.
+front-most capture (and plain area selection). *Scrolling Capture* runs
+through the same session (starting in the area selection); a picked window
+scrolls the part of its frame on the display it overlaps most
+(`pick::picked_rect`). The session itself (`Session`, `window_at`, `begin`)
+lives in `bugle_engine::pick`, so the CLI can run it too; `picker.rs` keeps the
+app's side (the gate, the cool-down and the worker's `pick`).
 `UiHost::pick_window` offers the picker (without the switch) to API callers:
 the `pick_window` target kind of `capture` and `record_start` goes through it,
-and an engine without a host refuses that target up front with
+and an engine with neither a host nor in-process overlays (`bugle serve`,
+`bugle mcp`) refuses that target up front with
 `BugleError::NoUiHost` (HTTP 503) before any permission prompt.
 Engine actions run on one worker thread so the menu never blocks; when an action
 needs the crosshair overlay or a pin window, the engine's `UiHost` (implemented
@@ -454,8 +468,6 @@ earn its keep.
 * **Markup editor extras** — opening a second editor (the window shim keeps
   one editor today). Also: keep the quick-access panel's thumbnails stacked
   when several captures arrive in a row.
-* **Window picker extras** — Space in the Scrolling Capture selection, and the
-  picker for `bugle capture` in a terminal (it needs a run loop of its own).
 * **Packaging extras** — the final bundle id; notification thumbnails
   (an attachment needs a copy of the file, since the notification center
   moves what it is given).
