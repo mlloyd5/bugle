@@ -95,6 +95,11 @@ int32_t bugle_select_rect_begin_ex(bugle_select_callback_t cb, void *ctx, int32_
 void bugle_select_rect_switch(void);
 // [NSApp deactivate]: hand focus back after a switch that led nowhere.
 void bugle_app_deactivate(void);
+// A loop of the caller's own (the CLI): bootstrap NSApplication once, then
+// pump events for up to `seconds` per call. Main thread only.
+void bugle_app_bootstrap(void);
+void bugle_run_loop_once(double seconds);
+int32_t bugle_is_main_thread(void);
 // Draws a one-line hint centred near the bottom of an overlay view (shared by
 // the selection overlay and the window picker).
 #ifdef __OBJC__
