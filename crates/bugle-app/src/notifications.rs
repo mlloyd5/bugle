@@ -11,16 +11,29 @@
 //! `--smoke-test` never asks for permission: with the switch on it only
 //! reads the current setting. Tests never touch the framework, since a test
 //! binary is never a bundle.
+//!
+//! A notice with a thumbnail carries it as the notification's attachment.
+//! The notification center moves an attachment's file into its own store,
+//! so each post writes a throwaway copy of the (already downscaled) toast
+//! thumbnail into [`thumb_dir`] and hands that over. The shim removes the
+//! copy once the request completes (a no-op when the center moved it) or
+//! when attaching fails, this module when the post is skipped. As a backstop
+//! each post sweeps copies older than [`THUMB_MAX_AGE`], and every launch
+//! (any switch, smoke test included) sweeps all of them.
 
 use bugle_platform::notify::{self, NotifyState};
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static LAST_REFRESH: Mutex<Option<Instant>> = Mutex::new(None);
 const REFRESH_EVERY: Duration = Duration::from_secs(5);
+/// Thumbnail copies older than this were never taken by the notification
+/// center (it moves them away at once) and are swept.
+const THUMB_MAX_AGE: Duration = Duration::from_secs(10 * 60);
+static THUMB_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// What [`init`] does for a given launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +63,9 @@ fn needs_refresh(state: NotifyState) -> bool {
 
 /// Called once at launch, after the event loop exists.
 pub fn init(enabled: bool, smoke_test: bool) {
+    // Nothing is in flight yet: leftovers from an earlier run go, whatever
+    // the switch says now.
+    sweep_thumbs(&thumb_dir(), Duration::ZERO);
     match plan(enabled, bugle_platform::login_item::in_app_bundle(), smoke_test) {
         Start::Off => {
             if enabled {
@@ -84,11 +100,56 @@ pub fn tick() {
 }
 
 /// Posts `title`/`body` to Notification Center when enabled and authorized;
-/// clicking it opens `open`.
-pub fn post(title: &str, body: &str, open: Option<&Path>) {
-    if ENABLED.load(Ordering::Relaxed) {
-        notify::post(title, body, open);
+/// clicking it opens `open`. `thumb` (PNG bytes, the notice's toast thumbnail) is
+/// attached as a throwaway copy.
+pub fn post(title: &str, body: &str, open: Option<&Path>, thumb: Option<&[u8]>) {
+    if !ENABLED.load(Ordering::Relaxed) || notify::state() != NotifyState::Authorized {
+        return;
     }
+    let copy = thumb.and_then(|png| {
+        let dir = thumb_dir();
+        sweep_thumbs(&dir, THUMB_MAX_AGE);
+        write_thumb(&dir, png)
+            .inspect_err(|e| tracing::debug!("notification thumbnail copy: {e}"))
+            .ok()
+    });
+    if !notify::post(title, body, open, copy.as_deref()) {
+        if let Some(c) = copy {
+            let _ = std::fs::remove_file(c);
+        }
+    }
+}
+
+/// Where the throwaway attachment copies go.
+fn thumb_dir() -> PathBuf {
+    std::env::temp_dir().join("bugle-notification-thumbnails")
+}
+
+/// Writes a fresh copy of `png` into `dir` under a name no other post uses.
+fn write_thumb(dir: &Path, png: &[u8]) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let seq = THUMB_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("{}-{nanos}-{seq}.png", std::process::id()));
+    std::fs::write(&path, png)?;
+    Ok(path)
+}
+
+/// Removes the `.png` copies in `dir` last modified at least `max_age` ago
+/// (`Duration::ZERO`: all of them). Returns how many went.
+fn sweep_thumbs(dir: &Path, max_age: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let now = SystemTime::now();
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "png"))
+        .filter(|p| {
+            let age = std::fs::metadata(p).and_then(|m| m.modified()).map(|t| now.duration_since(t).unwrap_or_default());
+            age.is_ok_and(|a| a >= max_age)
+        })
+        .filter(|p| std::fs::remove_file(p).is_ok())
+        .count()
 }
 
 #[cfg(test)]
@@ -122,7 +183,58 @@ mod tests {
     fn unbundled_is_a_no_op() {
         init(true, false);
         tick();
-        post("Bugle", "test", None);
+        let before = thumb_names();
+        post("Bugle", "test", None, Some(b"png"));
         assert!(!ENABLED.load(Ordering::Relaxed));
+        // No attachment copy is written when nothing is posted.
+        assert!(thumb_names().is_subset(&before));
+    }
+
+    fn thumb_names() -> std::collections::HashSet<PathBuf> {
+        std::fs::read_dir(thumb_dir()).map(|r| r.flatten().map(|e| e.path()).collect()).unwrap_or_default()
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bugle-notify-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn each_thumbnail_copy_is_a_new_file() {
+        let dir = scratch_dir("copies");
+        let a = write_thumb(&dir, b"first").unwrap();
+        let b = write_thumb(&dir, b"second").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), Some(dir.as_path()));
+        assert_eq!(a.extension().and_then(|x| x.to_str()), Some("png"));
+        assert_eq!(std::fs::read(&a).unwrap(), b"first");
+        assert_eq!(std::fs::read(&b).unwrap(), b"second");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sweep_removes_only_old_png_copies() {
+        let dir = scratch_dir("sweep");
+        let fresh = write_thumb(&dir, b"png").unwrap();
+        let other = dir.join("keep.txt");
+        std::fs::write(&other, b"not ours").unwrap();
+        // Fresh copies may still be on their way to the notification center.
+        assert_eq!(sweep_thumbs(&dir, THUMB_MAX_AGE), 0);
+        assert!(fresh.exists());
+        // An old copy goes while a fresh one stays.
+        let old = write_thumb(&dir, b"png").unwrap();
+        let past = SystemTime::now() - THUMB_MAX_AGE - Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(past).unwrap();
+        assert_eq!(sweep_thumbs(&dir, THUMB_MAX_AGE), 1);
+        assert!(!old.exists());
+        assert!(fresh.exists());
+        // At launch everything goes, but only the PNG copies.
+        assert_eq!(sweep_thumbs(&dir, Duration::ZERO), 1);
+        assert!(!fresh.exists());
+        assert!(other.exists());
+        // A missing directory is fine.
+        assert_eq!(sweep_thumbs(&dir.join("missing"), Duration::ZERO), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

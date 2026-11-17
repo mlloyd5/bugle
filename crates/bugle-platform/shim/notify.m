@@ -109,10 +109,33 @@ void bugle_notify_refresh(void) {
     }];
 }
 
+/// Attaches the PNG at `path` to `content`. The notification center moves an
+/// attachment's file into its own store, so `path` must be a throwaway copy;
+/// when it cannot be attached it is removed here.
+static void attach_thumbnail(UNMutableNotificationContent *content, NSString *path) {
+    NSURL *url = [NSURL fileURLWithPath:path];
+    NSError *error = nil;
+    UNNotificationAttachment *a =
+        [UNNotificationAttachment attachmentWithIdentifier:@"thumbnail"
+                                                       URL:url
+                                                   options:@{UNNotificationAttachmentOptionsTypeHintKey : @"public.png"}
+                                                     error:&error];
+    if (a) {
+        content.attachments = @[ a ];
+    } else {
+        NSLog(@"bugle: notification thumbnail not attached: %@", error.localizedDescription);
+        [NSFileManager.defaultManager removeItemAtURL:url error:nil];
+    }
+}
+
 /// Posts a notification when authorized. Returns 1 when it was handed to
 /// the notification center, 0 when skipped (not authorized). `open` may be
-/// NULL; otherwise clicking the notification opens that path.
-int bugle_notify_post(const char *title, const char *body, const char *open) {
+/// NULL; otherwise clicking the notification opens that path. `thumbnail`
+/// may be NULL; otherwise it is a PNG copy the notification center takes
+/// (moves) as the attachment. A skipped post leaves it alone; once handed
+/// over it is removed here when the request completes (a no-op when the
+/// center moved it), or as soon as it cannot be attached.
+int bugle_notify_post(const char *title, const char *body, const char *open, const char *thumbnail) {
     if (atomic_load(&g_state) != 2 || !title) return 0;
     UNMutableNotificationContent *content = [UNMutableNotificationContent new];
     content.title = [NSString stringWithUTF8String:title] ?: @"Bugle";
@@ -121,12 +144,18 @@ int bugle_notify_post(const char *title, const char *body, const char *open) {
         NSString *p = [NSString stringWithUTF8String:open];
         if (p) content.userInfo = @{@"open" : p};
     }
+    NSString *thumb = thumbnail ? [NSString stringWithUTF8String:thumbnail] : nil;
+    if (thumb.length > 0) attach_thumbnail(content, thumb);
     UNNotificationRequest *req = [UNNotificationRequest requestWithIdentifier:NSUUID.UUID.UUIDString
                                                                       content:content
                                                                       trigger:nil];
     [UNUserNotificationCenter.currentNotificationCenter
         addNotificationRequest:req
          withCompletionHandler:^(NSError *error) {
+             // Either way the copy is done with: delivered, the attachment
+             // store holds its own (a moved file is already gone, so this is
+             // a no-op); not delivered, it is ours to remove.
+             if (thumb.length > 0) [NSFileManager.defaultManager removeItemAtPath:thumb error:nil];
              if (!error) return;
              NSLog(@"bugle: notification not delivered: %@", error.localizedDescription);
              // Switched off in System Settings since start: stop trying.

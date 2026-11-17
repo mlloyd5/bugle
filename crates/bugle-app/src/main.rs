@@ -488,13 +488,13 @@ impl App {
 
     fn toast(&self, n: &Notice) {
         bugle_platform::toast_show(n.thumb.as_deref(), &n.title, &n.subtitle, n.open.as_deref(), 3.0);
-        notifications::post(&n.title, &n.subtitle, n.open.as_deref());
+        notifications::post(&n.title, &n.subtitle, n.open.as_deref(), n.thumb.as_deref());
     }
 
     fn toast_error(&self, msg: &str) {
         tracing::warn!("{msg}");
         bugle_platform::toast_show(None, "Bugle", msg, None, 5.0);
-        notifications::post("Bugle", msg, None);
+        notifications::post("Bugle", msg, None, None);
     }
 
     fn dispatch(&mut self, mut action: Action) {
@@ -587,7 +587,9 @@ impl App {
     fn on_done(&mut self, action: Action, result: Result<Option<Notice>, String>) {
         self.busy = false;
         match result {
-            Ok(Some(n)) if self.quick_show(action, &n) => notifications::post(&n.title, &n.subtitle, n.open.as_deref()),
+            Ok(Some(n)) if self.quick_show(action, &n) => {
+                notifications::post(&n.title, &n.subtitle, n.open.as_deref(), n.thumb.as_deref())
+            }
             Ok(Some(n)) => self.toast(&n),
             Ok(None) => {}
             Err(e) => self.toast_error(&format!("{action:?}: {e}")),

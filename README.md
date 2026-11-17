@@ -46,7 +46,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | Auto-zoom on clicks, smoothed pointer | pointer/click event track recorded next to the video (`clip.mp4.events.json`); frames re-rendered in Rust (`AVAssetReader` → `AVAssetWriter`, audio copied back in) | ✅ headless (CLI/API); track timing measured on real recordings, zoom checked with hand-written clicks, live clicks not exercised |
 | `Bugle.app` bundle | `cargo xtask bundle` (hardened runtime, ad-hoc or Developer ID) | ✅ ad-hoc; Developer ID signing and notarization not yet exercised |
 | Disk image, universal binary | `cargo xtask dmg` (`hdiutil`, `/Applications` link), `--universal` (`lipo`) | ✅ DMG; universal needs both Rust targets installed |
-| System notifications | `UNUserNotificationCenter` from Bugle.app, alongside the toast (`[general] system_notifications`) | built; reading the authorization verified from the bundle, posting unverified |
+| System notifications | `UNUserNotificationCenter` from Bugle.app, alongside the toast (`[general] system_notifications`), with the capture's thumbnail attached | built; reading the authorization verified from the bundle, posting and the attached thumbnail unverified |
 | Open at Login | `SMAppService.mainAppService` | built, status read verified; registering not yet exercised |
 
 ## Build
@@ -323,7 +323,8 @@ Notification Center (`UNUserNotificationCenter`), named and badged as Bugle:
 every finished menu or hotkey action (capture, recording, OCR, pin, sync —
 whether the quick-access panel or the toast shows it; clicking a saved file's
 notification opens it), a markup-editor save that falls back to the toast, and
-every error. Immediate feedback to a click in the panel or the editor (such as
+every error. A notice that has a thumbnail in the toast carries it in the
+notification too. Immediate feedback to a click in the panel or the editor (such as
 "Copied to clipboard") and the agent API's start message stay in-app only.
 macOS asks for permission at the first launch with the switch on. The panel or
 toast is shown either way: an unbundled `bugle-app`, a denied permission or
