@@ -1733,22 +1733,98 @@ static NSString *edit_preset_name(int32_t preset) {
     }
 }
 
-int32_t bugle_export_video(const char *in_path, const char *out_path, double start, double end, int32_t preset,
+/// Check `n` [start, end) ranges (pairs of seconds): finite, in order and
+/// not overlapping. Sets the error and returns NO otherwise.
+static BOOL valid_ranges(const double *ranges, int32_t n) {
+    if (!ranges || n < 1) { set_error(@"no time range"); return NO; }
+    for (int32_t i = 0; i < n; i++) {
+        double s = ranges[2 * i], e = ranges[2 * i + 1];
+        if (!isfinite(s) || !isfinite(e) || s < 0 || e <= s || (i > 0 && s < ranges[2 * i - 1])) {
+            set_error(@"invalid time range %g..%g s", s, e);
+            return NO;
+        }
+    }
+    return YES;
+}
+
+static CMTimeRange range_at(const double *ranges, int32_t i) {
+    return CMTimeRangeFromTimeToTime(CMTimeMakeWithSeconds(ranges[2 * i], 60000), CMTimeMakeWithSeconds(ranges[2 * i + 1], 60000));
+}
+
+/// Append the enabled audio tracks of `asset` over each range to `comp`,
+/// back to back from 0 (range i starts where the ranges before it end), one
+/// composition track per source track. Returns the tracks added, or -1.
+static int insert_audio_ranges(AVMutableComposition *comp, AVAsset *asset, const double *ranges, int32_t n) {
+    int added = 0;
+    NSError *err = nil;
+    for (AVAssetTrack *t in [asset tracksWithMediaType:AVMediaTypeAudio]) {
+        if (!t.enabled) continue;
+        AVMutableCompositionTrack *ca = nil;
+        CMTime at = kCMTimeZero;
+        for (int32_t i = 0; i < n; i++) {
+            CMTimeRange want = range_at(ranges, i);
+            CMTimeRange have = CMTimeRangeGetIntersection(want, t.timeRange);
+            if (!CMTIMERANGE_IS_INVALID(have) && !CMTIMERANGE_IS_EMPTY(have)) {
+                if (!ca) ca = [comp addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid];
+                if (![ca insertTimeRange:have ofTrack:t atTime:CMTimeAdd(at, CMTimeSubtract(have.start, want.start)) error:&err]) {
+                    set_error(@"could not copy an audio track: %@", err.localizedDescription);
+                    return -1;
+                }
+            }
+            at = CMTimeAdd(at, want.duration);
+        }
+        if (ca) added++;
+    }
+    return added;
+}
+
+/// The video track and enabled audio tracks of `asset` over each range,
+/// back to back from 0. NULL (error set) on failure.
+static AVMutableComposition *spliced_composition(AVAsset *asset, const double *ranges, int32_t n) {
+    AVAssetTrack *vt = first_video_track(asset);
+    AVMutableComposition *comp = [AVMutableComposition composition];
+    AVMutableCompositionTrack *cv = [comp addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid];
+    NSError *err = nil;
+    CMTime at = kCMTimeZero;
+    for (int32_t i = 0; i < n; i++) {
+        CMTimeRange want = range_at(ranges, i);
+        CMTimeRange have = CMTimeRangeGetIntersection(want, vt.timeRange);
+        if (CMTIMERANGE_IS_INVALID(have) || CMTIMERANGE_IS_EMPTY(have)) {
+            set_error(@"the range %g..%g s has no video", ranges[2 * i], ranges[2 * i + 1]);
+            return nil;
+        }
+        if (![cv insertTimeRange:have ofTrack:vt atTime:CMTimeAdd(at, CMTimeSubtract(have.start, want.start)) error:&err]) {
+            set_error(@"could not copy the video: %@", err.localizedDescription);
+            return nil;
+        }
+        at = CMTimeAdd(at, want.duration);
+    }
+    cv.preferredTransform = vt.preferredTransform;
+    if (insert_audio_ranges(comp, asset, ranges, n) < 0) return nil;
+    return comp;
+}
+
+int32_t bugle_export_video(const char *in_path, const char *out_path, const double *ranges, int32_t n_ranges, int32_t preset,
                            int32_t mp4, int32_t fps, double timeout) {
     @autoreleasepool {
         clear_error();
         NSString *name = edit_preset_name(preset);
         if (!name) { set_error(@"unknown export preset %d", preset); return -1; }
         if (!in_path || !out_path) { set_error(@"export: NULL path"); return -1; }
-        if (!isfinite(start) || !isfinite(end) || start < 0 || end <= start) {
-            set_error(@"invalid time range %g..%g s", start, end);
-            return -1;
-        }
+        if (!valid_ranges(ranges, n_ranges)) return -1;
         if (fps < 0 || fps > 240) { set_error(@"invalid frame rate %d", fps); return -1; }
         if (fps > 0 && preset == 0) { set_error(@"a frame rate needs a re-encoding preset"); return -1; }
         NSURL *out = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
-        AVURLAsset *asset = precise_asset(in_path);
-        if (!first_video_track(asset)) { set_error(@"the source has no video track"); return -1; }
+        AVURLAsset *source = precise_asset(in_path);
+        if (!first_video_track(source)) { set_error(@"the source has no video track"); return -1; }
+        // One range is exported from the file itself; several are spliced
+        // into a composition first, which is then exported whole.
+        AVAsset *asset = source;
+        if (n_ranges > 1) {
+            AVMutableComposition *comp = spliced_composition(source, ranges, n_ranges);
+            if (!comp) return -1;
+            asset = comp;
+        }
         // Passthrough is never listed as "compatible" but always works.
         if (preset != 0 && ![[AVAssetExportSession exportPresetsCompatibleWithAsset:asset] containsObject:name]) {
             set_error(@"export preset %@ is not available for this source", name);
@@ -1765,7 +1841,7 @@ int32_t bugle_export_video(const char *in_path, const char *out_path, double sta
         s.outputURL = out;
         s.outputFileType = type;
         s.shouldOptimizeForNetworkUse = YES;
-        s.timeRange = CMTimeRangeFromTimeToTime(CMTimeMakeWithSeconds(start, 60000), CMTimeMakeWithSeconds(end, 60000));
+        if (n_ranges == 1) s.timeRange = range_at(ranges, 0);
         if (preset != 0) {
             // Re-encodes always render through a video composition: without
             // one the encoder starts at the keyframe before the cut and hides
@@ -2104,17 +2180,15 @@ void bugle_seq_close(void *handle) {
 }
 
 // Copy the video track of `video_path` and the audio tracks of `audio_path`
-// over [start, end) (placed at 0) into one movie, without re-encoding.
-// Returns 1 (nothing written) when the audio source has no audio there.
-int32_t bugle_mux_audio(const char *video_path, const char *audio_path, double start, double end, const char *out_path,
-                        int32_t mp4, double timeout) {
+// over each [start, end) range (back to back from 0) into one movie, without
+// re-encoding. Returns 1 (nothing written) when the audio source has no
+// audio there.
+int32_t bugle_mux_audio(const char *video_path, const char *audio_path, const double *ranges, int32_t n_ranges,
+                        const char *out_path, int32_t mp4, double timeout) {
     @autoreleasepool {
         clear_error();
         if (!video_path || !audio_path || !out_path) { set_error(@"mux: NULL path"); return -1; }
-        if (!isfinite(start) || !isfinite(end) || start < 0 || end <= start) {
-            set_error(@"invalid time range %g..%g s", start, end);
-            return -1;
-        }
+        if (!valid_ranges(ranges, n_ranges)) return -1;
         AVURLAsset *v = precise_asset(video_path), *a = precise_asset(audio_path);
         AVAssetTrack *vt = first_video_track(v);
         if (!vt) { set_error(@"%s has no video track", video_path); return -1; }
@@ -2126,20 +2200,8 @@ int32_t bugle_mux_audio(const char *video_path, const char *audio_path, double s
             return -1;
         }
         cv.preferredTransform = vt.preferredTransform;
-        CMTime s = CMTimeMakeWithSeconds(start, 60000);
-        CMTimeRange want = CMTimeRangeFromTimeToTime(s, CMTimeMakeWithSeconds(end, 60000));
-        int added = 0;
-        for (AVAssetTrack *t in [a tracksWithMediaType:AVMediaTypeAudio]) {
-            if (!t.enabled) continue;
-            CMTimeRange have = CMTimeRangeGetIntersection(want, t.timeRange);
-            if (CMTIMERANGE_IS_INVALID(have) || CMTIMERANGE_IS_EMPTY(have)) continue;
-            AVMutableCompositionTrack *ca = [comp addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid];
-            if (![ca insertTimeRange:have ofTrack:t atTime:CMTimeSubtract(have.start, s) error:&err]) {
-                set_error(@"mux: could not copy an audio track: %@", err.localizedDescription);
-                return -1;
-            }
-            added++;
-        }
+        int added = insert_audio_ranges(comp, a, ranges, n_ranges);
+        if (added < 0) return -1;
         if (added == 0) return 1;
         AVAssetExportSession *x = [[AVAssetExportSession alloc] initWithAsset:comp presetName:AVAssetExportPresetPassthrough];
         if (!x) { set_error(@"mux: could not create export session"); return -1; }

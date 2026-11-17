@@ -6,6 +6,7 @@
 
 use crate::editor_window::guarded;
 use crate::video_editor::{preset_label, Caps, Effects, FrameRequest, VideoEditor, PRESETS, ZOOMS};
+use bugle_core::MediaKind;
 use crate::{file_name, saved_subtitle, App, AppEvent, Notice, Proxy};
 use bugle_engine::{EditRequest, EditSource, Engine};
 use bugle_platform::{VideoEditorCommand, VideoEditorEvent};
@@ -214,17 +215,18 @@ pub(crate) fn export_running() -> bool {
 }
 
 impl App {
-    /// The most recent video in the history, for *Edit Latest Recording*.
+    /// The most recent recording (video or GIF) in the history, for *Edit
+    /// Latest Recording*.
     pub(crate) fn edit_latest_recording(&mut self) {
         let all = self.engine.history.all().unwrap_or_default();
-        match all.iter().rev().find(|m| m.kind == bugle_core::MediaKind::Video && m.path.exists()) {
+        match all.iter().rev().find(|m| matches!(m.kind, MediaKind::Video | MediaKind::Gif) && m.path.exists()) {
             Some(m) => self.open_video_editor(&m.id.clone()),
-            None => self.toast_error("Edit Video: no video recording in the history yet"),
+            None => self.toast_error("Edit Video: no recording in the history yet"),
         }
     }
 
-    /// Open the video editor for a media id, `latest` or a video path. One
-    /// at a time: with one already open, that one comes forward.
+    /// Open the video editor for a media id, `latest` or a video or GIF
+    /// path. One at a time: with one already open, that one comes forward.
     pub(crate) fn open_video_editor(&mut self, source: &str) {
         if bugle_platform::video_editor_active() {
             bugle_platform::video_editor_focus();
@@ -239,7 +241,7 @@ impl App {
         }
         self.video_editor_generation += 1;
         let generation = self.video_editor_generation;
-        let caps = Caps { zoom: src.can_zoom(), smooth: src.can_smooth() };
+        let caps = Caps { zoom: src.can_zoom(), smooth: src.can_smooth(), gif: src.gif };
         let editor = VideoEditor::new(src.source.clone(), src.duration(), src.info.nominal_fps, caps);
         let session = Rc::new(RefCell::new(Session {
             editor,
@@ -252,7 +254,7 @@ impl App {
             last_error: None,
         }));
         let zoom_labels: Vec<&str> = ZOOMS.iter().map(|z| z.0).collect();
-        let preset_labels: Vec<&str> = PRESETS.iter().map(|p| preset_label(*p)).collect();
+        let preset_labels: Vec<&str> = session.borrow().editor.presets().iter().map(|p| preset_label(*p)).collect();
         let handler = session.clone();
         let opened = bugle_platform::video_editor_open(
             &format!("Edit Video — {}", file_name(&src.item.path)),
@@ -373,6 +375,12 @@ pub(crate) fn smoke(proxy: &Proxy) {
     snap("video-editor-zoomed");
     send(VideoEditorEvent::Smooth(false));
     send(VideoEditorEvent::Preset(PRESETS.iter().position(|p| *p == bugle_engine::ExportPreset::P720).unwrap_or(0)));
+    // Cut 1.4–1.8 out of the clip; playback jumps over it.
+    send(VideoEditorEvent::Seek(1.4));
+    command(VideoEditorCommand::Cut);
+    send(VideoEditorEvent::Seek(1.8));
+    command(VideoEditorCommand::Cut);
+    send(VideoEditorEvent::Seek(1.2));
     command(VideoEditorCommand::PlayPause);
     snap("video-editor-playing");
     // A markup editor opened over the video editor and closed again hands

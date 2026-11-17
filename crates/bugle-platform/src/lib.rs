@@ -908,11 +908,33 @@ pub fn export_video(
     fps: Option<u32>,
     timeout: Option<f64>,
 ) -> Result<()> {
+    export_video_ranges(input, output, &[(start, end)], preset, mp4, fps, timeout)
+}
+
+/// Flatten `[start, end)` ranges for the shim, which takes them as pairs.
+fn flat_ranges(ranges: &[(f64, f64)]) -> Result<(Vec<f64>, i32)> {
+    let n = i32::try_from(ranges.len()).map_err(|_| anyhow!("too many time ranges"))?;
+    Ok((ranges.iter().flat_map(|&(s, e)| [s, e]).collect(), n))
+}
+
+/// [`export_video`] over several ranges of `input` (in order, not
+/// overlapping), spliced back to back: the part between two ranges is cut
+/// out. Audio follows the video.
+pub fn export_video_ranges(
+    input: &Path,
+    output: &Path,
+    ranges: &[(f64, f64)],
+    preset: VideoExportPreset,
+    mp4: bool,
+    fps: Option<u32>,
+    timeout: Option<f64>,
+) -> Result<()> {
     let i = path_cstr(input)?;
     let o = path_cstr(output)?;
+    let (r, n) = flat_ranges(ranges)?;
     let fps = fps.map(|f| f.min(240) as i32).unwrap_or(0);
     let timeout = timeout.filter(|t| t.is_finite() && *t > 0.0).unwrap_or(0.0);
-    if unsafe { ffi::bugle_export_video(i.as_ptr(), o.as_ptr(), start, end, preset.code(), mp4 as i32, fps, timeout) } != 0 {
+    if unsafe { ffi::bugle_export_video(i.as_ptr(), o.as_ptr(), r.as_ptr(), n, preset.code(), mp4 as i32, fps, timeout) } != 0 {
         bail!("{}", last_error());
     }
     Ok(())
@@ -1078,9 +1100,16 @@ impl Drop for SequentialFrameReader {
 /// over `start..end` (placed at 0) into `output`, without re-encoding.
 /// Returns `false` (nothing written) when the source has no audio there.
 pub fn mux_audio(video: &Path, audio_source: &Path, start: f64, end: f64, output: &Path, mp4: bool, timeout: Option<f64>) -> Result<bool> {
+    mux_audio_ranges(video, audio_source, &[(start, end)], output, mp4, timeout)
+}
+
+/// [`mux_audio`] with the audio of several ranges of `audio_source` (in
+/// order, not overlapping), spliced back to back as the video was.
+pub fn mux_audio_ranges(video: &Path, audio_source: &Path, ranges: &[(f64, f64)], output: &Path, mp4: bool, timeout: Option<f64>) -> Result<bool> {
     let (v, a, o) = (path_cstr(video)?, path_cstr(audio_source)?, path_cstr(output)?);
+    let (r, n) = flat_ranges(ranges)?;
     let timeout = timeout.filter(|t| t.is_finite() && *t > 0.0).unwrap_or(0.0);
-    match unsafe { ffi::bugle_mux_audio(v.as_ptr(), a.as_ptr(), start, end, o.as_ptr(), mp4 as i32, timeout) } {
+    match unsafe { ffi::bugle_mux_audio(v.as_ptr(), a.as_ptr(), r.as_ptr(), n, o.as_ptr(), mp4 as i32, timeout) } {
         0 => Ok(true),
         1 => Ok(false),
         _ => bail!("{}", last_error()),
@@ -1722,6 +1751,24 @@ mod tests {
         assert_eq!(video_info(&clean).unwrap().stored_samples, Some(10));
         export_video(&movie, &clean, 0.5, 1.5, VideoExportPreset::Highest, true, None, None).unwrap();
         assert_eq!(video_info(&clean).unwrap().stored_samples, Some(10));
+
+        // Several ranges are spliced back to back, re-encoded or copied.
+        let spliced = dir.path().join("spliced.mp4");
+        let ranges = [(0.0, 0.5), (1.5, 2.0)];
+        export_video_ranges(&movie, &spliced, &ranges, VideoExportPreset::Highest, true, None, None).unwrap();
+        assert!((media_duration(&spliced).unwrap() - 1.0).abs() < 0.1);
+        let mut r = VideoFrameReader::open(&spliced, 0.0).unwrap();
+        assert!(close(r.frame_at(0.25).unwrap().get_pixel(32, 24), [255, 0, 0]));
+        assert!(close(r.frame_at(0.75).unwrap().get_pixel(32, 24), [0, 0, 255]));
+        assert_eq!(video_info(&spliced).unwrap().stored_samples, Some(10), "only the kept frames");
+        export_video_ranges(&movie, &spliced, &[(0.0, 0.5), (1.0, 1.5)], VideoExportPreset::Passthrough, true, None, None).unwrap();
+        assert!((media_duration(&spliced).unwrap() - 1.0).abs() < 0.1);
+        let mut r = VideoFrameReader::open(&spliced, 0.0).unwrap();
+        assert!(close(r.frame_at(0.75).unwrap().get_pixel(32, 24), [0, 0, 255]));
+        let bad = dir.path().join("bad.mp4");
+        assert!(export_video_ranges(&movie, &bad, &[(1.0, 1.5), (0.0, 0.5)], VideoExportPreset::Highest, true, None, None).is_err());
+        assert!(export_video_ranges(&movie, &bad, &[], VideoExportPreset::Highest, true, None, None).is_err());
+        assert!(!bad.exists());
 
         // A frame rate with passthrough is refused; a timeout cancels the export.
         let bad = dir.path().join("bad.mp4");
