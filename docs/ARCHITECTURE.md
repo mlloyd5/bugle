@@ -30,11 +30,12 @@ Pure data: `Rect`/`Point`, `CaptureTarget`, `CaptureOptions`, `OcrResult`,
 templates (`naming`) and the JSON-lines `History`. A history line whose id is
 already present replaces the earlier record, which is how a moved file or a new
 sync URL is stored without rewriting the file. `events` defines a recording's
-pointer/click event track, the `<name>.events.json` sidecar (format in the
-module docs: recorded area in global points, `move`/`down`/`up` events in
-points relative to it on the video's timeline, `cursor_in_video`), with
-validation, interpolation and trimming; `MediaItem.events` remembers where a
-recording's track is.
+pointer/click event track, the `<file>.events.json` sidecar named after the
+whole file name (format in the module docs: recorded area in global points,
+`move`/`down`/`up` events in points relative to it on the video's timeline,
+`cursor_in_video`, `fps`, `area_changed`), with validation, interpolation and
+trimming; `MediaItem.events` says where a history item's track is (an effects
+edit has none), and `History::delete` removes it with the file.
 
 
 ### `bugle-platform`
@@ -49,6 +50,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `register_translation` | `VNTranslationalImageRegistrationRequest` via `VNSequenceRequestHandler` |
 | `post_scroll`, `cursor_position` | `CGEventCreateScrollWheelEvent`, `CGEventPost` |
 | `mouse_buttons` | `CGEventSourceButtonState` (session state; no permission, nothing posted) |
+| `host_time_now`, `SckRecorder::session_start`, `window_frame`, `child_exited` | `CMClockGetHostTimeClock`; the stream recorder's writer session start; `CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow)`; `waitid(WEXITED \| WNOHANG \| WNOWAIT)` (does not reap) |
 | `SequentialFrameReader`, `mux_audio` | `AVAssetReader` over a time range (BGRA, presentation order); `AVMutableComposition` (rendered video + source audio range) → passthrough `AVAssetExportSession` |
 | `select_rect_blocking`, `select_rect_begin`/`_cancel` | borderless `NSWindow` per screen, dim fill, crosshair, size label; blocking (`[NSApp run]`) or callback-based for a host with its own run loop |
 | `window_pick_begin`/`_highlight`/`_cancel` (`shim/picker.m`) | see-through `NSWindow` per screen with an always-active `NSTrackingArea`; reports pointer moves and the final click/Esc/timeout through a C callback and draws whatever rect the host hands back |
@@ -131,13 +133,24 @@ recorder state machine, and exposes one method per user-facing action:
   screen's stale first-frame timestamp is clamped, and the last frame is
   re-appended at the stop time so the video track covers the whole recording.
   With `cursor_events` (`event_log.rs`) a thread polls the pointer and the
-  button state at 60 Hz from just before the recorder starts and logs changes;
-  on stop the log is aligned on its end (the video ends when the recording
-  is stopped, so the difference in length, up to 2 s, is the recorder's
-  startup delay) and written next to the file. `hide_cursor` sets
+  button state at 60 Hz from just before the recorder starts and logs changes,
+  stamped on the host clock. On stop they are placed on the video's timeline
+  by where its time 0 is: the stream recorder's writer session start (the
+  same clock), the GIF loop's per-frame grab times (frame `k` shown at
+  `k / fps`, so grabs that fall behind are accounted for), or for the system
+  recorder the moment it was interrupted, or exited by itself at its `-V`
+  deadline (watched with `waitid(WNOWAIT)`), minus the video track's length.
+  None of it depends on how long finalising takes. Measured against a window
+  flashing at known host times, changes appear in the frames 15–50 ms after
+  the time the track gives them (display latency plus one frame), for all
+  three recorders. For a window recording the pointer is logged relative to
+  the window's current origin (the recorders follow the window), a resize
+  sets `area_changed`, and the system recorder is given `-o` so its frames
+  are the window frame without the shadow. `hide_cursor` sets
   `showsCursor = NO` on the stream recorder (chosen for it in `auto`) and the
   GIF grabs, and implies the track; the system recorder cannot hide the
-  pointer, so the track then says `cursor_in_video`.
+  pointer (it draws it without `-C`), so the track then says
+  `cursor_in_video`.
 * `edit` (`edit.rs`) — trims a recording (`start`/`end` seconds, negative from
   the end, measured on the video track) and exports it with a preset. Video →
   video is one `AVAssetExportSession` over the time range, audio kept.
@@ -163,21 +176,31 @@ recorder state machine, and exposes one method per user-facing action:
   target (extension corrected to the container) and renamed, then added to
   history, with the source as `parent` when it is a history item.
   `zoom` and `smooth_cursor` (`cursor_fx.rs`) use the source's event track:
-  clicks become zoom segments (ease in so the view is fully zoomed at the
+  clicks inside the recorded area (8 pt margin), except one in the last 0.3 s
+  (the click that stopped the recording), become zoom segments (ease in so the view is fully zoomed at the
   click, hold 1.5 s past the last click of a run, ease out; a click before
   the view is back at 1x joins the run and the view pans to it, arriving as
   it happens), the visible rect keeps the frame's aspect and stays inside it,
-  and frames are cropped and scaled with a bilinear sampler. Smoothing
+  and frames are cropped and scaled with a fixed-point bilinear sampler
+  (taps computed once per row and column; frames with nothing to apply pass
+  through without a copy). Smoothing
   resamples the pointer path at 120 Hz and convolves it with a centred
   Gaussian (σ 0.1 s, so no lag), blending back to the raw path around each
   click; the pointer is drawn as an anti-aliased signed-distance arrow,
   scaled with the zoom. Positions map to pixels by the frame size over the
   area size, so any preset works. Video → video renders through
   `SequentialFrameReader` → effects → `VideoFrameWriter` (each output frame
-  shows the source frame on screen at its midpoint) and `mux_audio` copies
-  the source's audio over the same range back in; the GIF pipelines apply
-  the effects to the frames they already decode. A plain edit of a
-  recording with a track writes the trimmed track next to its output.
+  shows the source frame on screen at its midpoint) at the requested rate,
+  else the recording's (`fps` in the track), else the nominal rate but at
+  least 30 and at most 60 (variable-rate stream recordings of a still screen
+  store a few frames a second); `original`/`high` encode H.264, `hevc` HEVC.
+  Reader and writer are tagged BT.709 so small frames do not shift colour
+  from one generation to the next. Rendering is cancelled on the export
+  deadline, and `mux_audio` copies the source's audio tracks over the same
+  range back in untouched; the GIF pipelines apply the effects to the frames
+  they already decode. A plain edit of a recording with a track writes the
+  trimmed track next to its output; an effects edit removes any stale track
+  of its output's name. A track whose window was resized is refused.
 * `ocr` (Apple Vision or an AI provider, per request or `[ocr] engine`), `describe` (images or sampled video frames), `transcribe`
   (extracts the audio track first), `subtitles`, `annotate`, `pin`, `select_area`.
 * `sync` (`sync.rs`) — runs after every successful save (`save_image`, so
@@ -202,7 +225,9 @@ recorder state machine, and exposes one method per user-facing action:
   name the copy got is kept in `MediaItem.synced_as`; a video's `.srt` / `.vtt`
   sidecars go to the video's destination (or the `subtitle` entry) under that
   stem (`clip 2.mp4` → `clip 2.srt`), replacing only a sidecar Bugle wrote for
-  that video, and `subtitles` written later follow a synced video. Tests check
+  that video, and `subtitles` written later follow a synced video. A video's
+  cursor event track goes along under `<synced name>.events.json` (a move
+  updates `MediaItem.events`). Tests check
   the signer against the published AWS vectors and drive the S3 path against an
   in-process axum mock that checks signatures, part order and sizes, ETags and
   aborts. The object URL lands in `MediaItem.url` and on the clipboard when

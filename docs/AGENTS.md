@@ -89,7 +89,7 @@ curl -s -H "$H" -H 'content-type: application/json' \
 | `annotate` | `source`, `annotation`, `output`, `copy`, `inline_image` | `media` + image |
 | `annotate_schema` | – | example document |
 | `scroll_capture` | `rect`, `max_frames`, `step_lines`, `settle_ms`, `horizontal`, `output`, `inline_image` | `media`, `stats` |
-| `record_start` | `target`, `format` (mp4/mov/gif), `fps`, `microphone`, `system_audio`, `mix_audio`, `max_seconds`, `highlight_clicks`, `cursor_events` (writes `<name>.events.json`), `hide_cursor` (pointer left out of the frames; implies `cursor_events`), `output`, `label` | status |
+| `record_start` | `target`, `format` (mp4/mov/gif), `fps`, `microphone`, `system_audio`, `mix_audio`, `max_seconds`, `highlight_clicks`, `cursor_events` (writes `<file>.events.json`), `hide_cursor` (pointer left out of the frames; implies `cursor_events`), `output`, `label` | status |
 | `record_stop` | – | `media` |
 | `record_status` | – | status |
 | `transcribe` | `source`, `provider`, `language` | `transcript`, `srt` |
@@ -115,8 +115,12 @@ recoverable. One engine runs at most two edits at a time; a third is refused.
 
 `zoom` and `smooth_cursor` read the recording's event track (made by
 `record_start` with `cursor_events` or `hide_cursor`); without one they are a
-400. They re-render every frame, so `lossless` is refused with them; audio is
-copied back in unchanged.
+400. They re-render every frame (at the recording's frame rate, at least 30
+fps), so `lossless` is refused with them and `original`/`high` encode H.264
+(`hevc`: HEVC); the audio tracks are copied back in untouched. Zoom follows
+clicks inside the recorded area only. The track is `<file>.events.json` (the
+whole file name, so `clip.mp4` and `clip.mov` each have their own), and an
+effects edit's output has none.
 
 `source` accepts a media id (or prefix), `latest`, or a file path.
 Target coordinates are screen points (top-left origin); annotation and OCR

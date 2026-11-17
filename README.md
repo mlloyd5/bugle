@@ -43,7 +43,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | Menu-bar app, global hotkeys | `bugle-app`: `NSStatusItem` via `tray-icon`, Carbon hotkeys via `global-hotkey`, in-app overlays | ✅ |
 | Sync to your own storage | folder copy/move, or SigV4 uploads (multipart for large files) to any S3-compatible bucket; a destination per media kind; subtitles follow their video | ✅ |
 | Trim and export recordings (presets: trim, H.264/HEVC, 1080p/720p/540p, frame rate, GIF) | `AVAssetExportSession` + video composition, `AVAssetImageGenerator` → GIF, `AVAssetWriter` for GIF → MP4 | ✅ (headless: CLI/API) |
-| Auto-zoom on clicks, smoothed pointer | pointer/click event track recorded next to the video (`clip.events.json`); frames re-rendered in Rust (`AVAssetReader` → `AVAssetWriter`, audio copied back in) | ✅ (headless: CLI/API) |
+| Auto-zoom on clicks, smoothed pointer | pointer/click event track recorded next to the video (`clip.mp4.events.json`); frames re-rendered in Rust (`AVAssetReader` → `AVAssetWriter`, audio copied back in) | ✅ headless (CLI/API); track timing measured on real recordings, zoom checked with hand-written clicks, live clicks not exercised |
 | `Bugle.app` bundle | `cargo xtask bundle` (hardened runtime, ad-hoc or Developer ID) | ✅ ad-hoc; Developer ID signing and notarization not yet exercised |
 | Open at Login | `SMAppService.mainAppService` | built, status read verified; registering not yet exercised |
 
@@ -166,7 +166,7 @@ bugle record start area --rect 0,30,1280,720 -f gif --fps 10 -s 8
 bugle record start window --app Xcode -f mp4 --mic --subtitles   # Ctrl-C to stop
 bugle record start screen -f mp4 --system-audio -s 30              # ScreenCaptureKit backend
 bugle record start screen --system-audio --mic --mix-audio --clicks # one audio track, clicks shown
-bugle record start screen --cursor-events -s 30   # also writes <name>.events.json (pointer + clicks)
+bugle record start screen --cursor-events -s 30   # also writes <file>.events.json (pointer + clicks)
 bugle record start screen --hide-cursor -s 30     # pointer left out of the frames, logged instead
 
 bugle ocr latest                   # Apple Vision, reading order, --json for boxes
@@ -181,7 +181,7 @@ bugle edit latest -s 0:05 -e 0:12 -p 720p -o ~/Desktop/clip.mp4
 bugle edit latest -p high --fps 15            # re-encode at 15 fps
 bugle edit latest -p gif-small                # recording → chat-sized GIF
 bugle edit demo.gif -p hevc                   # GIF → HEVC .mp4
-bugle edit latest --zoom                      # zoom 2x on every click (--zoom 1.5 for less)
+bugle edit latest --zoom                      # zoom 2x on every click (--zoom=1.5 for less)
 bugle edit latest --smooth-cursor --zoom      # --hide-cursor recordings: smoothed pointer drawn in
 bugle edit --list-presets
 
@@ -211,16 +211,26 @@ not use it to remove something sensitive.
 
 Zoom and pointer smoothing: a recording made with `--cursor-events` (or
 `[recordings] cursor_events = true`) gets an event track next to it,
-`<name>.events.json`: the pointer position (polled 60 times a second) and every
-button press and release, in points relative to the recorded area, on the
-video's timeline. `bugle edit --zoom [FACTOR]` uses it to ease in on each click
-(fully zoomed as it happens, held 1.5 s after the last of a run of clicks, then
-eased out; nearby clicks pan from one to the next). `--hide-cursor` records
-without the pointer (ScreenCaptureKit recorder) and implies the track;
-`--smooth-cursor` then draws the pointer back along a smoothed path that still
-lands exactly on each click. A plain trim of such a recording writes the
-trimmed track next to its output, so you can cut first and zoom later. The
-format is documented in `crates/bugle-core/src/events.rs`.
+`<file>.events.json` (`clip.mp4` → `clip.mp4.events.json`): the pointer
+position and the mouse buttons, polled 60 times a second (a press shorter than
+one poll, about 16 ms, can be missed), in points relative to the recorded area,
+on the video's timeline (placed on it to within about one frame). `bugle edit
+--zoom` (2x) or `--zoom=FACTOR` uses it to ease in on each click inside the
+recorded area (fully zoomed as it happens, held 1.5 s after the last of a run of
+clicks, then eased out; nearby clicks pan from one to the next; the click that
+stops the recording is ignored). `--hide-cursor` records without the pointer
+(ScreenCaptureKit recorder) and implies the track; `--smooth-cursor` then draws
+the pointer back along a smoothed path that still lands exactly on each click.
+These edits re-render every frame (at the recording's frame rate, at least
+30 fps) and copy the audio tracks back in untouched; `original` and `high` then
+encode H.264 at the source size (about 0.1 bit per pixel per frame), `hevc`
+HEVC, so `original` does not keep a HEVC source's codec. A plain trim of such a
+recording writes the trimmed track next to its output, so you can cut first and
+zoom later. The track moves, syncs and is deleted with its video. Window
+recordings: the pointer is logged relative to the window as it moves; a window
+resized during the recording cannot be zoomed or smoothed, and the system
+recorder leaves out the window shadow when it logs events, so the frames match
+the window. The format is documented in `crates/bugle-core/src/events.rs`.
 
 Every command takes `--json`.
 

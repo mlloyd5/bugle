@@ -30,7 +30,7 @@ mix_audio = false         # one audio track instead of microphone + system audio
                           # (re-encodes the audio after stop; each source at 1/2;
                           # needs free space equal to the recording)
 highlight_clicks = false  # stream backend: macOS 15+
-cursor_events = false     # write <name>.events.json (pointer + clicks) for `bugle edit --zoom`
+cursor_events = false     # write <file>.events.json (pointer + clicks) for `bugle edit --zoom`
 hide_cursor = false       # leave the pointer out of the frames (stream backend; implies
                           # cursor_events; `bugle edit --smooth-cursor` draws it back)
 retina = true
