@@ -291,9 +291,19 @@ waiting document is rendered, stale results are dropped) and hands the pixels
 and `Annotation::source_origin` to the window, so the preview is the
 renderer's output. Only the shape being dragged (and the selection or crop
 marks) go to the window as overlay primitives; a shape being moved is left out
-of the render meanwhile, and the overlay waits for the render it belongs with.
-The window owns the zoom and reports image pixels per point on a later
-main-loop turn, so nothing it does in reply to Rust calls back into Rust.
+of the render meanwhile. After an edit that moves something from the overlay
+into the image (a shape released or finished, the crop tool left) the overlay
+waits for that render, until the next pointer input; while dragging it never
+waits. Renders, saves and copies run under `catch_unwind`, and every preview
+job answers, so a renderer failure is a toast rather than a frozen picture or
+a window stuck busy. Each picture travels with its own size and
+`source_origin`, so a click maps onto what is on screen; what can lag by one
+render is the edit state Rust applies it to (tool, crop), and image pixels
+per point lag by one main-loop turn: the window owns the zoom and reports it
+on a later turn, so nothing it does in reply to Rust calls back into Rust.
+Zoomed in, a new picture of another size or origin is scrolled so the image
+stays put under the pointer, and the zoom is capped so the canvas stays
+within 8192 points.
 Save runs `Engine::apply_annotations` on a thread and the window closes only
 once it succeeded; `shim/editor.m` frees the Rust handler on a later
 main-loop turn, so closing from inside the callback is safe. `--smoke-test`

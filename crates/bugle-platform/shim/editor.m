@@ -59,6 +59,9 @@ enum { ZOOM_IN = 0, ZOOM_OUT = 1, ZOOM_ACTUAL = 2, ZOOM_FIT = 3 };
 static const CGFloat kToolbarHeight = 44;
 static const CGFloat kCanvasMargin = 24;
 static const CGFloat kMenuWidth = 104;
+// Longest side of the zoomed canvas, in points: bounds the backing store a
+// deep zoom into a large capture needs.
+static const CGFloat kMaxCanvasSide = 8192;
 // Zoom stops, in percent of actual pixels (one image pixel per screen pixel).
 static const CGFloat kZoomStops[] = {10, 25, 33, 50, 67, 100, 150, 200, 300, 400, 600, 800};
 static const int kZoomStopCount = sizeof(kZoomStops) / sizeof(kZoomStops[0]);
@@ -508,11 +511,15 @@ static int32_t mouse_flags(NSEvent *e) { return (e.modifierFlags & NSEventModifi
         size.width = MAX(clip.width, ceil(self.imgW * z + 2 * kCanvasMargin));
         size.height = MAX(clip.height, ceil(self.imgH * z + 2 * kCanvasMargin));
     }
+    // Fitting never scrolls; showing scrollers only when zoomed keeps
+    // always-visible scroll bars from resizing the area being fitted.
+    self.scroll.hasHorizontalScroller = !self.fitMode;
+    self.scroll.hasVerticalScroller = !self.fitMode;
     if (!NSEqualSizes(self.canvas.frame.size, size)) [self.canvas setFrameSize:size];
     // A label being typed stays over its spot (this may run inside the
     // callback, so the field is moved, never finished, here).
     [self placeField];
-    [self.canvas setNeedsDisplay:YES];
+    [self.canvas setNeedsDisplayInRect:self.canvas.visibleRect];
     [self.window invalidateCursorRectsForView:self.canvas];
     [self.canvas reportScale];
 }
@@ -523,7 +530,11 @@ static int32_t mouse_flags(NSEvent *e) { return (e.modifierFlags & NSEventModifi
 /// NaN for the middle of the visible area) where it is on screen.
 - (void)setZoom:(CGFloat)z fit:(BOOL)fit anchor:(NSPoint)anchor {
     CGFloat backing = [self backing];
-    if (!fit) z = MIN(MAX(z, kZoomStops[0] / 100.0 / backing), kZoomStops[kZoomStopCount - 1] / 100.0 / backing);
+    if (!fit) {
+        CGFloat most = kZoomStops[kZoomStopCount - 1] / 100.0 / backing;
+        if (self.imgW > 0 && self.imgH > 0) most = MIN(most, kMaxCanvasSide / MAX(self.imgW, self.imgH));
+        z = MIN(MAX(z, MIN(kZoomStops[0] / 100.0 / backing, most)), most);
+    }
     NSRect vis = self.canvas.visibleRect;
     NSPoint a = isnan(anchor.x) ? NSMakePoint(NSMidX(vis), NSMidY(vis)) : anchor;
     CGFloat oldZ = [self.canvas zoom];
@@ -596,14 +607,26 @@ static NSUInteger line_count(NSString *s) {
     return n;
 }
 
-/// Grow or shrink the field to the number of lines typed.
+/// Size the field to what is typed: one row per line, as wide as the
+/// longest line plus room for the next characters (the renderer does not
+/// wrap, so neither does the field; it grows instead of clipping).
 - (void)fitField {
     NSTextField *f = self.field;
     if (!f) return;
-    NSString *s = f.currentEditor ? f.currentEditor.string : f.stringValue;
+    NSString *s = (f.currentEditor ? f.currentEditor.string : f.stringValue) ?: @"";
+    NSString *flat = [[s stringByReplacingOccurrencesOfString:@"\r\n" withString:@"\n"]
+        stringByReplacingOccurrencesOfString:@"\r" withString:@"\n"];
+    NSDictionary *attrs = @{NSFontAttributeName : f.font};
+    CGFloat widest = [f.placeholderString sizeWithAttributes:attrs].width;
+    for (NSString *line in [flat componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+        widest = MAX(widest, [line sizeWithAttributes:attrs].width);
+    }
     NSRect fr = f.frame;
-    fr.size.height = line_count(s ?: @"") * self.fieldLineHeight + 4;
-    f.frame = fr;
+    fr.size.width = ceil(widest + 2 * self.fieldLineHeight);
+    fr.size.height = line_count(s) * self.fieldLineHeight + 4;
+    if (!NSEqualRects(fr, f.frame)) f.frame = fr;
+    // Zoomed in, keep the caret's end of the field in view.
+    if (f.currentEditor) [f.currentEditor scrollRangeToVisible:f.currentEditor.selectedRange];
 }
 
 /// Put the field over its anchor at the current zoom and image origin.
@@ -611,12 +634,16 @@ static NSUInteger line_count(NSString *s) {
     NSTextField *f = self.field;
     if (!f) return;
     CGFloat size = MAX(9, self.fieldFontPx * [self.canvas zoom]);
-    NSFont *font = [NSFont fontWithName:@"Arial-BoldMT" size:size] ?: [NSFont boldSystemFontOfSize:size];
+    if (fabs(f.font.pointSize - size) > 0.01) {
+        NSFont *font = [NSFont fontWithName:@"Arial-BoldMT" size:size] ?: [NSFont boldSystemFontOfSize:size];
+        self.fieldLineHeight = ceil([[NSLayoutManager new] defaultLineHeightForFont:font]);
+        f.font = font;
+        // The field editor of a field being typed in keeps its own font.
+        NSText *editor = f.currentEditor;
+        if (editor) editor.font = font;
+    }
     NSPoint o = [self.canvas toView:self.fieldAnchor.x y:self.fieldAnchor.y];
-    self.fieldLineHeight = ceil([[NSLayoutManager new] defaultLineHeightForFont:font]);
-    CGFloat w = MAX(160, NSMaxX(self.canvas.visibleRect) - o.x - 8);
-    f.font = font;
-    f.frame = NSMakeRect(o.x - 2, o.y - 2, w, self.fieldLineHeight + 4);
+    [f setFrameOrigin:NSMakePoint(o.x - 2, o.y - 2)];
     [self fitField];
 }
 
@@ -780,6 +807,8 @@ static NSButton *symbol_button(NSString *symbol, NSString *tip, BugleEditor *tar
 static NSPopUpButton *pull_down(CGFloat width) {
     NSPopUpButton *b = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0, 0, width, 24) pullsDown:YES];
     b.bezelStyle = NSBezelStyleTexturedRounded;
+    // Check marks come from Rust only (`bugle_editor_set_menu`).
+    ((NSPopUpButtonCell *)b.cell).altersStateOfSelectedItem = NO;
     [b.widthAnchor constraintEqualToConstant:width].active = YES;
     [b addItemWithTitle:@""];
     return b;
@@ -921,7 +950,6 @@ int32_t bugle_editor_open(const char *title, uint32_t img_w, uint32_t img_h, con
         scroll.drawsBackground = YES;
         scroll.backgroundColor = [NSColor colorWithWhite:0.13 alpha:1];
         BugleEditorCanvas *canvas = [[BugleEditorCanvas alloc] initWithFrame:NSMakeRect(0, 0, cw, ch)];
-        canvas.wantsLayer = YES;
         canvas.editor = e;
         scroll.documentView = canvas;
         e.scroll = scroll;
@@ -998,12 +1026,24 @@ void bugle_editor_set_image(const uint8_t *rgba, uint32_t w, uint32_t h, double 
         if (e.image) CGImageRelease(e.image);
         e.image = img;
         BOOL moved = e.imgW != w || e.imgH != h || e.originX != origin_x || e.originY != origin_y;
+        // Where edited pixel (0, 0) is on screen, to keep it there.
+        NSPoint before = [e.canvas toView:0 y:0];
+        NSPoint scrolled = e.canvas.visibleRect.origin;
         e.imgW = w;
         e.imgH = h;
         e.originX = origin_x;
         e.originY = origin_y;
-        if (moved) [e layoutCanvas];
-        else [e.canvas setNeedsDisplay:YES];
+        if (moved) {
+            [e layoutCanvas];
+            if (!e.fitMode) {
+                // Zoomed: a crop or canvas change must not shift what is under
+                // the pointer.
+                NSPoint after = [e.canvas toView:0 y:0];
+                [e.canvas scrollPoint:NSMakePoint(scrolled.x + after.x - before.x, scrolled.y + after.y - before.y)];
+            }
+        } else {
+            [e.canvas setNeedsDisplayInRect:e.canvas.visibleRect];
+        }
     }
 }
 
@@ -1016,7 +1056,8 @@ void bugle_editor_set_overlay(const double *values, size_t n) {
         BugleEditor *e = g_editor;
         if (!e) return;
         e.overlay = (values && n) ? [NSData dataWithBytes:values length:n * sizeof(double)] : nil;
-        [e.canvas setNeedsDisplay:YES];
+        // Only what is on screen: a zoomed canvas can be far larger.
+        [e.canvas setNeedsDisplayInRect:e.canvas.visibleRect];
     }
 }
 

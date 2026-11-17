@@ -167,6 +167,8 @@ pub struct Effects {
     /// Show the text field.
     pub begin_text: Option<TextRequest>,
     pub request: Option<Request>,
+    /// Something was refused; tell the user why.
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -322,11 +324,15 @@ impl Editor {
     }
 
     fn canvas(&self) -> Option<Canvas> {
-        let pad = PADDINGS[self.frame.padding.min(PADDINGS.len() - 1)].1 * self.unit;
+        self.canvas_for(self.frame)
+    }
+
+    fn canvas_for(&self, frame: Frame) -> Option<Canvas> {
+        let pad = PADDINGS[frame.padding.min(PADDINGS.len() - 1)].1 * self.unit;
         if pad <= 0.0 {
             return None;
         }
-        let background = BACKGROUNDS[self.frame.background.min(BACKGROUNDS.len() - 1)].1;
+        let background = BACKGROUNDS[frame.background.min(BACKGROUNDS.len() - 1)].1;
         Some(Canvas {
             padding: (pad.round() as u32).min(limits::MAX_CANVAS_INSET),
             background: Background::Named(background.into()),
@@ -342,8 +348,11 @@ impl Editor {
         self.shapes.is_empty() && self.crop.is_none() && self.canvas().is_none()
     }
 
+    /// With no padding there is no canvas, whatever background was picked
+    /// before: such frames compare equal, so dirty agrees with empty.
     fn snapshot(&self) -> Snapshot {
-        Snapshot { shapes: self.shapes.clone(), crop: self.crop, frame: self.frame }
+        let frame = if self.frame.padding == 0 { Frame::default() } else { self.frame };
+        Snapshot { shapes: self.shapes.clone(), crop: self.crop, frame }
     }
 
     fn restore(&mut self, s: Snapshot) -> Snapshot {
@@ -514,6 +523,14 @@ impl Editor {
                     },
                 }
                 let mut fx = Effects { state: true, ..Default::default() };
+                // Refuse a canvas that would make the image larger than the
+                // renderer accepts, rather than leave a stale preview.
+                let (w, h) = self.crop.map_or(self.image, |c| (c.w as u32, c.h as u32));
+                let check = Annotation { canvas: self.canvas_for(frame), ..Default::default() };
+                if let Err(e) = check.output_size(w, h) {
+                    fx.error = Some(format!("{e:#}"));
+                    return fx;
+                }
                 if frame != self.frame && self.drag.is_none() {
                     let before = self.snapshot();
                     self.frame = frame;
@@ -1824,6 +1841,37 @@ mod tests {
         // Retyping starts from the lines as they are.
         let fx = e.handle(EditorEvent::MouseDown { at: pt(50.0, 60.0), shift: false, clicks: 2 });
         assert_eq!(fx.begin_text.map(|t| t.initial), Some("First\nSecond\n\nFourth\nFifth".into()));
+    }
+
+    #[test]
+    fn a_background_without_padding_is_not_an_unsaved_change() {
+        let mut e = editor();
+        // A background brings medium padding; taking the padding away again
+        // leaves nothing to save, and nothing unsaved.
+        menu(&mut e, MENU_CANVAS, CANVAS_BACKGROUND_ITEM + 4);
+        assert!(e.is_dirty() && !e.is_empty());
+        menu(&mut e, MENU_CANVAS, CANVAS_PADDING_ITEM);
+        assert!(e.is_empty());
+        assert!(!e.is_dirty() && !e.state().dirty);
+        // The background picked is still offered for next time.
+        assert_eq!(e.frame.background, 4);
+        // And undo goes back to the framed image.
+        cmd(&mut e, EditorCommand::Undo);
+        assert!(e.final_document().canvas.is_some());
+    }
+
+    #[test]
+    fn a_canvas_too_large_to_render_is_refused() {
+        // 10000 x 9990 is just under 100 megapixels; any padding is too much.
+        let mut e = Editor::new((10_000, 9_990));
+        let fx = menu(&mut e, MENU_CANVAS, CANVAS_BACKGROUND_ITEM + 2);
+        assert!(fx.error.as_deref().is_some_and(|m| m.contains("megapixels")), "{fx:?}");
+        assert!(!fx.render && e.final_document().canvas.is_none() && !e.state().can_undo);
+        // Cropped smaller, it fits.
+        pick(&mut e, Tool::Crop);
+        drag(&mut e, pt(0.0, 0.0), pt(5000.0, 5000.0));
+        let fx = menu(&mut e, MENU_CANVAS, CANVAS_BACKGROUND_ITEM + 2);
+        assert!(fx.error.is_none() && fx.render);
     }
 
     #[test]

@@ -595,7 +595,7 @@ pub fn schema_description() -> serde_json::Value {
             {"type":"line","from":{"x":0,"y":0},"to":{"x":100,"y":100}},
             {"type":"arrow","from":{"x":0,"y":0},"to":{"x":100,"y":100},"arrow":"standard | double | slim | fancy"},
             {"type":"freehand","points":[{"x":0,"y":0}]},
-            {"type":"text","at":{"x":0,"y":0},"text":"Hello","background":"#000000AA","font_size":28,"color":"white"},
+            {"type":"text","at":{"x":0,"y":0},"text":"Hello\nsecond line","background":"#000000AA","font_size":28,"color":"white","_doc":"\\n, \\r\\n, \\r, U+2028 and U+2029 break lines"},
             {"type":"highlight","rect":{"x":0,"y":0,"w":100,"h":20},"color":"yellow","_doc":"colour alpha and opacity set the strength"},
             {"type":"counter","at":{"x":0,"y":0},"number":1},
             {"type":"redact","rect":{"x":0,"y":0,"w":100,"h":20},"mode":"pixelate | blur | black_out | secure_blur","strength":0},

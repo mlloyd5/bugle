@@ -44,6 +44,30 @@ thread_local! {
 /// One preview to render: its sequence number and the document.
 type PreviewJob = (u64, Annotation);
 
+/// Run a render (or save) and turn a panic into an error, so a renderer bug
+/// can neither take down a worker thread that the window waits on nor
+/// unwind through the AppKit callback on the main thread.
+fn guarded<T>(what: &str, f: impl FnOnce() -> anyhow::Result<T>) -> Result<T, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r.map_err(|e| format!("{e:#}")),
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            tracing::error!("editor: {what} panicked: {msg}");
+            Err(format!("{what} failed unexpectedly ({msg})"))
+        }
+    }
+}
+
+/// Tell the user about a refused change or a failed preview.
+fn toast_problem(msg: &str) {
+    tracing::warn!("editor: {msg}");
+    bugle_platform::toast_show(None, "Annotate", msg, None, 4.0);
+}
+
 /// Render previews on a thread of their own, so a very large capture never
 /// stalls the main loop. Only the newest waiting job is rendered; the thread
 /// ends when the session (holding the sender) is dropped.
@@ -56,7 +80,8 @@ fn spawn_preview(engine: Arc<Engine>, base: Arc<RgbaImage>, proxy: Proxy, genera
             }
             let (seq, doc) = job;
             let t = std::time::Instant::now();
-            let result = engine.render_annotations(&base, &doc).map(|img| (img, doc.source_origin())).map_err(|e| format!("{e:#}"));
+            // Every job answers, error or not: the window waits for it.
+            let result = guarded("preview", || engine.render_annotations(&base, &doc)).map(|img| (img, doc.source_origin()));
             tracing::debug!("editor: preview {seq} rendered in {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
             proxy.send(AppEvent::Editor(EditorMsg::Preview { generation, seq, result }));
         }
@@ -85,11 +110,17 @@ struct Session {
     preview: Option<mpsc::Sender<PreviewJob>>,
     /// The newest preview asked for; results for older ones are dropped.
     seq: u64,
-    /// A preview is being rendered. The overlay waits for it, so a shape
-    /// that moves between the overlay and the image never shows twice or
-    /// not at all.
+    /// A preview is being rendered.
     pending: bool,
+    /// The overlay waits for the pending preview: the edit that started it
+    /// moved something from the overlay into the image (a shape released or
+    /// finished, the crop tool left), so showing the new overlay over the old
+    /// image would make it vanish for a moment. The next pointer input lets
+    /// go, so a new drag is never held up.
+    hold_overlay: bool,
     overlay_stale: bool,
+    /// The last preview error toasted, so a failing render is reported once.
+    last_error: Option<String>,
     /// The menus as last sent to the window.
     menus: Vec<EditorMenu>,
 }
@@ -99,13 +130,23 @@ impl Session {
         if self.saving.load(Ordering::SeqCst) {
             return;
         }
+        let pointer = matches!(event, EditorEvent::MouseDown { .. } | EditorEvent::MouseDrag { .. });
         let fx = self.editor.handle(event);
-        self.apply(fx);
+        self.apply(fx, pointer);
     }
 
-    fn apply(&mut self, fx: Effects) {
+    /// `pointer`: the effects answer a mouse-down or drag, whose feedback
+    /// must show at once.
+    fn apply(&mut self, fx: Effects, pointer: bool) {
         if fx.render {
             self.render();
+            self.hold_overlay = self.pending && !pointer;
+        }
+        if pointer {
+            self.hold_overlay = false;
+        }
+        if let Some(e) = &fx.error {
+            toast_problem(e);
         }
         if fx.render || fx.overlay {
             self.overlay_stale = true;
@@ -126,7 +167,7 @@ impl Session {
     }
 
     fn flush_overlay(&mut self) {
-        if self.overlay_stale && !self.pending {
+        if self.overlay_stale && !self.hold_overlay {
             self.overlay_stale = false;
             bugle_platform::editor_set_overlay(&self.editor.overlay());
         }
@@ -159,11 +200,11 @@ impl Session {
             }
             self.preview = None;
         }
+        // No preview thread (or it is gone): render here.
         self.pending = false;
-        match self.engine.render_annotations(&self.base, &doc) {
-            Ok(img) => bugle_platform::editor_set_image(&img, doc.source_origin()),
-            Err(e) => tracing::warn!("editor: preview failed: {e:#}"),
-        }
+        self.hold_overlay = false;
+        let result = guarded("preview", || self.engine.render_annotations(&self.base, &doc)).map(|img| (img, doc.source_origin()));
+        self.show_preview(result);
     }
 
     fn on_preview(&mut self, seq: u64, result: Result<(RgbaImage, Point), String>) {
@@ -172,11 +213,24 @@ impl Session {
             return;
         }
         self.pending = false;
-        match result {
-            Ok((img, origin)) => bugle_platform::editor_set_image(&img, origin),
-            Err(e) => tracing::warn!("editor: preview failed: {e}"),
-        }
+        self.hold_overlay = false;
+        self.show_preview(result);
         self.flush_overlay();
+    }
+
+    fn show_preview(&mut self, result: Result<(RgbaImage, Point), String>) {
+        match result {
+            Ok((img, origin)) => {
+                self.last_error = None;
+                bugle_platform::editor_set_image(&img, origin);
+            }
+            Err(e) => {
+                if self.last_error.as_ref() != Some(&e) {
+                    toast_problem(&format!("the preview could not be drawn: {e}"));
+                }
+                self.last_error = Some(e);
+            }
+        }
     }
 
     /// Save an annotated copy as a new history item. The window stays up
@@ -194,15 +248,13 @@ impl Session {
         bugle_platform::editor_set_busy(true);
         let flag = saving.clone();
         let spawned = std::thread::Builder::new().name("bugle-editor-save".into()).spawn(move || {
-            let result = engine
-                .apply_annotations(&source, doc, None, false)
-                .map(|(item, img)| Notice {
-                    title: "Annotated copy saved".into(),
-                    subtitle: saved_subtitle(&engine, &item),
-                    thumb: bugle_engine::encode_png_bounded(&img, 112).ok(),
-                    open: Some(item.path.clone()),
-                })
-                .map_err(|e| format!("{e:#}"));
+            // Always answers, so the window never stays busy.
+            let result = guarded("save", || engine.apply_annotations(&source, doc, None, false)).map(|(item, img)| Notice {
+                title: "Annotated copy saved".into(),
+                subtitle: saved_subtitle(&engine, &item),
+                thumb: bugle_engine::encode_png_bounded(&img, 112).ok(),
+                open: Some(item.path.clone()),
+            });
             if result.is_err() {
                 flag.store(false, Ordering::SeqCst);
             }
@@ -220,7 +272,7 @@ impl Session {
         let doc = self.editor.final_document();
         let (engine, proxy, base) = (self.engine.clone(), self.proxy.clone(), self.base.clone());
         let spawned = std::thread::Builder::new().name("bugle-editor-copy".into()).spawn(move || {
-            let result = (|| {
+            let result = guarded("copy", || {
                 let rendered;
                 let img = if doc == Annotation::default() {
                     &*base
@@ -231,8 +283,8 @@ impl Session {
                 let mut png = Vec::new();
                 img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
                 bugle_platform::clipboard_write_png(&png)
-            })();
-            proxy.send(AppEvent::Editor(EditorMsg::Copied(result.map_err(|e| format!("{e:#}")))));
+            });
+            proxy.send(AppEvent::Editor(EditorMsg::Copied(result)));
         });
         if let Err(e) = spawned {
             self.proxy.send(AppEvent::Editor(EditorMsg::Copied(Err(e.to_string()))));
@@ -281,7 +333,9 @@ impl App {
             saving: Arc::new(AtomicBool::new(false)),
             seq: 0,
             pending: false,
+            hold_overlay: false,
             overlay_stale: false,
+            last_error: None,
             menus: Vec::new(),
         }));
         let tools: Vec<EditorTool> = Tool::ALL.iter().map(|t| t.button()).collect();
@@ -304,7 +358,7 @@ impl App {
         CURRENT.with(|c| *c.borrow_mut() = Rc::downgrade(&session));
         tracing::info!("editor: opened {} ({}×{})", file_name(&item.path), size.0, size.1);
         // First paint: the image, an empty overlay, the toolbar and menus.
-        session.borrow_mut().apply(Effects { render: true, ..Default::default() });
+        session.borrow_mut().apply(Effects { render: true, ..Default::default() }, false);
     }
 
     pub(crate) fn on_editor(&mut self, msg: EditorMsg) {
@@ -336,7 +390,9 @@ impl App {
                         Ok(mut s) if s.generation == generation => s.on_preview(seq, result),
                         // A window that has closed since.
                         Ok(_) => {}
-                        Err(_) => tracing::warn!("editor: preview dropped, session busy"),
+                        // Never dropped (the window would wait for it): try
+                        // again on the next turn.
+                        Err(_) => self.proxy.send(AppEvent::Editor(EditorMsg::Preview { generation, seq, result })),
                     }
                 }
             }
@@ -420,6 +476,11 @@ pub(crate) fn smoke(proxy: &Proxy) {
     send(EditorEvent::Key(Tool::Text.key()));
     click(pt(80.0, 470.0), 1);
     send(EditorEvent::Text("Smoke test\r\nsecond line".into()));
+    // Shapes the crop will cut away entirely (past its right and bottom
+    // edges): rendered after the crop they start outside the image.
+    drag(Tool::Redact, pt(875.0, 300.0), pt(898.0, 420.0));
+    drag(Tool::Highlight, pt(100.0, 545.0), pt(400.0, 558.0));
+    drag(Tool::Rectangle, pt(880.0, 470.0), pt(898.0, 556.0));
     // Crop off the edges, then a canvas (Ocean, which brings padding).
     drag(Tool::Crop, pt(50.0, 40.0), pt(870.0, 540.0));
     snap("editor-crop");

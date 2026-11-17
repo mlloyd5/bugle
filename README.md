@@ -229,7 +229,7 @@ Coordinates are image pixels. Styles can be set per shape or document-wide.
 Shapes: `rectangle`, `ellipse`, `line`, `arrow` (standard/double/slim/fancy),
 `freehand`, `text`, `highlight`, `counter`, `redact` (pixelate/blur/black_out/secure_blur),
 `spotlight`, `image`. A `text` label breaks into lines at `\n` (also `\r\n`, a
-lone `\r` and U+2028). Background presets: sunset, ocean, forest, candy, mono, midnight,
+lone `\r`, U+2028 and U+2029). Background presets: sunset, ocean, forest, candy, mono, midnight,
 peach, mint, any `#hex`, or `gradient:#a,#b[,angle]`.
 
 ## Menu-bar app
@@ -358,8 +358,11 @@ What you see is what is saved: finished shapes are drawn by the same renderer
 as `bugle annotate`, and a saved document can use everything that command
 can. Only the shape under the pointer is drawn by the window, so an arrow
 head or a redaction can look slightly different while you drag it. The
-preview renders on a thread of its own, so a very large capture never makes
-the window stall; while it renders, the old picture stays up.
+preview renders on a thread of its own, so drawing on a very large capture
+stays responsive (handing the finished picture to the window still copies it
+on the main thread); while it renders, the old picture stays up. A preview
+that cannot be drawn, or a canvas too large to render, is reported in a
+toast.
 
 The editor's window, shapes, selection, menus, crop, canvas, zoom and undo are
 checked by `bugle-app --smoke-test`, which feeds it synthetic events rather
