@@ -320,7 +320,8 @@ for the next overlay; if none follows, the session deactivates Bugle itself. `[s
 front-most capture (and plain area selection). *Scrolling Capture* runs
 through the same session (starting in the area selection); a picked window
 scrolls the part of its frame on the display it overlaps most
-(`pick::picked_rect`). The session itself (`Session`, `window_at`, `begin`)
+(`pick::picked_rect`); a pick does not raise the window, so `pick::scroll_rect`
+refuses one that another window partly covers. The session itself (`Session`, `window_at`, `begin`)
 lives in `bugle_engine::pick`, so the CLI can run it too; `picker.rs` keeps the
 app's side (the gate, the cool-down and the worker's `pick`).
 `UiHost::pick_window` offers the picker (without the switch) to API callers:

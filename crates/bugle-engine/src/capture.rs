@@ -267,6 +267,10 @@ impl Engine {
                 .unwrap_or_else(|| "window".into()),
             CaptureTarget::Screen { display } => format!("screen {}", display.map(|d| d.to_string()).unwrap_or("main".into())),
             CaptureTarget::Area { rect } => format!("area {rect}"),
+            // Space in the selection picked a window.
+            CaptureTarget::Interactive if window.is_some() => {
+                window.as_ref().map(|w| format!("window {} — {} ({})", w.id, w.owner, w.title)).unwrap_or_default()
+            }
             CaptureTarget::Interactive => format!("area {}", rect.map(|r| r.to_string()).unwrap_or_default()),
             CaptureTarget::AllScreens => "all screens".into(),
         };

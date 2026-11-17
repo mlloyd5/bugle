@@ -188,10 +188,9 @@ fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<N
         Action::ScrollCapture => {
             let rect = if engine.config.screenshots.window_picker {
                 // Space switches to the window picker; a picked window
-                // scrolls its on-screen part.
+                // scrolls its on-screen part, unless another window covers it.
                 let Some(picked) = picker::pick(proxy, picker::Mode::Area, true, picker::PICK_TIMEOUT)? else { return Ok(None) };
-                let displays: Vec<Rect> = bugle_platform::displays()?.into_iter().map(|d| d.frame).collect();
-                picker::picked_rect(&picked, &displays).ok_or_else(|| anyhow!("the picked window is not on any display"))?
+                picker::scroll_rect(&picked)?
             } else {
                 let Some(rect) = engine.select_area()? else { return Ok(None) };
                 rect

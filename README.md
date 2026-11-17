@@ -375,7 +375,10 @@ records the window you click (MP4), the other two start in the area selection.
 *Scrolling Capture* starts in the area selection too; a picked window scrolls
 the part of it that is on screen. From a terminal, `bugle capture`, `bugle
 scroll` and `bugle record start` without a target offer the same Space toggle
-in their area selection.
+in their area selection, which then also closes after two minutes (with
+`window_picker = false` it waits as long as you like). Scrolling a picked
+window needs it in front: when another window covers part of it, Bugle says
+so instead of capturing.
 A picked window is recorded by id, the way `record_start` with a window target
 records it, not as the screen area under it. The two overlays together close after two minutes
 (each picker turn still after 30 seconds; never in the middle of a drag).

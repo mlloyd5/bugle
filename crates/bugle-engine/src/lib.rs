@@ -504,7 +504,8 @@ impl Engine {
     /// Refuse a `pick_window` target up front when there is no picker, so
     /// the caller hears why before any permission prompt or delay.
     pub fn check_target_host(&self, target: &bugle_core::CaptureTarget) -> Result<()> {
-        if *target == bugle_core::CaptureTarget::PickWindow && self.ui_host.is_none() && !self.main_thread_ui {
+        let in_process = self.main_thread_ui && bugle_platform::is_main_thread();
+        if *target == bugle_core::CaptureTarget::PickWindow && self.ui_host.is_none() && !in_process {
             return Err(BugleError::NoUiHost(NO_UI_HOST_PICK.into()).into());
         }
         Ok(())
@@ -826,6 +827,33 @@ mod tests {
         }
     }
 
+    /// A host whose area selection answers with a fixed rect.
+    struct AreaHost(Rect);
+
+    impl UiHost for AreaHost {
+        fn select_area(&self) -> Result<Option<Rect>> {
+            Ok(Some(self.0))
+        }
+        fn pin(&self, _: Vec<u8>, _: Option<Rect>, _: f64) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn select_area_or_window_falls_back_to_the_plain_selection() {
+        let (_dir, mut engine) = temp_engine();
+        let r = Rect::new(10.0, 20.0, 300.0, 200.0);
+        engine.ui_host = Some(Arc::new(AreaHost(r)));
+        // A host runs its own sessions: no in-process Space toggle.
+        assert!(engine.config.screenshots.window_picker);
+        assert!(matches!(engine.select_area_or_window().unwrap(), Some(pick::Picked::Area(a)) if a == r));
+        engine.config.screenshots.window_picker = false;
+        assert!(matches!(engine.select_area_or_window().unwrap(), Some(pick::Picked::Area(a)) if a == r));
+        // The host cancelling is `None`.
+        engine.ui_host = Some(Arc::new(FakeHost(None)));
+        assert!(engine.select_area_or_window().unwrap().is_none());
+    }
+
     /// A host that only implements the required methods.
     struct OldHost;
 
@@ -856,11 +884,11 @@ mod tests {
         let (_dir, mut engine) = temp_engine();
         let target = bugle_core::CaptureTarget::PickWindow;
         assert!(is_no_host(&engine.check_target_host(&target).unwrap_err()));
-        // The CLI shows its overlays in-process: the target is accepted...
+        // The CLI shows its overlays in-process, but on the main thread
+        // only: off it (tests run on worker threads) the target is refused
+        // up front and the picker refuses without showing anything.
         engine.main_thread_ui = true;
-        engine.check_target_host(&target).unwrap();
-        // ...but the picker itself refuses off the main thread (tests run on
-        // worker threads) without showing anything.
+        assert!(is_no_host(&engine.check_target_host(&target).unwrap_err()));
         assert!(is_no_host(&engine.pick_window().unwrap_err()));
         assert!(!engine.in_process_picker(), "no Space toggle off the main thread");
     }

@@ -422,6 +422,9 @@ pub fn run_blocking(start: Mode, allow_switch: bool, timeout: Duration) -> Resul
             Err(TryRecvError::Disconnected) => return Err(anyhow!("window picker request dropped")),
             Err(TryRecvError::Empty) if Instant::now() > give_up => {
                 control(Control::Cancel);
+                // The overlay's final callback is dispatched asynchronously;
+                // let it run so the session state and its context are freed.
+                bugle_platform::run_loop_once(PUMP_SLICE);
                 return Err(anyhow!("window picker did not answer"));
             }
             Err(TryRecvError::Empty) => bugle_platform::run_loop_once(PUMP_SLICE),
@@ -452,6 +455,32 @@ pub fn picked_rect(picked: &Picked, displays: &[Rect]) -> Option<Rect> {
         Picked::Window(w) => visible_frame(w.frame, displays),
         Picked::Area(r) => Some(*r),
     }
+}
+
+/// The first window in front of `picked` (`windows` in z-order, front-most
+/// first) that the filter accepts and that overlaps `rect`. A pick does not
+/// raise the window, so such a window would be in the screenshots and catch
+/// the scroll events. `Err` when `picked` is no longer in `windows`.
+pub fn covering_window<'a>(windows: &'a [WindowInfo], picked: &WindowInfo, rect: Rect, filter: &PickFilter) -> Result<Option<&'a WindowInfo>> {
+    let Some(at) = windows.iter().position(|w| w.id == picked.id) else {
+        return Err(BugleError::Invalid(format!("the picked window ({}) is no longer on screen", label(picked))).into());
+    };
+    Ok(windows[..at].iter().find(|w| filter.accepts(w) && w.frame.intersection(&rect).is_some()))
+}
+
+/// [`picked_rect`] for a scrolling capture, checked against the screen as it
+/// is now: a picked window must be on a display and not be covered by
+/// another window in that area (bring it to the front first).
+pub fn scroll_rect(picked: &Picked) -> Result<Rect> {
+    let filter = PickFilter::current();
+    let rect = picked_rect(picked, &filter.displays).ok_or_else(|| BugleError::Invalid("the picked window is not on any display".into()))?;
+    if let Picked::Window(w) = picked {
+        let windows = bugle_platform::windows(true)?;
+        if let Some(front) = covering_window(&windows, w, rect, &filter)? {
+            return Err(BugleError::Invalid(format!("the picked window is partly covered by {}; bring it to the front and try again", label(front))).into());
+        }
+    }
+    Ok(rect)
 }
 
 #[cfg(test)]
@@ -706,6 +735,25 @@ mod tests {
         assert_eq!(visible_frame(across.frame, &[]), Some(across.frame));
         let area = Rect::new(-50.0, -50.0, 100.0, 100.0);
         assert_eq!(picked_rect(&Picked::Area(area), &displays), Some(area));
+    }
+
+    #[test]
+    fn a_covered_window_is_not_scrolled() {
+        let f = PickFilter { own_pid: 1, displays: vec![] };
+        let picked = win(5, 2, 100.0, 100.0, 800.0, 600.0);
+        let rect = picked.frame;
+        let beside = win(3, 3, 1000.0, 100.0, 300.0, 300.0);
+        let mine = win(4, 1, 200.0, 200.0, 300.0, 300.0);
+        let behind = win(6, 4, 150.0, 150.0, 300.0, 300.0);
+        // In front but elsewhere, Bugle's own, or behind: not covering.
+        let windows = vec![beside.clone(), mine, picked.clone(), behind];
+        assert!(covering_window(&windows, &picked, rect, &f).unwrap().is_none());
+        // An accepted window in front that overlaps the area covers it.
+        let over = win(2, 3, 700.0, 500.0, 300.0, 300.0);
+        let windows = vec![over, beside, picked.clone()];
+        assert_eq!(covering_window(&windows, &picked, rect, &f).unwrap().map(|w| w.id), Some(2));
+        // A window that has gone away is refused.
+        assert!(covering_window(&windows[..2], &picked, rect, &f).is_err());
     }
 
     #[test]

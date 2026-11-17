@@ -595,12 +595,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             let rect = match a.rect {
                 Some(r) => parse_rect(&r)?,
                 // Space picks a whole window instead (`[screenshots]
-                // window_picker`); its on-screen part is scrolled.
+                // window_picker`); its on-screen part is scrolled, unless
+                // another window covers it.
                 None => {
                     let picked = engine.select_area_or_window()?.ok_or(BugleError::Cancelled)?;
-                    let displays: Vec<Rect> = bugle_platform::displays()?.into_iter().map(|d| d.frame).collect();
-                    bugle_engine::pick::picked_rect(&picked, &displays)
-                        .ok_or_else(|| BugleError::Invalid("the picked window is not on any display".into()))?
+                    bugle_engine::pick::scroll_rect(&picked)?
                 }
             };
             bugle_engine::capture::validate_rect(&rect)?;
