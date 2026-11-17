@@ -452,7 +452,9 @@ corner do the same, and a zoomed image scrolls.
 `annotated`, named and synced like any other capture) and leaves the original
 alone; the quick-access panel then offers the copy. **Copy** (⌘C) puts the
 annotated image on the clipboard and keeps the window open. Closing with
-unsaved shapes asks first. One editor is open at a time.
+unsaved shapes asks first. Several editors can be open at once, each in a
+window of its own; annotating a capture that already has an editor open
+brings that window forward instead.
 
 What you see is what is saved: finished shapes are drawn by the same renderer
 as `bugle annotate`, and a saved document can use everything that command

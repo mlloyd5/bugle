@@ -59,7 +59,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `select_rect_begin_ex`, `select_rect_switch` | the selection overlay with an optional timeout and a Space "switch" result (not while dragging); a switch from either overlay leaves Bugle active so the other can open at once |
 | `pin_image_blocking`, `pin_image_show` | floating borderless window, drag/resize/close; blocking or fire-and-forget |
 | `toast_show` | non-activating `NSPanel` with `NSVisualEffectView`, thumbnail + two lines, fades out |
-| `editor_open` (`shim/editor.m`) | markup editor window: toolbar with pull-down menus, canvas in an `NSScrollView` (fit, zoom stops, pinch, ⌘+/⌘−/⌘1/⌘0), multi-line label text field, unsaved-changes sheet; reports input in edited-image pixels through a callback and draws the image (told where the edited image's origin lies in it), overlay primitives and menus it is handed |
+| `editor_open` (`shim/editor.m`) | markup editor windows, several at once, each named by the `EditorId` `editor_open` returns: toolbar with pull-down menus, canvas in an `NSScrollView` (fit, zoom stops, pinch, ⌘+/⌘−/⌘1/⌘0), multi-line label text field, unsaved-changes sheet; reports input in edited-image pixels through a callback and draws the image (told where the edited image's origin lies in it), overlay primitives and menus it is handed |
 | `panel_show` (`shim/panel.m`) | quick-access panel: non-activating, never-key `NSPanel`, thumbnail, buttons, close; reports clicks through a callback |
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
@@ -436,6 +436,11 @@ on a later turn, so nothing it does in reply to Rust calls back into Rust.
 Zoomed in, a new picture of another size or origin is scrolled so the image
 stays put under the pointer, and the zoom is capped so the canvas stays
 within 8192 points.
+Several editors can be open at once. Each `Session` lives in its window's
+handler and knows its `EditorId`; a thread-local registry maps editor
+generations to sessions (weakly, so a closed window drops out by itself) and
+routes preview and save results to their own window. Opening a capture that
+already has a window brings that one forward.
 Save runs `Engine::apply_annotations` on a thread and the window closes only
 once it succeeded; `shim/editor.m` frees the Rust handler on a later
 main-loop turn, so closing from inside the callback is safe. `--smoke-test`

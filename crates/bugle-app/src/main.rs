@@ -469,7 +469,7 @@ struct App {
     proxy: Proxy,
     last_tick: Instant,
     quick: quick_access::QuickAccess,
-    /// Counts editor windows, so a late save result closes only its own.
+    /// Numbers editor windows, so a late save or preview reaches only its own.
     editor_generation: u64,
 }
 

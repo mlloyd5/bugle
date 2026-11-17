@@ -8,7 +8,7 @@ use crate::{file_name, saved_subtitle, App, AppEvent, Notice, Proxy};
 use bugle_core::Point;
 use bugle_engine::Engine;
 use bugle_markup::Annotation;
-use bugle_platform::{EditorCommand, EditorEvent, EditorMenu, EditorTool, EditorZoom};
+use bugle_platform::{EditorCommand, EditorEvent, EditorId, EditorMenu, EditorTool, EditorZoom};
 use image::RgbaImage;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
@@ -27,18 +27,70 @@ pub(crate) enum EditorMsg {
     /// A preview finished rendering on the preview thread: the image and
     /// where the edited image's pixel (0, 0) is in it.
     Preview { generation: u64, seq: u64, result: Result<(RgbaImage, Point), String> },
-    /// Smoke test: deliver an event as if the window had reported it.
+    /// Smoke test: deliver an event to the newest editor as if its window
+    /// had reported it.
     Inject(EditorEvent),
-    /// Smoke test: zoom as the keyboard shortcuts do.
+    /// Smoke test: zoom the newest editor as the keyboard shortcuts do.
     Zoom(EditorZoom),
-    /// Smoke test: close without saving.
+    /// Smoke test: close the newest editor without saving.
     Close,
+    /// Smoke test: how many editor windows are open.
+    Count(mpsc::Sender<usize>),
+}
+
+/// The open editors by generation, oldest first. Each window's handler owns
+/// its session; the registry only points at it, so a closed window's session
+/// drops out by itself.
+struct Registry<T> {
+    entries: Vec<(u64, EditorId, Weak<T>)>,
+}
+
+impl<T> Registry<T> {
+    const fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    fn insert(&mut self, generation: u64, window: EditorId, session: &Rc<T>) {
+        self.entries.retain(|(_, _, s)| s.strong_count() > 0);
+        self.entries.push((generation, window, Rc::downgrade(session)));
+    }
+
+    /// The window and session of editor `generation`, while it lives.
+    fn get(&self, generation: u64) -> Option<(EditorId, Rc<T>)> {
+        let (_, window, s) = self.entries.iter().find(|(g, _, _)| *g == generation)?;
+        Some((*window, s.upgrade()?))
+    }
+
+    /// The live editors, newest first.
+    fn newest_first(&self) -> impl Iterator<Item = (EditorId, Rc<T>)> + '_ {
+        self.entries.iter().rev().filter_map(|(_, w, s)| Some((*w, s.upgrade()?)))
+    }
 }
 
 thread_local! {
-    /// The open window's session, for preview results arriving on the loop.
-    /// The window's handler owns the session; this never keeps it alive.
-    static CURRENT: RefCell<Weak<RefCell<Session>>> = const { RefCell::new(Weak::new()) };
+    /// The open windows' sessions, for results arriving on the loop.
+    static SESSIONS: RefCell<Registry<RefCell<Session>>> = const { RefCell::new(Registry::new()) };
+}
+
+/// The window and session of editor `generation`, while it is alive.
+fn session(generation: u64) -> Option<(EditorId, Rc<RefCell<Session>>)> {
+    SESSIONS.with(|r| r.borrow().get(generation))
+}
+
+/// The newest editor window that is still open.
+fn newest_window() -> Option<EditorId> {
+    SESSIONS.with(|r| r.borrow().newest_first().map(|(w, _)| w).find(|w| bugle_platform::editor_is_open(*w)))
+}
+
+/// The open window already editing `source`, if any.
+fn open_window_for(source: &str) -> Option<EditorId> {
+    SESSIONS.with(|r| {
+        r.borrow()
+            .newest_first()
+            .filter(|(w, _)| bugle_platform::editor_is_open(*w))
+            .find(|(_, s)| s.try_borrow().is_ok_and(|s| s.source == source))
+            .map(|(w, _)| w)
+    })
 }
 
 /// One preview to render: its sequence number and the document.
@@ -98,6 +150,8 @@ fn spawn_preview(engine: Arc<Engine>, base: Arc<RgbaImage>, proxy: Proxy, genera
 /// One open editor window. Lives in the window's event handler and is
 /// dropped when the window closes.
 struct Session {
+    /// The window, once it is open.
+    window: EditorId,
     editor: Editor,
     base: Arc<RgbaImage>,
     engine: Arc<Engine>,
@@ -153,11 +207,11 @@ impl Session {
             self.flush_overlay();
         }
         if fx.render || fx.state {
-            bugle_platform::editor_set_state(self.editor.state());
+            bugle_platform::editor_set_state(self.window, self.editor.state());
             self.sync_menus();
         }
         if let Some(t) = fx.begin_text {
-            bugle_platform::editor_begin_text(t.at, t.font_px, &t.initial, t.color);
+            bugle_platform::editor_begin_text(self.window, t.at, t.font_px, &t.initial, t.color);
         }
         match fx.request {
             Some(Request::Save) => self.save(),
@@ -169,7 +223,7 @@ impl Session {
     fn flush_overlay(&mut self) {
         if self.overlay_stale && !self.hold_overlay {
             self.overlay_stale = false;
-            bugle_platform::editor_set_overlay(&self.editor.overlay());
+            bugle_platform::editor_set_overlay(self.window, &self.editor.overlay());
         }
     }
 
@@ -178,7 +232,7 @@ impl Session {
         let menus = self.editor.menus();
         for (i, m) in menus.iter().enumerate() {
             if self.menus.get(i) != Some(m) {
-                bugle_platform::editor_set_menu(i, m);
+                bugle_platform::editor_set_menu(self.window, i, m);
             }
         }
         self.menus = menus.to_vec();
@@ -191,7 +245,7 @@ impl Session {
         self.seq += 1;
         if doc == Annotation::default() {
             self.pending = false;
-            return bugle_platform::editor_set_image(&self.base, Point::default());
+            return bugle_platform::editor_set_image(self.window, &self.base, Point::default());
         }
         if let Some(tx) = &self.preview {
             if tx.send((self.seq, doc.clone())).is_ok() {
@@ -222,7 +276,7 @@ impl Session {
         match result {
             Ok((img, origin)) => {
                 self.last_error = None;
-                bugle_platform::editor_set_image(&img, origin);
+                bugle_platform::editor_set_image(self.window, &img, origin);
             }
             Err(e) => {
                 if self.last_error.as_ref() != Some(&e) {
@@ -238,14 +292,14 @@ impl Session {
     fn save(&mut self) {
         if self.editor.is_empty() {
             // Nothing drawn, cropped or framed: there is no copy worth writing.
-            return bugle_platform::editor_close();
+            return bugle_platform::editor_close(self.window);
         }
         let doc = self.editor.final_document();
         let (engine, proxy, source, generation) = (self.engine.clone(), self.proxy.clone(), self.source.clone(), self.generation);
         let saving = self.saving.clone();
         saving.store(true, Ordering::SeqCst);
         // No closing half-way: the copy is being written either way.
-        bugle_platform::editor_set_busy(true);
+        bugle_platform::editor_set_busy(self.window, true);
         let flag = saving.clone();
         let spawned = std::thread::Builder::new().name("bugle-editor-save".into()).spawn(move || {
             // Always answers, so the window never stays busy.
@@ -262,7 +316,7 @@ impl Session {
         });
         if let Err(e) = spawned {
             saving.store(false, Ordering::SeqCst);
-            bugle_platform::editor_set_busy(false);
+            bugle_platform::editor_set_busy(self.window, false);
             self.proxy.send(AppEvent::Editor(EditorMsg::Saved { generation, result: Err(e.to_string()) }));
         }
     }
@@ -302,33 +356,36 @@ impl App {
         }
     }
 
-    /// Open the markup editor for a media id, `latest` or an image path. One
-    /// editor at a time: with one already open, that one comes forward.
+    /// Open the markup editor for a media id, `latest` or an image path, in
+    /// a window of its own. Several editors can be open at once; one already
+    /// open on the same capture comes forward instead of a second one.
     pub(crate) fn open_editor(&mut self, source: &str) {
-        if bugle_platform::editor_active() {
-            bugle_platform::editor_focus();
-            return self.toast_error("Annotate: finish or close the open editor first");
-        }
         let (item, base) = match self.engine.load_image(source) {
             Ok(v) => v,
             Err(e) => return self.toast_error(&format!("Annotate: {e:#}")),
         };
+        // Pin down what is on screen: `latest` may be something else by the
+        // time the copy is saved.
+        let source = match self.engine.history.get(&item.id) {
+            Ok(Some(_)) => item.id.clone(),
+            _ => item.path.display().to_string(),
+        };
+        if let Some(window) = open_window_for(&source) {
+            tracing::info!("editor: {} is already open", file_name(&item.path));
+            return bugle_platform::editor_focus(window);
+        }
         self.editor_generation += 1;
         let generation = self.editor_generation;
         let size = base.dimensions();
         let base = Arc::new(base);
         let session = Rc::new(RefCell::new(Session {
+            window: EditorId::NONE,
             editor: Editor::new(size),
             preview: spawn_preview(self.engine.clone(), base.clone(), self.proxy.clone(), generation),
             base,
             engine: self.engine.clone(),
             proxy: self.proxy.clone(),
-            // Pin down what is on screen: `latest` may be something else by
-            // the time the copy is saved.
-            source: match self.engine.history.get(&item.id) {
-                Ok(Some(_)) => item.id.clone(),
-                _ => item.path.display().to_string(),
-            },
+            source,
             generation,
             saving: Arc::new(AtomicBool::new(false)),
             seq: 0,
@@ -352,11 +409,15 @@ impl App {
                 Err(_) => tracing::warn!("editor: dropped re-entrant event {event:?}"),
             },
         );
-        if let Err(e) = opened {
-            return self.toast_error(&format!("Annotate: {e:#}"));
-        }
-        CURRENT.with(|c| *c.borrow_mut() = Rc::downgrade(&session));
-        tracing::info!("editor: opened {} ({}×{})", file_name(&item.path), size.0, size.1);
+        let window = match opened {
+            Ok(w) => w,
+            Err(e) => return self.toast_error(&format!("Annotate: {e:#}")),
+        };
+        // The window reports nothing before this turn ends (its first zoom
+        // report is queued), so the session knows its id before any event.
+        session.borrow_mut().window = window;
+        SESSIONS.with(|r| r.borrow_mut().insert(generation, window, &session));
+        tracing::info!("editor: opened {} ({}×{}) as {window:?}", file_name(&item.path), size.0, size.1);
         // First paint: the image, an empty overlay, the toolbar and menus.
         session.borrow_mut().apply(Effects { render: true, ..Default::default() }, false);
     }
@@ -365,8 +426,8 @@ impl App {
         match msg {
             EditorMsg::Open(source) => self.open_editor(&source),
             EditorMsg::Saved { generation, result: Ok(n) } => {
-                if generation == self.editor_generation {
-                    bugle_platform::editor_close();
+                if let Some((window, _)) = session(generation) {
+                    bugle_platform::editor_close(window);
                 }
                 tracing::info!("editor: saved {}", n.subtitle);
                 if !self.quick_show_notice(&n) {
@@ -376,29 +437,30 @@ impl App {
             }
             EditorMsg::Saved { generation, result: Err(e) } => {
                 // The window is still up with the work in it; let it go on.
-                if generation == self.editor_generation {
-                    bugle_platform::editor_set_busy(false);
+                if let Some((window, _)) = session(generation) {
+                    bugle_platform::editor_set_busy(window, false);
                 }
                 self.toast_error(&format!("Annotate: could not save: {e}"));
             }
             EditorMsg::Copied(Ok(())) => bugle_platform::toast_show(None, "Copied to clipboard", "Annotated image", None, 2.5),
             EditorMsg::Copied(Err(e)) => self.toast_error(&format!("Annotate: could not copy: {e}")),
             EditorMsg::Preview { generation, seq, result } => {
-                let session = CURRENT.with(|c| c.borrow().upgrade());
-                if let Some(session) = session {
+                // Nothing to do for a window that has closed since.
+                if let Some((_, session)) = session(generation) {
                     match session.try_borrow_mut() {
-                        Ok(mut s) if s.generation == generation => s.on_preview(seq, result),
-                        // A window that has closed since.
-                        Ok(_) => {}
+                        Ok(mut s) => s.on_preview(seq, result),
                         // Never dropped (the window would wait for it): try
                         // again on the next turn.
                         Err(_) => self.proxy.send(AppEvent::Editor(EditorMsg::Preview { generation, seq, result })),
                     }
                 }
             }
-            EditorMsg::Inject(event) => bugle_platform::editor_inject(&event),
-            EditorMsg::Zoom(z) => bugle_platform::editor_zoom(z),
-            EditorMsg::Close => bugle_platform::editor_close(),
+            EditorMsg::Inject(event) => newest_window().into_iter().for_each(|w| bugle_platform::editor_inject(w, &event)),
+            EditorMsg::Zoom(z) => newest_window().into_iter().for_each(|w| bugle_platform::editor_zoom(w, z)),
+            EditorMsg::Close => newest_window().into_iter().for_each(bugle_platform::editor_close),
+            EditorMsg::Count(tx) => {
+                let _ = tx.send(bugle_platform::editor_count());
+            }
         }
     }
 }
@@ -408,8 +470,10 @@ impl App {
 /// input the window reports — the events are injected, since nothing can
 /// click — pick styles and a canvas from the menus, crop, retype a label
 /// over two lines and zoom, capturing the window along the way, and close
-/// without saving. The captures are kept only when `BUGLE_SMOKE_KEEP` is
-/// set; the PNG is removed either way. With `BUGLE_SMOKE_SAVE` set it saves
+/// without saving. Before closing it opens a second editor next to the
+/// first (and the first image once more, which only brings its window
+/// forward) and counts the windows. The captures are kept only when
+/// `BUGLE_SMOKE_KEEP` is set; the PNGs are removed either way. With `BUGLE_SMOKE_SAVE` set it saves
 /// instead, which writes an annotated copy to the configured `save_dir` and
 /// history: use it with a throwaway `--config`.
 pub(crate) fn smoke(proxy: &Proxy) {
@@ -502,9 +566,79 @@ pub(crate) fn smoke(proxy: &Proxy) {
         send(EditorEvent::Command(EditorCommand::Save));
         std::thread::sleep(Duration::from_millis(2500));
     }
+    let count = || {
+        let (tx, rx) = mpsc::channel();
+        proxy.send(AppEvent::Editor(EditorMsg::Count(tx)));
+        rx.recv_timeout(Duration::from_secs(2)).ok()
+    };
+    // A second editor beside the first; the first image again only focuses.
+    let second = std::env::temp_dir().join("bugle-smoke-editor-2.png");
+    let img2 = RgbaImage::from_fn(480, 320, |x, y| image::Rgba([200, 80 + (x / 4) as u8, 40 + (y / 3) as u8, 255]));
+    match img2.save(&second) {
+        Ok(()) => {
+            proxy.send(AppEvent::Editor(EditorMsg::Open(second.display().to_string())));
+            proxy.send(AppEvent::Editor(EditorMsg::Open(path.display().to_string())));
+            std::thread::sleep(Duration::from_millis(700));
+            eprintln!("smoke test: editors open with a second one: {:?} (want Some(2))", count());
+            // The newest is the second editor: draw in it, then close it.
+            drag(Tool::Rectangle, pt(40.0, 40.0), pt(200.0, 160.0));
+            snap("editor-second");
+            proxy.send(AppEvent::Editor(EditorMsg::Close));
+            std::thread::sleep(Duration::from_millis(300));
+            eprintln!("smoke test: editors open after closing it: {:?} (want Some(1))", count());
+        }
+        Err(e) => eprintln!("smoke test: second editor skipped ({e})"),
+    }
     proxy.send(AppEvent::Editor(EditorMsg::Close));
     std::thread::sleep(Duration::from_millis(300));
-    if let Err(e) = std::fs::remove_file(&path) {
-        eprintln!("smoke test: could not remove {} ({e})", path.display());
+    eprintln!("smoke test: editors open at the end: {:?} (want Some(0))", count());
+    for p in [&path, &second] {
+        match std::fs::remove_file(p) {
+            Err(e) if p.exists() => eprintln!("smoke test: could not remove {} ({e})", p.display()),
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Only the shim hands out window ids; the tests tell entries apart by
+    // generation.
+    const W: EditorId = EditorId::NONE;
+
+    #[test]
+    fn registry_finds_live_sessions_by_generation() {
+        let mut r = Registry::new();
+        let (a, b) = (Rc::new("a"), Rc::new("b"));
+        r.insert(1, W, &a);
+        r.insert(2, W, &b);
+        assert_eq!(r.get(1).map(|(_, s)| *s), Some("a"));
+        assert_eq!(r.get(2).map(|(_, s)| *s), Some("b"));
+        assert!(r.get(3).is_none(), "never opened");
+        let newest: Vec<&str> = r.newest_first().map(|(_, s)| *s).collect();
+        assert_eq!(newest, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn registry_forgets_closed_windows() {
+        let mut r = Registry::new();
+        let a = Rc::new(1);
+        {
+            let b = Rc::new(2);
+            r.insert(1, W, &a);
+            r.insert(2, W, &b);
+            assert_eq!(r.newest_first().count(), 2);
+        }
+        // The second window's handler (the session's only owner) was dropped.
+        assert!(r.get(2).is_none());
+        assert_eq!(r.newest_first().map(|(_, s)| *s).collect::<Vec<_>>(), vec![1]);
+        let c = Rc::new(3);
+        r.insert(3, W, &c);
+        assert_eq!(r.entries.len(), 2, "dead entries go on the next insert");
+        drop(a);
+        drop(c);
+        assert_eq!(r.newest_first().count(), 0);
     }
 }
