@@ -1168,7 +1168,8 @@ int32_t bugle_video_track_count(const char *path) {
     }
 }
 
-// Fold every enabled audio track of a movie into one AAC track. A post-pass
+// Fold every enabled audio track of a movie into one AAC track, or re-level
+// each in place (`separate`). A post-pass
 // on the finished file: each audio track is decoded to 48 kHz stereo float
 // PCM by its own reader (an AVAssetReaderAudioMixOutput over that one track,
 // so its edit timeline and offset are kept, and no track's reads wait on
@@ -1176,7 +1177,9 @@ int32_t bugle_video_track_count(const char *path) {
 // (gaps and late starts filled with silence; in practice the mix output
 // already renders a track's offset as leading silence and delivers
 // contiguous times, so that path is a guard), and `process` turns each
-// block of aligned tracks into the mixed block, which is encoded once.
+// block of aligned tracks into the mixed block, which is encoded once. With
+// `separate`, `process` returns one block per source instead (levels applied,
+// tracks kept apart) and each is encoded as its own AAC track, in order.
 // Video tracks are copied sample for sample without re-encoding, on their
 // own timescale. Returns 1 and writes nothing when there are fewer than two
 // audio tracks; refuses to write over its input.
@@ -1268,7 +1271,8 @@ static CMSampleBufferRef mix_buffer(CMAudioFormatDescriptionRef fmt, const float
     return st == noErr ? sb : NULL;
 }
 
-int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, bugle_mix_fn process, void *ctx) {
+int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, int32_t separate, bugle_mix_fn process,
+                               void *ctx) {
     @autoreleasepool {
         clear_error();
         NSURL *in = [NSURL fileURLWithPath:[NSString stringWithUTF8String:in_path]];
@@ -1346,9 +1350,21 @@ int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, bugle_
             AVNumberOfChannelsKey: @(MIX_CH),
             AVEncoderBitRateKey: @160000,
         };
-        AVAssetWriterInput *ai = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:aac];
-        if (![writer canAddInput:ai]) { set_error(@"could not set up the audio mix"); return -1; }
-        [writer addInput:ai];
+        // One output track for a mix, one per source when the tracks are kept
+        // separate (in source order, each keeping its language tag).
+        NSUInteger n = sources.count;
+        NSUInteger nOut = separate ? n : 1;
+        NSMutableArray<AVAssetWriterInput *> *audioInputs = [NSMutableArray array];
+        for (NSUInteger k = 0; k < nOut; k++) {
+            AVAssetWriterInput *ai = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:aac];
+            if (separate) {
+                if (audio[k].languageCode) ai.languageCode = audio[k].languageCode;
+                if (audio[k].extendedLanguageTag) ai.extendedLanguageTag = audio[k].extendedLanguageTag;
+            }
+            if (![writer canAddInput:ai]) { set_error(@"could not set up the audio mix"); return -1; }
+            [writer addInput:ai];
+            [audioInputs addObject:ai];
+        }
         AudioStreamBasicDescription asbd = {
             .mSampleRate = MIX_RATE,
             .mFormatID = kAudioFormatLinearPCM,
@@ -1384,12 +1400,12 @@ int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, bugle_
             }
         }
         [writer startSessionAtSourceTime:kCMTimeZero];
-        // One pump per output track, each on its own queue: the writer
-        // interleaves tracks and holds one back until the others catch up.
+        // One pump per output track: the writer interleaves tracks and holds
+        // one back until the others catch up.
         dispatch_group_t group = dispatch_group_create();
         // Once this function gives up on a stuck pump (timeout), `abandoned`
         // is set under the gate: from then on no pump touches the cancelled
-        // writer, and the audio pump never calls `process`/`ctx`, which
+        // writer, and the audio pumps never call `process`/`ctx`, which
         // belong to the caller.
         NSLock *gate = [NSLock new];
         __block BOOL abandoned = NO;
@@ -1414,67 +1430,100 @@ int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, bugle_
                                           }
                                       }];
         }
-        // The audio pump: line the tracks up block by block, mix, encode.
-        // Its buffers are owned by the block (`scratch` is captured), so a
-        // pump still running after a timeout never touches freed memory.
-        NSUInteger n = sources.count;
-        NSMutableData *scratch = [NSMutableData dataWithLength:(n + 1) * MIX_BLOCK * MIX_FRAME_BYTES
+        // The audio side: `produce` lines the tracks up for one block, runs
+        // `process` and queues one buffer per output track. The audio pumps
+        // share one serial queue, so `produce` never runs twice at once, and
+        // a pump produces a block only when its own queue is empty (the
+        // writer's interleaving keeps the queues short). Buffers are owned by
+        // the blocks (`scratch` is captured), so a pump still running after a
+        // timeout never touches freed memory.
+        NSMutableData *scratch = [NSMutableData dataWithLength:(n + nOut) * MIX_BLOCK * MIX_FRAME_BYTES
                                                                + n * sizeof(float *)];
+        NSMutableArray<NSMutableArray *> *queues = [NSMutableArray array];
+        for (NSUInteger k = 0; k < nOut; k++) [queues addObject:[NSMutableArray array]];
         __block int64_t cursor = 0;
-        __block BOOL audioDone = NO;
+        __block BOOL sourceDone = NO;
         __block NSString *audioError = nil;
-        dispatch_group_enter(group);
-        [ai requestMediaDataWhenReadyOnQueue:dispatch_queue_create("bugle.mix.audio", DISPATCH_QUEUE_SERIAL)
-                                  usingBlock:^{
+        void (^produce)(void) = ^{
             float *tracks = scratch.mutableBytes;
-            float *mixed = tracks + n * MIX_BLOCK * MIX_CH;
-            const float **ptrs = (const float **)(void *)(mixed + MIX_BLOCK * MIX_CH);
-            while (!audioDone && ai.readyForMoreMediaData) {
-                @autoreleasepool {
-                    BOOL ok = YES;
-                    int64_t frames = 0;
-                    for (BugleMixSource *s in sources) {
-                        if (!mix_fill(s, cursor, cursor + MIX_BLOCK)) {
-                            ok = NO;
-                            audioError = s.reader.error.localizedDescription ?: @"decoding an audio track failed";
-                        }
-                        frames = MAX(frames, MIN((int64_t)MIX_BLOCK, mix_frames(s.fifo)));
-                    }
-                    if (ok && frames > 0) {
-                        for (NSUInteger t = 0; t < n; t++) {
-                            BugleMixSource *s = sources[t];
-                            int64_t have = MIN(frames, mix_frames(s.fifo));
-                            float *dst = tracks + t * MIX_BLOCK * MIX_CH;
-                            memcpy(dst, s.fifo.bytes, (size_t)have * MIX_FRAME_BYTES);
-                            memset(dst + have * MIX_CH, 0, (size_t)(frames - have) * MIX_FRAME_BYTES);
-                            [s.fifo replaceBytesInRange:NSMakeRange(0, (NSUInteger)have * MIX_FRAME_BYTES) withBytes:NULL length:0];
-                            ptrs[t] = dst;
-                        }
-                        [gate lock];
-                        if (abandoned) {
-                            ok = NO;
-                        } else if (process(ctx, ptrs, (int32_t)n, MIX_CH, MIX_RATE, mixed, (int32_t)frames) != 0) {
-                            ok = NO;
-                            audioError = @"the mix function failed";
-                        } else {
-                            CMSampleBufferRef sb = mix_buffer((__bridge CMAudioFormatDescriptionRef)fmt, mixed, frames, cursor);
-                            if (!sb) audioError = @"could not build a mixed audio buffer";
-                            ok = sb && [ai appendSampleBuffer:sb];
-                            if (sb) CFRelease(sb);
-                        }
-                        [gate unlock];
-                        cursor += frames;
-                    }
-                    if (!ok || frames == 0) {
-                        audioDone = YES;
-                        [gate lock];
-                        if (!abandoned) [ai markAsFinished];
-                        [gate unlock];
-                        dispatch_group_leave(group);
+            float *outBuf = tracks + n * MIX_BLOCK * MIX_CH;
+            const float **ptrs = (const float **)(void *)(outBuf + nOut * MIX_BLOCK * MIX_CH);
+            BOOL ok = YES;
+            int64_t frames = 0;
+            for (BugleMixSource *s in sources) {
+                if (!mix_fill(s, cursor, cursor + MIX_BLOCK)) {
+                    ok = NO;
+                    audioError = s.reader.error.localizedDescription ?: @"decoding an audio track failed";
+                }
+                frames = MAX(frames, MIN((int64_t)MIX_BLOCK, mix_frames(s.fifo)));
+            }
+            if (ok && frames > 0) {
+                for (NSUInteger t = 0; t < n; t++) {
+                    BugleMixSource *s = sources[t];
+                    int64_t have = MIN(frames, mix_frames(s.fifo));
+                    float *dst = tracks + t * MIX_BLOCK * MIX_CH;
+                    memcpy(dst, s.fifo.bytes, (size_t)have * MIX_FRAME_BYTES);
+                    memset(dst + have * MIX_CH, 0, (size_t)(frames - have) * MIX_FRAME_BYTES);
+                    [s.fifo replaceBytesInRange:NSMakeRange(0, (NSUInteger)have * MIX_FRAME_BYTES) withBytes:NULL length:0];
+                    ptrs[t] = dst;
+                }
+                [gate lock];
+                if (abandoned) {
+                    ok = NO;
+                } else if (process(ctx, ptrs, (int32_t)n, MIX_CH, MIX_RATE, outBuf, (int32_t)nOut, (int32_t)frames) != 0) {
+                    ok = NO;
+                    audioError = @"the mix function failed";
+                }
+                [gate unlock];
+                // Output track k is the k-th run of `frames` frames in `outBuf`.
+                for (NSUInteger k = 0; ok && k < nOut; k++) {
+                    CMSampleBufferRef sb = mix_buffer((__bridge CMAudioFormatDescriptionRef)fmt,
+                                                      outBuf + k * (NSUInteger)frames * MIX_CH, frames, cursor);
+                    if (!sb) {
+                        audioError = @"could not build a mixed audio buffer";
+                        ok = NO;
+                    } else {
+                        [queues[k] addObject:CFBridgingRelease(sb)];
                     }
                 }
+                cursor += frames;
             }
-        }];
+            if (!ok || frames == 0) sourceDone = YES;
+        };
+        dispatch_queue_t audioQueue = dispatch_queue_create("bugle.mix.audio", DISPATCH_QUEUE_SERIAL);
+        for (NSUInteger k = 0; k < nOut; k++) {
+            AVAssetWriterInput *ai = audioInputs[k];
+            NSMutableArray *queue = queues[k];
+            __block BOOL done = NO;
+            dispatch_group_enter(group);
+            [ai requestMediaDataWhenReadyOnQueue:audioQueue
+                                      usingBlock:^{
+                while (!done && ai.readyForMoreMediaData) {
+                    @autoreleasepool {
+                        if (queue.count == 0 && !sourceDone) produce();
+                        BOOL ok = queue.count > 0;
+                        if (ok) {
+                            id sb = queue.firstObject;
+                            [queue removeObjectAtIndex:0];
+                            [gate lock];
+                            ok = !abandoned && [ai appendSampleBuffer:(__bridge CMSampleBufferRef)sb];
+                            [gate unlock];
+                            // A failed append means the writer failed: stop
+                            // producing for every track.
+                            if (!ok) sourceDone = YES;
+                        }
+                        if (!ok) {
+                            done = YES;
+                            [queue removeAllObjects];
+                            [gate lock];
+                            if (!abandoned) [ai markAsFinished];
+                            [gate unlock];
+                            dispatch_group_leave(group);
+                        }
+                    }
+                }
+            }];
+        }
         // A failed writer stops asking for data, so bound the wait by the
         // media length (decoding runs many times faster than real time).
         double secs = CMTimeGetSeconds(asset.duration);
