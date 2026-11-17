@@ -320,10 +320,10 @@ click to open).
 With `system_notifications = true` under `[general]`, Bugle.app also posts to
 Notification Center (`UNUserNotificationCenter`), named and badged as Bugle:
 every finished menu or hotkey action (capture, recording, OCR, pin, sync —
-whether the quick-access panel or the toast shows it; a capture's or
-recording's notification carries the same thumbnail as the toast, and clicking a saved file's notification
-opens it), a markup-editor save that falls back to the toast, and
-every error. Immediate feedback to a click in the panel or the editor (such as
+whether the quick-access panel or the toast shows it; clicking a saved file's
+notification opens it), a markup-editor save that falls back to the toast, and
+every error. A notice that has a thumbnail in the toast carries it in the
+notification too. Immediate feedback to a click in the panel or the editor (such as
 "Copied to clipboard") and the agent API's start message stay in-app only.
 macOS asks for permission at the first launch with the switch on. The panel or
 toast is shown either way: an unbundled `bugle-app`, a denied permission or

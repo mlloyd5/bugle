@@ -340,10 +340,11 @@ A notice with a thumbnail (the toast's PNG, already downscaled to 112 px)
 carries it as a `UNNotificationAttachment`. The notification center moves an
 attachment's file into its own store, so `notifications::post` writes a
 throwaway copy into `$TMPDIR/bugle-notification-thumbnails/` and hands that
-over, and only once authorized. A copy the center does not take is removed:
-by the shim when the attachment or the request fails, by `post` when the shim
-skips the post, and by a sweep of copies older than 10 minutes on each post
-(all of them at launch).
+over, and only once authorized. The shim removes the copy when the request
+completes, delivered or not (a no-op when the center moved it), or as soon as
+the attachment fails; `post` removes it when the shim skips the post. As a
+backstop each post sweeps copies older than 10 minutes, and every launch sweeps
+all of them, whatever the switch.
 
 The status-bar glyph is a signed distance field (`icon/glyph.rs`) that scales
 its stroke widths with the render size, so the same drawing serves the 36 px

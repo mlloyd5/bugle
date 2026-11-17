@@ -15,10 +15,11 @@
 //! A notice with a thumbnail carries it as the notification's attachment.
 //! The notification center moves an attachment's file into its own store,
 //! so each post writes a throwaway copy of the (already downscaled) toast
-//! thumbnail into [`thumb_dir`] and hands that over. Copies the center did
-//! not take are removed: by the shim when attaching or delivery fails, here
-//! when the post is skipped, and by a sweep of anything older than
-//! [`THUMB_MAX_AGE`] on each post (everything at launch).
+//! thumbnail into [`thumb_dir`] and hands that over. The shim removes the
+//! copy once the request completes (a no-op when the center moved it) or
+//! when attaching fails, this module when the post is skipped. As a backstop
+//! each post sweeps copies older than [`THUMB_MAX_AGE`], and every launch
+//! (any switch, smoke test included) sweeps all of them.
 
 use bugle_platform::notify::{self, NotifyState};
 use std::path::{Path, PathBuf};
@@ -62,6 +63,9 @@ fn needs_refresh(state: NotifyState) -> bool {
 
 /// Called once at launch, after the event loop exists.
 pub fn init(enabled: bool, smoke_test: bool) {
+    // Nothing is in flight yet: leftovers from an earlier run go, whatever
+    // the switch says now.
+    sweep_thumbs(&thumb_dir(), Duration::ZERO);
     match plan(enabled, bugle_platform::login_item::in_app_bundle(), smoke_test) {
         Start::Off => {
             if enabled {
@@ -76,8 +80,6 @@ pub fn init(enabled: bool, smoke_test: bool) {
             });
         }
         Start::Request => {
-            // Nothing is in flight yet: leftovers from an earlier run go.
-            sweep_thumbs(&thumb_dir(), Duration::ZERO);
             notify::start(true);
             ENABLED.store(true, Ordering::Relaxed);
         }
@@ -181,8 +183,15 @@ mod tests {
     fn unbundled_is_a_no_op() {
         init(true, false);
         tick();
+        let before = thumb_names();
         post("Bugle", "test", None, Some(b"png"));
         assert!(!ENABLED.load(Ordering::Relaxed));
+        // No attachment copy is written when nothing is posted.
+        assert!(thumb_names().is_subset(&before));
+    }
+
+    fn thumb_names() -> std::collections::HashSet<PathBuf> {
+        std::fs::read_dir(thumb_dir()).map(|r| r.flatten().map(|e| e.path()).collect()).unwrap_or_default()
     }
 
     fn scratch_dir(name: &str) -> PathBuf {
@@ -212,6 +221,13 @@ mod tests {
         std::fs::write(&other, b"not ours").unwrap();
         // Fresh copies may still be on their way to the notification center.
         assert_eq!(sweep_thumbs(&dir, THUMB_MAX_AGE), 0);
+        assert!(fresh.exists());
+        // An old copy goes while a fresh one stays.
+        let old = write_thumb(&dir, b"png").unwrap();
+        let past = SystemTime::now() - THUMB_MAX_AGE - Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(past).unwrap();
+        assert_eq!(sweep_thumbs(&dir, THUMB_MAX_AGE), 1);
+        assert!(!old.exists());
         assert!(fresh.exists());
         // At launch everything goes, but only the PNG copies.
         assert_eq!(sweep_thumbs(&dir, Duration::ZERO), 1);

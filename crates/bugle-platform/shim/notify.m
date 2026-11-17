@@ -133,8 +133,8 @@ static void attach_thumbnail(UNMutableNotificationContent *content, NSString *pa
 /// NULL; otherwise clicking the notification opens that path. `thumbnail`
 /// may be NULL; otherwise it is a PNG copy the notification center takes
 /// (moves) as the attachment. A skipped post leaves it alone; once handed
-/// over it is moved, or removed here when it cannot be attached or the
-/// request fails.
+/// over it is removed here when the request completes (a no-op when the
+/// center moved it), or as soon as it cannot be attached.
 int bugle_notify_post(const char *title, const char *body, const char *open, const char *thumbnail) {
     if (atomic_load(&g_state) != 2 || !title) return 0;
     UNMutableNotificationContent *content = [UNMutableNotificationContent new];
@@ -152,9 +152,11 @@ int bugle_notify_post(const char *title, const char *body, const char *open, con
     [UNUserNotificationCenter.currentNotificationCenter
         addNotificationRequest:req
          withCompletionHandler:^(NSError *error) {
-             if (!error) return;
-             // Not taken: the attachment copy, if it is still there, is ours.
+             // Either way the copy is done with: delivered, the attachment
+             // store holds its own (a moved file is already gone, so this is
+             // a no-op); not delivered, it is ours to remove.
              if (thumb.length > 0) [NSFileManager.defaultManager removeItemAtPath:thumb error:nil];
+             if (!error) return;
              NSLog(@"bugle: notification not delivered: %@", error.localizedDescription);
              // Switched off in System Settings since start: stop trying.
              if ([error.domain isEqualToString:UNErrorDomain] && error.code == UNErrorCodeNotificationsNotAllowed)
