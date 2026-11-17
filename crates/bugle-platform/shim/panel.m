@@ -214,7 +214,8 @@ static BuglePanelButton *make_button(NSString *title, NSString *symbol, int32_t 
 
 /// Show panel `ident` (non-zero) in front of the stack, replacing a panel
 /// with the same id. Returns 1, or 0 without taking `ctx` when the
-/// arguments are unusable. Brings hidden panels back too.
+/// arguments are unusable. While the stack is hidden, the new panel joins it
+/// off screen and comes back with `bugle_panel_show_all`.
 int32_t bugle_panel_show(uint64_t ident, const uint8_t *png, size_t len, const char *title, const char *subtitle,
                          const char *const *labels, int32_t n_labels, int32_t corner, bugle_panel_callback_t cb, void *ctx,
                          bugle_panel_free_t free_ctx) {
