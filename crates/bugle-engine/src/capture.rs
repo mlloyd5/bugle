@@ -154,7 +154,16 @@ impl Engine {
                 Ok((self.maybe_downscale(img, scale), Some(w.frame), Some(w)))
             }
             CaptureTarget::Interactive => {
-                let rect = self.select_area()?.ok_or(BugleError::Cancelled)?;
+                // In a terminal with `[screenshots] window_picker`, Space in
+                // the selection switches to the window picker.
+                let rect = match self.select_area_or_window()?.ok_or(BugleError::Cancelled)? {
+                    crate::pick::Picked::Area(rect) => rect,
+                    crate::pick::Picked::Window(w) => {
+                        let target = CaptureTarget::Window { id: Some(w.id), title: None, owner: None };
+                        let (img, frame, _) = self.grab(&target, shadow, show_cursor)?;
+                        return Ok((img, frame, Some(w)));
+                    }
+                };
                 validate_rect(&rect)?;
                 let img = bugle_platform::capture_area(rect, show_cursor)?;
                 let scale = img.width() as f64 / rect.w.max(1.0);
