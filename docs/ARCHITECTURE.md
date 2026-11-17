@@ -69,7 +69,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `export_video`, `video_info`, `video_sync_at`, `VideoFrameReader`, `VideoFrameWriter` | `AVAssetExportSession` with `timeRange`/preset, an `AVMutableVideoComposition` on every re-encode (`frameDuration` + `sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid` for a new frame rate), bounded wait + `cancelExport`; `AVSampleCursor` (stored samples, sync sample at a cut); one reusable `AVAssetImageGenerator` (`maximumSize` for scaled previews); `AVAssetWriter` + pixel-buffer adaptor (H.264 or HEVC) |
 | `screen_access_*`, `accessibility_trusted` | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted` |
 | `login_item::{in_app_bundle, status, set_enabled}` | `SMAppService.mainAppService` (`shim/login_item.m`, ServiceManagement) |
-| `prompt_text` | `NSAlert` with an `NSTextField` accessory, `runModal` on the main thread (`shim/prompt.m`): a one-line value for the app's *Custom…* menu items |
+| `prompt_text`, `prompt_active`, `prompt_answer` | A non-modal `NSPanel` with a text field and OK/Cancel (`shim/prompt.m`): returns at once and reports the answer through a callback, one prompt at a time (a second open brings the first to the front); the panel maps ⌘A/C/V/X/Z itself (no Edit menu) and hands the focus on like the editors (`bugle_editor_window_closed`) when it closes |
 | `notify::{start, state, refresh, post}` | `UNUserNotificationCenter` (`shim/notify.m`, UserNotifications): delegate (banner while active, click opens the file), `requestAuthorizationWithOptions` or `getNotificationSettings`, `addNotificationRequest` with an optional `UNNotificationAttachment` (a PNG copy it consumes); nothing is called outside an app bundle |
 
 Window shadows: ScreenCaptureKit clips single-window screenshots to the window
@@ -363,10 +363,16 @@ pending approval is shown in the title, and clicking it then opens System
 Settings → Login Items. The *Audio Levels* submenu (`audio_menu.rs`) offers
 level presets for the microphone and system audio, a ducking toggle and
 ducking-amount presets in dB, each list ending in *Custom…*, which asks for a
-free-form value in a modal prompt (`bugle_platform::prompt_text`, an
-`NSAlert` with a text field in `shim/prompt.m`; percent 0 to 800 or dB 0 to
-60, kept to one decimal, anything else refused with a toast); a value that is
-not a preset checks *Custom (value)…*. A change applies to the next recordings, from the menu, hotkeys or the in-app
+free-form value in a prompt (`bugle_platform::prompt_text`, a small panel
+with a text field in `shim/prompt.m`; percent 0 to 800 or dB 0 to 60, kept
+to one decimal, anything else refused with a toast); a value that is not a
+preset checks *Custom (value)…*. The prompt is not modal: `on_menu` opens it
+and returns, and the answer arrives later as an `AppEvent::AudioPrompt`, so
+hotkeys (Stop Recording too), menu clicks and worker results go on while it
+is open; clicking *Custom…* again brings the open prompt to the front.
+`--smoke-test` clicks the microphone's *Custom…* twice, checks one prompt
+opened, cancels it (nothing is saved) and checks Bugle let go of the focus. A
+change applies to the next recordings, from the menu, hotkeys or the in-app
 API alike (`Engine::set_recording_levels`), and is written back to
 `[recordings]` with `toml_edit`, replacing only that key so the rest of the
 file and its comments stay put (through a temp file and a rename, following

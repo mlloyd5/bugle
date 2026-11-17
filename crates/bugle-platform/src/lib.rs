@@ -25,7 +25,7 @@ pub mod notify;
 #[cfg(target_os = "macos")]
 mod prompt;
 #[cfg(target_os = "macos")]
-pub use prompt::prompt_text;
+pub use prompt::{prompt_active, prompt_answer, prompt_text};
 #[cfg(target_os = "macos")]
 mod editor;
 #[cfg(target_os = "macos")]

@@ -2,7 +2,10 @@
 //! ducking for the next recordings, without editing the config file by hand.
 //!
 //! Each level is a preset or a custom value typed into a prompt (*Custom…*),
-//! and so is the ducking amount; ducking itself is a toggle.
+//! and so is the ducking amount; ducking itself is a toggle. The prompt is
+//! not modal: a *Custom…* click returns [`Step::Ask`], the app opens the
+//! prompt and later hands the answer to [`AudioMenu::answer`], so hotkeys
+//! and the rest of the menu keep working while it is open.
 //!
 //! A change takes effect from the next recording, whether the menu, a
 //! hotkey or the in-app agent API starts it (the app hands the new levels to
@@ -167,9 +170,15 @@ fn parse_number(text: &str, lo: f32, hi: f32, unit: &str) -> Result<f32, String>
     }
 }
 
-/// `v` rounded to one decimal place.
+/// `v` rounded to one decimal place, with `-0` (or a tiny negative that
+/// rounds to it) made `0`.
 fn round_tenth(v: f32) -> f32 {
-    (v * 10.0).round() / 10.0
+    let r = (v * 10.0).round() / 10.0;
+    if r == 0.0 {
+        0.0
+    } else {
+        r
+    }
 }
 
 /// `v` with at most one decimal and no trailing `.0`.
@@ -353,7 +362,7 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// What handling a click came to.
+/// What answering a prompt came to.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
     /// The levels changed (the caller hands [`AudioMenu::levels`] to the
@@ -363,6 +372,34 @@ pub enum Outcome {
     Cancelled,
     /// The typed value was refused; nothing changed.
     Invalid(String),
+}
+
+/// What a click in the submenu comes to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Step {
+    /// The levels changed (see [`Outcome::Changed`]).
+    Changed(Change),
+    /// A *Custom…* item: ask for `field` with this prompt, then hand the
+    /// answer to [`AudioMenu::answer`].
+    Ask(Field, Prompt),
+}
+
+/// What a click on item `id` comes to with the current `levels`, or `None`
+/// for an id that is not one of this submenu's.
+pub fn resolve_click(id: &str, levels: &AudioMixConfig) -> Option<Step> {
+    Some(match parse_id(id, levels.ducking)? {
+        Click::Set(change) => Step::Changed(change),
+        Click::Custom(field) => Step::Ask(field, field.prompt(levels)),
+    })
+}
+
+/// What the answer to a prompt for `field` comes to (`None`: cancelled).
+pub fn resolve_answer(field: Field, text: Option<&str>) -> Outcome {
+    match text.map(|t| field.parse(t)) {
+        None => Outcome::Cancelled,
+        Some(Ok(change)) => Outcome::Changed(change),
+        Some(Err(e)) => Outcome::Invalid(e),
+    }
 }
 
 /// One choice submenu and its items: the presets, then *Custom…*.
@@ -447,25 +484,28 @@ impl AudioMenu {
     }
 
     /// Act on a click if `id` is one of this submenu's items, or return
-    /// `None` for an id that is not an audio item. A *Custom…* item asks
-    /// for the value through `ask` (given the [`Prompt`]; `None` = cancel).
-    pub fn handle(&mut self, id: &str, ask: impl FnOnce(&Prompt) -> Option<String>) -> Option<Outcome> {
-        let outcome = match parse_id(id, self.levels.ducking)? {
-            Click::Set(change) => Outcome::Changed(change),
-            Click::Custom(field) => match ask(&field.prompt(&self.levels)) {
-                None => Outcome::Cancelled,
-                Some(text) => match field.parse(&text) {
-                    Ok(change) => Outcome::Changed(change),
-                    Err(e) => Outcome::Invalid(e),
-                },
-            },
-        };
-        if let Outcome::Changed(change) = outcome {
+    /// `None` for an id that is not an audio item. A preset or the ducking
+    /// toggle applies at once; a *Custom…* item returns
+    /// [`Step::Ask`], and the typed answer comes back through
+    /// [`AudioMenu::answer`].
+    pub fn click(&mut self, id: &str) -> Option<Step> {
+        let step = resolve_click(id, &self.levels)?;
+        if let Step::Changed(change) = step {
             self.levels = change.apply(self.levels);
         }
         // The menu toggles a check item on click; show what is set.
         self.sync();
-        Some(outcome)
+        Some(step)
+    }
+
+    /// Act on the answer to a prompt for `field` (`None`: cancelled).
+    pub fn answer(&mut self, field: Field, text: Option<&str>) -> Outcome {
+        let outcome = resolve_answer(field, text);
+        if let Outcome::Changed(change) = outcome {
+            self.levels = change.apply(self.levels);
+        }
+        self.sync();
+        outcome
     }
 }
 
@@ -524,6 +564,13 @@ mod tests {
         assert!((third - 0.333).abs() < 1e-6, "{third}");
         assert_eq!(mic.parse("Muted"), Ok(Change::Gain(Source::Microphone, 0.0)));
         assert_eq!(mic.parse("800"), Ok(Change::Gain(Source::Microphone, 8.0)));
+        // A negative zero is plain zero, so the config gets `0.0`.
+        for zero in ["-0", "-0.0", "-0%"] {
+            let Ok(Change::Gain(_, g)) = mic.parse(zero) else { panic!("{zero}") };
+            assert!(g == 0.0 && g.is_sign_positive(), "{zero}: {g}");
+        }
+        let Ok(Change::DuckingAmount(db)) = Field::DuckingAmount.parse("-0 dB") else { panic!() };
+        assert!(db.is_sign_positive());
         for bad in ["801", "-1", "abc", "", "NaN", "inf"] {
             let e = mic.parse(bad).unwrap_err();
             assert!(e.contains("0% to 800%"), "{bad}: {e}");
@@ -580,6 +627,34 @@ mod tests {
             Choices { title: "Microphone: 60%".into(), checked: None, custom: "Custom (60%)…".into() }
         );
         assert_eq!(v.amount, Choices { title: "Ducking Amount: 20 dB".into(), checked: None, custom: "Custom (20 dB)…".into() });
+    }
+
+    #[test]
+    fn clicks_and_answers_resolve_to_changes() {
+        let levels = AudioMixConfig { ducking_amount_db: 7.5, ..Default::default() };
+        // A preset applies at once.
+        let half = PRESETS.iter().position(|p| *p == 0.5).unwrap();
+        assert_eq!(
+            resolve_click(&preset_id(Source::Microphone, half), &levels),
+            Some(Step::Changed(Change::Gain(Source::Microphone, 0.5)))
+        );
+        assert_eq!(resolve_click(DUCK_ID, &levels), Some(Step::Changed(Change::Ducking(true))));
+        // Custom… asks, starting from the current value.
+        let Some(Step::Ask(field, prompt)) = resolve_click(&amount_custom_id(), &levels) else { panic!() };
+        assert_eq!((field, prompt.initial.as_str()), (Field::DuckingAmount, "7.5"));
+        let Some(Step::Ask(field, _)) = resolve_click(&custom_id(Source::SystemAudio), &levels) else { panic!() };
+        assert_eq!(field, Field::Gain(Source::SystemAudio));
+        // Not an audio item.
+        for other in ["record", "recent:/tmp/a", "audio:hint", "login"] {
+            assert_eq!(resolve_click(other, &levels), None, "{other}");
+        }
+        // The answer: OK with a valid value changes, anything else does not.
+        assert_eq!(resolve_answer(field, Some("60%")), Outcome::Changed(Change::Gain(Source::SystemAudio, 0.6)));
+        assert_eq!(resolve_answer(field, None), Outcome::Cancelled);
+        let Outcome::Invalid(e) = resolve_answer(field, Some("loud")) else { panic!() };
+        assert!(e.contains("not a number"), "{e}");
+        let Outcome::Invalid(e) = resolve_answer(Field::DuckingAmount, Some("99")) else { panic!() };
+        assert!(e.contains("out of range"), "{e}");
     }
 
     #[test]

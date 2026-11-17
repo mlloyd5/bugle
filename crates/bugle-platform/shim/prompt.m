@@ -1,35 +1,204 @@
-// A small modal text prompt (an NSAlert with a text field), for values the
-// menu-bar app asks for that a menu of presets cannot hold, such as a custom
-// audio level. Bindings live in src/prompt.rs.
+// A small text prompt (a panel with a title, a message, a text field and
+// OK/Cancel), for values the menu-bar app asks for that a menu of presets
+// cannot hold, such as a custom audio level. Bindings live in src/prompt.rs.
+//
+// The panel is not modal: opening it returns at once and the answer comes
+// later through the callback, so the app's event loop (hotkeys, the menu,
+// worker results) keeps running while it is open. One prompt at a time.
 
 #import <AppKit/AppKit.h>
-#include <string.h>
+#include <stdint.h>
+#include "shim.h"
 
-/// Runs a modal alert titled `title` with `message` below it and a text
-/// field holding `initial`, on the main thread. Returns 1 with the typed text
-/// in *out (malloc'd, free with bugle_free) for OK, 0 for Cancel, and -1 off
-/// the main thread.
-int bugle_prompt_text(const char *title, const char *message, const char *initial, char **out) {
-    if (out) *out = NULL;
+typedef void (*bugle_prompt_callback_t)(void *ctx, int32_t ok, const char *text);
+typedef void (*bugle_prompt_free_t)(void *ctx);
+
+@class BuglePrompt;
+
+// The app has no main menu (no Edit menu), so the usual editing keys are
+// mapped here, as the editors do.
+@interface BuglePromptPanel : NSPanel
+@end
+
+@implementation BuglePromptPanel
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (BOOL)performKeyEquivalent:(NSEvent *)event {
+    NSEventModifierFlags mods = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+    if (!(mods & NSEventModifierFlagCommand) || (mods & (NSEventModifierFlagControl | NSEventModifierFlagOption))) {
+        return [super performKeyEquivalent:event];
+    }
+    BOOL shift = (mods & NSEventModifierFlagShift) != 0;
+    NSString *key = event.charactersIgnoringModifiers.lowercaseString;
+    SEL action = NULL;
+    if ([key isEqualToString:@"c"]) action = @selector(copy:);
+    else if ([key isEqualToString:@"v"]) action = @selector(paste:);
+    else if ([key isEqualToString:@"x"]) action = @selector(cut:);
+    else if ([key isEqualToString:@"a"]) action = @selector(selectAll:);
+    else if ([key isEqualToString:@"z"]) action = shift ? NSSelectorFromString(@"redo:") : NSSelectorFromString(@"undo:");
+    else if ([key isEqualToString:@"w"]) {
+        [self performClose:nil];
+        return YES;
+    }
+    if (action && [NSApp sendAction:action to:nil from:self]) return YES;
+    return [super performKeyEquivalent:event];
+}
+@end
+
+@interface BuglePrompt : NSObject <NSWindowDelegate>
+@property(nonatomic, strong) BuglePromptPanel *panel;
+@property(nonatomic, strong) NSTextField *field;
+@property(nonatomic) bugle_prompt_callback_t cb;
+@property(nonatomic) void *ctx;
+@property(nonatomic) bugle_prompt_free_t freeCtx;
+- (void)finish:(BOOL)ok;
+@end
+
+static BuglePrompt *g_prompt;
+
+static NSTextField *label(NSString *text, NSFont *font) {
+    NSTextField *l = [NSTextField wrappingLabelWithString:text];
+    l.font = font;
+    l.selectable = NO;
+    l.preferredMaxLayoutWidth = 300;
+    l.translatesAutoresizingMaskIntoConstraints = NO;
+    return l;
+}
+
+@implementation BuglePrompt
+
+- (void)ok:(id)sender { [self finish:YES]; }
+- (void)cancel:(id)sender { [self finish:NO]; }
+
+// The title-bar close button.
+- (BOOL)windowShouldClose:(NSWindow *)sender {
+    [self finish:NO];
+    return NO;
+}
+
+/// Report the answer once, take the panel down and hand the focus on.
+- (void)finish:(BOOL)ok {
+    bugle_prompt_callback_t cb = self.cb;
+    void *ctx = self.ctx;
+    bugle_prompt_free_t f = self.freeCtx;
+    if (!cb && !f) return;
+    self.cb = NULL;
+    self.ctx = NULL;
+    self.freeCtx = NULL;
+    NSString *text = self.field.stringValue ?: @"";
+    if (cb) cb(ctx, ok ? 1 : 0, ok ? (text.UTF8String ?: "") : NULL);
+    self.panel.delegate = nil;
+    [self.panel orderOut:nil];
+    BuglePrompt *keep = self;
+    if (g_prompt == self) g_prompt = nil;
+    // Focus goes to an open editor, else back to the app the user came from.
+    bugle_editor_window_closed();
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (ctx && f) f(ctx);
+        (void)keep;
+    });
+}
+
+- (void)buildWithTitle:(NSString *)title message:(NSString *)message initial:(NSString *)initial {
+    BuglePromptPanel *panel = [[BuglePromptPanel alloc] initWithContentRect:NSMakeRect(0, 0, 340, 150)
+                                                                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                                                                    backing:NSBackingStoreBuffered
+                                                                      defer:NO];
+    panel.title = title;
+    panel.releasedWhenClosed = NO;
+    // A panel hides when its app deactivates by default; this one must stay
+    // up until answered (clicking Custom… again brings it to the front).
+    panel.hidesOnDeactivate = NO;
+    panel.delegate = self;
+
+    NSTextField *heading = label(title, [NSFont boldSystemFontOfSize:NSFont.systemFontSize]);
+    NSTextField *body = label(message, [NSFont systemFontOfSize:NSFont.smallSystemFontSize]);
+    NSTextField *field = [NSTextField textFieldWithString:initial];
+    field.translatesAutoresizingMaskIntoConstraints = NO;
+    // Return in the field presses OK (the default button), Esc presses Cancel.
+    NSButton *ok = [NSButton buttonWithTitle:@"OK" target:self action:@selector(ok:)];
+    ok.keyEquivalent = @"\r";
+    NSButton *cancel = [NSButton buttonWithTitle:@"Cancel" target:self action:@selector(cancel:)];
+    cancel.keyEquivalent = @"\033";
+    ok.translatesAutoresizingMaskIntoConstraints = NO;
+    cancel.translatesAutoresizingMaskIntoConstraints = NO;
+
+    NSView *v = panel.contentView;
+    for (NSView *s in @[ heading, body, field, ok, cancel ]) [v addSubview:s];
+    [NSLayoutConstraint activateConstraints:@[
+        [heading.topAnchor constraintEqualToAnchor:v.topAnchor constant:16],
+        [heading.leadingAnchor constraintEqualToAnchor:v.leadingAnchor constant:20],
+        [heading.trailingAnchor constraintEqualToAnchor:v.trailingAnchor constant:-20],
+        [body.topAnchor constraintEqualToAnchor:heading.bottomAnchor constant:6],
+        [body.leadingAnchor constraintEqualToAnchor:heading.leadingAnchor],
+        [body.trailingAnchor constraintEqualToAnchor:heading.trailingAnchor],
+        [field.topAnchor constraintEqualToAnchor:body.bottomAnchor constant:12],
+        [field.leadingAnchor constraintEqualToAnchor:heading.leadingAnchor],
+        [field.trailingAnchor constraintEqualToAnchor:heading.trailingAnchor],
+        [ok.topAnchor constraintEqualToAnchor:field.bottomAnchor constant:16],
+        [ok.trailingAnchor constraintEqualToAnchor:heading.trailingAnchor],
+        [ok.bottomAnchor constraintEqualToAnchor:v.bottomAnchor constant:-16],
+        [ok.widthAnchor constraintGreaterThanOrEqualToConstant:76],
+        [cancel.centerYAnchor constraintEqualToAnchor:ok.centerYAnchor],
+        [cancel.trailingAnchor constraintEqualToAnchor:ok.leadingAnchor constant:-10],
+        [cancel.widthAnchor constraintGreaterThanOrEqualToConstant:76],
+    ]];
+    panel.initialFirstResponder = field;
+    self.panel = panel;
+    self.field = field;
+}
+
+- (void)show {
+    // A menu-bar app is not frontmost; without this the panel opens behind
+    // the active app's windows and gets no keys.
+    [NSApp activateIgnoringOtherApps:YES];
+    [self.panel makeKeyAndOrderFront:nil];
+    [self.panel makeFirstResponder:self.field];
+    // Select the current value so typing replaces it.
+    [self.field selectText:nil];
+}
+
+@end
+
+/// Open a prompt titled `title` with `message` below it and a text field
+/// holding `initial`, and return at once. `cb` runs once on the main thread
+/// when it is answered: ok = 1 with the typed text, or ok = 0 with NULL for
+/// Cancel, Esc or the close button. `free_ctx` runs after that, on a later
+/// main-loop turn. Returns 1 when opened (the shim owns `ctx`), 0 when a
+/// prompt is already open (it is brought to the front; `ctx` is not taken),
+/// and -1 off the main thread.
+int32_t bugle_prompt_open(const char *title, const char *message, const char *initial, bugle_prompt_callback_t cb, void *ctx,
+                          bugle_prompt_free_t free_ctx) {
     if (![NSThread isMainThread]) return -1;
     @autoreleasepool {
-        NSAlert *alert = [[NSAlert alloc] init];
-        alert.messageText = [NSString stringWithUTF8String:title ? title : ""] ?: @"";
-        alert.informativeText = [NSString stringWithUTF8String:message ? message : ""] ?: @"";
-        [alert addButtonWithTitle:@"OK"];
-        [alert addButtonWithTitle:@"Cancel"];
-        NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 200, 24)];
-        field.stringValue = [NSString stringWithUTF8String:initial ? initial : ""] ?: @"";
-        alert.accessoryView = field;
-        // A menu-bar app is not frontmost; without this the alert opens
-        // behind the active app's windows.
-        [NSApp activateIgnoringOtherApps:YES];
-        [alert layout];
-        alert.window.initialFirstResponder = field;
-        NSModalResponse r = [alert runModal];
-        if (r != NSAlertFirstButtonReturn) return 0;
-        const char *u = field.stringValue.UTF8String;
-        if (out) *out = strdup(u ? u : "");
+        if (g_prompt) {
+            [g_prompt show];
+            return 0;
+        }
+        BuglePrompt *p = [[BuglePrompt alloc] init];
+        p.cb = cb;
+        p.ctx = ctx;
+        p.freeCtx = free_ctx;
+        NSString *(^s)(const char *) = ^NSString *(const char *c) { return [NSString stringWithUTF8String:c ? c : ""] ?: @""; };
+        [p buildWithTitle:s(title) message:s(message) initial:s(initial)];
+        [p.panel center];
+        g_prompt = p;
+        [p show];
         return 1;
     }
+}
+
+/// Whether a prompt is open.
+int32_t bugle_prompt_active(void) { return g_prompt ? 1 : 0; }
+
+/// Answer the open prompt as if OK (with `text`, or the field's text when
+/// NULL) or Cancel were pressed. Any thread; for smoke tests, which cannot
+/// click.
+void bugle_prompt_answer(int32_t ok, const char *text) {
+    NSString *t = text ? [NSString stringWithUTF8String:text] : nil;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        BuglePrompt *p = g_prompt;
+        if (!p) return;
+        if (t) p.field.stringValue = t;
+        [p finish:ok != 0];
+    });
 }
