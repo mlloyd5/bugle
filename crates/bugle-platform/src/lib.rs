@@ -471,6 +471,28 @@ pub fn app_deactivate() {
     unsafe { ffi::bugle_app_deactivate() }
 }
 
+/// Prepare AppKit for a process that has no run loop of its own (the CLI):
+/// an accessory app (no Dock icon) that has finished launching. Idempotent.
+/// Main thread only; pair with [`run_loop_once`].
+pub fn app_bootstrap() {
+    unsafe { ffi::bugle_app_bootstrap() }
+}
+
+/// Handle AppKit events (and the main dispatch queue, and timers) for up to
+/// `slice`, returning after the first event or when it runs out. Lets a
+/// caller without `[NSApp run]` drive the non-blocking overlays such as
+/// [`window_pick_begin`] and [`select_rect_begin_ex`] while checking its own
+/// state in between. Main thread only, after [`app_bootstrap`].
+pub fn run_loop_once(slice: std::time::Duration) {
+    unsafe { ffi::bugle_run_loop_once(slice.as_secs_f64()) }
+}
+
+/// Whether the caller is on the process main thread, where AppKit overlays
+/// must run.
+pub fn is_main_thread() -> bool {
+    unsafe { ffi::bugle_is_main_thread() == 1 }
+}
+
 /// Whether a selection overlay is currently on screen.
 pub fn select_rect_active() -> bool {
     unsafe { ffi::bugle_select_rect_active() == 1 }

@@ -863,6 +863,37 @@ void bugle_app_deactivate(void) {
     }
 }
 
+// For a process without a running AppKit loop (the CLI): make it an
+// accessory app (no Dock icon) that has finished launching, so overlays can
+// become key and receive keys, then pump events in short slices from the
+// caller's own loop. `[NSApp run]` cannot be used there: the host needs to
+// look at its own state (a Rust channel) between events.
+void bugle_app_bootstrap(void) {
+    @autoreleasepool {
+        static BOOL launched = NO;
+        NSApplication *app = [NSApplication sharedApplication];
+        [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        if (!launched) {
+            launched = YES;
+            [app finishLaunching];
+        }
+    }
+}
+
+void bugle_run_loop_once(double seconds) {
+    @autoreleasepool {
+        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:seconds > 0 ? seconds : 0];
+        // Dispatching events also runs the main run loop in the default
+        // mode, which drains the main dispatch queue and fires the overlay
+        // timers.
+        NSEvent *e = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:until inMode:NSDefaultRunLoopMode dequeue:YES];
+        if (e) [NSApp sendEvent:e];
+        [NSApp updateWindows];
+    }
+}
+
+int32_t bugle_is_main_thread(void) { return [NSThread isMainThread] ? 1 : 0; }
+
 /// What Space does: hand over to the window picker, when the host allowed it
 /// and no drag is in progress.
 void bugle_select_rect_switch(void) {
