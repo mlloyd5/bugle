@@ -31,9 +31,9 @@ fn rect_schema() -> Value {
 fn target_schema() -> Value {
     json!({
         "type":"object",
-        "description":"What to capture. kind=screen (optional display id), window (id, or title/owner substring; omit all for the front-most window), area (rect in screen points), interactive (user drags a selection), all_screens.",
+        "description":"What to capture. kind=screen (optional display id), window (id, or title/owner substring; omit all for the front-most window), area (rect in screen points), interactive (user drags a selection), pick_window (user clicks a window in the hover-highlight picker; only when the Bugle menu-bar app serves the API, otherwise an error), all_screens.",
         "properties":{
-            "kind":{"type":"string","enum":["screen","window","area","interactive","all_screens"]},
+            "kind":{"type":"string","enum":["screen","window","area","interactive","pick_window","all_screens"]},
             "display":{"type":"integer"},
             "id":{"type":"integer"},
             "title":{"type":"string"},
@@ -142,7 +142,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "record_start",
-            description: "Start a screen recording (mp4/mov via screencapture or, with system_audio, the ScreenCaptureKit recorder; gif via a frame grab loop). Only one recording at a time.",
+            description: "Start a screen recording (mp4/mov via screencapture or, with system_audio, hide_cursor or cursor_events, the ScreenCaptureKit recorder; gif via a frame grab loop). Only one recording at a time.",
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -158,6 +158,8 @@ pub fn catalog() -> Vec<ToolSpec> {
                     "ducking_amount_db":{"type":"number","minimum":0,"maximum":60,"description":"how far ducking lowers system audio, in dB"},
                     "max_seconds":{"type":"number","description":"auto-stop"},
                     "highlight_clicks":{"type":"boolean"},
+                    "cursor_events":{"type":"boolean","description":"log pointer moves and clicks to <file>.events.json next to the recording (for edit_video zoom / smooth_cursor)"},
+                    "hide_cursor":{"type":"boolean","description":"leave the pointer out of the frames (implies cursor_events; edit_video smooth_cursor draws it back)"},
                     "output":{"type":"string"},
                     "label":{"type":"string"}
                 }
@@ -201,7 +203,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_video",
-            description: "Trim a recording (video or GIF) and export it with a preset: original (same format; copied when the cut starts on a keyframe, otherwise re-encoded so nothing before the cut stays in the file), lossless (always copied; may keep up to one keyframe interval before the cut in the file, hidden), high, hevc, 1080p, 720p, 540p, gif, gif-small. Times are seconds; negative counts from the end. Saves a new media item (parent = the source when it is a history item).",
+            description: "Trim a recording (video or GIF) and export it with a preset: original (same format; copied when the cut starts on a keyframe, otherwise re-encoded so nothing before the cut stays in the file), lossless (always copied; may keep up to one keyframe interval before the cut in the file, hidden), high, hevc, 1080p, 720p, 540p, gif, gif-small. Times are seconds; negative counts from the end. Saves a new media item (parent = the source when it is a history item). Recordings made with cursor_events (or hide_cursor) can be auto-zoomed on clicks (zoom) and, with hide_cursor, get a smoothed pointer drawn in (smooth_cursor).",
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -211,6 +213,8 @@ pub fn catalog() -> Vec<ToolSpec> {
                     "preset":{"type":"string","enum":bugle_engine::ExportPreset::ALL.iter().map(|p| p.name()).collect::<Vec<_>>(),"default":"original"},
                     "fps":{"type":"integer","description":"output frame rate: re-encodes a video (not with lossless), resamples a GIF"},
                     "max_size":{"type":"integer","description":"long edge of GIF output in pixels"},
+                    "zoom":{"type":"number","exclusiveMinimum":1,"maximum":4,"description":"zoom in on clicks to this factor (e.g. 2); needs a recording made with cursor_events"},
+                    "smooth_cursor":{"type":"boolean","description":"draw the pointer along a smoothed path; needs a recording made with hide_cursor"},
                     "output":{"type":"string"},
                     "label":{"type":"string"}
                 }
@@ -443,8 +447,9 @@ pub fn status_for(err: &anyhow::Error) -> u16 {
         Some(E::PermissionDenied) => 403,
         Some(E::NoSuchDisplay(_)) | Some(E::NoSuchWindow(_)) | Some(E::MediaNotFound(_)) => 404,
         Some(E::Invalid(_)) | Some(E::ProviderNotConfigured(_)) => 400,
-        Some(E::Cancelled) => 409,
+        Some(E::Cancelled) | Some(E::Busy(_)) => 409,
         Some(E::Unsupported(_)) => 501,
+        Some(E::NoUiHost(_)) => 503,
         None => {
             if err.chain().any(|e| e.downcast_ref::<serde_json::Error>().is_some()) {
                 400
@@ -512,6 +517,19 @@ pub(crate) mod tests {
         assert_eq!(out.json["media"]["parent"], json!(id));
         let err = run(&engine, "edit_video", json!({"source": src, "preset": "lossless"})).await.err().unwrap();
         assert_eq!(status_for(&err), 400);
+
+        // zoom needs the recording's event track: a 400 without one.
+        let err = run(&engine, "edit_video", json!({"source": src, "zoom": 2})).await.err().unwrap();
+        assert_eq!(status_for(&err), 400);
+        use bugle_core::events::{CursorEvent, EventKind, EventTrack, MouseButton};
+        let click = CursorEvent { t: 0.25, kind: EventKind::Down, button: Some(MouseButton::Left), x: 2.0, y: 2.0 };
+        EventTrack::new(bugle_core::Rect::new(0.0, 0.0, 8.0, 6.0), true, 0.4, vec![click]).save(&EventTrack::sidecar_path(&src)).unwrap();
+        let out = run(&engine, "edit_video", json!({"source": src, "zoom": 2, "preset": "gif"})).await.unwrap();
+        assert!(out.json["media"]["source"].as_str().unwrap().contains("zoom 2x"), "{}", out.json);
+        let err = run(&engine, "edit_video", json!({"source": src, "zoom": 9})).await.err().unwrap();
+        assert_eq!(status_for(&err), 400);
+        let err = run(&engine, "edit_video", json!({"source": src, "smooth_cursor": true})).await.err().unwrap();
+        assert_eq!(status_for(&err), 400, "the pointer is in the frames");
     }
 
     #[test]
@@ -526,8 +544,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn pick_window_is_in_the_target_schema() {
+        for name in ["capture", "record_start"] {
+            let spec = catalog().into_iter().find(|t| t.name == name).unwrap();
+            let kinds = &spec.input_schema["properties"]["target"]["properties"]["kind"]["enum"];
+            assert!(kinds.as_array().unwrap().contains(&json!("pick_window")), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_window_without_a_ui_host_is_503() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = bugle_core::Config::default();
+        cfg.general.save_dir = tmp.path().join("save").display().to_string();
+        cfg.general.history_path = Some(tmp.path().join("history.jsonl").display().to_string());
+        let engine = Arc::new(Engine::new(cfg, false).unwrap());
+        for (name, args) in [
+            ("capture", json!({"target": {"kind": "pick_window"}})),
+            ("record_start", json!({"target": {"kind": "pick_window"}, "format": "mp4"})),
+        ] {
+            let err = run(&engine, name, args).await.err().unwrap();
+            assert_eq!(status_for(&err), 503, "{name}: {err:#}");
+            assert!(format!("{err:#}").contains("menu-bar app"), "{name}: {err:#}");
+        }
+    }
+
+    #[test]
     fn status_codes() {
         assert_eq!(status_for(&BugleError::Cancelled.into()), 409);
+        assert_eq!(status_for(&BugleError::NoUiHost("x".into()).into()), 503);
+        assert_eq!(status_for(&BugleError::Busy("x".into()).into()), 409);
         assert_eq!(status_for(&BugleError::PermissionDenied.into()), 403);
         assert_eq!(status_for(&BugleError::MediaNotFound("x".into()).into()), 404);
         assert_eq!(status_for(&anyhow!("boom")), 500);

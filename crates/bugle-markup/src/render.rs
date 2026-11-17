@@ -185,7 +185,7 @@ impl Renderer {
     fn draw_text(&self, img: &mut RgbaImage, at: Point, text: &str, size: f32, color: Color, background: Option<Color>) {
         let scale = PxScale::from(size);
         let line_h = (size * 1.25).round() as f64;
-        let lines: Vec<&str> = text.lines().collect();
+        let lines = text_lines(text);
         let widths: Vec<u32> = lines.iter().map(|l| text_size(scale, &self.font, l).0).collect();
         let max_w = widths.iter().copied().max().unwrap_or(0) as f64;
         let total_h = line_h * lines.len().max(1) as f64;
@@ -456,7 +456,8 @@ fn clamp_rect(img: &RgbaImage, r: &Rect) -> Option<(u32, u32, u32, u32)> {
     let y0 = r.y.floor().max(0.0) as u32;
     let x1 = (r.right().ceil().max(0.0) as u32).min(img.width());
     let y1 = (r.bottom().ceil().max(0.0) as u32).min(img.height());
-    (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0))
+    // Lazily: a rect starting past the edge has x0 > x1.
+    (x1 > x0 && y1 > y0).then(|| (x0, y0, x1 - x0, y1 - y0))
 }
 
 /// Multiply the pixels under `r` by `c`, mixed in with strength `alpha`
@@ -607,17 +608,19 @@ fn apply_canvas(img: &RgbaImage, canvas: &Canvas) -> Result<RgbaImage> {
         let sigma = (pad as f32 / 3.0).clamp(4.0, 28.0);
         let offset_y = (pad as f64 / 4.0).min(24.0);
         let shadow_rect = Rect::new(inner.x, inner.y + offset_y, inner.w, inner.h);
-        let mut mask = RgbaImage::from_pixel(ow, oh, Rgba([0, 0, 0, 0]));
-        fill_coverage(&mut mask, expand(&shadow_rect, 1.0), Color([0, 0, 0, 140]), |x, y| {
-            coverage(sdf_round_rect(x, y, &shadow_rect, radius))
-        });
-        let mask = imageops::blur(&mask, sigma);
-        for y in 0..oh {
-            for x in 0..ow {
-                let m = mask.get_pixel(x, y);
-                if m.0[3] > 0 {
-                    blend(out.get_pixel_mut(x, y), Color([0, 0, 0, 255]), m.0[3] as f32 / 255.0);
-                }
+        // A one-channel mask, blurred in time independent of sigma: this is
+        // the costliest step on a large capture.
+        let (w, h) = (ow as usize, oh as usize);
+        let mut mask = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                mask[y * w + x] = coverage(sdf_round_rect(x as f64 + 0.5, y as f64 + 0.5, &shadow_rect, radius)) * (140.0 / 255.0);
+            }
+        }
+        blur_mask(&mut mask, w, h, sigma);
+        for (i, m) in mask.iter().enumerate() {
+            if *m > 0.5 / 255.0 {
+                blend(out.get_pixel_mut((i % w) as u32, (i / w) as u32), Color([0, 0, 0, 255]), *m);
             }
         }
     }
@@ -641,6 +644,57 @@ fn apply_canvas(img: &RgbaImage, canvas: &Canvas) -> Result<RgbaImage> {
         }
     }
     Ok(out)
+}
+
+/// Box widths for three box blurs that together approximate a Gaussian of
+/// `sigma` (each odd, so the boxes are centred).
+fn box_sizes(sigma: f32) -> [usize; 3] {
+    let n = 3.0;
+    let ideal = ((12.0 * sigma * sigma / n) + 1.0).sqrt();
+    let mut lo = ideal.floor() as i64;
+    if lo % 2 == 0 {
+        lo -= 1;
+    }
+    let lo = lo.max(1);
+    let hi = lo + 2;
+    let l = lo as f32;
+    let m = ((12.0 * sigma * sigma - n * l * l - 4.0 * n * l - 3.0 * n) / (-4.0 * l - 4.0)).round() as i64;
+    std::array::from_fn(|i| if (i as i64) < m { lo as usize } else { hi as usize })
+}
+
+/// Blur a one-channel `w` x `h` mask in place with three box blurs per axis
+/// (running sums: the cost does not grow with `sigma`). Outside the mask
+/// counts as zero.
+fn blur_mask(mask: &mut [f32], w: usize, h: usize, sigma: f32) {
+    if w == 0 || h == 0 || sigma.is_nan() || sigma <= 0.0 {
+        return;
+    }
+    let mut line = Vec::new();
+    for size in box_sizes(sigma) {
+        let r = size / 2;
+        // Rows, then columns.
+        for (len, count, stride, step) in [(w, h, w, 1), (h, w, 1, w)] {
+            line.resize(len, 0.0);
+            for k in 0..count {
+                let at = |i: usize| k * stride + i * step;
+                for (i, v) in line.iter_mut().enumerate() {
+                    *v = mask[at(i)];
+                }
+                // Running sum over [i - r, i + r], computed in f64 so long
+                // lines do not drift.
+                let mut sum: f64 = line[..r.min(len)].iter().map(|v| *v as f64).sum();
+                for i in 0..len {
+                    if i + r < len {
+                        sum += line[i + r] as f64;
+                    }
+                    if i > r {
+                        sum -= line[i - r - 1] as f64;
+                    }
+                    mask[at(i)] = (sum / size as f64) as f32;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -884,6 +938,181 @@ mod tests {
         let doc: Annotation =
             serde_json::from_value(serde_json::json!({"shapes":[{"type":"image","at":{"x":10,"y":10},"path":small,"scale":0.05}]})).unwrap();
         assert_eq!(*render(&base(), &doc).unwrap().get_pixel(20, 20), Rgba([1, 2, 3, 255]));
+    }
+
+    /// Pixels that differ from the plain background inside `r`.
+    fn inked(img: &RgbaImage, r: (u32, u32, u32, u32)) -> usize {
+        let bg = Rgba([240, 240, 240, 255]);
+        (r.1..r.1 + r.3).flat_map(|y| (r.0..r.0 + r.2).map(move |x| (x, y))).filter(|&(x, y)| *img.get_pixel(x, y) != bg).count()
+    }
+
+    #[test]
+    fn multi_line_labels_draw_every_line() {
+        // 20 px font: lines start 25 px apart. A lone `\r` (as some text
+        // fields send it) breaks the line too.
+        for text in ["Top\nBottom", "Top\rBottom", "Top\r\nBottom", "Top\u{2028}Bottom"] {
+            let doc: Annotation = serde_json::from_value(serde_json::json!({
+                "shapes": [{"type":"text","at":{"x":10,"y":10},"text":text,"font_size":20,"color":"black"}]
+            }))
+            .unwrap();
+            let out = render(&base(), &doc).unwrap();
+            assert!(inked(&out, (10, 10, 120, 22)) > 20, "{text:?}: first line");
+            assert!(inked(&out, (10, 36, 120, 22)) > 20, "{text:?}: second line");
+            assert_eq!(inked(&out, (10, 62, 120, 40)), 0, "{text:?}: nothing below");
+        }
+        // A blank line in the middle keeps its height.
+        let doc: Annotation = serde_json::from_value(serde_json::json!({
+            "shapes": [{"type":"text","at":{"x":10,"y":10},"text":"a\n\nb","font_size":20,"color":"black"}]
+        }))
+        .unwrap();
+        let out = render(&base(), &doc).unwrap();
+        assert_eq!(inked(&out, (10, 36, 120, 22)), 0);
+        assert!(inked(&out, (10, 62, 120, 22)) > 5);
+    }
+
+    #[test]
+    fn arrow_styles_differ() {
+        let draw = |style: &str| {
+            let doc: Annotation = serde_json::from_value(serde_json::json!({
+                "shapes": [{"type":"arrow","from":{"x":20,"y":60},"to":{"x":180,"y":60},"arrow":style,"stroke_width":6,"color":"black"}]
+            }))
+            .unwrap();
+            render(&base(), &doc).unwrap()
+        };
+        let [standard, double, slim, fancy] = ["standard", "double", "slim", "fancy"].map(draw);
+        // Only the double arrow has a head at the tail: ink beside the shaft.
+        let beside_tail = (34, 52, 10, 4);
+        assert!(inked(&double, beside_tail) > 20);
+        assert_eq!(inked(&standard, beside_tail), 0);
+        // Slim is thinner along the shaft, fancy tapers towards the tail.
+        let shaft = (60, 50, 40, 20);
+        assert!(inked(&slim, shaft) < inked(&standard, shaft));
+        assert!(inked(&fancy, (25, 50, 20, 20)) < inked(&standard, (25, 50, 20, 20)));
+        assert_ne!(standard, fancy);
+    }
+
+    #[test]
+    fn redact_styles_differ() {
+        let mut img = base();
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = Rgba([(x * 7) as u8, (y * 11) as u8, ((x * y) & 0xFF) as u8, 255]);
+        }
+        let draw = |mode: &str| {
+            let doc: Annotation = serde_json::from_value(serde_json::json!({
+                "shapes": [{"type":"redact","rect":{"x":20,"y":20,"w":120,"h":60},"mode":mode}]
+            }))
+            .unwrap();
+            render(&img, &doc).unwrap()
+        };
+        let outs = ["pixelate", "blur", "black_out", "secure_blur"].map(draw);
+        for (i, a) in outs.iter().enumerate() {
+            assert_ne!(*a, img, "mode {i} changed nothing");
+            assert_eq!(*a.get_pixel(5, 5), *img.get_pixel(5, 5), "mode {i} leaked outside");
+            for b in &outs[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn source_origin_matches_the_render() {
+        // A marker at source (60, 40); crop from (50, 30) and a 16 + 4 px
+        // canvas: it lands at (60 - 50 + 20, 40 - 30 + 20).
+        let mut img = base();
+        img.put_pixel(60, 40, Rgba([255, 0, 0, 255]));
+        let doc = Annotation {
+            crop: Some(Rect::new(50.0, 30.0, 100.0, 60.0)),
+            canvas: Some(Canvas {
+                padding: 16,
+                border_width: 4,
+                border: Some(Color::WHITE),
+                corner_radius: 0,
+                shadow: false,
+                background: Background::Named("mono".into()),
+            }),
+            ..Default::default()
+        };
+        let out = render(&img, &doc).unwrap();
+        let o = doc.source_origin();
+        assert_eq!((o.x, o.y), (-30.0, -10.0));
+        assert_eq!(*out.get_pixel((60.0 + o.x) as u32, (40.0 + o.y) as u32), Rgba([255, 0, 0, 255]));
+        assert_eq!(out.dimensions(), (140, 100));
+    }
+
+    #[test]
+    fn box_blur_matches_a_gaussian() {
+        for sigma in [4.0f32, 9.5, 28.0] {
+            let sizes = box_sizes(sigma);
+            assert!(sizes.iter().all(|s| s % 2 == 1), "{sizes:?}");
+            // Three boxes of width s have variance sum((s^2 - 1) / 12).
+            let var: f32 = sizes.iter().map(|s| (*s as f32 * *s as f32 - 1.0) / 12.0).sum();
+            assert!((var.sqrt() - sigma).abs() < 0.6, "sigma {sigma}: boxes {sizes:?} give {}", var.sqrt());
+        }
+        // A filled square, blurred both ways: within a few percent anywhere.
+        let (w, h) = (160usize, 120usize);
+        let inside = |x: usize, y: usize| (50..110).contains(&x) && (40..80).contains(&y);
+        let mut mask: Vec<f32> = (0..w * h).map(|i| if inside(i % w, i / w) { 1.0 } else { 0.0 }).collect();
+        let total: f32 = mask.iter().sum();
+        blur_mask(&mut mask, w, h, 8.0);
+        let img = image::GrayImage::from_fn(w as u32, h as u32, |x, y| image::Luma([if inside(x as usize, y as usize) { 255 } else { 0 }]));
+        let reference = imageops::blur(&img, 8.0);
+        let worst = (0..w * h).map(|i| (mask[i] - reference.as_raw()[i] as f32 / 255.0).abs()).fold(0.0, f32::max);
+        assert!(worst < 0.05, "largest difference {worst}");
+        // Nothing reaches the edge, so nothing is lost.
+        assert!((mask.iter().sum::<f32>() - total).abs() < 1.0);
+        // Degenerate input is left alone.
+        blur_mask(&mut [], 0, 0, 3.0);
+        let mut one = [1.0f32];
+        blur_mask(&mut one, 1, 1, f32::NAN);
+        assert_eq!(one, [1.0]);
+    }
+
+    /// `cargo test -p bugle-markup --release -- --ignored --nocapture`:
+    /// how long a canvas takes on a 5K capture.
+    #[test]
+    #[ignore]
+    fn time_large_canvas() {
+        let img = RgbaImage::from_pixel(5120, 2880, Rgba([90, 120, 200, 255]));
+        let doc: Annotation = serde_json::from_value(serde_json::json!({
+            "shapes": [{"type":"arrow","from":{"x":100,"y":100},"to":{"x":3000,"y":2000}},
+                       {"type":"spotlight","rect":{"x":500,"y":500,"w":1000,"h":800}}],
+            "canvas": {"padding": 192, "background": "ocean"}
+        }))
+        .unwrap();
+        let r = Renderer::with_defaults().unwrap();
+        let t = std::time::Instant::now();
+        let out = r.render(&img, &doc).unwrap();
+        eprintln!("5120x2880 with canvas: {:?} → {}x{}", t.elapsed(), out.width(), out.height());
+    }
+
+    #[test]
+    fn shapes_past_the_cropped_edge_draw_nothing() {
+        // An editor keeps shapes in original pixels and translates them by
+        // the crop, so after cropping they routinely start past the right or
+        // bottom edge (or before the top-left one).
+        let img = RgbaImage::from_pixel(800, 600, Rgba([240, 240, 240, 255]));
+        let rect = |x: f64, y: f64| serde_json::json!({"x":x,"y":y,"w":120,"h":80});
+        for (x, y) in [(500.0, 100.0), (100.0, 450.0), (500.0, 450.0), (-300.0, -300.0)] {
+            let doc: Annotation = serde_json::from_value(serde_json::json!({
+                "crop": {"x":0,"y":0,"w":400,"h":300},
+                "shapes": [
+                    {"type":"highlight","rect":rect(x, y)},
+                    {"type":"redact","rect":rect(x, y),"mode":"pixelate"},
+                    {"type":"redact","rect":rect(x, y),"mode":"blur"},
+                    {"type":"redact","rect":rect(x, y),"mode":"black_out"},
+                    {"type":"redact","rect":rect(x, y),"mode":"secure_blur"},
+                    {"type":"spotlight","rect":rect(x, y),"dim":0.5},
+                    {"type":"rectangle","rect":rect(x, y),"fill":"#FF000080"},
+                    {"type":"ellipse","rect":rect(x, y)},
+                    {"type":"arrow","from":{"x":x,"y":y},"to":{"x":x + 100.0,"y":y + 50.0}},
+                    {"type":"text","at":{"x":x,"y":y},"text":"off\nside","background":"#000000"},
+                    {"type":"counter","at":{"x":x,"y":y}}
+                ]
+            }))
+            .unwrap();
+            let out = render(&img, &doc).unwrap();
+            assert_eq!(out.dimensions(), (400, 300), "({x}, {y})");
+        }
     }
 
     #[test]

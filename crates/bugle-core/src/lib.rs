@@ -5,6 +5,7 @@
 
 pub mod audio_mix;
 pub mod config;
+pub mod events;
 pub mod geometry;
 pub mod history;
 pub mod media_item;
@@ -12,6 +13,7 @@ pub mod naming;
 pub mod spec;
 
 pub use config::Config;
+pub use events::EventTrack;
 pub use geometry::{Point, Rect, Size};
 pub use history::History;
 pub use media_item::{MediaItem, MediaKind};
@@ -38,4 +40,12 @@ pub enum BugleError {
     Unsupported(String),
     #[error("selection cancelled")]
     Cancelled,
+    /// An interactive overlay was requested from a process that cannot show
+    /// one in-process (`bugle serve`, `bugle mcp`, the CLI).
+    #[error("{0}")]
+    NoUiHost(String),
+    /// Another interactive overlay is open, or one was just dismissed;
+    /// retrying later can work.
+    #[error("busy: {0}")]
+    Busy(String),
 }

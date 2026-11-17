@@ -21,7 +21,10 @@ jpeg_quality = 90
 window_shadow = true      # keep the window drop shadow in window captures
 downscale_retina = false  # save at 1x points instead of 2x pixels
 # bugle-app Capture Window: hover to highlight a window, click to capture it.
-# false = capture the front-most window at once (the CLI and API always do).
+# Space switches between the picker and the area selection (Capture Area,
+# Capture Window, Record Video/GIF/Window).
+# false = capture the front-most window at once (the CLI and API always do,
+# unless an API caller asks for target kind "pick_window").
 window_picker = true
 
 [recordings]
@@ -48,9 +51,12 @@ ducking_threshold_db = -40.0  # mic peak level (dBFS, as recorded, before
 ducking_attack_ms = 10.0  # fade down
 ducking_release_ms = 500.0  # fade back up once the mic is quiet
 highlight_clicks = false  # stream backend: macOS 15+
+cursor_events = false     # write <file>.events.json (pointer + clicks) for `bugle edit --zoom`
+hide_cursor = false       # leave the pointer out of the frames (stream backend; implies
+                          # cursor_events; `bugle edit --smooth-cursor` draws it back)
 retina = true
 # auto: ScreenCaptureKit (SCStream + AVAssetWriter, H.264 + AAC .mp4) when system
-#       audio is requested, otherwise `screencapture -v`
+#       audio, hide_cursor or cursor_events is requested, otherwise `screencapture -v`
 # stream | system: always use that recorder
 backend = "auto"
 
@@ -88,6 +94,7 @@ capture_screen = "cmd+shift+3"
 # scroll_capture = "cmd+shift+s"
 record = "cmd+shift+5"        # starts an MP4 recording, or stops the active one
 # record_gif = "cmd+shift+g"
+# record_window = "cmd+shift+r"     # pick a window and record it (MP4)
 ocr_latest = "cmd+shift+2"
 pin_latest = "cmd+shift+p"
 # annotate_latest = "cmd+shift+e"   # markup editor for the newest screenshot

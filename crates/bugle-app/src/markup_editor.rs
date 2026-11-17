@@ -6,10 +6,15 @@
 //! renderer `bugle annotate` uses, so the saved file matches the preview;
 //! only the shape under the pointer is drawn by the window, from
 //! [`Editor::overlay`].
+//!
+//! Shapes and the crop are kept in pixels of the original image, whatever
+//! is cropped away or added around it; [`Editor::document`] translates them
+//! for the renderer, and the window maps its input back with
+//! [`Annotation::source_origin`].
 
 use bugle_core::{Point, Rect};
-use bugle_markup::{limits, Annotation, ArrowStyle, Color, RedactStyle, Shape, Style};
-use bugle_platform::{EditorCommand, EditorEvent, EditorPrim, EditorState, EditorTool};
+use bugle_markup::{limits, text_lines, Annotation, ArrowStyle, Background, Canvas, Color, RedactStyle, Shape, Style};
+use bugle_platform::{EditorCommand, EditorEvent, EditorMenu, EditorMenuItem, EditorPrim, EditorState, EditorTool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -24,11 +29,12 @@ pub enum Tool {
     Counter,
     Redact,
     Spotlight,
+    Crop,
 }
 
 impl Tool {
     /// Toolbar order.
-    pub const ALL: [Tool; 11] = [
+    pub const ALL: [Tool; 12] = [
         Tool::Select,
         Tool::Arrow,
         Tool::Rectangle,
@@ -40,6 +46,7 @@ impl Tool {
         Tool::Counter,
         Tool::Redact,
         Tool::Spotlight,
+        Tool::Crop,
     ];
 
     /// The key that picks the tool.
@@ -56,6 +63,7 @@ impl Tool {
             Tool::Counter => 'n',
             Tool::Redact => 'b',
             Tool::Spotlight => 's',
+            Tool::Crop => 'c',
         }
     }
 
@@ -73,6 +81,7 @@ impl Tool {
             Tool::Counter => ("Numbered step (N)", "1.circle"),
             Tool::Redact => ("Redact (B)", "eye.slash"),
             Tool::Spotlight => ("Spotlight (S)", "rectangle.dashed"),
+            Tool::Crop => ("Crop (C); Delete removes the crop", "crop"),
         };
         EditorTool { label, symbol }
     }
@@ -101,6 +110,47 @@ const STROKES: [f64; 3] = [3.0, 5.0, 9.0];
 /// Font sizes, likewise.
 const FONTS: [f64; 3] = [18.0, 28.0, 44.0];
 const HIGHLIGHT_ALPHA: u8 = 0x80;
+/// Smallest crop, in image pixels.
+const MIN_CROP: f64 = 8.0;
+
+/// The toolbar menus, by index.
+pub const MENUS: usize = 2;
+pub(crate) const MENU_STYLE: usize = 0;
+pub(crate) const MENU_CANVAS: usize = 1;
+const ARROW_STYLES: [(ArrowStyle, &str); 4] = [
+    (ArrowStyle::Standard, "Standard"),
+    (ArrowStyle::Double, "Double-headed"),
+    (ArrowStyle::Slim, "Slim"),
+    (ArrowStyle::Fancy, "Tapered"),
+];
+const REDACT_STYLES: [(RedactStyle, &str); 4] = [
+    (RedactStyle::Pixelate, "Pixelate"),
+    (RedactStyle::Blur, "Blur"),
+    (RedactStyle::BlackOut, "Black out"),
+    (RedactStyle::SecureBlur, "Secure blur"),
+];
+/// Canvas padding choices: label and pixels on a small image (multiplied by
+/// the unit, like strokes).
+const PADDINGS: [(&str, f64); 4] = [("None", 0.0), ("Small", 32.0), ("Medium", 64.0), ("Large", 112.0)];
+/// Canvas backgrounds: label and the renderer's background name.
+const BACKGROUNDS: [(&str, &str); 10] = [
+    ("Transparent", "none"),
+    ("White", "#FFFFFF"),
+    ("Sunset", "sunset"),
+    ("Ocean", "ocean"),
+    ("Forest", "forest"),
+    ("Candy", "candy"),
+    ("Peach", "peach"),
+    ("Mint", "mint"),
+    ("Midnight", "midnight"),
+    ("Graphite", "mono"),
+];
+/// Canvas menu layout: a heading, the paddings, a separator, a heading,
+/// the backgrounds.
+const CANVAS_PADDING_ITEM: usize = 1;
+pub(crate) const CANVAS_BACKGROUND_ITEM: usize = CANVAS_PADDING_ITEM + PADDINGS.len() + 2;
+/// Padding picked when a background is chosen with no padding.
+const DEFAULT_PADDING: usize = 2;
 const UNDO_LIMIT: usize = 200;
 /// Points kept for one pen stroke; the rest of a very long drag is dropped.
 const MAX_STROKE_POINTS: usize = 5_000;
@@ -117,6 +167,8 @@ pub struct Effects {
     /// Show the text field.
     pub begin_text: Option<TextRequest>,
     pub request: Option<Request>,
+    /// Something was refused; tell the user why.
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +185,44 @@ pub enum Request {
     Copy,
 }
 
+/// The canvas around the image, as picked in the canvas menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Frame {
+    /// Index into [`PADDINGS`]; 0 is no canvas.
+    padding: usize,
+    /// Index into [`BACKGROUNDS`].
+    background: usize,
+}
+
+impl Default for Frame {
+    fn default() -> Self {
+        Self { padding: 0, background: 2 }
+    }
+}
+
+/// Everything an undo step restores.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct Snapshot {
+    shapes: Vec<Shape>,
+    crop: Option<Rect>,
+    frame: Frame,
+}
+
+/// What the style menu is about right now.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StyleTarget {
+    Arrow(ArrowStyle),
+    Redact(RedactStyle),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CropDrag {
+    New,
+    Move,
+    /// Dragging a corner, clockwise from top-left.
+    Corner(usize),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Drag {
     /// Dragging out a new shape with the current tool.
@@ -141,6 +231,8 @@ enum Drag {
     Move { index: usize, start: Point, original: Shape, moved: bool },
     /// Dragging one of the selected shape's handles.
     Resize { index: usize, handle: usize, start: Point, original: Shape, moved: bool },
+    /// Drawing, moving or resizing the crop; `original` is the crop at mouse down.
+    Crop { mode: CropDrag, start: Point, original: Option<Rect>, moved: bool },
 }
 
 /// A label being typed in the window's text field.
@@ -155,13 +247,21 @@ pub struct Editor {
     /// Image-pixel multiplier for strokes and fonts, so they look the same on
     /// a Retina capture as on a small one.
     unit: f64,
+    /// The edited image's size in pixels.
+    image: (u32, u32),
     shapes: Vec<Shape>,
-    saved: Vec<Shape>,
-    undo: Vec<Vec<Shape>>,
-    redo: Vec<Vec<Shape>>,
+    /// Whole pixels inside the image; `None` keeps all of it.
+    crop: Option<Rect>,
+    frame: Frame,
+    saved: Snapshot,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
     tool: Tool,
     color: usize,
     size: usize,
+    /// Style for new arrows and redactions.
+    arrow: ArrowStyle,
+    redact: RedactStyle,
     selected: Option<usize>,
     drag: Option<Drag>,
     text: Option<TextEdit>,
@@ -177,13 +277,18 @@ impl Editor {
         let long = image_size.0.max(image_size.1) as f64;
         Self {
             unit: (long / 1400.0).clamp(1.0, 3.0),
+            image: image_size,
             shapes: Vec::new(),
-            saved: Vec::new(),
+            crop: None,
+            frame: Frame::default(),
+            saved: Snapshot::default(),
             undo: Vec::new(),
             redo: Vec::new(),
             tool: Tool::Arrow,
             color: 0,
             size: 1,
+            arrow: ArrowStyle::Standard,
+            redact: RedactStyle::Pixelate,
             selected: None,
             drag: None,
             text: None,
@@ -192,24 +297,74 @@ impl Editor {
         }
     }
 
-    /// The shapes for the live preview: everything except a shape the window
-    /// is drawing itself right now.
+    /// The document for the live preview: everything except a shape the
+    /// window is drawing itself right now. With the crop tool picked the
+    /// whole image shows, without crop or canvas, so the crop can be
+    /// changed; the window maps its input with [`Annotation::source_origin`].
     pub fn document(&self) -> Annotation {
         let shapes = self.shapes.iter().enumerate().filter(|(i, _)| Some(*i) != self.hidden).map(|(_, s)| s.clone()).collect();
-        Annotation { shapes, ..Default::default() }
+        if self.tool == Tool::Crop {
+            return Annotation { shapes, ..Default::default() };
+        }
+        self.compose(shapes)
     }
 
-    /// Every shape, for saving and copying.
+    /// Every shape with the crop and canvas, for saving and copying.
     pub fn final_document(&self) -> Annotation {
-        Annotation { shapes: self.shapes.clone(), ..Default::default() }
+        self.compose(self.shapes.clone())
     }
 
+    /// `shapes` (in original-image pixels) as a document for the renderer,
+    /// whose shape coordinates are relative to the crop.
+    fn compose(&self, mut shapes: Vec<Shape>) -> Annotation {
+        if let Some(c) = self.crop {
+            shapes.iter_mut().for_each(|s| s.translate(-c.x, -c.y));
+        }
+        Annotation { shapes, crop: self.crop, canvas: self.canvas(), ..Default::default() }
+    }
+
+    fn canvas(&self) -> Option<Canvas> {
+        self.canvas_for(self.frame)
+    }
+
+    fn canvas_for(&self, frame: Frame) -> Option<Canvas> {
+        let pad = PADDINGS[frame.padding.min(PADDINGS.len() - 1)].1 * self.unit;
+        if pad <= 0.0 {
+            return None;
+        }
+        let background = BACKGROUNDS[frame.background.min(BACKGROUNDS.len() - 1)].1;
+        Some(Canvas {
+            padding: (pad.round() as u32).min(limits::MAX_CANVAS_INSET),
+            background: Background::Named(background.into()),
+            corner_radius: (10.0 * self.unit).round() as u32,
+            shadow: true,
+            border: None,
+            border_width: 0,
+        })
+    }
+
+    /// Nothing drawn, cropped or framed: there is no copy worth saving.
     pub fn is_empty(&self) -> bool {
-        self.shapes.is_empty()
+        self.shapes.is_empty() && self.crop.is_none() && self.canvas().is_none()
+    }
+
+    /// With no padding there is no canvas, whatever background was picked
+    /// before: such frames compare equal, so dirty agrees with empty.
+    fn snapshot(&self) -> Snapshot {
+        let frame = if self.frame.padding == 0 { Frame::default() } else { self.frame };
+        Snapshot { shapes: self.shapes.clone(), crop: self.crop, frame }
+    }
+
+    fn restore(&mut self, s: Snapshot) -> Snapshot {
+        let now = self.snapshot();
+        self.shapes = s.shapes;
+        self.crop = s.crop;
+        self.frame = s.frame;
+        now
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.shapes != self.saved
+        self.snapshot() != self.saved
     }
 
     pub fn state(&self) -> EditorState {
@@ -237,6 +392,51 @@ impl Editor {
 
     fn style(&self) -> Style {
         Style { color: Some(self.color()), stroke_width: Some(self.stroke()), ..Default::default() }
+    }
+
+    /// The style menu applies to the selected arrow or redaction, or to the
+    /// next one drawn.
+    fn style_target(&self) -> Option<StyleTarget> {
+        match (self.tool, self.selected.and_then(|i| self.shapes.get(i))) {
+            (Tool::Arrow, _) => Some(StyleTarget::Arrow(self.arrow)),
+            (Tool::Redact, _) => Some(StyleTarget::Redact(self.redact)),
+            (Tool::Select, Some(Shape::Arrow { arrow, .. })) => Some(StyleTarget::Arrow(*arrow)),
+            (Tool::Select, Some(Shape::Redact { mode, .. })) => Some(StyleTarget::Redact(*mode)),
+            _ => None,
+        }
+    }
+
+    /// The toolbar menus: the style of arrows and redactions, and the canvas
+    /// (padding and background) around the image.
+    pub fn menus(&self) -> [EditorMenu; MENUS] {
+        fn choices<T: PartialEq + Copy>(list: &[(T, &str)], current: T) -> (String, Vec<EditorMenuItem>) {
+            let title = list.iter().find(|(v, _)| *v == current).map_or("Style", |(_, l)| l).to_string();
+            (title, list.iter().map(|(v, l)| EditorMenuItem::choice(*l, *v == current)).collect())
+        }
+        let style = match self.style_target() {
+            Some(StyleTarget::Arrow(a)) => {
+                let (title, items) = choices(&ARROW_STYLES, a);
+                EditorMenu { title, tip: "Arrow style".into(), items, enabled: true }
+            }
+            Some(StyleTarget::Redact(r)) => {
+                let (title, items) = choices(&REDACT_STYLES, r);
+                EditorMenu { title, tip: "Redaction style".into(), items, enabled: true }
+            }
+            None => EditorMenu {
+                title: "Style".into(),
+                tip: "Arrow and redaction styles: pick the arrow or redact tool, or select one".into(),
+                items: Vec::new(),
+                enabled: false,
+            },
+        };
+        let mut items = vec![EditorMenuItem::Heading("Padding".into())];
+        items.extend(PADDINGS.iter().enumerate().map(|(i, (l, _))| EditorMenuItem::choice(*l, i == self.frame.padding)));
+        items.push(EditorMenuItem::Separator);
+        items.push(EditorMenuItem::Heading("Background".into()));
+        items.extend(BACKGROUNDS.iter().enumerate().map(|(i, (l, _))| EditorMenuItem::choice(*l, i == self.frame.background)));
+        let title = if self.frame.padding == 0 { "Canvas" } else { BACKGROUNDS[self.frame.background].0 };
+        let canvas = EditorMenu { title: title.into(), tip: "Padding and background around the image".into(), items, enabled: true };
+        [style, canvas]
     }
 
     /// Pointer slack for grabbing thin things, in image pixels.
@@ -279,15 +479,73 @@ impl Editor {
             EditorEvent::Command(c) => self.command(c),
             EditorEvent::Text(t) => self.finish_text(&t),
             EditorEvent::Scale(s) => {
-                self.px_per_pt = s.clamp(0.05, 100.0);
+                self.px_per_pt = s.clamp(0.01, 100.0);
                 Effects::default()
             }
+            EditorEvent::Menu { menu, item } => self.menu(menu, item),
+        }
+    }
+
+    fn menu(&mut self, menu: usize, item: usize) -> Effects {
+        match (menu, self.style_target()) {
+            (MENU_STYLE, Some(StyleTarget::Arrow(_))) if item < ARROW_STYLES.len() => {
+                let style = ARROW_STYLES[item].0;
+                self.arrow = style;
+                self.restyle(|s| {
+                    if let Shape::Arrow { arrow, .. } = s {
+                        *arrow = style;
+                    }
+                })
+            }
+            (MENU_STYLE, Some(StyleTarget::Redact(_))) if item < REDACT_STYLES.len() => {
+                let style = REDACT_STYLES[item].0;
+                self.redact = style;
+                self.restyle(|s| {
+                    if let Shape::Redact { mode, strength, .. } = s {
+                        *mode = style;
+                        // A strength means different things per mode.
+                        *strength = 0.0;
+                    }
+                })
+            }
+            (MENU_CANVAS, _) => {
+                let mut frame = self.frame;
+                match item.checked_sub(CANVAS_PADDING_ITEM) {
+                    Some(i) if i < PADDINGS.len() => frame.padding = i,
+                    _ => match item.checked_sub(CANVAS_BACKGROUND_ITEM) {
+                        Some(i) if i < BACKGROUNDS.len() => {
+                            frame.background = i;
+                            if frame.padding == 0 {
+                                frame.padding = DEFAULT_PADDING;
+                            }
+                        }
+                        _ => return Effects::default(),
+                    },
+                }
+                let mut fx = Effects { state: true, ..Default::default() };
+                // Refuse a canvas that would make the image larger than the
+                // renderer accepts, rather than leave a stale preview.
+                let (w, h) = self.crop.map_or(self.image, |c| (c.w as u32, c.h as u32));
+                let check = Annotation { canvas: self.canvas_for(frame), ..Default::default() };
+                if let Err(e) = check.output_size(w, h) {
+                    fx.error = Some(format!("{e:#}"));
+                    return fx;
+                }
+                if frame != self.frame && self.drag.is_none() {
+                    let before = self.snapshot();
+                    self.frame = frame;
+                    self.commit(before, &mut fx);
+                }
+                fx
+            }
+            _ => Effects::default(),
         }
     }
 
     fn pick_tool(&mut self, tool: Tool) -> Effects {
-        // A cancelled move put a shape back that the image was drawn without.
-        let render = self.cancel_drag();
+        // A cancelled move put a shape back that the image was drawn without;
+        // entering or leaving the crop tool shows or hides what is cropped.
+        let render = self.cancel_drag() | ((self.tool == Tool::Crop) != (tool == Tool::Crop));
         self.tool = tool;
         if tool != Tool::Select {
             self.selected = None;
@@ -299,11 +557,13 @@ impl Editor {
         // A drag still armed here lost its mouse-up; put its shape back.
         let render = self.cancel_drag();
         let mut fx = Effects { render, overlay: true, ..Default::default() };
-        if self.shapes.len() >= limits::MAX_SHAPES && self.tool != Tool::Select {
+        if self.shapes.len() >= limits::MAX_SHAPES && !matches!(self.tool, Tool::Select | Tool::Crop) {
             return fx;
         }
         match self.tool {
             Tool::Select => {
+                // The selection (and with it the style menu) may change.
+                fx.state = true;
                 if let Some(index) = self.selected {
                     let grab = handles(&self.shapes[index]).iter().position(|h| distance(*h, at) <= self.slack());
                     if let Some(handle) = grab {
@@ -334,10 +594,22 @@ impl Editor {
                 fx.begin_text =
                     Some(TextRequest { at, font_px: self.font() as f64, initial: String::new(), color: self.color().0 });
             }
+            Tool::Crop => {
+                let original = self.crop;
+                let mode = match original {
+                    Some(r) => match corners(&r).iter().position(|c| distance(*c, at) <= self.slack()) {
+                        Some(corner) => CropDrag::Corner(corner),
+                        None if r.contains(at) => CropDrag::Move,
+                        None => CropDrag::New,
+                    },
+                    None => CropDrag::New,
+                };
+                self.drag = Some(Drag::Crop { mode, start: at, original, moved: false });
+            }
             Tool::Counter => {
                 let next = self.shapes.iter().filter(|s| matches!(s, Shape::Counter { .. })).map(counter_number).max();
                 let style = Style { color: Some(self.color()), font_size: Some(self.font()), ..Default::default() };
-                let before = self.shapes.clone();
+                let before = self.snapshot();
                 self.shapes.push(Shape::Counter { at, number: Some(next.unwrap_or(0).saturating_add(1)), style });
                 self.commit(before, &mut fx);
             }
@@ -348,8 +620,26 @@ impl Editor {
 
     fn mouse_drag(&mut self, at: Point, shift: bool) -> Effects {
         let mut fx = Effects::default();
-        let (tool, slack) = (self.tool, 2.0 * self.px_per_pt);
+        let (tool, slack, image) = (self.tool, 2.0 * self.px_per_pt, self.image);
         match &mut self.drag {
+            Some(Drag::Crop { mode, start, original, moved }) => {
+                if !*moved && distance(at, *start) < slack {
+                    return fx;
+                }
+                *moved = true;
+                let (dx, dy) = (at.x - start.x, at.y - start.y);
+                let wanted = match (*mode, *original) {
+                    (CropDrag::Move, Some(r)) => {
+                        // Slide, keeping the size, without leaving the image.
+                        let x = (r.x + dx).clamp(0.0, (image.0 as f64 - r.w).max(0.0));
+                        let y = (r.y + dy).clamp(0.0, (image.1 as f64 - r.h).max(0.0));
+                        Rect::new(x, y, r.w, r.h)
+                    }
+                    (CropDrag::Corner(c), Some(r)) => rect_between(corners(&r)[(c + 2) % 4], at),
+                    _ => rect_between(*start, at),
+                };
+                self.crop = crop_within(wanted, image).or(*original);
+            }
             None => return fx,
             Some(Drag::Draw { start, current, points }) => {
                 *current = if shift { constrain(tool, *start, at) } else { at };
@@ -403,7 +693,7 @@ impl Editor {
         match drag {
             Drag::Draw { start, current, points } => {
                 if let Some(shape) = self.shape_for(start, current, &points) {
-                    let before = self.shapes.clone();
+                    let before = self.snapshot();
                     self.shapes.push(shape);
                     self.commit(before, fx);
                 }
@@ -411,8 +701,19 @@ impl Editor {
             Drag::Move { index, original, moved, .. } | Drag::Resize { index, original, moved, .. } => {
                 self.hidden = None;
                 if moved {
-                    let mut before = self.shapes.clone();
-                    before[index] = original;
+                    let mut before = self.snapshot();
+                    before.shapes[index] = original;
+                    self.commit(before, fx);
+                }
+            }
+            Drag::Crop { original, .. } => {
+                // A crop of the whole image is no crop.
+                if self.crop.is_some_and(|r| r == Rect::new(0.0, 0.0, self.image.0 as f64, self.image.1 as f64)) {
+                    self.crop = None;
+                }
+                if self.crop != original {
+                    let mut before = self.snapshot();
+                    before.crop = original;
                     self.commit(before, fx);
                 }
             }
@@ -426,6 +727,10 @@ impl Editor {
                 self.shapes[index] = original;
                 self.hidden = None;
                 true
+            }
+            Some(Drag::Crop { original, .. }) => {
+                self.crop = original;
+                false
             }
             Some(Drag::Draw { .. }) => true,
             None => false,
@@ -445,17 +750,22 @@ impl Editor {
             }
             EditorCommand::Undo | EditorCommand::Redo => {
                 self.cancel_drag();
-                let (from, to) = if c == EditorCommand::Undo { (&mut self.undo, &mut self.redo) } else { (&mut self.redo, &mut self.undo) };
-                if let Some(shapes) = from.pop() {
-                    to.push(std::mem::replace(&mut self.shapes, shapes));
+                let undo = c == EditorCommand::Undo;
+                if let Some(snapshot) = if undo { self.undo.pop() } else { self.redo.pop() } {
+                    let now = self.restore(snapshot);
+                    if undo { self.redo.push(now) } else { self.undo.push(now) }
                     self.selected = None;
                 }
                 fx.render = true;
             }
             EditorCommand::Delete => {
                 fx.render = self.cancel_drag();
-                if let Some(index) = self.selected.take() {
-                    let before = self.shapes.clone();
+                if self.tool == Tool::Crop && self.crop.is_some() {
+                    let before = self.snapshot();
+                    self.crop = None;
+                    self.commit(before, &mut fx);
+                } else if let Some(index) = self.selected.take() {
+                    let before = self.snapshot();
                     self.shapes.remove(index);
                     self.commit(before, &mut fx);
                 }
@@ -464,9 +774,11 @@ impl Editor {
             EditorCommand::Escape => {
                 // Back out one step at a time: the drag, then the selection,
                 // then the tool. Never closes the window.
-                if self.cancel_drag() {
-                    fx.render = true;
+                if self.drag.is_some() {
+                    fx.render = self.cancel_drag();
                 } else if self.selected.take().is_none() && self.tool != Tool::Select {
+                    // Leaving the crop tool applies the crop.
+                    fx.render = self.tool == Tool::Crop;
                     self.tool = Tool::Select;
                 }
                 fx.overlay = true;
@@ -481,14 +793,16 @@ impl Editor {
         let Some(edit) = self.text.take() else { return fx };
         let was_hidden = self.hidden.take().is_some();
         fx.render = was_hidden;
-        // No longer than the renderer accepts.
+        // One kind of line break, no blank lines around the label, and no
+        // longer than the renderer accepts.
+        let typed = text_lines(typed).join("\n");
         let typed: String = typed.trim().chars().take(limits::MAX_TEXT_CHARS).collect();
         let typed = typed.trim_end();
         if typed.is_empty() {
             // Cancelled or left blank: an edited label stays as it was.
             return fx;
         }
-        let before = self.shapes.clone();
+        let before = self.snapshot();
         match edit.replacing {
             Some(index) => match self.shapes.get_mut(index) {
                 Some(Shape::Text { text, .. }) if text != typed => *text = typed.to_string(),
@@ -510,17 +824,17 @@ impl Editor {
             return fx;
         }
         if let Some(index) = self.selected {
-            let before = self.shapes.clone();
+            let before = self.snapshot();
             change(&mut self.shapes[index]);
-            if self.shapes != before {
+            if self.shapes != before.shapes {
                 self.commit(before, &mut fx);
             }
         }
         fx
     }
 
-    /// Record `before` for undo after `self.shapes` changed.
-    fn commit(&mut self, before: Vec<Shape>, fx: &mut Effects) {
+    /// Record `before` for undo after the document changed.
+    fn commit(&mut self, before: Snapshot, fx: &mut Effects) {
         self.undo.push(before);
         if self.undo.len() > UNDO_LIMIT {
             self.undo.remove(0);
@@ -531,8 +845,12 @@ impl Editor {
         fx.overlay = true;
     }
 
-    /// The topmost shape under `p`.
+    /// The topmost shape under `p`. Nothing is picked outside the crop,
+    /// where nothing shows.
     fn hit(&self, p: Point) -> Option<usize> {
+        if self.crop.is_some_and(|c| !c.contains(p)) {
+            return None;
+        }
         (0..self.shapes.len()).rev().find(|i| hits(&self.shapes[*i], p, self.slack()))
     }
 
@@ -545,10 +863,10 @@ impl Editor {
         let long_enough = distance(start, end) >= min;
         let style = self.style();
         match self.tool {
-            Tool::Arrow => long_enough.then(|| Shape::Arrow { from: start, to: end, arrow: ArrowStyle::Standard, style }),
-            Tool::Line => long_enough.then(|| Shape::Line { from: start, to: end, style }),
-            Tool::Rectangle => big_enough.then(|| Shape::Rectangle { rect, radius: 0.0, style }),
-            Tool::Ellipse => big_enough.then(|| Shape::Ellipse { rect, style }),
+            Tool::Arrow => long_enough.then_some(Shape::Arrow { from: start, to: end, arrow: self.arrow, style }),
+            Tool::Line => long_enough.then_some(Shape::Line { from: start, to: end, style }),
+            Tool::Rectangle => big_enough.then_some(Shape::Rectangle { rect, radius: 0.0, style }),
+            Tool::Ellipse => big_enough.then_some(Shape::Ellipse { rect, style }),
             Tool::Pen => {
                 let travelled: f64 = points.windows(2).map(|w| distance(w[0], w[1])).sum();
                 let used: usize = self.shapes.iter().map(|s| if let Shape::Freehand { points, .. } = s { points.len() } else { 0 }).sum();
@@ -559,9 +877,9 @@ impl Editor {
                 rect,
                 style: Style { color: Some(self.color().with_alpha(HIGHLIGHT_ALPHA)), ..Default::default() },
             }),
-            Tool::Redact => big_enough.then(|| Shape::Redact { rect, mode: RedactStyle::Pixelate, strength: 0.0 }),
-            Tool::Spotlight => big_enough.then(|| Shape::Spotlight { rect, dim: 0.6 }),
-            Tool::Select | Tool::Text | Tool::Counter => None,
+            Tool::Redact => big_enough.then_some(Shape::Redact { rect, mode: self.redact, strength: 0.0 }),
+            Tool::Spotlight => big_enough.then_some(Shape::Spotlight { rect, dim: 0.6 }),
+            Tool::Select | Tool::Text | Tool::Counter | Tool::Crop => None,
         }
     }
 
@@ -569,6 +887,26 @@ impl Editor {
     /// or moved, and the selection marks.
     pub fn overlay(&self) -> Vec<EditorPrim> {
         let mut out = Vec::new();
+        if self.tool == Tool::Crop {
+            // The whole image shows: dim what the crop leaves out.
+            if let Some(r) = self.crop {
+                let (w, h) = (self.image.0 as f64, self.image.1 as f64);
+                let shade = [0, 0, 0, 0xA0];
+                for rect in [
+                    Rect::new(0.0, 0.0, w, r.y),
+                    Rect::new(0.0, r.bottom(), w, h - r.bottom()),
+                    Rect::new(0.0, r.y, r.x, r.h),
+                    Rect::new(r.right(), r.y, w - r.right(), r.h),
+                ] {
+                    if rect.w > 0.0 && rect.h > 0.0 {
+                        out.push(EditorPrim::Fill { rect, color: shade });
+                    }
+                }
+                out.push(EditorPrim::Selection { rect: r });
+                out.extend(corners(&r).into_iter().map(|at| EditorPrim::Handle { at }));
+            }
+            return out;
+        }
         if let Some(Drag::Draw { start, current, points }) = &self.drag {
             if let Some(shape) = self.shape_for(*start, *current, points) {
                 out.extend(preview(&shape));
@@ -587,7 +925,7 @@ impl Editor {
     /// The document as saved is now the baseline for [`Editor::is_dirty`].
     #[cfg(test)]
     fn mark_saved(&mut self) {
-        self.saved = self.shapes.clone();
+        self.saved = self.snapshot();
     }
 }
 
@@ -605,6 +943,24 @@ fn rect_between(a: Point, b: Point) -> Rect {
 
 fn normalized(r: &Rect) -> Rect {
     rect_between(r.origin(), Point { x: r.x + r.w, y: r.y + r.h })
+}
+
+/// Corners clockwise from top-left.
+fn corners(r: &Rect) -> [Point; 4] {
+    let r = normalized(r);
+    [Point { x: r.x, y: r.y }, Point { x: r.right(), y: r.y }, Point { x: r.right(), y: r.bottom() }, Point { x: r.x, y: r.bottom() }]
+}
+
+/// `r` cut to the image and rounded to whole pixels; `None` when less than
+/// [`MIN_CROP`] is left either way.
+fn crop_within(r: Rect, image: (u32, u32)) -> Option<Rect> {
+    let r = normalized(&r);
+    let (w, h) = (image.0 as f64, image.1 as f64);
+    let x0 = r.x.clamp(0.0, w).round();
+    let y0 = r.y.clamp(0.0, h).round();
+    let x1 = r.right().clamp(0.0, w).round();
+    let y1 = r.bottom().clamp(0.0, h).round();
+    (x1 - x0 >= MIN_CROP && y1 - y0 >= MIN_CROP).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
 }
 
 /// Shift-drag: lines snap to 45° steps, boxes become squares.
@@ -663,8 +1019,9 @@ fn bounds(shape: &Shape) -> Rect {
         Shape::Freehand { points, .. } => around(points),
         Shape::Text { at, text, style, .. } => {
             let size = style.font_size.unwrap_or(28.0) as f64;
-            let widest = text.lines().map(|l| l.chars().count()).max().unwrap_or(0).max(1) as f64;
-            let lines = text.lines().count().max(1) as f64;
+            let lines = text_lines(text);
+            let widest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(1) as f64;
+            let lines = lines.len().max(1) as f64;
             Rect::new(at.x, at.y, widest * size * 0.58, lines * size * 1.25)
         }
         Shape::Counter { at, style, .. } => {
@@ -728,27 +1085,8 @@ fn hits(shape: &Shape, p: Point, slack: f64) -> bool {
 }
 
 fn translate(shape: &Shape, dx: f64, dy: f64) -> Shape {
-    let mv = |p: &mut Point| {
-        p.x += dx;
-        p.y += dy;
-    };
     let mut s = shape.clone();
-    match &mut s {
-        Shape::Rectangle { rect, .. }
-        | Shape::Ellipse { rect, .. }
-        | Shape::Highlight { rect, .. }
-        | Shape::Redact { rect, .. }
-        | Shape::Spotlight { rect, .. } => {
-            rect.x += dx;
-            rect.y += dy;
-        }
-        Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => {
-            mv(from);
-            mv(to);
-        }
-        Shape::Freehand { points, .. } => points.iter_mut().for_each(mv),
-        Shape::Text { at, .. } | Shape::Counter { at, .. } | Shape::Image { at, .. } => mv(at),
-    }
+    s.translate(dx, dy);
     s
 }
 
@@ -760,15 +1098,7 @@ fn handles(shape: &Shape) -> Vec<Point> {
         | Shape::Ellipse { rect, .. }
         | Shape::Highlight { rect, .. }
         | Shape::Redact { rect, .. }
-        | Shape::Spotlight { rect, .. } => {
-            let r = normalized(rect);
-            vec![
-                Point { x: r.x, y: r.y },
-                Point { x: r.right(), y: r.y },
-                Point { x: r.right(), y: r.bottom() },
-                Point { x: r.x, y: r.bottom() },
-            ]
-        }
+        | Shape::Spotlight { rect, .. } => corners(rect).to_vec(),
         Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => vec![*from, *to],
         _ => Vec::new(),
     }
@@ -841,9 +1171,10 @@ fn preview(shape: &Shape) -> Vec<EditorPrim> {
             let (color, width) = ink(style);
             vec![EditorPrim::Polyline { points: vec![*from, *to], color, width }]
         }
-        Shape::Arrow { from, to, style, .. } => {
+        Shape::Arrow { from, to, style, arrow } => {
             let (color, width) = ink(style);
-            vec![EditorPrim::Arrow { from: *from, to: *to, color, width }]
+            let width = if *arrow == ArrowStyle::Slim { width * 0.6 } else { width };
+            vec![EditorPrim::Arrow { from: *from, to: *to, color, width, double: *arrow == ArrowStyle::Double }]
         }
         Shape::Freehand { points, style } => {
             let (color, width) = ink(style);
@@ -853,8 +1184,11 @@ fn preview(shape: &Shape) -> Vec<EditorPrim> {
             let c = style.color.unwrap_or(Color::YELLOW).0;
             vec![EditorPrim::Fill { rect: normalized(rect), color: [c[0], c[1], c[2], 0x66] }]
         }
-        Shape::Redact { rect, .. } => vec![
-            EditorPrim::Fill { rect: normalized(rect), color: [0x80, 0x80, 0x80, 0xC0] },
+        Shape::Redact { rect, mode, .. } => vec![
+            EditorPrim::Fill {
+                rect: normalized(rect),
+                color: if *mode == RedactStyle::BlackOut { [0, 0, 0, 0xFF] } else { [0x80, 0x80, 0x80, 0xC0] },
+            },
             EditorPrim::Rect { rect: normalized(rect), color: [0xFF, 0xFF, 0xFF, 0xC0], width: 0.0 },
         ],
         Shape::Spotlight { rect, .. } => vec![
@@ -1309,10 +1643,254 @@ mod tests {
                 }
             }
         }
-        assert_eq!(e.shapes.len(), Tool::ALL.len() - 1);
+        // Select and Crop draw no shape; the crop drag cropped.
+        assert_eq!(e.shapes.len(), Tool::ALL.len() - 2);
+        assert_eq!(e.crop, Some(Rect::new(30.0, 30.0, 60.0, 50.0)));
         let src = image::RgbaImage::from_pixel(120, 100, image::Rgba([200, 200, 200, 255]));
         let out = bugle_markup::render(&src, &e.final_document()).unwrap();
-        assert_eq!(out.dimensions(), (120, 100));
-        assert_ne!(out, src);
+        assert_eq!(out.dimensions(), (60, 50));
+        assert_ne!(out, image::imageops::crop_imm(&src, 30, 30, 60, 50).to_image());
+    }
+
+    fn menu(e: &mut Editor, menu: usize, item: usize) -> Effects {
+        e.handle(EditorEvent::Menu { menu, item })
+    }
+
+    fn select_at(e: &mut Editor, at: Point) {
+        pick(e, Tool::Select);
+        e.handle(EditorEvent::MouseDown { at, shift: false, clicks: 1 });
+        e.handle(EditorEvent::MouseUp { at, shift: false });
+    }
+
+    #[test]
+    fn arrow_styles_come_from_the_style_menu() {
+        let mut e = editor();
+        // The menu follows the tool.
+        assert!(e.menus()[MENU_STYLE].enabled);
+        assert_eq!(e.menus()[MENU_STYLE].title, "Standard");
+        pick(&mut e, Tool::Pen);
+        assert!(!e.menus()[MENU_STYLE].enabled);
+        assert_eq!(menu(&mut e, MENU_STYLE, 1), Effects::default(), "no style for the pen");
+        pick(&mut e, Tool::Arrow);
+        let fx = menu(&mut e, MENU_STYLE, 1);
+        assert!(fx.state && !fx.render, "nothing selected: only the next arrow changes");
+        assert_eq!(e.menus()[MENU_STYLE].title, "Double-headed");
+        assert!(matches!(&e.menus()[MENU_STYLE].items[1], EditorMenuItem::Choice { checked: true, .. }));
+        drag(&mut e, pt(10.0, 10.0), pt(110.0, 10.0));
+        assert!(matches!(&e.shapes[0], Shape::Arrow { arrow: ArrowStyle::Double, .. }));
+        // The overlay draws both heads while dragging one out.
+        e.handle(EditorEvent::MouseDown { at: pt(10.0, 50.0), shift: false, clicks: 1 });
+        e.handle(EditorEvent::MouseDrag { at: pt(90.0, 50.0), shift: false });
+        assert!(matches!(&e.overlay()[..], [EditorPrim::Arrow { double: true, .. }]));
+        e.handle(EditorEvent::MouseUp { at: pt(90.0, 50.0), shift: false });
+        // Restyle the selected one: one undo step.
+        select_at(&mut e, pt(60.0, 10.0));
+        assert_eq!(e.menus()[MENU_STYLE].title, "Double-headed");
+        let depth = e.undo.len();
+        assert!(menu(&mut e, MENU_STYLE, 3).render);
+        assert!(matches!(&e.shapes[0], Shape::Arrow { arrow: ArrowStyle::Fancy, .. }));
+        assert_eq!(e.undo.len(), depth + 1);
+        cmd(&mut e, EditorCommand::Undo);
+        assert!(matches!(&e.shapes[0], Shape::Arrow { arrow: ArrowStyle::Double, .. }));
+        // Out of range.
+        assert_eq!(menu(&mut e, MENU_STYLE, 9), Effects::default());
+    }
+
+    #[test]
+    fn redaction_styles_come_from_the_style_menu() {
+        let mut e = editor();
+        pick(&mut e, Tool::Redact);
+        assert_eq!(e.menus()[MENU_STYLE].title, "Pixelate");
+        menu(&mut e, MENU_STYLE, 2);
+        drag(&mut e, pt(100.0, 100.0), pt(200.0, 150.0));
+        assert!(matches!(&e.shapes[0], Shape::Redact { mode: RedactStyle::BlackOut, .. }));
+        select_at(&mut e, pt(150.0, 125.0));
+        assert_eq!(e.menus()[MENU_STYLE].title, "Black out");
+        menu(&mut e, MENU_STYLE, 3);
+        assert!(matches!(&e.shapes[0], Shape::Redact { mode: RedactStyle::SecureBlur, .. }));
+        e.final_document().validate().unwrap();
+    }
+
+    #[test]
+    fn the_canvas_menu_frames_the_image() {
+        let mut e = editor();
+        assert!(e.final_document().canvas.is_none());
+        assert_eq!(e.menus()[MENU_CANVAS].title, "Canvas");
+        // A background on its own brings the default padding.
+        let fx = menu(&mut e, MENU_CANVAS, CANVAS_BACKGROUND_ITEM + 3);
+        assert!(fx.render && fx.state);
+        let canvas = e.final_document().canvas.expect("canvas");
+        assert_eq!((canvas.padding, canvas.background), (64, Background::Named("ocean".into())));
+        assert_eq!(e.menus()[MENU_CANVAS].title, "Ocean");
+        assert!(e.is_dirty() && !e.is_empty());
+        // Padding: large, then none (no canvas at all).
+        menu(&mut e, MENU_CANVAS, CANVAS_PADDING_ITEM + 3);
+        assert_eq!(e.final_document().canvas.map(|c| c.padding), Some(112));
+        menu(&mut e, MENU_CANVAS, CANVAS_PADDING_ITEM);
+        assert!(e.final_document().canvas.is_none());
+        assert!(e.is_empty());
+        // Every step undoes.
+        cmd(&mut e, EditorCommand::Undo);
+        assert_eq!(e.final_document().canvas.map(|c| c.padding), Some(112));
+        cmd(&mut e, EditorCommand::Undo);
+        cmd(&mut e, EditorCommand::Undo);
+        assert!(e.final_document().canvas.is_none() && !e.is_dirty());
+        // Headings and separators do nothing; picking what is set is no edit.
+        assert_eq!(menu(&mut e, MENU_CANVAS, 0), Effects::default());
+        assert_eq!(menu(&mut e, MENU_CANVAS, CANVAS_BACKGROUND_ITEM - 1), Effects::default());
+        assert_eq!(menu(&mut e, MENU_CANVAS, 99), Effects::default());
+        let depth = e.undo.len();
+        assert!(!menu(&mut e, MENU_CANVAS, CANVAS_PADDING_ITEM).render);
+        assert_eq!(e.undo.len(), depth);
+        // Padding scales with the image, like strokes.
+        let mut big = Editor::new((4200, 2400));
+        menu(&mut big, MENU_CANVAS, CANVAS_PADDING_ITEM + 1);
+        assert_eq!(big.final_document().canvas.map(|c| c.padding), Some(96));
+    }
+
+    #[test]
+    fn crop_keeps_shapes_in_image_pixels() {
+        let mut e = editor();
+        pick(&mut e, Tool::Rectangle);
+        drag(&mut e, pt(200.0, 200.0), pt(300.0, 260.0));
+        // Crop drawn past the image edge: cut to the image, whole pixels.
+        let fx = {
+            pick(&mut e, Tool::Crop);
+            drag(&mut e, pt(100.4, 150.6), pt(900.0, 400.0))
+        };
+        assert!(fx.state && fx.overlay);
+        assert_eq!(e.crop, Some(Rect::new(100.0, 151.0, 700.0, 249.0)));
+        // While cropping, the preview is the whole image and the crop is drawn on top.
+        assert_eq!(e.document().crop, None);
+        assert!(e.overlay().iter().any(|p| matches!(p, EditorPrim::Selection { .. })));
+        assert_eq!(e.overlay().iter().filter(|p| matches!(p, EditorPrim::Handle { .. })).count(), 4);
+        // Leaving the tool applies it: shapes are moved for the renderer only.
+        assert!(e.handle(EditorEvent::Key('v')).render);
+        let doc = e.document();
+        assert_eq!(doc.crop, e.crop);
+        assert!(matches!(&doc.shapes[0], Shape::Rectangle { rect, .. } if *rect == Rect::new(100.0, 49.0, 100.0, 60.0)));
+        assert!(matches!(&e.shapes[0], Shape::Rectangle { rect, .. } if *rect == Rect::new(200.0, 200.0, 100.0, 60.0)));
+        assert_eq!(doc.source_origin(), pt(-100.0, -151.0));
+        // Nothing outside the crop can be picked.
+        pick(&mut e, Tool::Line);
+        drag(&mut e, pt(10.0, 10.0), pt(90.0, 10.0));
+        select_at(&mut e, pt(50.0, 10.0));
+        assert_eq!(e.selected, None);
+        // The rendered copy is the crop.
+        let src = image::RgbaImage::from_pixel(800, 600, image::Rgba([200, 200, 200, 255]));
+        let out = bugle_markup::render(&src, &e.final_document()).unwrap();
+        assert_eq!(out.dimensions(), (700, 249));
+        assert_ne!(*out.get_pixel(100, 49), image::Rgba([200, 200, 200, 255]), "the rectangle's corner");
+    }
+
+    #[test]
+    fn crop_moves_resizes_and_undoes() {
+        let mut e = editor();
+        pick(&mut e, Tool::Crop);
+        // A click is not a crop.
+        drag(&mut e, pt(100.0, 100.0), pt(102.0, 101.0));
+        assert_eq!(e.crop, None);
+        assert!(!e.state().can_undo);
+        drag(&mut e, pt(100.0, 100.0), pt(300.0, 200.0));
+        let first = Rect::new(100.0, 100.0, 200.0, 100.0);
+        assert_eq!(e.crop, Some(first));
+        // Drag from inside moves it, never past the image.
+        drag(&mut e, pt(150.0, 150.0), pt(1150.0, 150.0));
+        assert_eq!(e.crop, Some(Rect::new(600.0, 100.0, 200.0, 100.0)));
+        // A corner resizes it; the opposite corner stays.
+        drag(&mut e, pt(600.0, 100.0), pt(500.0, 50.0));
+        assert_eq!(e.crop, Some(Rect::new(500.0, 50.0, 300.0, 150.0)));
+        // Esc mid-drag puts it back and stays in the crop tool.
+        e.handle(EditorEvent::MouseDown { at: pt(10.0, 10.0), shift: false, clicks: 1 });
+        e.handle(EditorEvent::MouseDrag { at: pt(400.0, 400.0), shift: false });
+        assert_eq!(e.crop, Some(Rect::new(10.0, 10.0, 390.0, 390.0)));
+        cmd(&mut e, EditorCommand::Escape);
+        assert_eq!(e.crop, Some(Rect::new(500.0, 50.0, 300.0, 150.0)));
+        assert_eq!(e.tool, Tool::Crop);
+        e.handle(EditorEvent::MouseUp { at: pt(400.0, 400.0), shift: false });
+        assert_eq!(e.crop, Some(Rect::new(500.0, 50.0, 300.0, 150.0)));
+        // Delete removes it; undo walks back through every step.
+        assert!(cmd(&mut e, EditorCommand::Delete).render);
+        assert_eq!(e.crop, None);
+        cmd(&mut e, EditorCommand::Undo);
+        cmd(&mut e, EditorCommand::Undo);
+        cmd(&mut e, EditorCommand::Undo);
+        assert_eq!(e.crop, Some(first));
+        cmd(&mut e, EditorCommand::Undo);
+        assert!(e.crop.is_none() && !e.is_dirty());
+        // Cropping to the whole image is no crop.
+        drag(&mut e, pt(-50.0, -50.0), pt(900.0, 700.0));
+        assert_eq!(e.crop, None);
+        // Esc leaves the tool and shows the crop.
+        drag(&mut e, pt(100.0, 100.0), pt(300.0, 200.0));
+        let fx = cmd(&mut e, EditorCommand::Escape);
+        assert!(fx.render && e.tool == Tool::Select);
+    }
+
+    #[test]
+    fn labels_keep_their_lines() {
+        let mut e = editor();
+        pick(&mut e, Tool::Text);
+        e.handle(EditorEvent::MouseDown { at: pt(40.0, 50.0), shift: false, clicks: 1 });
+        e.handle(EditorEvent::Text("\n  First\r\nSecond\r\rFourth\u{2028}Fifth \n\n".into()));
+        let Shape::Text { text, .. } = &e.shapes[0] else { panic!() };
+        assert_eq!(text, "First\nSecond\n\nFourth\nFifth");
+        // Selection covers every line: a click on the last line picks it.
+        select_at(&mut e, pt(50.0, 50.0 + 4.5 * 28.0 * 1.25));
+        assert_eq!(e.selected, Some(0));
+        // Retyping starts from the lines as they are.
+        let fx = e.handle(EditorEvent::MouseDown { at: pt(50.0, 60.0), shift: false, clicks: 2 });
+        assert_eq!(fx.begin_text.map(|t| t.initial), Some("First\nSecond\n\nFourth\nFifth".into()));
+    }
+
+    #[test]
+    fn a_background_without_padding_is_not_an_unsaved_change() {
+        let mut e = editor();
+        // A background brings medium padding; taking the padding away again
+        // leaves nothing to save, and nothing unsaved.
+        menu(&mut e, MENU_CANVAS, CANVAS_BACKGROUND_ITEM + 4);
+        assert!(e.is_dirty() && !e.is_empty());
+        menu(&mut e, MENU_CANVAS, CANVAS_PADDING_ITEM);
+        assert!(e.is_empty());
+        assert!(!e.is_dirty() && !e.state().dirty);
+        // The background picked is still offered for next time.
+        assert_eq!(e.frame.background, 4);
+        // And undo goes back to the framed image.
+        cmd(&mut e, EditorCommand::Undo);
+        assert!(e.final_document().canvas.is_some());
+    }
+
+    #[test]
+    fn a_canvas_too_large_to_render_is_refused() {
+        // 10000 x 9990 is just under 100 megapixels; any padding is too much.
+        let mut e = Editor::new((10_000, 9_990));
+        let fx = menu(&mut e, MENU_CANVAS, CANVAS_BACKGROUND_ITEM + 2);
+        assert!(fx.error.as_deref().is_some_and(|m| m.contains("megapixels")), "{fx:?}");
+        assert!(!fx.render && e.final_document().canvas.is_none() && !e.state().can_undo);
+        // Cropped smaller, it fits.
+        pick(&mut e, Tool::Crop);
+        drag(&mut e, pt(0.0, 0.0), pt(5000.0, 5000.0));
+        let fx = menu(&mut e, MENU_CANVAS, CANVAS_BACKGROUND_ITEM + 2);
+        assert!(fx.error.is_none() && fx.render);
+    }
+
+    #[test]
+    fn dirty_and_empty_follow_crop_and_canvas() {
+        let mut e = editor();
+        assert!(e.is_empty() && !e.is_dirty());
+        pick(&mut e, Tool::Crop);
+        drag(&mut e, pt(100.0, 100.0), pt(300.0, 200.0));
+        assert!(!e.is_empty() && e.is_dirty());
+        e.mark_saved();
+        assert!(!e.is_dirty());
+        menu(&mut e, MENU_CANVAS, CANVAS_BACKGROUND_ITEM);
+        assert!(e.is_dirty());
+        let doc = e.final_document();
+        doc.validate().unwrap();
+        let src = image::RgbaImage::from_pixel(800, 600, image::Rgba([200, 200, 200, 255]));
+        let out = bugle_markup::render(&src, &doc).unwrap();
+        assert_eq!(out.dimensions(), (200 + 128, 100 + 128));
+        // Transparent background: the padding corner is see-through.
+        assert_eq!(out.get_pixel(0, 0).0[3], 0);
     }
 }

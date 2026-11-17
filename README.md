@@ -30,7 +30,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | OCR with bounding boxes | Apple Vision `VNRecognizeTextRequest` (accurate, language correction) | ✅ |
 | Scrolling capture | Vision `VNTranslationalImageRegistrationRequest` + row-profile fallback | ✅ (needs Accessibility) |
 | Annotation | Pure-Rust renderer: arrows (4 styles), boxes, ellipses, lines, freehand, text, highlight, counters, pixelate/blur/black-out/secure-blur, spotlight, crop, padding + gradient background + shadow | ✅ |
-| Markup editor | `bugle-app` window: toolbar and canvas in AppKit, editing logic in Rust, preview and saved file drawn by the annotation renderer | ✅ |
+| Markup editor | `bugle-app` window: toolbar and zoomable canvas in AppKit, editing logic in Rust, crop, canvas, arrow and redaction styles, multi-line labels; preview (on its own thread) and saved file drawn by the annotation renderer | ✅ |
 | Pin to screen | Floating AppKit panel (drag, scroll-to-resize, Esc/double-click closes) | ✅ |
 | GIF recording | In-process frame grab loop + `image` GIF encoder | ✅ |
 | Video recording | `screencapture -v` (H.264 .mov → remuxed .mp4), microphone, click highlight | ✅ |
@@ -43,6 +43,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | Menu-bar app, global hotkeys | `bugle-app`: `NSStatusItem` via `tray-icon`, Carbon hotkeys via `global-hotkey`, in-app overlays | ✅ |
 | Sync to your own storage | folder copy/move, or SigV4 uploads (multipart for large files) to any S3-compatible bucket; a destination per media kind; subtitles follow their video | ✅ |
 | Trim and export recordings (presets: trim, H.264/HEVC, 1080p/720p/540p, frame rate, GIF) | `AVAssetExportSession` + video composition, `AVAssetImageGenerator` → GIF, `AVAssetWriter` for GIF → MP4 | ✅ (headless: CLI/API) |
+| Auto-zoom on clicks, smoothed pointer | pointer/click event track recorded next to the video (`clip.mp4.events.json`); frames re-rendered in Rust (`AVAssetReader` → `AVAssetWriter`, audio copied back in) | ✅ headless (CLI/API); track timing measured on real recordings, zoom checked with hand-written clicks, live clicks not exercised |
 | `Bugle.app` bundle | `cargo xtask bundle` (hardened runtime, ad-hoc or Developer ID) | ✅ ad-hoc; Developer ID signing and notarization not yet exercised |
 | Disk image, universal binary | `cargo xtask dmg` (`hdiutil`, `/Applications` link), `--universal` (`lipo`) | ✅ DMG; universal needs both Rust targets installed |
 | System notifications | `UNUserNotificationCenter` from Bugle.app, alongside the toast (`[general] system_notifications`) | built; reading the authorization verified from the bundle, posting unverified |
@@ -200,6 +201,8 @@ bugle record start window --app Xcode -f mp4 --mic --subtitles   # Ctrl-C to sto
 bugle record start screen -f mp4 --system-audio -s 30              # ScreenCaptureKit backend
 bugle record start screen --system-audio --mic --mix-audio --clicks # one audio track, clicks shown
 bugle record start screen --system-audio --mic --mix-audio --mic-gain 1.5 --duck  # voice over, system audio ducked
+bugle record start screen --cursor-events -s 30   # also writes <file>.events.json (pointer + clicks)
+bugle record start screen --hide-cursor -s 30     # pointer left out of the frames, logged instead
 
 bugle ocr latest                   # Apple Vision, reading order, --json for boxes
 bugle ocr latest --engine llama    # OCR through a vision model instead
@@ -213,6 +216,8 @@ bugle edit latest -s 0:05 -e 0:12 -p 720p -o ~/Desktop/clip.mp4
 bugle edit latest -p high --fps 15            # re-encode at 15 fps
 bugle edit latest -p gif-small                # recording → chat-sized GIF
 bugle edit demo.gif -p hevc                   # GIF → HEVC .mp4
+bugle edit latest --zoom                      # zoom 2x on every click (--zoom=1.5 for less)
+bugle edit latest --smooth-cursor --zoom      # --hide-cursor recordings: smoothed pointer drawn in
 bugle edit --list-presets
 
 bugle annotate latest --arrow 200,300,500,150 --box 100,100,400,200 \
@@ -238,6 +243,32 @@ nothing you trimmed off stays in the file. `-p lossless` always copies (faster,
 no quality loss) but keeps up to one keyframe interval of footage before the
 cut inside the file, hidden from players and recoverable with other tools; do
 not use it to remove something sensitive.
+
+Zoom and pointer smoothing: a recording made with `--cursor-events` (or
+`[recordings] cursor_events = true`) gets an event track next to it,
+`<file>.events.json` (`clip.mp4` → `clip.mp4.events.json`): the pointer
+position and the mouse buttons, polled 60 times a second (a press shorter than
+one poll, about 16 ms, can be missed), in points relative to the recorded area,
+on the video's timeline (placed on it to within about one frame; with
+`backend = "auto"` such recordings use the ScreenCaptureKit recorder, whose
+clock the track shares). `bugle edit
+--zoom` (2x) or `--zoom=FACTOR` uses it to ease in on each click inside the
+recorded area (fully zoomed as it happens, held 1.5 s after the last of a run of
+clicks, then eased out; nearby clicks pan from one to the next; the click that
+stops the recording is ignored). `--hide-cursor` records without the pointer
+(ScreenCaptureKit recorder) and implies the track; `--smooth-cursor` then draws
+the pointer back along a smoothed path that still lands exactly on each click.
+These edits re-render every frame (at the recording's frame rate, at least
+30 fps) and copy the audio tracks back in untouched; `original` and `high` then
+encode H.264 at the source size (about 0.1 bit per pixel per frame), `hevc`
+HEVC, so `original` does not keep a HEVC source's codec. A plain trim of such a
+recording writes the trimmed track next to its output, so you can cut first and
+zoom later. The track moves, syncs and is deleted with its video. Window
+recordings: the pointer is logged relative to the window as it moves; a window
+resized during the recording cannot be zoomed or smoothed, and the system
+recorder leaves out the window shadow when it logs events, so the frames match
+the window. The format is documented in `crates/bugle-core/src/events.rs`.
+
 Every command takes `--json`.
 
 ### Annotation documents
@@ -263,7 +294,8 @@ Coordinates are image pixels. Styles can be set per shape or document-wide.
 
 Shapes: `rectangle`, `ellipse`, `line`, `arrow` (standard/double/slim/fancy),
 `freehand`, `text`, `highlight`, `counter`, `redact` (pixelate/blur/black_out/secure_blur),
-`spotlight`, `image`. Background presets: sunset, ocean, forest, candy, mono, midnight,
+`spotlight`, `image`. A `text` label breaks into lines at `\n` (also `\r\n`, a
+lone `\r`, U+2028 and U+2029). Background presets: sunset, ocean, forest, candy, mono, midnight,
 peach, mint, any `#hex`, or `gradient:#a,#b[,angle]`.
 
 ## Menu-bar app
@@ -278,7 +310,7 @@ menu bar and listens for global hotkeys. Everything it does goes through the sam
 history, and play the shutter sound when `general.shutter_sound` is on.
 
 Menu: Capture Area · Capture Window · Capture Screen ·
-Scrolling Capture · Record Video · Record GIF · Stop Recording · Annotate Latest
+Scrolling Capture · Record Video · Record GIF · Record Window · Stop Recording · Annotate Latest
 (opens the markup editor) · OCR Latest (copies the text) · Pin Latest · Recent Captures (last five, click to open) ·
 Open History Folder · Start/Stop Agent API · Preferences… (opens the config
 file) · Open at Login (only when running from `Bugle.app`) · Quit. While recording, the status item shows `● m:ss`. Other actions
@@ -331,6 +363,20 @@ them. Set
 `[screenshots] window_picker = false` to capture the front-most window at once
 instead, as `bugle capture window` and the API do.
 
+Space switches between the window picker and the area selection while either
+is up, so *Capture Area* and *Capture Window* are one gesture apart; the hint
+at the bottom of the screen says which mode is on. In the area selection Space
+only works before you start dragging. *Record Video*, *Record GIF* and *Record
+Window* use the same pair of overlays: Record Window starts in the picker and
+records the window you click (MP4), the other two start in the area selection.
+A picked window is recorded by id, the way `record_start` with a window target
+records it, not as the screen area under it. The two overlays together close after two minutes
+(each picker turn still after 30 seconds; never in the middle of a drag).
+With `window_picker = false` the menu items do without the picker: Space does
+nothing, Capture Area and the Record items use the plain area selection, and
+*Record Window* records the front-most window at once. An API caller that asks
+for `pick_window` explicitly still gets the picker.
+
 Hotkeys live in the `[hotkeys]` section of the config file and are parsed as
 `modifier+modifier+key` (`cmd`, `shift`, `alt`/`option`, `ctrl`; letters,
 digits, `F1`…`F24`, `space`, …). Defaults:
@@ -343,7 +389,7 @@ digits, `F1`…`F24`, `space`, …). Defaults:
 | `ocr_latest` | ⌘⇧2 | OCR the latest capture to the clipboard |
 | `pin_latest` | ⌘⇧P | pin the latest capture |
 | `capture_window`, `scroll_capture`, `record_gif` | — | unbound until set |
-| `stop_recording`, `sync_latest`, `open_folder`, `toggle_api`, `preferences`, `quit` | — | unbound until set |
+| `record_window`, `stop_recording`, `sync_latest`, `open_folder`, `toggle_api`, `preferences`, `quit` | — | unbound until set |
 
 Every menu item except *Recent Captures* can be bound; the keys are the names
 above. An empty string unbinds an action. Unknown keys, values that are not
@@ -354,7 +400,14 @@ toast at launch; the config still loads. ⌘⇧3/4/5 are also the system screens
 shortcuts; disable those in System Settings → Keyboard → Keyboard Shortcuts →
 Screenshots (or pick other keys) so they do not fire twice. The agent API started
 from the menu uses `[api]` from the config and serves the in-app overlay for
-`select_area`, `pin` and interactive captures — no helper processes.
+`select_area`, `pin` and interactive captures — no helper processes. It also
+offers the window picker: a `capture` or `record_start` whose target is
+`{"kind":"pick_window"}` shows the picker and uses the window the user clicks
+(Space does not switch to the area selection there), whatever
+`window_picker` says. One overlay request is served at a time: a second pick
+while one is open, or one within 3 seconds of the user dismissing the picker,
+is refused with HTTP 409 instead of queuing. `bugle serve` and `bugle mcp`
+cannot show the picker and answer with an error (HTTP 503) that says so.
 
 Screen Recording permission is requested on first launch (granted to the
 terminal or app that launched `bugle-app` when run from a shell, or to Bugle
@@ -364,7 +417,7 @@ itself when run from [the app bundle](#app-bundle)).
 
 *Annotate* on the quick-access panel and *Annotate Latest* in the menu (bind it
 with `annotate_latest` in `[hotkeys]`) open the newest screenshot in a window:
-a toolbar above the image, which is scaled to fit and never cropped.
+a toolbar above the image, which is scaled to fit until you zoom.
 
 | Tool | Key | Draws |
 |---|---|---|
@@ -372,17 +425,28 @@ a toolbar above the image, which is scaled to fit and never cropped.
 | Arrow, Line | A, L | drag; Shift snaps to 45° steps |
 | Rectangle, Ellipse | R, O | drag; Shift makes a square or circle |
 | Pen | P | freehand stroke |
-| Text | T | click, type, Return (Esc cancels) |
+| Text | T | click, type, Return (⇧Return or ⌥Return starts a new line; Esc cancels) |
 | Highlight | H | marker-pen band in the current colour |
 | Numbered step | N | click to place 1, 2, 3… |
-| Redact | B | pixelates the area |
+| Redact | B | hides the area: pixelate, blur, black out or secure blur |
 | Spotlight | S | dims everything outside the area |
+| Crop | C | drag the part to keep; drag inside it to move it, a corner to resize it; Delete removes the crop |
 
 The swatches and S/M/L set the colour and the stroke or text size for new
-shapes, and restyle the selected one. Strokes and text are sized relative to
+shapes, and restyle the selected one. The **style** menu does the same for
+arrows (standard, double-headed, slim, tapered) and redactions. The
+**canvas** menu puts padding (small, medium, large) and a background
+(transparent, white or a gradient preset) around the image; picking a
+background turns medium padding on. While the crop tool is picked the whole
+image shows with the cropped-away part dimmed; the crop and canvas show as
+soon as you pick another tool, and shapes keep their place in the original
+image, so the crop can change later. Strokes and text are sized relative to
 the image, so they look the same on a Retina capture as on a small one. ⌘Z and
-⇧⌘Z undo and redo; Esc backs out of a drag, then the selection, then the tool,
-and never closes the window.
+⇧⌘Z undo and redo (crop and canvas changes too); Esc backs out of a drag,
+then the selection, then the tool, and never closes the window. ⌘+ and ⌘−
+zoom in and out (10% to 800%), ⌘1 shows actual pixels and ⌘0 fits the
+window again; pinching, a two-finger double tap and the zoom menu in the
+corner do the same, and a zoomed image scrolls.
 
 **Save** (⌘S) writes an annotated copy as a new history item (kind
 `annotated`, named and synced like any other capture) and leaves the original
@@ -393,12 +457,18 @@ unsaved shapes asks first. One editor is open at a time.
 What you see is what is saved: finished shapes are drawn by the same renderer
 as `bugle annotate`, and a saved document can use everything that command
 can. Only the shape under the pointer is drawn by the window, so an arrow
-head or a redaction can look slightly different while you drag it. Crop,
-padding and backgrounds are `bugle annotate` only for now.
+head or a redaction can look slightly different while you drag it. The
+preview renders on a thread of its own, so drawing on a very large capture
+stays responsive (handing the finished picture to the window still copies it
+on the main thread); while it renders, the old picture stays up. A preview
+that cannot be drawn, or a canvas too large to render, is reported in a
+toast.
 
-The editor's window, shapes, selection and undo are checked by
-`bugle-app --smoke-test`, which feeds it synthetic events rather than clicks
-(and saves a copy too when `BUGLE_SMOKE_SAVE` is set).
+The editor's window, shapes, selection, menus, crop, canvas, zoom and undo are
+checked by `bugle-app --smoke-test`, which feeds it synthetic events rather
+than clicks (keeping window captures in the temp directory when
+`BUGLE_SMOKE_KEEP` is set, and saving a copy too when `BUGLE_SMOKE_SAVE` is
+set).
 
 ## Configuration
 

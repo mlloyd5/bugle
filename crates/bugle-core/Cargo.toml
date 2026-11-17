@@ -16,3 +16,6 @@ uuid.workspace = true
 dirs.workspace = true
 image.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

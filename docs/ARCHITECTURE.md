@@ -31,7 +31,13 @@ templates (`naming`) and the JSON-lines `History`. A history line whose id is
 already present replaces the earlier record, which is how a moved file or a new
 sync URL is stored without rewriting the file. `audio_mix` holds the sample
 math for the mixed recording track (per-source gain, ducking, peak limiter),
-so it is tested on synthetic buffers without AVFoundation.
+so it is tested on synthetic buffers without AVFoundation. `events` defines a recording's
+pointer/click event track, the `<file>.events.json` sidecar named after the
+whole file name (format in the module docs: recorded area in global points,
+`move`/`down`/`up` events in points relative to it on the video's timeline,
+`cursor_in_video`, `fps`, `area_changed`), with validation, interpolation and
+trimming; `MediaItem.events` says where a history item's track is (an effects
+edit has none), and `History::delete` removes it with the file.
 
 
 ### `bugle-platform`
@@ -45,11 +51,15 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `ocr` | `VNRecognizeTextRequest` (accurate, `usesLanguageCorrection`, `recognitionLanguages`, auto-detect) |
 | `register_translation` | `VNTranslationalImageRegistrationRequest` via `VNSequenceRequestHandler` |
 | `post_scroll`, `cursor_position` | `CGEventCreateScrollWheelEvent`, `CGEventPost` |
+| `mouse_buttons` | `CGEventSourceButtonState` (session state; no permission, nothing posted) |
+| `host_time_now`, `SckRecorder::session_start`, `window_frame`, `child_exited` | `CMClockGetHostTimeClock`; the stream recorder's writer session start; `CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow)`; `waitid(WEXITED \| WNOHANG \| WNOWAIT)` (does not reap) |
+| `SequentialFrameReader`, `mux_audio` | `AVAssetReader` over a time range (BGRA, presentation order); `AVMutableComposition` (rendered video + source audio range) → passthrough `AVAssetExportSession` |
 | `select_rect_blocking`, `select_rect_begin`/`_cancel` | borderless `NSWindow` per screen, dim fill, crosshair, size label; blocking (`[NSApp run]`) or callback-based for a host with its own run loop |
-| `window_pick_begin`/`_highlight`/`_cancel` (`shim/picker.m`) | see-through `NSWindow` per screen with an always-active `NSTrackingArea`; reports pointer moves and the final click/Esc/timeout through a C callback and draws whatever rect the host hands back |
+| `window_pick_begin`/`_highlight`/`_cancel`/`_switch` (`shim/picker.m`) | see-through `NSWindow` per screen with an always-active `NSTrackingArea`; reports pointer moves and the final click/Esc/Space/timeout through a C callback and draws whatever rect the host hands back |
+| `select_rect_begin_ex`, `select_rect_switch` | the selection overlay with an optional timeout and a Space "switch" result (not while dragging); a switch from either overlay leaves Bugle active so the other can open at once |
 | `pin_image_blocking`, `pin_image_show` | floating borderless window, drag/resize/close; blocking or fire-and-forget |
 | `toast_show` | non-activating `NSPanel` with `NSVisualEffectView`, thumbnail + two lines, fades out |
-| `editor_open` (`shim/editor.m`) | markup editor window: toolbar, canvas scaled to fit, label text field, unsaved-changes sheet; reports input in image pixels through a callback and draws the image and overlay primitives it is handed |
+| `editor_open` (`shim/editor.m`) | markup editor window: toolbar with pull-down menus, canvas in an `NSScrollView` (fit, zoom stops, pinch, ⌘+/⌘−/⌘1/⌘0), multi-line label text field, unsaved-changes sheet; reports input in edited-image pixels through a callback and draws the image (told where the edited image's origin lies in it), overlay primitives and menus it is handed |
 | `panel_show` (`shim/panel.m`) | quick-access panel: non-activating, never-key `NSPanel`, thumbnail, buttons, close; reports clicks through a callback |
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
@@ -74,7 +84,12 @@ variants, which never nest a run loop.
 ### `bugle-markup`
 `Annotation` documents (serde) and a renderer. Shapes are rasterised from signed
 distance functions so strokes are anti-aliased without a vector library; text uses
-`ab_glyph` with a system font (Arial Bold → Helvetica → Geneva).
+`ab_glyph` with a system font (Arial Bold → Helvetica → Geneva), one line per
+`text_lines` entry (`\n`, `\r\n`, a lone `\r`, U+2028/U+2029). The canvas
+shadow blurs a one-channel mask with three box blurs (running sums), so its
+cost does not grow with the blur radius. `Shape::translate` and
+`Annotation::source_origin` (where source pixel (0, 0) lands after crop and
+canvas) let an editor keep shapes in original-image pixels.
 
 
 ### `bugle-ai`
@@ -103,8 +118,9 @@ recorder state machine, and exposes one method per user-facing action:
   new strip, repeat until the frame stops changing.
 * `record_start/stop` — GIF: a thread grabbing frames at N fps, encoded on stop.
   Video: `screencapture -v` as a child process, stopped with SIGINT, remuxed to MP4
-  with `AVAssetExportSession` passthrough — or, when system audio is requested
-  (`recordings.backend = "auto"`) or always (`"stream"`), the in-process
+  with `AVAssetExportSession` passthrough — or, when system audio, `hide_cursor`
+  or `cursor_events` is requested (`recordings.backend = "auto"`) or always
+  (`"stream"`), the in-process
   ScreenCaptureKit recorder: one `SCStream` delivers screen and system-audio
   sample buffers, `AVAssetWriter` encodes them to H.264 + AAC straight into the
   `.mp4` (a `.mov` request is remuxed afterwards). The microphone is an
@@ -146,6 +162,30 @@ recorder state machine, and exposes one method per user-facing action:
   recorder comment: the writer session opens before the stream starts, a static
   screen's stale first-frame timestamp is clamped, and the last frame is
   re-appended at the stop time so the video track covers the whole recording.
+  With `cursor_events` (`event_log.rs`) a thread polls the pointer and the
+  button state at 60 Hz from just before the recorder starts and logs changes,
+  stamped on the host clock. On stop they are placed on the video's timeline
+  by where its time 0 is: the stream recorder's writer session start (the
+  same clock), the GIF loop's per-frame grab times (frame `k` shown at
+  `k / fps`, so grabs that fall behind are accounted for), or for the system
+  recorder (used for event tracks only with `backend = "system"` or without
+  ScreenCaptureKit, since `auto` picks the stream recorder for them) an
+  estimate: the moment it was interrupted, or exited by itself at its `-V`
+  deadline (watched with `waitid(WNOWAIT)`; a child already reaped by its
+  owner counts as exited), minus the video track's length. The log stops
+  before the file is finalised, and none of it depends on how long that
+  takes. Measured against a window flashing at known host times, changes
+  appear in the frames this long after the time the track gives them
+  (display latency plus up to one frame): stream recorder 19–68 ms (5 runs),
+  system recorder stopping itself at `-V` 36–70 ms (10 runs), GIF −27 to
+  +11 ms. For a window recording the pointer is logged relative to
+  the window's current origin (the recorders follow the window), a resize
+  sets `area_changed`, and the system recorder is given `-o` so its frames
+  are the window frame without the shadow. `hide_cursor` sets
+  `showsCursor = NO` on the stream recorder (chosen for it in `auto`) and the
+  GIF grabs, and implies the track; the system recorder cannot hide the
+  pointer (it draws it without `-C`), so the track then says
+  `cursor_in_video`.
 * `edit` (`edit.rs`) — trims a recording (`start`/`end` seconds, negative from
   the end, measured on the video track) and exports it with a preset. Video →
   video is one `AVAssetExportSession` over the time range, audio kept.
@@ -170,6 +210,32 @@ recorder state machine, and exposes one method per user-facing action:
   both are scaled to `gif_max_size`. Output is written to a temp file beside the
   target (extension corrected to the container) and renamed, then added to
   history, with the source as `parent` when it is a history item.
+  `zoom` and `smooth_cursor` (`cursor_fx.rs`) use the source's event track:
+  clicks inside the recorded area (8 pt margin), except one in the last 0.3 s
+  (the click that stopped the recording), become zoom segments (ease in so the view is fully zoomed at the
+  click, hold 1.5 s past the last click of a run, ease out; a click before
+  the view is back at 1x joins the run and the view pans to it, arriving as
+  it happens), the visible rect keeps the frame's aspect and stays inside it,
+  and frames are cropped and scaled with a fixed-point bilinear sampler
+  (taps computed once per row and column; frames with nothing to apply pass
+  through without a copy). Smoothing
+  resamples the pointer path at 120 Hz and convolves it with a centred
+  Gaussian (σ 0.1 s, so no lag), blending back to the raw path around each
+  click; the pointer is drawn as an anti-aliased signed-distance arrow,
+  scaled with the zoom. Positions map to pixels by the frame size over the
+  area size, so any preset works. Video → video renders through
+  `SequentialFrameReader` → effects → `VideoFrameWriter` (each output frame
+  shows the source frame on screen at its midpoint) at the requested rate,
+  else the recording's (`fps` in the track), else the nominal rate but at
+  least 30 and at most 60 (variable-rate stream recordings of a still screen
+  store a few frames a second); `original`/`high` encode H.264, `hevc` HEVC.
+  Reader and writer are tagged BT.709 so small frames do not shift colour
+  from one generation to the next. Rendering is cancelled on the export
+  deadline, and `mux_audio` copies the source's audio tracks over the same
+  range back in untouched; the GIF pipelines apply the effects to the frames
+  they already decode. A plain edit of a recording with a track writes the
+  trimmed track next to its output; an effects edit removes any stale track
+  of its output's name. A track whose window was resized is refused.
 * `ocr` (Apple Vision or an AI provider, per request or `[ocr] engine`), `describe` (images or sampled video frames), `transcribe`
   (extracts the audio track first), `subtitles`, `annotate`, `pin`, `select_area`.
 * `sync` (`sync.rs`) — runs after every successful save (`save_image`, so
@@ -194,7 +260,9 @@ recorder state machine, and exposes one method per user-facing action:
   name the copy got is kept in `MediaItem.synced_as`; a video's `.srt` / `.vtt`
   sidecars go to the video's destination (or the `subtitle` entry) under that
   stem (`clip 2.mp4` → `clip 2.srt`), replacing only a sidecar Bugle wrote for
-  that video, and `subtitles` written later follow a synced video. Tests check
+  that video, and `subtitles` written later follow a synced video. A video's
+  cursor event track goes along under `<synced name>.events.json` (a move
+  updates `MediaItem.events`). Tests check
   the signer against the published AWS vectors and drive the S3 path against an
   in-process axum mock that checks signatures, part order and sizes, ETags and
   aborts. The object URL lands in `MediaItem.url` and on the clipboard when
@@ -220,7 +288,7 @@ built by walking it and `[hotkeys]` keys are resolved against its names, so ever
 item is bindable and the two cannot drift. Unknown keys, unparsable or duplicate
 combinations and bindings the OS refuses are logged, summarised in one toast and
 skipped. Menu and hotkey events are forwarded to the loop as user events.
-*Capture Window* opens the window picker (`picker.rs`): the main thread snapshots
+*Capture Window* and *Record Window* open the window picker (`picker.rs`): the main thread snapshots
 the on-screen window list, shows the shim's overlay and, on every pointer move,
 asks `window_at` — a pure function over the z-ordered list that skips Bugle's
 own windows, non-zero layers, fully transparent (alpha 0), off-screen and
@@ -228,9 +296,24 @@ sub-50-point windows — which window to highlight. A click captures that window
 by id after a 150 ms settle; Esc, a right click, Bugle losing active status (Esc
 only arrives while it is active) or the 30-second timeout cancel. A request the
 main thread reaches more than 3 s late is refused, and every refusal reaches
-the worker with its reason. The picker and the area selection refuse to open
-over each other. `[screenshots] window_picker = false` restores the immediate
-front-most capture, which the CLI and API always use.
+the worker with its reason (a typed `BugleError::Busy`, HTTP 409, when retrying
+can help). The picker and the area selection refuse to open over each other,
+and one gate (`picker.rs`) is held for a whole pick session and by
+`UiHost::select_area`: a second pick is refused rather than queued, and nothing
+can open in the gap between two overlays of a session. API picks are also
+refused for 3 s after the user dismissed one. Space switches between them: a pick *session* is a small
+state machine (`picker::Session`, unit-tested without a screen) that starts in
+either mode, flips on each switch and answers with a window or a rect; the
+main thread opens the next overlay from the previous one's final callback.
+*Capture Area*, *Capture Window* and the three *Record* items run through it;
+each picker turn keeps the 30 s timeout and a whole session closes after two
+minutes (an area phase never times out mid-drag). A switch leaves Bugle active
+for the next overlay; if none follows, the session deactivates Bugle itself. `[screenshots] window_picker = false` restores the immediate
+front-most capture (and plain area selection), which the CLI always uses.
+`UiHost::pick_window` offers the picker (without the switch) to API callers:
+the `pick_window` target kind of `capture` and `record_start` goes through it,
+and an engine without a host refuses that target up front with
+`BugleError::NoUiHost` (HTTP 503) before any permission prompt.
 Engine actions run on one worker thread so the menu never blocks; when an action
 needs the crosshair overlay or a pin window, the engine's `UiHost` (implemented
 here) sends a request to the main thread and blocks the worker on a channel until
@@ -326,36 +409,53 @@ off the main thread.
 
 The markup editor follows the same split. `markup_editor.rs` is the
 platform-free part: `Editor::handle` turns the window's events (pointer in
-image pixels, tool, colour, size, commands, typed text) into edits of a
-`Vec<Shape>` with snapshot undo, and answers with `Effects` saying what to
-refresh. `editor_window.rs` is the glue: it renders `Editor::document` with
-`Engine::render_annotations` and hands the pixels to the window, so the preview
-is the renderer's output; only the shape being dragged (and the selection
-marks) go to the window as overlay primitives, and a shape being moved is left
-out of the render meanwhile. Save runs `Engine::apply_annotations` on a thread
-and the window closes only once it succeeded; `shim/editor.m` frees the Rust
-handler on a later main-loop turn, so closing from inside the callback is safe.
-`--smoke-test` drives it through `editor_inject`.
+image pixels, tool, colour, size, menu picks, commands, typed text) into edits
+of the shapes, the crop and the canvas choice, with snapshot undo over all
+three, and answers with `Effects` saying what to refresh. Shapes and the crop
+stay in original-image pixels; `Editor::document` translates the shapes by the
+crop for the renderer and adds the canvas, except while the crop tool is
+picked, when the whole image is shown with the crop as an overlay.
+`Editor::menus` describes the toolbar's style menu (arrow or redaction styles,
+for the tool or the selected shape) and canvas menu (padding, background).
+`editor_window.rs` is the glue: it renders `Editor::document` with
+`Engine::render_annotations` on a per-window preview thread (only the newest
+waiting document is rendered, stale results are dropped) and hands the pixels
+and `Annotation::source_origin` to the window, so the preview is the
+renderer's output. Only the shape being dragged (and the selection or crop
+marks) go to the window as overlay primitives; a shape being moved is left out
+of the render meanwhile. After an edit that moves something from the overlay
+into the image (a shape released or finished, the crop tool left) the overlay
+waits for that render, until the next pointer input; while dragging it never
+waits. Renders, saves and copies run under `catch_unwind`, and every preview
+job answers, so a renderer failure is a toast rather than a frozen picture or
+a window stuck busy. Each picture travels with its own size and
+`source_origin`, so a click maps onto what is on screen; what can lag by one
+render is the edit state Rust applies it to (tool, crop), and image pixels
+per point lag by one main-loop turn: the window owns the zoom and reports it
+on a later turn, so nothing it does in reply to Rust calls back into Rust.
+Zoomed in, a new picture of another size or origin is scrolled so the image
+stays put under the pointer, and the zoom is capped so the canvas stays
+within 8192 points.
+Save runs `Engine::apply_annotations` on a thread and the window closes only
+once it succeeded; `shim/editor.m` frees the Rust handler on a later
+main-loop turn, so closing from inside the callback is safe. `--smoke-test`
+drives it through `editor_inject` and `editor_zoom`.
 
 ## Feature ideas
 
 Bugle is a standalone app; this is the backlog, roughly in the order it would
 earn its keep.
 
-* **Video editor extras** — auto-zoom on clicks and cursor smoothing (the
-  recorders bake the cursor into the frames and log no click or cursor
-  positions, so these first need a click/cursor event track recorded alongside
-  the video), and an editing window on top of the headless `edit` pipeline.
+* **Video editor extras** — an editing window on top of the headless `edit`
+  pipeline (trim, zoom and pointer options with a preview).
 * **Audio mixing extras** — per-source levels and ducking work on the mixed
   track; still open: levels for the two-track (unmixed) output, and setting
   them from the menu-bar app instead of the config file.
-* **Markup editor extras** — crop and canvas (padding, background) in the
-  window, multi-line labels, arrow and redaction styles, zoom, a preview
-  render off the main thread for very large captures, and opening a second
-  editor. Also: keep the quick-access panel's thumbnails stacked when several
-  captures arrive in a row.
-* **Window picker extras** — Space to switch to area selection, a picker for
-  window recordings, and offering the picker to API callers through `UiHost`.
+* **Markup editor extras** — opening a second editor (the window shim keeps
+  one editor today). Also: keep the quick-access panel's thumbnails stacked
+  when several captures arrive in a row.
+* **Window picker extras** — Space in the Scrolling Capture selection, and the
+  picker for `bugle capture` in a terminal (it needs a run loop of its own).
 * **Packaging extras** — the final bundle id; notification thumbnails
   (an attachment needs a copy of the file, since the notification center
   moves what it is given).

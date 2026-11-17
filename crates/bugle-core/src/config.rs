@@ -64,8 +64,9 @@ pub struct ScreenshotConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordingBackend {
-    /// ScreenCaptureKit when system audio is requested (and available),
-    /// otherwise `screencapture -v`.
+    /// ScreenCaptureKit when system audio, a hidden pointer or a cursor
+    /// event track is requested (and it is available), otherwise
+    /// `screencapture -v`.
     #[default]
     Auto,
     /// Always the in-process ScreenCaptureKit + AVAssetWriter recorder.
@@ -93,6 +94,10 @@ pub struct RecordingConfig {
     #[serde(flatten)]
     pub mix: crate::audio_mix::AudioMixConfig,
     pub highlight_clicks: bool,
+    /// Write a pointer/click event track next to every recording.
+    pub cursor_events: bool,
+    /// Leave the pointer out of the frames (implies `cursor_events`).
+    pub hide_cursor: bool,
     pub retina: bool,
     pub backend: RecordingBackend,
 }
@@ -237,6 +242,8 @@ impl Default for RecordingConfig {
             mix_audio: false,
             mix: Default::default(),
             highlight_clicks: false,
+            cursor_events: false,
+            hide_cursor: false,
             retina: true,
             backend: RecordingBackend::Auto,
         }
@@ -301,7 +308,7 @@ pub struct HotkeyConfig {
     /// Pin the latest capture to the screen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pin_latest: Option<String>,
-    /// Bindings for the other menu items (`stop_recording`, `sync_latest`,
+    /// Bindings for the other menu items (`record_window`, `stop_recording`, `sync_latest`,
     /// `open_folder`, `toggle_api`, `preferences`, `quit`), plus any value
     /// that is not a string. `bugle-app` owns the list of valid names and
     /// warns about unknown keys and non-string values.

@@ -680,6 +680,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pick_window_keeps_the_security_checks() {
+        let f = fixture();
+        let post = |host: &str, token: Option<&str>| {
+            let mut b = Request::builder()
+                .method("POST")
+                .uri("/v1/capture")
+                .header(header::HOST, host)
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(t) = token {
+                b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+            }
+            b.body(Body::from(json!({"target": {"kind": "pick_window"}}).to_string())).unwrap()
+        };
+        let app = router(f.engine.clone(), Some("secret".into()), false);
+        // The overlay is never requested before Host and token pass.
+        assert_eq!(send(&app, post("evil.example", Some("secret"))).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(send(&app, post("127.0.0.1", None)).await.0, StatusCode::UNAUTHORIZED);
+        // Authorised, but `bugle serve` has no UI host: a clear 503.
+        let (status, _, body) = send(&app, post("127.0.0.1", Some("secret"))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        envelope(&body);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("menu-bar app"), "{v}");
+    }
+
+    #[tokio::test]
     async fn non_loopback_bind_needs_a_token() {
         let f = fixture();
         for token in [None, Some(String::new())] {

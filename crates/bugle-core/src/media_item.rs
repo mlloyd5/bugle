@@ -46,6 +46,11 @@ pub struct MediaItem {
     /// a folder collision). Sidecar subtitles are synced under the same stem.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synced_as: Option<String>,
+    /// The recording's pointer/click event track, when it has one (see
+    /// `events`). Kept here so the track is found after a sync moved the
+    /// video.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<PathBuf>,
 }
 
 impl MediaItem {
@@ -66,6 +71,7 @@ impl MediaItem {
             bytes,
             url: None,
             synced_as: None,
+            events: None,
         }
     }
 

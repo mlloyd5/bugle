@@ -12,6 +12,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <ApplicationServices/ApplicationServices.h>
 #include "shim.h"
+#include <sys/wait.h>
 
 // ---------------------------------------------------------------------------
 // Errors / memory
@@ -532,6 +533,44 @@ void bugle_cursor_position(double *x, double *y) {
     *y = p.y;
 }
 
+int32_t bugle_mouse_buttons(void) {
+    // Reads the session's button state; needs no permission and posts nothing.
+    int32_t m = 0;
+    if (CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonLeft)) m |= 1;
+    if (CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonRight)) m |= 2;
+    if (CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonCenter)) m |= 4;
+    return m;
+}
+
+double bugle_host_time_now(void) { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock())); }
+
+int32_t bugle_window_frame(uint32_t window_id, double *x, double *y, double *w, double *h) {
+    @autoreleasepool {
+        CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, window_id);
+        if (!list) return -1;
+        int32_t rc = -1;
+        if (CFArrayGetCount(list) > 0) {
+            NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(list, 0);
+            CGRect r;
+            if ([info[(id)kCGWindowNumber] unsignedIntValue] == window_id &&
+                CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)info[(id)kCGWindowBounds], &r)) {
+                *x = r.origin.x; *y = r.origin.y; *w = r.size.width; *h = r.size.height;
+                rc = 0;
+            }
+        }
+        CFRelease(list);
+        return rc;
+    }
+}
+
+int32_t bugle_child_exited(int32_t pid) {
+    // WNOWAIT leaves the child to be reaped by its owner.
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    if (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOHANG | WNOWAIT) != 0) return -1;
+    return info.si_pid == pid ? 1 : 0;
+}
+
 // Clipboard, sound and workspace calls below run on whichever thread the
 // engine uses (often a blocking-pool worker). NSPasteboard, NSSound playback
 // and -[NSWorkspace openURL:] are safe off the main thread in practice, and a
@@ -588,7 +627,22 @@ static void stop_app(void) {
     [NSApp postEvent:e atStart:YES];
 }
 
-typedef void (^BugleSelectCompletion)(BOOL ok, CGRect rect);
+/// `result`: 0 = cancelled, 1 = `rect` selected, 2 = Space asked for the
+/// window picker instead.
+typedef void (^BugleSelectCompletion)(int32_t result, CGRect rect);
+
+void bugle_draw_overlay_hint(NSRect bounds, NSString *text) {
+    if (text.length == 0) return;
+    NSDictionary *attrs = @{
+        NSFontAttributeName : [NSFont systemFontOfSize:13 weight:NSFontWeightMedium],
+        NSForegroundColorAttributeName : [NSColor whiteColor]
+    };
+    NSSize sz = [text sizeWithAttributes:attrs];
+    NSRect r = NSMakeRect(NSMidX(bounds) - (sz.width + 24) / 2, NSMinY(bounds) + 48, sz.width + 24, sz.height + 12);
+    [[NSColor colorWithWhite:0 alpha:0.66] setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:r xRadius:8 yRadius:8] fill];
+    [text drawAtPoint:NSMakePoint(r.origin.x + 12, r.origin.y + 6) withAttributes:attrs];
+}
 
 @class BugleSelectSession;
 
@@ -603,7 +657,10 @@ typedef void (^BugleSelectCompletion)(BOOL ok, CGRect rect);
 @property(nonatomic, strong) NSMutableArray<NSWindow *> *windows;
 @property(nonatomic, copy) BugleSelectCompletion completion;
 @property(nonatomic) BOOL finished;
-- (void)finishWithRect:(CGRect)rect ok:(BOOL)ok;
+@property(nonatomic) BOOL allowSwitch;
+@property(nonatomic, strong) NSTimer *timer;
+- (void)finishWithRect:(CGRect)rect result:(int32_t)result;
+- (void)armTimer:(double)seconds;
 @end
 
 static BugleSelectSession *g_select_session = nil;
@@ -615,6 +672,9 @@ static BugleSelectSession *g_select_session = nil;
 - (void)drawRect:(NSRect)dirty {
     [[NSColor colorWithWhite:0 alpha:0.28] setFill];
     NSRectFill(self.bounds);
+    if (self.session.allowSwitch && !self.dragging) {
+        bugle_draw_overlay_hint(self.bounds, @"Drag an area  ·  Space: pick a window  ·  Esc: cancel");
+    }
     if (self.dragging && self.sel.size.width > 0 && self.sel.size.height > 0) {
         [[NSColor clearColor] setFill];
         NSRectFillUsingOperation(self.sel, NSCompositingOperationCopy);
@@ -657,13 +717,15 @@ static BugleSelectSession *g_select_session = nil;
         CGFloat primaryH = [NSScreen screens].firstObject.frame.size.height;
         CGRect r = CGRectMake(screenRect.origin.x, primaryH - screenRect.origin.y - screenRect.size.height,
                               screenRect.size.width, screenRect.size.height);
-        [self.session finishWithRect:r ok:YES];
+        [self.session finishWithRect:r result:1];
     }
     [self setNeedsDisplay:YES];
 }
 - (void)keyDown:(NSEvent *)e {
     if (e.keyCode == 53) { // Esc
-        [self.session finishWithRect:CGRectZero ok:NO];
+        [self.session finishWithRect:CGRectZero result:0];
+    } else if (e.keyCode == 49 && !e.isARepeat) { // Space
+        bugle_select_rect_switch();
     }
 }
 @end
@@ -676,30 +738,56 @@ static BugleSelectSession *g_select_session = nil;
 @end
 
 @implementation BugleSelectSession
-- (void)finishWithRect:(CGRect)rect ok:(BOOL)ok {
+/// Cancel after `seconds`, but never in the middle of a drag: a drag in
+/// progress pushes the timeout back a few seconds at a time.
+- (void)armTimer:(double)seconds {
+    [self.timer invalidate];
+    __weak BugleSelectSession *weak = self;
+    self.timer = [NSTimer timerWithTimeInterval:seconds
+                                        repeats:NO
+                                          block:^(NSTimer *timer) {
+                                              BugleSelectSession *s = weak;
+                                              if (!s || s.finished) return;
+                                              for (NSWindow *win in s.windows) {
+                                                  if ([win.contentView isKindOfClass:[BugleSelectView class]] &&
+                                                      ((BugleSelectView *)win.contentView).dragging) {
+                                                      [s armTimer:3.0];
+                                                      return;
+                                                  }
+                                              }
+                                              [s finishWithRect:CGRectZero result:0];
+                                          }];
+    [[NSRunLoop mainRunLoop] addTimer:self.timer forMode:NSRunLoopCommonModes];
+}
+- (void)finishWithRect:(CGRect)rect result:(int32_t)result {
     if (self.finished) return;
     self.finished = YES;
+    [self.timer invalidate];
+    self.timer = nil;
     [NSCursor pop];
     for (NSWindow *win in self.windows) [win orderOut:nil];
     [self.windows removeAllObjects];
     BugleSelectCompletion done = self.completion;
     self.completion = nil;
     if (g_select_session == self) g_select_session = nil;
-    // Give keyboard focus back to whatever the user was working in.
-    [NSApp deactivate];
-    if (done) done(ok, rect);
+    // Give keyboard focus back to whatever the user was working in, unless
+    // the window picker opens next (it needs Bugle active for Esc, and a
+    // resign-active would cancel it).
+    if (result != 2) [NSApp deactivate];
+    if (done) done(result, rect);
 }
 @end
 
 /// Show the overlay on every screen. Returns NO when a selection is already
 /// in progress (the completion is then never called).
-static BOOL select_begin(BugleSelectCompletion completion) {
+static BOOL select_begin(BugleSelectCompletion completion, BOOL allowSwitch, double timeoutSeconds) {
     if (g_select_session || bugle_pick_active()) return NO;
     NSApplication *app = [NSApplication sharedApplication];
     [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
     BugleSelectSession *session = [[BugleSelectSession alloc] init];
     session.windows = [NSMutableArray array];
     session.completion = completion;
+    session.allowSwitch = allowSwitch;
     for (NSScreen *screen in [NSScreen screens]) {
         BugleOverlayWindow *win = [[BugleOverlayWindow alloc] initWithContentRect:screen.frame
                                                                         styleMask:NSWindowStyleMaskBorderless
@@ -722,6 +810,7 @@ static BOOL select_begin(BugleSelectCompletion completion) {
         [win makeKeyAndOrderFront:nil];
         [session.windows addObject:win];
     }
+    if (timeoutSeconds > 0) [session armTimer:timeoutSeconds];
     g_select_session = session;
     [app activateIgnoringOtherApps:YES];
     [[NSCursor crosshairCursor] push];
@@ -732,11 +821,13 @@ int32_t bugle_select_rect_blocking(double *x, double *y, double *w, double *h) {
     @autoreleasepool {
         __block BOOL ok = NO;
         __block CGRect r = CGRectZero;
-        if (!select_begin(^(BOOL k, CGRect rect) {
-                ok = k;
-                r = rect;
-                stop_app();
-            })) {
+        if (!select_begin(
+                ^(int32_t k, CGRect rect) {
+                    ok = k == 1;
+                    r = rect;
+                    stop_app();
+                },
+                NO, 0)) {
             return 0;
         }
         [NSApp run];
@@ -749,21 +840,46 @@ int32_t bugle_select_rect_blocking(double *x, double *y, double *w, double *h) {
     }
 }
 
-int32_t bugle_select_rect_begin(bugle_select_callback_t cb, void *ctx) {
+int32_t bugle_select_rect_begin_ex(bugle_select_callback_t cb, void *ctx, int32_t allow_switch, double timeout_seconds) {
     @autoreleasepool {
-        BOOL started = select_begin(^(BOOL ok, CGRect r) {
-            cb(ctx, ok ? 1 : 0, r.origin.x, r.origin.y, r.size.width, r.size.height);
-        });
+        BOOL started = select_begin(
+            ^(int32_t result, CGRect r) {
+                cb(ctx, result, r.origin.x, r.origin.y, r.size.width, r.size.height);
+            },
+            allow_switch != 0, timeout_seconds);
         return started ? 1 : 0;
     }
 }
 
+int32_t bugle_select_rect_begin(bugle_select_callback_t cb, void *ctx) {
+    return bugle_select_rect_begin_ex(cb, ctx, 0, 0);
+}
+
 int32_t bugle_select_rect_active(void) { return g_select_session ? 1 : 0; }
+
+void bugle_app_deactivate(void) {
+    @autoreleasepool {
+        [NSApp deactivate];
+    }
+}
+
+/// What Space does: hand over to the window picker, when the host allowed it
+/// and no drag is in progress.
+void bugle_select_rect_switch(void) {
+    @autoreleasepool {
+        BugleSelectSession *s = g_select_session;
+        if (!s || !s.allowSwitch) return;
+        for (NSWindow *win in s.windows) {
+            if ([win.contentView isKindOfClass:[BugleSelectView class]] && ((BugleSelectView *)win.contentView).dragging) return;
+        }
+        [s finishWithRect:CGRectZero result:2];
+    }
+}
 
 /// Dismiss an in-progress selection as cancelled (the callback fires with ok=0).
 void bugle_select_rect_cancel(void) {
     @autoreleasepool {
-        [g_select_session finishWithRect:CGRectZero ok:NO];
+        [g_select_session finishWithRect:CGRectZero result:0];
     }
 }
 
@@ -1612,6 +1728,14 @@ void bugle_frames_close(void *handle) {
     }
 }
 
+static NSDictionary *bt709_properties(void) {
+    return @{
+        AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+        AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+        AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+    };
+}
+
 @interface BugleFrameWriter : NSObject
 @property(strong) AVAssetWriter *writer;
 @property(strong) AVAssetWriterInput *input;
@@ -1654,6 +1778,9 @@ void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int
             AVVideoWidthKey: @(w),
             AVVideoHeightKey: @(h),
             AVVideoCompressionPropertiesKey: compression,
+            // Tagged explicitly: untagged small movies are read back with
+            // the SD (601) matrix and shift colour on every round trip.
+            AVVideoColorPropertiesKey: bt709_properties(),
         };
         AVAssetWriterInput *input = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:video];
         input.expectsMediaDataInRealTime = NO;
@@ -1767,6 +1894,158 @@ void bugle_writer_cancel(void *handle) {
         BugleFrameWriter *fw = (__bridge_transfer BugleFrameWriter *)handle;
         [fw.writer cancelWriting];
         [[NSFileManager defaultManager] removeItemAtURL:fw.url error:nil];
+    }
+}
+
+// Sequential frame reader: AVAssetReader decodes the video track over a
+// time range in presentation order (one decode per frame, unlike the
+// random-access generator above). The first frame may start before the range
+// (it is the one shown at its start). The preferred transform is not applied.
+@interface BugleSeqReader : NSObject
+@property(strong) AVAssetReader *reader;
+@property(strong) AVAssetReaderTrackOutput *output;
+@end
+@implementation BugleSeqReader
+@end
+
+void *bugle_seq_open(const char *path, double start, double end) {
+    @autoreleasepool {
+        clear_error();
+        if (!path) { set_error(@"reader: NULL path"); return NULL; }
+        AVURLAsset *asset = precise_asset(path);
+        AVAssetTrack *track = first_video_track(asset);
+        if (!track) { set_error(@"the source has no video track"); return NULL; }
+        NSError *err = nil;
+        AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&err];
+        if (!reader) { set_error(@"could not read %s: %@", path, err.localizedDescription); return NULL; }
+        NSDictionary *settings = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+            AVVideoColorPropertiesKey: bt709_properties(),
+        };
+        AVAssetReaderTrackOutput *out = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:track outputSettings:settings];
+        out.alwaysCopiesSampleData = NO;
+        if (![reader canAddOutput:out]) { set_error(@"could not decode the video track"); return NULL; }
+        [reader addOutput:out];
+        if (isfinite(start) && isfinite(end) && start >= 0 && end > start) {
+            reader.timeRange = CMTimeRangeFromTimeToTime(CMTimeMakeWithSeconds(start, 60000), CMTimeMakeWithSeconds(end, 60000));
+        }
+        if (![reader startReading]) { set_error(@"could not read %s: %@", path, reader.error.localizedDescription); return NULL; }
+        BugleSeqReader *r = [[BugleSeqReader alloc] init];
+        r.reader = reader;
+        r.output = out;
+        return (__bridge_retained void *)r;
+    }
+}
+
+bugle_image_t bugle_seq_next(void *handle, double *pts) {
+    @autoreleasepool {
+        clear_error();
+        if (!handle || !pts) { set_error(@"reader: NULL argument"); return (bugle_image_t){0}; }
+        BugleSeqReader *r = (__bridge BugleSeqReader *)handle;
+        for (;;) {
+            CMSampleBufferRef sb = [r.output copyNextSampleBuffer];
+            if (!sb) {
+                if (r.reader.status == AVAssetReaderStatusFailed) {
+                    set_error(@"decoding failed: %@", r.reader.error.localizedDescription ?: @"unknown error");
+                }
+                return (bugle_image_t){0};
+            }
+            CVImageBufferRef ib = CMSampleBufferGetImageBuffer(sb);
+            if (!ib) { CFRelease(sb); continue; }
+            *pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb));
+            CVPixelBufferLockBaseAddress(ib, kCVPixelBufferLock_ReadOnly);
+            size_t w = CVPixelBufferGetWidth(ib), h = CVPixelBufferGetHeight(ib), stride = CVPixelBufferGetBytesPerRow(ib);
+            const uint8_t *base = CVPixelBufferGetBaseAddress(ib);
+            size_t len = rgba_len((int64_t)w, (int64_t)h);
+            uint8_t *buf = (len && base) ? malloc(len) : NULL;
+            if (buf) {
+                for (size_t y = 0; y < h; y++) {
+                    const uint8_t *src = base + y * stride;
+                    uint8_t *dst = buf + y * w * 4;
+                    for (size_t x = 0; x < w; x++) {
+                        dst[x * 4 + 0] = src[x * 4 + 2];
+                        dst[x * 4 + 1] = src[x * 4 + 1];
+                        dst[x * 4 + 2] = src[x * 4 + 0];
+                        dst[x * 4 + 3] = 255;
+                    }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(ib, kCVPixelBufferLock_ReadOnly);
+            CFRelease(sb);
+            if (!buf) { set_error(@"reader: could not convert a %zux%zu frame", w, h); return (bugle_image_t){0}; }
+            return (bugle_image_t){buf, (int32_t)w, (int32_t)h};
+        }
+    }
+}
+
+void bugle_seq_close(void *handle) {
+    if (!handle) return;
+    @autoreleasepool {
+        BugleSeqReader *r = (__bridge_transfer BugleSeqReader *)handle;
+        [r.reader cancelReading];
+    }
+}
+
+// Copy the video track of `video_path` and the audio tracks of `audio_path`
+// over [start, end) (placed at 0) into one movie, without re-encoding.
+// Returns 1 (nothing written) when the audio source has no audio there.
+int32_t bugle_mux_audio(const char *video_path, const char *audio_path, double start, double end, const char *out_path,
+                        int32_t mp4, double timeout) {
+    @autoreleasepool {
+        clear_error();
+        if (!video_path || !audio_path || !out_path) { set_error(@"mux: NULL path"); return -1; }
+        if (!isfinite(start) || !isfinite(end) || start < 0 || end <= start) {
+            set_error(@"invalid time range %g..%g s", start, end);
+            return -1;
+        }
+        AVURLAsset *v = precise_asset(video_path), *a = precise_asset(audio_path);
+        AVAssetTrack *vt = first_video_track(v);
+        if (!vt) { set_error(@"%s has no video track", video_path); return -1; }
+        AVMutableComposition *comp = [AVMutableComposition composition];
+        NSError *err = nil;
+        AVMutableCompositionTrack *cv = [comp addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid];
+        if (![cv insertTimeRange:vt.timeRange ofTrack:vt atTime:kCMTimeZero error:&err]) {
+            set_error(@"mux: could not copy the video: %@", err.localizedDescription);
+            return -1;
+        }
+        cv.preferredTransform = vt.preferredTransform;
+        CMTime s = CMTimeMakeWithSeconds(start, 60000);
+        CMTimeRange want = CMTimeRangeFromTimeToTime(s, CMTimeMakeWithSeconds(end, 60000));
+        int added = 0;
+        for (AVAssetTrack *t in [a tracksWithMediaType:AVMediaTypeAudio]) {
+            if (!t.enabled) continue;
+            CMTimeRange have = CMTimeRangeGetIntersection(want, t.timeRange);
+            if (CMTIMERANGE_IS_INVALID(have) || CMTIMERANGE_IS_EMPTY(have)) continue;
+            AVMutableCompositionTrack *ca = [comp addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid];
+            if (![ca insertTimeRange:have ofTrack:t atTime:CMTimeSubtract(have.start, s) error:&err]) {
+                set_error(@"mux: could not copy an audio track: %@", err.localizedDescription);
+                return -1;
+            }
+            added++;
+        }
+        if (added == 0) return 1;
+        AVAssetExportSession *x = [[AVAssetExportSession alloc] initWithAsset:comp presetName:AVAssetExportPresetPassthrough];
+        if (!x) { set_error(@"mux: could not create export session"); return -1; }
+        NSURL *out = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
+        [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+        x.outputURL = out;
+        x.outputFileType = mp4 ? AVFileTypeMPEG4 : AVFileTypeQuickTimeMovie;
+        x.shouldOptimizeForNetworkUse = YES;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        [x exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
+        if (!wait_bounded(sem, timeout)) {
+            [x cancelExport];
+            wait_bounded(sem, 10);
+            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+            set_error(@"mux timed out after %.0f s and was cancelled", timeout);
+            return -1;
+        }
+        if (x.status != AVAssetExportSessionStatusCompleted) {
+            set_error(@"mux failed: %@", x.error.localizedDescription ?: @"unknown error");
+            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+            return -1;
+        }
+        return 0;
     }
 }
 
@@ -2252,6 +2531,15 @@ void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t wi
         }
         return (__bridge_retained void *)rec;
     }
+}
+
+double bugle_sck_record_session_start(void *handle) {
+    if (!handle) return NAN;
+    BugleSckRecorder *rec = (__bridge BugleSckRecorder *)handle;
+    [rec.lock lock];
+    double s = rec.sessionStarted ? CMTimeGetSeconds(rec.sessionStart) : NAN;
+    [rec.lock unlock];
+    return s;
 }
 
 int64_t bugle_sck_record_frames(void *handle) {
