@@ -7,7 +7,9 @@
 //!
 //! Security: when the listener is bound to loopback, requests whose `Host`
 //! is not a loopback name are refused (DNS rebinding). A non-loopback bind
-//! requires a token, and CORS is only enabled when a token is set.
+//! requires a token, and CORS is only enabled when a token is set. Without a
+//! token, requests a browser marks as coming from another origin are refused
+//! on every route, since some need no CORS preflight.
 
 use crate::actions::{self, catalog, status_for};
 use axum::{
@@ -149,17 +151,33 @@ fn error(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(json!({"ok": false, "error": msg.into()}))).into_response()
 }
 
+/// Whether the request was sent by a web page on another origin. Browsers
+/// attach `Origin` to every cross-origin request that can change state and
+/// `Sec-Fetch-Site` to all requests; other clients send neither. `host` is the
+/// request's own `Host`, so a page served from this listener still passes.
+fn is_cross_origin(headers: &HeaderMap, host: Option<&str>) -> bool {
+    if headers.get("sec-fetch-site").is_some_and(|v| !matches!(v.as_bytes(), b"same-origin" | b"none")) {
+        return true;
+    }
+    let Some(origin) = headers.get(header::ORIGIN) else { return false };
+    let authority = origin.to_str().ok().and_then(|o| o.strip_prefix("http://").or_else(|| o.strip_prefix("https://")));
+    !matches!((authority, host), (Some(a), Some(h)) if a.eq_ignore_ascii_case(h))
+}
+
 async fn auth(State(state): State<AppState>, headers: HeaderMap, req: Request<Body>, next: Next) -> Response {
-    if state.loopback_only {
-        // HTTP/2 carries the host in the URI authority instead of `Host`.
-        let host = headers
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-            .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()));
-        if !host.as_deref().is_some_and(is_loopback_host) {
-            return error(StatusCode::FORBIDDEN, "Host header must be a loopback address (127.0.0.1, localhost or [::1])");
-        }
+    // HTTP/2 carries the host in the URI authority instead of `Host`.
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()));
+    if state.loopback_only && !host.as_deref().is_some_and(is_loopback_host) {
+        return error(StatusCode::FORBIDDEN, "Host header must be a loopback address (127.0.0.1, localhost or [::1])");
+    }
+    // Without a token nothing else stops a web page: a body-less POST (and any
+    // GET) needs no CORS preflight, so the browser would simply send it.
+    if state.token.is_none() && is_cross_origin(&headers, host.as_deref()) {
+        return error(StatusCode::FORBIDDEN, "cross-origin requests need a token: set [api] token (and cors = true for web pages)");
     }
     if let Some(expected) = &state.token {
         let ok = headers
@@ -450,12 +468,151 @@ mod tests {
             let mut req = get("/v1/health", Some("127.0.0.1:4848"));
             req.headers_mut().insert(header::ORIGIN, "https://evil.example".parse().unwrap());
             let (status, headers, _) = send(&app, req).await;
-            assert_eq!(status, StatusCode::OK);
+            assert_eq!(status, StatusCode::FORBIDDEN);
             assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN), "cors={cors}");
         }
         let app = router(f.engine.clone(), Some("secret".into()), true);
         let (_, headers, _) = send(&app, preflight()).await;
         assert!(headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+    }
+
+    /// A request with no body and only headers a browser adds by itself: what
+    /// a page on another origin can send without a preflight.
+    fn bare(method: &str, uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut b = Request::builder().method(method).uri(uri).header(header::HOST, "127.0.0.1:4848");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    /// Every route; the body-less POSTs come first.
+    const ROUTES: &[(&str, &str)] = &[
+        ("POST", "/v1/select"),
+        ("POST", "/v1/record/stop"),
+        ("POST", "/v1/actions/select_area"),
+        ("POST", "/v1/actions/record_stop"),
+        ("POST", "/v1/capture"),
+        ("POST", "/v1/scroll"),
+        ("POST", "/v1/ocr"),
+        ("POST", "/v1/describe"),
+        ("POST", "/v1/annotate"),
+        ("POST", "/v1/transcribe"),
+        ("POST", "/v1/subtitles"),
+        ("POST", "/v1/complete"),
+        ("POST", "/v1/edit"),
+        ("POST", "/v1/record/start"),
+        ("POST", "/v1/pin"),
+        ("POST", "/v1/copy"),
+        ("POST", "/v1/sync"),
+        ("DELETE", "/v1/media/latest"),
+        ("GET", "/v1/media/latest"),
+        ("GET", "/v1/media/latest/file"),
+        ("GET", "/v1/health"),
+        ("GET", "/v1/openapi.json"),
+        ("GET", "/v1/tools"),
+        ("GET", "/v1/annotate/schema"),
+        ("GET", "/v1/record/status"),
+        ("GET", "/v1/displays"),
+        ("GET", "/v1/windows"),
+        ("GET", "/v1/providers"),
+        ("GET", "/v1/permissions"),
+        ("GET", "/v1/history"),
+    ];
+
+    #[tokio::test]
+    async fn cross_origin_requests_are_refused_without_a_token() {
+        let f = fixture();
+        let app = router(f.engine.clone(), None, false);
+        for (method, uri) in ROUTES {
+            let (status, _, body) = send(&app, bare(method, uri, &[("origin", "https://example.com")])).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {}", String::from_utf8_lossy(&body));
+            envelope(&body);
+        }
+        // Other shapes of the same request, on the two body-less POST routes.
+        let foreign: &[&[(&str, &str)]] = &[
+            &[("origin", "null")],
+            &[("origin", "http://localhost:3000")],
+            &[("origin", "http://127.0.0.1:4848.example.com")],
+            &[("origin", "https://example.com"), ("sec-fetch-site", "cross-site")],
+            &[("sec-fetch-site", "cross-site")],
+            &[("sec-fetch-site", "same-site")],
+            &[("origin", "https://example.com"), ("content-type", "text/plain")],
+            &[("origin", "https://example.com"), ("content-type", "application/x-www-form-urlencoded")],
+        ];
+        for uri in ["/v1/select", "/v1/record/stop"] {
+            for headers in foreign {
+                let (status, _, body) = send(&app, bare("POST", uri, headers)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{uri} {headers:?}: {}", String::from_utf8_lossy(&body));
+                envelope(&body);
+            }
+        }
+        // `cors = true` without a token changes nothing.
+        let app = router(f.engine.clone(), None, true);
+        assert_eq!(send(&app, bare("POST", "/v1/record/stop", &[("origin", "https://example.com")])).await.0, StatusCode::FORBIDDEN);
+    }
+
+    /// The action ran: with no recording in progress `record_stop` fails with
+    /// its own error rather than a refusal from the middleware.
+    fn reached_record_stop(status: StatusCode, body: &[u8]) {
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{}", String::from_utf8_lossy(body));
+        assert!(String::from_utf8_lossy(body).contains("no recording in progress"));
+    }
+
+    #[tokio::test]
+    async fn requests_from_non_browser_clients_need_no_extra_headers() {
+        let f = fixture();
+        let app = router(f.engine.clone(), None, false);
+        // (`/v1/select` shares this path but would start the selection helper.)
+        let local: &[&[(&str, &str)]] = &[
+            &[],
+            &[("origin", "http://127.0.0.1:4848")],
+            &[("origin", "http://127.0.0.1:4848"), ("sec-fetch-site", "same-origin")],
+            &[("sec-fetch-site", "none")],
+        ];
+        for uri in ["/v1/record/stop", "/v1/actions/record_stop"] {
+            for headers in local {
+                // The catch-all route takes a JSON body like every other action.
+                let mut req = bare("POST", uri, headers);
+                if uri.starts_with("/v1/actions/") {
+                    req.headers_mut().insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+                    *req.body_mut() = Body::from("{}");
+                }
+                let (status, _, body) = send(&app, req).await;
+                reached_record_stop(status, &body);
+            }
+        }
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/actions/history")
+            .header(header::HOST, "127.0.0.1:4848")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(send(&app, req).await.0, StatusCode::OK);
+        for uri in ["/v1/health", "/v1/history", "/v1/record/status", "/v1/tools"] {
+            assert_eq!(send(&app, bare("GET", uri, &[])).await.0, StatusCode::OK, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_decides_alone_when_one_is_set() {
+        let f = fixture();
+        let origin = ("origin", "https://example.com");
+        let token = ("authorization", "Bearer secret");
+        for cors in [false, true] {
+            let app = router(f.engine.clone(), Some("secret".into()), cors);
+            for uri in ["/v1/select", "/v1/record/stop"] {
+                let (status, _, body) = send(&app, bare("POST", uri, &[origin])).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} cors={cors}");
+                envelope(&body);
+            }
+            for sent in [&[token][..], &[origin, token], &[origin, token, ("sec-fetch-site", "cross-site")]] {
+                let (status, headers, body) = send(&app, bare("POST", "/v1/record/stop", sent)).await;
+                reached_record_stop(status, &body);
+                assert_eq!(headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN), cors && sent.contains(&origin), "{sent:?}");
+            }
+        }
     }
 
     #[tokio::test]

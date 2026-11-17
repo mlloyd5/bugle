@@ -64,6 +64,14 @@ bugle serve --bind 127.0.0.1:4848 --token secret     # alias: bugle jameson
   `[::1]` (with or without port) get 403, which blocks DNS-rebinding pages.
 * CORS (`[api] cors = true`) is off by default and only enabled when a token is
   set; without one it is ignored with a warning.
+* With no token, a request that a browser marks as coming from another origin
+  gets 403 on every route and method: an `Origin` header that is not the API's
+  own address (`http://<Host>`), or `Sec-Fetch-Site` other than `same-origin` or
+  `none`. This covers the requests browsers send without a CORS preflight
+  (body-less `POST /v1/select` and `/v1/record/stop`, form posts, plain GETs).
+  Clients that send neither header (`curl`, HTTP libraries, agents) are
+  unaffected; do not add an `Origin` header by hand. With a token configured the
+  token alone decides, and web pages need the token plus `cors = true`.
 * `/v1/media/{id}/file` serves history items only (id, id prefix or `latest`),
   never arbitrary file paths.
 

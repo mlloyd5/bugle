@@ -72,7 +72,8 @@ bind = "127.0.0.1:4848"
 # Bearer token required on every request when set. Recommended; required
 # when `bind` is not a loopback address (the server refuses to start).
 # token = "change-me"
-# Let browser pages call the API. Only takes effect when a token is set.
+# Let browser pages call the API. Only takes effect when a token is set;
+# without a token, requests from web pages on other origins are refused.
 cors = false
 
 # Global hotkeys for the menu-bar app (`bugle-app`). "mod+mod+key"; modifiers
