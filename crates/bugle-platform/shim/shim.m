@@ -2193,6 +2193,83 @@ void bugle_open_path(const char *path) {
 // the stop time so the video track covers the whole recording.
 // ---------------------------------------------------------------------------
 
+// Live level of one audio source, for the menu-bar meter and record_status.
+// Measured as the samples arrive (before any gain or ducking, which happen
+// after the recording stops). `peak` holds the largest magnitude and falls at
+// BUGLE_PEAK_FALL_DB_PER_S once the signal drops; `meanSquare` is averaged
+// with time constant BUGLE_RMS_TAU_S. Reads decay both to the current time
+// without changing them, so any number of readers see the same values. These
+// match bugle_core::audio_level's constants.
+#define BUGLE_PEAK_FALL_DB_PER_S 20.0
+#define BUGLE_RMS_TAU_S 0.3
+
+typedef struct {
+    BOOL seen;          // a buffer has been measured
+    double updated;     // host seconds of the last update
+    double peak;        // linear, 1.0 = full scale
+    double meanSquare;
+} BugleLevel;
+
+static double host_seconds(void) {
+    return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()));
+}
+
+// Peak magnitude and sum of squares of a linear-PCM sample buffer (float32,
+// float64, int16 or int32; interleaved or not); 0 for anything else.
+int32_t bugle_audio_buffer_stats(const void *buffer, double *peak, double *sumSquares, size_t *count, double *seconds) {
+    CMSampleBufferRef sb = (CMSampleBufferRef)buffer;
+    CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(sb);
+    const AudioStreamBasicDescription *asbd = fd ? CMAudioFormatDescriptionGetStreamBasicDescription(fd) : NULL;
+    if (!asbd || asbd->mFormatID != kAudioFormatLinearPCM || (asbd->mFormatFlags & kAudioFormatFlagIsBigEndian)) return 0;
+    BOOL isFloat = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+    BOOL isSigned = (asbd->mFormatFlags & kAudioFormatFlagIsSignedInteger) != 0;
+    UInt32 bits = asbd->mBitsPerChannel;
+    if (isFloat ? (bits != 32 && bits != 64) : (!isSigned || (bits != 16 && bits != 32))) return 0;
+    if (asbd->mSampleRate <= 0) return 0;
+    size_t need = 0;
+    if (CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sb, &need, NULL, 0, NULL, NULL, 0, NULL) != noErr || need == 0) return 0;
+    AudioBufferList *abl = malloc(need);
+    if (!abl) return 0;
+    CMBlockBufferRef block = NULL;
+    OSStatus st = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        sb, NULL, abl, need, NULL, NULL, kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, &block);
+    if (st != noErr) { free(abl); return 0; }
+    double p = 0, ss = 0;
+    size_t n = 0;
+    for (UInt32 b = 0; b < abl->mNumberBuffers; b++) {
+        const void *data = abl->mBuffers[b].mData;
+        size_t len = abl->mBuffers[b].mDataByteSize / (bits / 8);
+        if (!data) continue;
+        for (size_t i = 0; i < len; i++) {
+            double v;
+            if (isFloat) v = bits == 32 ? ((const float *)data)[i] : ((const double *)data)[i];
+            else v = bits == 16 ? ((const int16_t *)data)[i] / 32768.0 : ((const int32_t *)data)[i] / 2147483648.0;
+            if (!isfinite(v)) continue;
+            double a = fabs(v);
+            if (a > p) p = a;
+            ss += v * v;
+        }
+        n += len;
+    }
+    if (block) CFRelease(block);
+    free(abl);
+    *peak = p;
+    *sumSquares = ss;
+    *count = n;
+    *seconds = (double)CMSampleBufferGetNumSamples(sb) / asbd->mSampleRate;
+    return 1;
+}
+
+// `l` decayed to `now` with no new samples.
+static BugleLevel level_decayed(BugleLevel l, double now) {
+    if (!l.seen) return l;
+    double dt = fmax(0, now - l.updated);
+    l.peak *= pow(10.0, -BUGLE_PEAK_FALL_DB_PER_S * dt / 20.0);
+    l.meanSquare *= exp(-dt / BUGLE_RMS_TAU_S);
+    l.updated = now;
+    return l;
+}
+
 @interface BugleSckRecorder : NSObject <SCStreamOutput, SCStreamDelegate, AVCaptureAudioDataOutputSampleBufferDelegate>
 @property (nonatomic, strong) SCStream *stream;
 @property (nonatomic, strong) AVAssetWriter *writer;
@@ -2217,6 +2294,8 @@ void bugle_open_path(const char *path) {
 @property (nonatomic, strong) NSString *failure;   // guarded by `lock`
 @property (nonatomic) BOOL captureRequested;        // startCapture was called
 @property (nonatomic, strong) NSMutableArray<NSString *> *warnings;
+@property (nonatomic) BugleLevel systemLevel;      // guarded by `lock`
+@property (nonatomic) BugleLevel micLevel;         // guarded by `lock`
 @end
 
 @implementation BugleSckRecorder
@@ -2262,8 +2341,27 @@ void bugle_open_path(const char *path) {
     if (type == SCStreamOutputTypeScreen) {
         [self handleScreen:sb];
     } else if (type == SCStreamOutputTypeAudio) {
+        [self meter:sb mic:NO];
         [self handleAudio:sb input:self.audioInput];
     }
+}
+
+- (void)meter:(CMSampleBufferRef)sb mic:(BOOL)mic {
+    double peak, sumSquares, seconds;
+    size_t count;
+    if (!bugle_audio_buffer_stats(sb, &peak, &sumSquares, &count, &seconds) || count == 0) return;
+    double now = host_seconds();
+    [self.lock lock];
+    BugleLevel l = level_decayed(mic ? self.micLevel : self.systemLevel, now);
+    // The buffer's own mean square enters the average with the weight of
+    // its duration; the first buffer starts it.
+    double ms = sumSquares / (double)count;
+    l.meanSquare = l.seen ? l.meanSquare + (1.0 - exp(-seconds / BUGLE_RMS_TAU_S)) * (ms - l.meanSquare) : ms;
+    l.peak = fmax(l.peak, peak);
+    l.seen = YES;
+    l.updated = now;
+    if (mic) self.micLevel = l; else self.systemLevel = l;
+    [self.lock unlock];
 }
 
 - (void)handleScreen:(CMSampleBufferRef)sb {
@@ -2321,6 +2419,7 @@ void bugle_open_path(const char *path) {
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sb
        fromConnection:(AVCaptureConnection *)connection {
     if (!sb || !CMSampleBufferDataIsReady(sb)) return;
+    [self meter:sb mic:YES];
     CMClockRef sessionClock = self.micSession.synchronizationClock;
     CMClockRef host = CMClockGetHostTimeClock();
     if (sessionClock && !CFEqual(sessionClock, host)) {
@@ -2657,6 +2756,22 @@ double bugle_sck_record_session_start(void *handle) {
     double s = rec.sessionStarted ? CMTimeGetSeconds(rec.sessionStart) : NAN;
     [rec.lock unlock];
     return s;
+}
+
+int32_t bugle_sck_record_levels(void *handle, float *out) {
+    if (!handle || !out) return 0;
+    BugleSckRecorder *rec = (__bridge BugleSckRecorder *)handle;
+    double now = host_seconds();
+    [rec.lock lock];
+    int32_t present = (rec.audioInput ? 1 : 0) | (rec.micInput ? 2 : 0);
+    BugleLevel sys = level_decayed(rec.systemLevel, now);
+    BugleLevel mic = level_decayed(rec.micLevel, now);
+    [rec.lock unlock];
+    out[0] = (float)sys.peak;
+    out[1] = (float)sqrt(fmax(0, sys.meanSquare));
+    out[2] = (float)mic.peak;
+    out[3] = (float)sqrt(fmax(0, mic.meanSquare));
+    return present;
 }
 
 int64_t bugle_sck_record_frames(void *handle) {

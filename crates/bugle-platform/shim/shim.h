@@ -153,6 +153,12 @@ int32_t bugle_video_track_count(const char *path);
 // success.
 char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double seconds, double amplitude, int32_t overlap,
                                 double delay, int32_t video);
+// Builds an audio sample buffer of `frames` frames at `rate` Hz from
+// `samples` (channel-major floats, `channels` blocks of `frames`), as int16
+// or float32, interleaved or not, and measures it with
+// bugle_audio_buffer_stats. 0 on success with the peak and RMS in `out[2]`.
+int32_t bugle_fixture_audio_level(int32_t int16, int32_t channels, int32_t interleaved, const float *samples,
+                                  int32_t frames, double rate, double *out);
 double bugle_media_duration(const char *path);
 bugle_image_t bugle_video_frame(const char *path, double seconds);
 
@@ -205,6 +211,15 @@ void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t wi
                              int32_t system_audio, int32_t microphone, int32_t show_cursor, int32_t show_clicks,
                              double max_seconds, const char *out_path);
 int64_t bugle_sck_record_frames(void *handle);
+// Current levels, linear (1.0 = full scale): out[4] = system peak, system RMS,
+// microphone peak, microphone RMS. Returns which sources are recorded:
+// 1 = system audio, 2 = microphone.
+int32_t bugle_sck_record_levels(void *handle, float *out);
+// Peak magnitude, sum of squares, sample count and duration of a linear-PCM
+// CMSampleBufferRef (float32/float64/int16/int32, interleaved or not), as the
+// recorder's level meter measures it. 1 on success, 0 for other formats.
+int32_t bugle_audio_buffer_stats(const void *sample_buffer, double *peak, double *sum_squares, size_t *count,
+                                 double *seconds);
 // Host-clock time (seconds) of the movie's time 0; NaN before it starts.
 double bugle_sck_record_session_start(void *handle);
 char *bugle_sck_record_warnings(void *handle);   // malloc'd, NULL when none

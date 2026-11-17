@@ -39,6 +39,7 @@ pub use video_editor::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use bugle_core::audio_level::{AudioLevels, TrackLevel};
 use bugle_core::audio_mix::{AudioMixConfig, Leveler, Mixer};
 use bugle_core::{BugleError, DisplayInfo, OcrLine, Point, Rect, WindowInfo};
 use image::RgbaImage;
@@ -787,6 +788,27 @@ pub fn write_tone_fixture(output: &Path, f: &ToneFixture) -> Result<()> {
     Ok(())
 }
 
+/// Test fixture: measure `samples` (channel-major, `channels` blocks of equal
+/// length) the way the recorder's level meter does, packed as int16 or
+/// float32, interleaved or not. Returns (peak, RMS, seconds) at `rate`.
+#[doc(hidden)]
+pub fn audio_level_fixture(samples: &[f32], channels: usize, int16: bool, interleaved: bool, rate: f64) -> Option<(f64, f64, f64)> {
+    let frames = samples.len().checked_div(channels)?;
+    let mut out = [0f64; 3];
+    let rc = unsafe {
+        ffi::bugle_fixture_audio_level(
+            int16 as i32,
+            channels as i32,
+            interleaved as i32,
+            samples.as_ptr(),
+            frames as i32,
+            rate,
+            out.as_mut_ptr(),
+        )
+    };
+    (rc == 0).then_some((out[0], out[1], out[2]))
+}
+
 pub fn media_duration(path: &Path) -> Result<f64> {
     let p = path_cstr(path)?;
     let d = unsafe { ffi::bugle_media_duration(p.as_ptr()) };
@@ -1168,6 +1190,17 @@ impl SckRecorder {
         unsafe { ffi::bugle_sck_record_frames(self.handle) }.max(0) as u64
     }
 
+    /// Current levels of the audio sources this recording captures (the
+    /// microphone is `None` when it was asked for but could not be opened).
+    pub fn audio_levels(&self) -> AudioLevels {
+        let mut v = [0f32; 4];
+        let present = unsafe { ffi::bugle_sck_record_levels(self.handle, v.as_mut_ptr()) };
+        AudioLevels {
+            system_audio: (present & 1 != 0).then(|| TrackLevel::from_linear(v[0], v[1])),
+            microphone: (present & 2 != 0).then(|| TrackLevel::from_linear(v[2], v[3])),
+        }
+    }
+
     /// Non-fatal problems (microphone unavailable, stream stopped early).
     pub fn warnings(&self) -> Option<String> {
         unsafe {
@@ -1469,6 +1502,28 @@ mod tests {
 
     fn peak(samples: &[f32]) -> f32 {
         samples.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+    }
+
+    #[test]
+    fn level_meter_reads_every_sample_layout() {
+        // Two channels of 480 frames: a 0.5 sine on the left, silence but
+        // for one -0.8 sample on the right.
+        let n = 480;
+        let mut s: Vec<f32> = (0..n).map(|i| 0.5 * (i as f32 * std::f32::consts::TAU * 1000.0 / 48000.0).sin()).collect();
+        s.extend(std::iter::repeat_n(0.0, n));
+        s[n + 100] = -0.8;
+        let want_rms = ((0.25 * 0.5 * n as f64 + 0.64) / (2 * n) as f64).sqrt();
+        for int16 in [false, true] {
+            for interleaved in [false, true] {
+                let (peak, rms, secs) = audio_level_fixture(&s, 2, int16, interleaved, 48000.0).expect("measured");
+                let tol = if int16 { 1e-3 } else { 1e-5 };
+                assert!((peak - 0.8).abs() < tol, "peak {peak} (int16 {int16}, interleaved {interleaved})");
+                assert!((rms - want_rms).abs() < tol, "rms {rms} vs {want_rms} (int16 {int16}, interleaved {interleaved})");
+                assert!((secs - 0.01).abs() < 1e-9, "seconds {secs}");
+            }
+        }
+        let silent = vec![0f32; 256];
+        assert_eq!(audio_level_fixture(&silent, 1, false, true, 48000.0).map(|r| (r.0, r.1)), Some((0.0, 0.0)));
     }
 
     #[test]

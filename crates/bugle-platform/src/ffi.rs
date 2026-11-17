@@ -170,6 +170,15 @@ extern "C" {
         delay: f64,
         video: i32,
     ) -> *mut c_char;
+    pub fn bugle_fixture_audio_level(
+        int16: i32,
+        channels: i32,
+        interleaved: i32,
+        samples: *const f32,
+        frames: i32,
+        rate: f64,
+        out: *mut f64,
+    ) -> i32;
     pub fn bugle_media_duration(path: *const c_char) -> f64;
     pub fn bugle_video_frame(path: *const c_char, seconds: f64) -> bugle_image_t;
     pub fn bugle_video_info(path: *const c_char, out: *mut bugle_video_info_t) -> i32;
@@ -224,6 +233,7 @@ extern "C" {
         out_path: *const c_char,
     ) -> *mut c_void;
     pub fn bugle_sck_record_frames(handle: *mut c_void) -> i64;
+    pub fn bugle_sck_record_levels(handle: *mut c_void, out: *mut f32) -> i32;
     pub fn bugle_sck_record_session_start(handle: *mut c_void) -> f64;
     pub fn bugle_sck_record_warnings(handle: *mut c_void) -> *mut c_char;
     pub fn bugle_sck_record_stop(handle: *mut c_void) -> i32;

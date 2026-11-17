@@ -280,6 +280,11 @@ pub struct RecordingStatus {
     pub elapsed_seconds: f64,
     pub frames: u64,
     pub output: Option<String>,
+    /// Live levels of the audio sources while a recording captures them
+    /// (ScreenCaptureKit recorder only); `None` when idle, finishing, or
+    /// recording without audio or with a recorder that does not report them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_levels: Option<crate::audio_level::AudioLevels>,
 }
 
 /// Transcript produced by a speech-to-text provider.

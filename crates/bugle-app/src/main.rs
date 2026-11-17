@@ -10,6 +10,7 @@ mod audio_menu;
 mod commands;
 mod editor_window;
 mod icon;
+mod level_meter;
 mod login;
 mod markup_editor;
 mod notifications;
@@ -431,6 +432,7 @@ struct MenuItems {
     api: MenuItem,
     login: Option<login::LoginMenu>,
     audio: audio_menu::AudioMenu,
+    meter: level_meter::LevelMeter,
 }
 
 /// Build the status menu from [`commands::MENU`]. `keys` maps entry names to
@@ -444,6 +446,7 @@ fn build_menu(config: &Config, keys: &HashMap<&'static str, String>) -> Result<M
         audio_menu::requirement(&config.recordings, bugle_platform::sck_record_available()),
     )?;
     let mut by_name: HashMap<&'static str, MenuItem> = HashMap::new();
+    let mut meter_at = None;
     for slot in commands::MENU {
         match slot {
             Slot::Separator => menu.append(&PredefinedMenuItem::separator())?,
@@ -459,6 +462,9 @@ fn build_menu(config: &Config, keys: &HashMap<&'static str, String>) -> Result<M
                 let item = MenuItem::with_id(e.name, e.label, true, key.and_then(|k| k.parse::<Accelerator>().ok()));
                 menu.append(&item)?;
                 by_name.insert(e.name, item);
+                if e.name == "stop_recording" {
+                    meter_at = Some(menu.items().len());
+                }
             }
         }
     }
@@ -473,6 +479,7 @@ fn build_menu(config: &Config, keys: &HashMap<&'static str, String>) -> Result<M
         recent,
         login,
         audio,
+        meter: level_meter::LevelMeter::new(meter_at.ok_or_else(|| anyhow!("menu table has no stop_recording"))?),
     };
     take("sync_latest")?.set_enabled(config.sync.has_destination());
     items.stop.set_enabled(false);
@@ -497,6 +504,10 @@ struct App {
     history_mtime: Option<SystemTime>,
     proxy: Proxy,
     last_tick: Instant,
+    /// Whether the status item shows a recording (the meter then redraws
+    /// every [`level_meter::INTERVAL`]), and when it last did.
+    recording_shown: bool,
+    last_meter: Instant,
     quick: quick_access::QuickAccess,
     /// Numbers editor windows, so a late save or preview reaches only its own.
     editor_generation: u64,
@@ -639,9 +650,25 @@ impl App {
         self.items.record_window.set_enabled(!recording);
         if recording {
             let secs = st.elapsed_seconds as u64;
-            self.tray.set_title(Some(format!("● {}:{:02}", secs / 60, secs % 60)));
+            let meter = st.audio_levels.as_ref().and_then(bugle_core::audio_level::meter_title);
+            let meter = meter.map(|m| format!(" {m}")).unwrap_or_default();
+            self.tray.set_title(Some(format!("● {}:{:02}{meter}", secs / 60, secs % 60)));
         } else {
             self.tray.set_title(None::<&str>);
+        }
+        if let Err(e) = self.items.meter.update(&self.items.menu, st.audio_levels.as_ref()) {
+            tracing::warn!("level meter: {e:#}");
+        }
+        self.recording_shown = recording;
+        self.last_meter = Instant::now();
+    }
+
+    /// How long the event loop may sleep before the next [`App::tick`].
+    fn wake_interval(&self) -> Duration {
+        if self.recording_shown {
+            level_meter::INTERVAL
+        } else {
+            Duration::from_secs(1)
         }
     }
 
@@ -733,9 +760,13 @@ impl App {
         *control_flow = ControlFlow::Exit;
     }
 
-    /// Periodic housekeeping: recording timer in the status bar, recent list.
+    /// Periodic housekeeping: recording timer and level meter in the status
+    /// bar, recent list.
     fn tick(&mut self) {
         self.quick_tick();
+        if self.recording_shown && self.last_meter.elapsed() >= level_meter::INTERVAL {
+            self.update_recording_ui();
+        }
         if self.last_tick.elapsed() < Duration::from_millis(900) {
             return;
         }
@@ -856,6 +887,8 @@ fn main() -> Result<()> {
         history_mtime: None,
         proxy: proxy.clone(),
         last_tick: Instant::now() - Duration::from_secs(5),
+        recording_shown: false,
+        last_meter: Instant::now(),
         quick: quick_access::QuickAccess::new(engine.config.quick_access.clone()),
         editor_generation: 0,
         video_editor_generation: 0,
@@ -881,7 +914,7 @@ fn main() -> Result<()> {
     let smoke_started = cli.smoke_test.then(|| smoke_test(engine.clone(), proxy.clone()));
 
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_secs(1));
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + app.wake_interval());
         match event {
             Event::NewEvents(StartCause::ResumeTimeReached { .. }) | Event::MainEventsCleared => {
                 app.tick();

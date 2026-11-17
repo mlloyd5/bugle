@@ -99,7 +99,7 @@ curl -s -H "$H" -H 'content-type: application/json' \
 | `scroll_capture` | `rect`, `max_frames`, `step_lines`, `settle_ms`, `horizontal`, `output`, `inline_image` | `media`, `stats` |
 | `record_start` | `target`, `format` (mp4/mov/gif), `fps`, `microphone`, `system_audio`, `mix_audio`, `microphone_gain`, `system_audio_gain`, `ducking`, `ducking_amount_db` (levels of the mixed track, or of each separate track without `mix_audio`; defaults from `[recordings]`), `max_seconds`, `highlight_clicks`, `cursor_events` (writes `<file>.events.json`), `hide_cursor` (pointer left out of the frames; implies `cursor_events`), `output`, `label` | status |
 | `record_stop` | – | `media` |
-| `record_status` | – | status |
+| `record_status` | – | status (`audio_levels` while capturing audio, see below) |
 | `transcribe` | `source`, `provider`, `language` | `transcript`, `srt` |
 | `subtitles` | `source`, `format` (srt/vtt), `provider`, `language`, `output` | `path`, `segments`, `text` |
 | `edit_video` | `source`, `start`, `end` (seconds, negative = from the end), `preset` (original/lossless/high/hevc/1080p/720p/540p/gif/gif-small), `fps` (re-encodes video; resamples GIF), `max_size` (GIF long edge), `zoom` (factor above 1, at most 4: zoom in on clicks), `smooth_cursor` (draw a smoothed pointer; `hide_cursor` recordings), `output`, `label` | `media` (parent = source when it is a history item) |
@@ -129,6 +129,18 @@ fps), so `lossless` is refused with them and `original`/`high` encode H.264
 clicks inside the recorded area only. The track is `<file>.events.json` (the
 whole file name, so `clip.mp4` and `clip.mov` each have their own), and an
 effects edit's output has none.
+
+While a recording captures audio with the ScreenCaptureKit recorder (system
+audio and/or the microphone), `record_status` (and the status
+`record_start` returns) carries `audio_levels`:
+`{"microphone": {"peak_db": -18.2, "rms_db": -31.0}, "system_audio": null}`.
+Values are dBFS (0 = full scale), floored at -100 for silence, measured as
+recorded (before `microphone_gain`, `system_audio_gain` and ducking). The peak
+falls at 20 dB/s once the signal drops and the RMS is averaged over 0.3 s, so
+polling a few times a second is enough. A source the recording does not
+capture (or a microphone that could not be opened) is `null`; the field is
+absent when idle, finishing, recording a GIF, or on the `screencapture`
+recorder, which does not report levels.
 
 `source` accepts a media id (or prefix), `latest`, or a file path.
 Target coordinates are screen points (top-left origin); annotation and OCR

@@ -172,7 +172,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "record_status",
-            description: "Report whether a recording is running, for how long, and how many frames were captured.",
+            description: "Report whether a recording is running, for how long, and how many frames were captured. While a recording captures audio (system audio or microphone on the ScreenCaptureKit recorder), audio_levels gives each source's current peak_db and rms_db (dBFS, -100 = silence, before gain/ducking; null for a source not recorded).",
             input_schema: json!({"type":"object","properties":{}}),
         },
         ToolSpec {
