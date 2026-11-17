@@ -34,7 +34,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | Pin to screen | Floating AppKit panel (drag, scroll-to-resize, Esc/double-click closes) | ✅ |
 | GIF recording | In-process frame grab loop + `image` GIF encoder | ✅ |
 | Video recording | `screencapture -v` (H.264 .mov → remuxed .mp4), microphone, click highlight | ✅ |
-| System audio in recordings | ScreenCaptureKit `SCStream` audio tap + `AVAssetWriter` (H.264 + AAC .mp4), microphone as a second track or mixed into one (`--mix-audio`) with per-source levels, optional ducking of system audio under the microphone and a peak limiter | ✅ (macOS 14+) |
+| System audio in recordings | ScreenCaptureKit `SCStream` audio tap + `AVAssetWriter` (H.264 + AAC .mp4), microphone as a second track or mixed into one (`--mix-audio`) with per-source levels (on either output), optional ducking of system audio under the microphone and a peak limiter | ✅ (macOS 14+) |
 | Describe image / video frames with a vision model | OpenAI-compatible, Ollama, Anthropic, command | ✅ |
 | Transcribe / subtitles (SRT, VTT) | whisper.cpp server, OpenAI-compatible, command | ✅ |
 | History | JSON-lines file, ids, delete | ✅ |
@@ -310,7 +310,9 @@ menu bar and listens for global hotkeys. Everything it does goes through the sam
 history, and play the shutter sound when `general.shutter_sound` is on.
 
 Menu: Capture Area · Capture Window · Capture Screen ·
-Scrolling Capture · Record Video · Record GIF · Record Window · Stop Recording · Annotate Latest
+Scrolling Capture · Record Video · Record GIF · Record Window · Stop Recording · Audio Levels
+(microphone and system-audio level presets and ducking for the next recordings, saved to
+`[recordings]` in the config file) · Annotate Latest
 (opens the markup editor) · OCR Latest (copies the text) · Pin Latest · Recent Captures (last five, click to open) ·
 Open History Folder · Start/Stop Agent API · Preferences… (opens the config
 file) · Open at Login (only when running from `Bugle.app`) · Quit. While recording, the status item shows `● m:ss`. Other actions
