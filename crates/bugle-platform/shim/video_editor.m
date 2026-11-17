@@ -20,6 +20,7 @@
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 #include <stdint.h>
+#include "shim.h"
 
 typedef void (*bugle_video_editor_callback_t)(void *ctx, int32_t kind, double value, int32_t arg);
 typedef void (*bugle_video_editor_free_t)(void *ctx);
@@ -281,7 +282,9 @@ typedef enum { DRAG_NONE, DRAG_PLAYHEAD, DRAG_IN, DRAG_OUT } DragKind;
     self.cb = NULL;
     self.ctx = NULL;
     self.freeCtx = NULL;
-    [NSApp deactivate];
+    // Focus goes to an open markup editor, else back to the app the user
+    // came from.
+    bugle_editor_window_closed();
     dispatch_async(dispatch_get_main_queue(), ^{
         if (ctx && f) f(ctx);
         (void)keep;
@@ -519,6 +522,8 @@ void bugle_video_editor_close(void) {
 }
 
 int32_t bugle_video_editor_active(void) { return g_video_editor ? 1 : 0; }
+
+NSWindow *bugle_video_editor_window(void) { return g_video_editor.window; }
 
 /// Bring the open video editor to the front.
 void bugle_video_editor_focus(void) {

@@ -857,6 +857,33 @@ int32_t bugle_select_rect_begin(bugle_select_callback_t cb, void *ctx) {
 
 int32_t bugle_select_rect_active(void) { return g_select_session ? 1 : 0; }
 
+void bugle_editor_window_closed(void) {
+    NSWindow *next = bugle_markup_editor_front_window();
+    if (!next) next = bugle_video_editor_window();
+    if (next) {
+        [next makeKeyAndOrderFront:nil];
+    } else {
+        [NSApp deactivate];
+    }
+}
+
+int32_t bugle_key_window_title(char *buf, size_t cap) {
+    if (!buf || cap == 0) return 0;
+    __block int32_t found = 0;
+    void (^read)(void) = ^{
+        @autoreleasepool {
+            NSWindow *w = NSApp.keyWindow;
+            if (!w || !NSApp.isActive) return;
+            found = 1;
+            const char *t = w.title.UTF8String ?: "";
+            strlcpy(buf, t, cap);
+        }
+    };
+    if ([NSThread isMainThread]) read();
+    else dispatch_sync(dispatch_get_main_queue(), read);
+    return found;
+}
+
 void bugle_app_deactivate(void) {
     @autoreleasepool {
         [NSApp deactivate];

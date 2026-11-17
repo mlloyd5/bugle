@@ -135,6 +135,7 @@ extern "C" {
     pub fn bugle_select_rect_cancel();
     pub fn bugle_select_rect_switch();
     pub fn bugle_app_deactivate();
+    pub fn bugle_key_window_title(buf: *mut c_char, cap: size_t) -> i32;
     pub fn bugle_app_bootstrap();
     pub fn bugle_run_loop_once(seconds: f64);
     pub fn bugle_is_main_thread() -> i32;
