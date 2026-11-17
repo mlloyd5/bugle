@@ -125,8 +125,11 @@ extern "C" {
     pub fn bugle_select_rect_blocking(x: *mut f64, y: *mut f64, w: *mut f64, h: *mut f64) -> i32;
     pub fn bugle_pin_image_blocking(png: *const u8, len: size_t, x: f64, y: f64, w: f64, h: f64, opacity: f64);
     pub fn bugle_select_rect_begin(cb: bugle_select_callback_t, ctx: *mut c_void) -> i32;
+    pub fn bugle_select_rect_begin_ex(cb: bugle_select_callback_t, ctx: *mut c_void, allow_switch: i32, timeout_seconds: f64) -> i32;
     pub fn bugle_select_rect_active() -> i32;
     pub fn bugle_select_rect_cancel();
+    pub fn bugle_select_rect_switch();
+    pub fn bugle_app_deactivate();
     pub fn bugle_pin_image_show(png: *const u8, len: size_t, x: f64, y: f64, w: f64, h: f64, opacity: f64) -> i32;
     pub fn bugle_toast_show(
         png: *const u8,

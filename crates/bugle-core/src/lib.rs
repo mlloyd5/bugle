@@ -38,4 +38,12 @@ pub enum BugleError {
     Unsupported(String),
     #[error("selection cancelled")]
     Cancelled,
+    /// An interactive overlay was requested from a process that cannot show
+    /// one in-process (`bugle serve`, `bugle mcp`, the CLI).
+    #[error("{0}")]
+    NoUiHost(String),
+    /// Another interactive overlay is open, or one was just dismissed;
+    /// retrying later can work.
+    #[error("busy: {0}")]
+    Busy(String),
 }

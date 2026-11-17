@@ -278,7 +278,7 @@ menu bar and listens for global hotkeys. Everything it does goes through the sam
 history, and play the shutter sound when `general.shutter_sound` is on.
 
 Menu: Capture Area · Capture Window · Capture Screen ·
-Scrolling Capture · Record Video · Record GIF · Stop Recording · Annotate Latest
+Scrolling Capture · Record Video · Record GIF · Record Window · Stop Recording · Annotate Latest
 (opens the markup editor) · OCR Latest (copies the text) · Pin Latest · Recent Captures (last five, click to open) ·
 Open History Folder · Start/Stop Agent API · Preferences… (opens the config
 file) · Open at Login (only when running from `Bugle.app`) · Quit. While recording, the status item shows `● m:ss`. Other actions
@@ -331,6 +331,20 @@ them. Set
 `[screenshots] window_picker = false` to capture the front-most window at once
 instead, as `bugle capture window` and the API do.
 
+Space switches between the window picker and the area selection while either
+is up, so *Capture Area* and *Capture Window* are one gesture apart; the hint
+at the bottom of the screen says which mode is on. In the area selection Space
+only works before you start dragging. *Record Video*, *Record GIF* and *Record
+Window* use the same pair of overlays: Record Window starts in the picker and
+records the window you click (MP4), the other two start in the area selection.
+A picked window is recorded by id, the way `record_start` with a window target
+records it, not as the screen area under it. The two overlays together close after two minutes
+(each picker turn still after 30 seconds; never in the middle of a drag).
+With `window_picker = false` the menu items do without the picker: Space does
+nothing, Capture Area and the Record items use the plain area selection, and
+*Record Window* records the front-most window at once. An API caller that asks
+for `pick_window` explicitly still gets the picker.
+
 Hotkeys live in the `[hotkeys]` section of the config file and are parsed as
 `modifier+modifier+key` (`cmd`, `shift`, `alt`/`option`, `ctrl`; letters,
 digits, `F1`…`F24`, `space`, …). Defaults:
@@ -343,7 +357,7 @@ digits, `F1`…`F24`, `space`, …). Defaults:
 | `ocr_latest` | ⌘⇧2 | OCR the latest capture to the clipboard |
 | `pin_latest` | ⌘⇧P | pin the latest capture |
 | `capture_window`, `scroll_capture`, `record_gif` | — | unbound until set |
-| `stop_recording`, `sync_latest`, `open_folder`, `toggle_api`, `preferences`, `quit` | — | unbound until set |
+| `record_window`, `stop_recording`, `sync_latest`, `open_folder`, `toggle_api`, `preferences`, `quit` | — | unbound until set |
 
 Every menu item except *Recent Captures* can be bound; the keys are the names
 above. An empty string unbinds an action. Unknown keys, values that are not
@@ -354,7 +368,14 @@ toast at launch; the config still loads. ⌘⇧3/4/5 are also the system screens
 shortcuts; disable those in System Settings → Keyboard → Keyboard Shortcuts →
 Screenshots (or pick other keys) so they do not fire twice. The agent API started
 from the menu uses `[api]` from the config and serves the in-app overlay for
-`select_area`, `pin` and interactive captures — no helper processes.
+`select_area`, `pin` and interactive captures — no helper processes. It also
+offers the window picker: a `capture` or `record_start` whose target is
+`{"kind":"pick_window"}` shows the picker and uses the window the user clicks
+(Space does not switch to the area selection there), whatever
+`window_picker` says. One overlay request is served at a time: a second pick
+while one is open, or one within 3 seconds of the user dismissing the picker,
+is refused with HTTP 409 instead of queuing. `bugle serve` and `bugle mcp`
+cannot show the picker and answer with an error (HTTP 503) that says so.
 
 Screen Recording permission is requested on first launch (granted to the
 terminal or app that launched `bugle-app` when run from a shell, or to Bugle

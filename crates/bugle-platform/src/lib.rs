@@ -10,7 +10,7 @@ mod ffi;
 #[cfg(target_os = "macos")]
 mod picker;
 #[cfg(target_os = "macos")]
-pub use picker::{window_pick_active, window_pick_begin, window_pick_cancel, window_pick_highlight, PickEvent};
+pub use picker::{window_pick_active, window_pick_begin, window_pick_cancel, window_pick_highlight, window_pick_switch, PickEvent};
 #[cfg(target_os = "macos")]
 mod panel;
 #[cfg(target_os = "macos")]
@@ -402,6 +402,48 @@ pub fn select_rect_begin(done: impl FnOnce(Option<Rect>) + 'static) -> bool {
     started
 }
 
+/// How a switchable area selection ended, see [`select_rect_begin_ex`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SelectOutcome {
+    Selected(Rect),
+    /// Esc, the timeout or [`select_rect_cancel`].
+    Cancelled,
+    /// Space: the user wants the window picker instead. Bugle is left active
+    /// so the picker can open at once.
+    Switch,
+}
+
+/// [`select_rect_begin`] with two extras: when `allow_switch` is set, Space
+/// (while not dragging) ends the selection with [`SelectOutcome::Switch`];
+/// a `timeout` cancels the overlay after that long. `done` runs once on the
+/// main thread. Returns `false` (and never calls `done`) when a selection or
+/// window picker is already on screen. Main thread only.
+pub fn select_rect_begin_ex(allow_switch: bool, timeout: Option<std::time::Duration>, done: impl FnOnce(SelectOutcome) + 'static) -> bool {
+    type Cb = Box<dyn FnOnce(SelectOutcome)>;
+    unsafe extern "C" fn trampoline(ctx: *mut libc::c_void, result: i32, x: f64, y: f64, w: f64, h: f64) {
+        let cb: Box<Cb> = unsafe { Box::from_raw(ctx as *mut Cb) };
+        cb(match result {
+            1 => SelectOutcome::Selected(Rect::new(x, y, w, h)),
+            2 => SelectOutcome::Switch,
+            _ => SelectOutcome::Cancelled,
+        });
+    }
+    let boxed: Box<Cb> = Box::new(Box::new(done));
+    let ctx = Box::into_raw(boxed);
+    let secs = timeout.map(|t| t.as_secs_f64().max(0.5)).unwrap_or(0.0);
+    let started = unsafe { ffi::bugle_select_rect_begin_ex(trampoline, ctx as *mut libc::c_void, allow_switch as i32, secs) } == 1;
+    if !started {
+        drop(unsafe { Box::from_raw(ctx) });
+    }
+    started
+}
+
+/// Hand keyboard focus back to the app the user was in (`[NSApp deactivate]`).
+/// Main thread only.
+pub fn app_deactivate() {
+    unsafe { ffi::bugle_app_deactivate() }
+}
+
 /// Whether a selection overlay is currently on screen.
 pub fn select_rect_active() -> bool {
     unsafe { ffi::bugle_select_rect_active() == 1 }
@@ -410,6 +452,13 @@ pub fn select_rect_active() -> bool {
 /// Dismiss the selection overlay as if Esc was pressed. Main thread only.
 pub fn select_rect_cancel() {
     unsafe { ffi::bugle_select_rect_cancel() }
+}
+
+/// Do what Space does in a selection opened by [`select_rect_begin_ex`] with
+/// `allow_switch`: end it with [`SelectOutcome::Switch`] unless a drag is in
+/// progress. Otherwise nothing. Main thread only.
+pub fn select_rect_switch() {
+    unsafe { ffi::bugle_select_rect_switch() }
 }
 
 /// Show a pin window and return immediately; it stays until the user closes

@@ -31,9 +31,9 @@ fn rect_schema() -> Value {
 fn target_schema() -> Value {
     json!({
         "type":"object",
-        "description":"What to capture. kind=screen (optional display id), window (id, or title/owner substring; omit all for the front-most window), area (rect in screen points), interactive (user drags a selection), all_screens.",
+        "description":"What to capture. kind=screen (optional display id), window (id, or title/owner substring; omit all for the front-most window), area (rect in screen points), interactive (user drags a selection), pick_window (user clicks a window in the hover-highlight picker; only when the Bugle menu-bar app serves the API, otherwise an error), all_screens.",
         "properties":{
-            "kind":{"type":"string","enum":["screen","window","area","interactive","all_screens"]},
+            "kind":{"type":"string","enum":["screen","window","area","interactive","pick_window","all_screens"]},
             "display":{"type":"integer"},
             "id":{"type":"integer"},
             "title":{"type":"string"},
@@ -443,8 +443,9 @@ pub fn status_for(err: &anyhow::Error) -> u16 {
         Some(E::PermissionDenied) => 403,
         Some(E::NoSuchDisplay(_)) | Some(E::NoSuchWindow(_)) | Some(E::MediaNotFound(_)) => 404,
         Some(E::Invalid(_)) | Some(E::ProviderNotConfigured(_)) => 400,
-        Some(E::Cancelled) => 409,
+        Some(E::Cancelled) | Some(E::Busy(_)) => 409,
         Some(E::Unsupported(_)) => 501,
+        Some(E::NoUiHost(_)) => 503,
         None => {
             if err.chain().any(|e| e.downcast_ref::<serde_json::Error>().is_some()) {
                 400
@@ -526,8 +527,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn pick_window_is_in_the_target_schema() {
+        for name in ["capture", "record_start"] {
+            let spec = catalog().into_iter().find(|t| t.name == name).unwrap();
+            let kinds = &spec.input_schema["properties"]["target"]["properties"]["kind"]["enum"];
+            assert!(kinds.as_array().unwrap().contains(&json!("pick_window")), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_window_without_a_ui_host_is_503() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = bugle_core::Config::default();
+        cfg.general.save_dir = tmp.path().join("save").display().to_string();
+        cfg.general.history_path = Some(tmp.path().join("history.jsonl").display().to_string());
+        let engine = Arc::new(Engine::new(cfg, false).unwrap());
+        for (name, args) in [
+            ("capture", json!({"target": {"kind": "pick_window"}})),
+            ("record_start", json!({"target": {"kind": "pick_window"}, "format": "mp4"})),
+        ] {
+            let err = run(&engine, name, args).await.err().unwrap();
+            assert_eq!(status_for(&err), 503, "{name}: {err:#}");
+            assert!(format!("{err:#}").contains("menu-bar app"), "{name}: {err:#}");
+        }
+    }
+
+    #[test]
     fn status_codes() {
         assert_eq!(status_for(&BugleError::Cancelled.into()), 409);
+        assert_eq!(status_for(&BugleError::NoUiHost("x".into()).into()), 503);
+        assert_eq!(status_for(&BugleError::Busy("x".into()).into()), 409);
         assert_eq!(status_for(&BugleError::PermissionDenied.into()), 403);
         assert_eq!(status_for(&BugleError::MediaNotFound("x".into()).into()), 404);
         assert_eq!(status_for(&anyhow!("boom")), 500);

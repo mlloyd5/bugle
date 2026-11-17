@@ -55,6 +55,10 @@ pub enum CaptureTarget {
     Area { rect: Rect },
     /// Let the user drag a selection with the system crosshair.
     Interactive,
+    /// Let the user click a window with the menu-bar app's hover-highlight
+    /// picker. Needs `bugle-app` hosting the engine (its Agent API); other
+    /// front ends answer with [`crate::BugleError::NoUiHost`].
+    PickWindow,
     /// All displays stitched side by side.
     AllScreens,
 }
@@ -377,5 +381,14 @@ mod tests {
         assert!(j.contains("\"kind\":\"area\""));
         let back: CaptureTarget = serde_json::from_str(&j).unwrap();
         assert_eq!(back, t);
+    }
+
+    #[test]
+    fn pick_window_target_parses() {
+        let t: CaptureTarget = serde_json::from_str(r#"{"kind":"pick_window"}"#).unwrap();
+        assert_eq!(t, CaptureTarget::PickWindow);
+        assert_eq!(serde_json::to_string(&t).unwrap(), r#"{"kind":"pick_window"}"#);
+        let req: RecordRequest = serde_json::from_str(r#"{"target":{"kind":"pick_window"},"format":"gif"}"#).unwrap();
+        assert_eq!(req.target, CaptureTarget::PickWindow);
     }
 }
