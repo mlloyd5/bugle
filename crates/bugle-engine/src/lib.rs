@@ -63,6 +63,9 @@ impl Engine {
         if let Err(e) = config.sync.validate() {
             tracing::warn!("{e:#}; media that would sync there is not synced until the config is fixed");
         }
+        if let Err(e) = config.recordings.mix.validate() {
+            tracing::warn!("[recordings] {e}; mixed recordings are refused until the config is fixed");
+        }
         for w in config.sync.warnings() {
             tracing::warn!("{w}");
         }

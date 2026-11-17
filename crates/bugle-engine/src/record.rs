@@ -10,7 +10,8 @@
 
 use crate::Engine;
 use anyhow::{anyhow, bail, Context, Result};
-use bugle_core::config::RecordingBackend;
+use bugle_core::audio_mix::AudioMixConfig;
+use bugle_core::config::{RecordingBackend, RecordingConfig};
 use bugle_platform::{SckRecordOptions, SckRecorder};
 use bugle_core::{BugleError, CaptureTarget, MediaItem, MediaKind, Rect, RecordRequest, RecordingFormat, RecordingState, RecordingStatus};
 use chrono::Utc;
@@ -63,8 +64,8 @@ enum Backend {
     Video { child: std::process::Child, wants_mp4: bool },
     /// ScreenCaptureKit stream written by AVAssetWriter. Always produces an
     /// MP4; a `.mov` request is remuxed afterwards. `rec` is `None` once
-    /// stopped.
-    Sck { rec: Option<SckRecorder>, wants_mov: bool, mix_audio: bool },
+    /// stopped. `mix_audio` holds the levels when the tracks are mixed.
+    Sck { rec: Option<SckRecorder>, wants_mov: bool, mix_audio: Option<AudioMixConfig> },
 }
 
 impl Backend {
@@ -239,8 +240,25 @@ fn keep_raw_after_failed_export(tmp: &Path, output: &Path, ext: &str, e: anyhow:
     }
 }
 
-/// The audio mixer: `bugle_platform::mix_audio_tracks` (a parameter so the
-/// tests can make it fail).
+/// Levels for the mixed track when `req` (or the config) asks for one: the
+/// `[recordings]` levels with the request's overrides on top. Levels given
+/// without mixing do nothing, which is worth a warning; out-of-range levels
+/// are an invalid request.
+fn mix_levels(cfg: &RecordingConfig, req: &RecordRequest) -> Result<Option<AudioMixConfig>> {
+    let mixing = req.mix_audio || cfg.mix_audio;
+    if !mixing {
+        if !req.mix.is_empty() {
+            tracing::warn!("audio levels and ducking apply to the mixed track; they are ignored without mix_audio");
+        }
+        return Ok(None);
+    }
+    let levels = cfg.mix.with(&req.mix);
+    levels.validate().map_err(|e| BugleError::Invalid(format!("audio mix: {e}")))?;
+    Ok(Some(levels))
+}
+
+/// The audio mixer: `bugle_platform::mix_audio_tracks_with` at the
+/// recording's levels (a parameter so the tests can make it fail).
 type MixFn<'a> = &'a dyn Fn(&Path, &Path) -> Result<bool>;
 
 /// Check that `mixed`, a mix of `src`, is complete before it replaces
@@ -457,7 +475,7 @@ impl Engine {
                 let output = self.output_path(req.output.as_deref(), if wants_mp4 { "mp4" } else { "mov" }, &vars);
                 let microphone = req.microphone || self.config.recordings.microphone;
                 let system_audio = req.system_audio || self.config.recordings.system_audio;
-                let mix_audio = req.mix_audio || self.config.recordings.mix_audio;
+                let mix_audio = mix_levels(&self.config.recordings, req)?;
                 let highlight_clicks = req.highlight_clicks || self.config.recordings.highlight_clicks;
                 let sck_available = bugle_platform::sck_record_available();
                 let use_sck = match self.config.recordings.backend {
@@ -475,7 +493,7 @@ impl Engine {
                         system_audio && sck_available
                     }
                 };
-                if mix_audio && !(use_sck && microphone && system_audio) {
+                if mix_audio.is_some() && !(use_sck && microphone && system_audio) {
                     tracing::warn!(
                         "mix_audio has nothing to mix: it needs both the microphone and system audio, recorded by the ScreenCaptureKit recorder"
                     );
@@ -653,7 +671,9 @@ impl Engine {
                     let _ = std::fs::remove_file(&written);
                     bail!("no frames were captured");
                 }
-                finish_stream_file(&written, &active.output, wants_mov, mix_audio, &bugle_platform::mix_audio_tracks)?;
+                let levels = mix_audio.unwrap_or_default();
+                let mix = |src: &Path, dst: &Path| bugle_platform::mix_audio_tracks_with(src, dst, &levels);
+                finish_stream_file(&written, &active.output, wants_mov, mix_audio.is_some(), &mix)?;
                 MediaKind::Video
             }
         };
@@ -900,7 +920,7 @@ mod tests {
 
     #[test]
     fn sck_deadline_counts_as_finished_and_elapsed_is_capped() {
-        let mut a = active(Backend::Sck { rec: None, wants_mov: false, mix_audio: false }, PathBuf::from("/nonexistent/x.mp4"), Some(0.01));
+        let mut a = active(Backend::Sck { rec: None, wants_mov: false, mix_audio: None }, PathBuf::from("/nonexistent/x.mp4"), Some(0.01));
         a.started -= Duration::from_secs(3);
         assert_eq!(a.poll(), RecordingState::Finishing);
         assert_eq!(a.elapsed_seconds(), 0.01);
@@ -957,6 +977,28 @@ mod tests {
         assert!(engine.record_stop().is_err());
         assert!(!out.exists());
         assert!(engine.record_stop().is_err(), "slot is free after a failed stop");
+    }
+
+    #[test]
+    fn mix_levels_merge_config_and_request() {
+        let mut cfg = RecordingConfig::default();
+        cfg.mix.system_audio_gain = 0.5;
+        let mut req = RecordRequest::default();
+        // No mixing: no levels, whatever the request says.
+        req.mix.microphone_gain = Some(2.0);
+        assert_eq!(mix_levels(&cfg, &req).unwrap(), None);
+        // Mixing from the request or the config: config levels, request on top.
+        req.mix_audio = true;
+        let l = mix_levels(&cfg, &req).unwrap().unwrap();
+        assert_eq!((l.microphone_gain, l.system_audio_gain, l.ducking), (2.0, 0.5, false));
+        req.mix_audio = false;
+        cfg.mix_audio = true;
+        req.mix.ducking = Some(true);
+        assert!(mix_levels(&cfg, &req).unwrap().unwrap().ducking);
+        // Out of range is an invalid request.
+        req.mix.microphone_gain = Some(100.0);
+        let e = mix_levels(&cfg, &req).unwrap_err();
+        assert!(matches!(e.downcast_ref::<BugleError>(), Some(BugleError::Invalid(_))), "{e}");
     }
 
     use bugle_platform::{audio_track_count, mix_audio_tracks, video_track_count, write_tone_fixture, ToneFixture};

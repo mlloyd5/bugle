@@ -89,6 +89,9 @@ pub struct RecordingConfig {
     /// Fold the microphone and system-audio tracks into one when both are
     /// recorded (otherwise they are two AAC tracks).
     pub mix_audio: bool,
+    /// Levels and ducking for the mixed track (flat `[recordings]` keys).
+    #[serde(flatten)]
+    pub mix: crate::audio_mix::AudioMixConfig,
     pub highlight_clicks: bool,
     pub retina: bool,
     pub backend: RecordingBackend,
@@ -232,6 +235,7 @@ impl Default for RecordingConfig {
             microphone: false,
             system_audio: false,
             mix_audio: false,
+            mix: Default::default(),
             highlight_clicks: false,
             retina: true,
             backend: RecordingBackend::Auto,
