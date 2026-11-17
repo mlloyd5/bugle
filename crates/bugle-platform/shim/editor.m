@@ -1,14 +1,20 @@
 // Bugle markup editor window.
 //
-// A regular window with a toolbar (tools, colours, stroke sizes, undo/redo,
-// Copy, Save) above a canvas that shows an image scaled to fit. The window
-// owns no editing policy: pointer and key input is reported to Rust through a
-// callback in image pixel coordinates, and Rust answers by replacing the
-// image (`bugle_editor_set_image`), the overlay drawn on top of it
-// (`bugle_editor_set_overlay`) and the toolbar state
-// (`bugle_editor_set_state`). The only thing the window does by itself is
-// host the text field for typing a label and ask before closing with
-// unsaved changes.
+// A regular window with a toolbar (tools, colours, stroke sizes, menus,
+// undo/redo, Copy, Save) above a scrollable canvas that shows an image,
+// scaled to fit or at a chosen zoom. The window owns no editing policy:
+// pointer and key input is reported to Rust through a callback in image
+// pixel coordinates, and Rust answers by replacing the image
+// (`bugle_editor_set_image`), the overlay drawn on top of it
+// (`bugle_editor_set_overlay`), the toolbar state (`bugle_editor_set_state`)
+// and the toolbar menus (`bugle_editor_set_menu`). What the window does by
+// itself is the zoom (reported as EV_SCALE), hosting the text field for
+// typing a label, and asking before closing with unsaved changes.
+//
+// The image shown can be bigger than the edited image (a canvas around it)
+// or a part of it (a crop). `bugle_editor_set_image` gives the position of
+// the edited image's pixel (0, 0) in the shown image (the origin); every
+// coordinate exchanged with Rust is in edited-image pixels.
 //
 // Main thread only; needs a running AppKit loop. One editor at a time.
 
@@ -31,20 +37,45 @@ enum {
     EV_TEXT = 7,     // text = what was typed (may be empty)
     EV_KEY = 8,      // arg = unicode scalar of an unmodified key
     EV_SCALE = 9,    // x = image pixels per point at the current zoom
+    EV_MENU = 10,    // arg = menu index << 16 | item index
 };
 enum { CMD_UNDO = 0, CMD_REDO = 1, CMD_DELETE = 2, CMD_SAVE = 3, CMD_COPY = 4, CMD_ESCAPE = 5 };
 
 // Overlay primitive kinds. Mirrored in src/editor.rs.
-enum { PRIM_POLYLINE = 0, PRIM_ARROW = 1, PRIM_RECT = 2, PRIM_ELLIPSE = 3, PRIM_FILL = 4, PRIM_SELECTION = 5, PRIM_HANDLE = 6 };
+enum {
+    PRIM_POLYLINE = 0,
+    PRIM_ARROW = 1,
+    PRIM_RECT = 2,
+    PRIM_ELLIPSE = 3,
+    PRIM_FILL = 4,
+    PRIM_SELECTION = 5,
+    PRIM_HANDLE = 6,
+    PRIM_ARROW2 = 7,  // arrow with a head at both ends
+};
+
+// Zoom steps. Mirrored in src/editor.rs (EditorZoom).
+enum { ZOOM_IN = 0, ZOOM_OUT = 1, ZOOM_ACTUAL = 2, ZOOM_FIT = 3 };
 
 static const CGFloat kToolbarHeight = 44;
 static const CGFloat kCanvasMargin = 24;
+static const CGFloat kMenuWidth = 104;
+// Longest side of the zoomed canvas, in points: bounds the backing store a
+// deep zoom into a large capture needs.
+static const CGFloat kMaxCanvasSide = 8192;
+// Zoom stops, in percent of actual pixels (one image pixel per screen pixel).
+static const CGFloat kZoomStops[] = {10, 25, 33, 50, 67, 100, 150, 200, 300, 400, 600, 800};
+static const int kZoomStopCount = sizeof(kZoomStops) / sizeof(kZoomStops[0]);
 
 @class BugleEditor;
 static BugleEditor *g_editor = nil;
 
 @interface BugleEditorCanvas : NSView
 @property(nonatomic, weak) BugleEditor *editor;
+- (CGFloat)zoom;
+- (CGFloat)fitZoom;
+- (NSRect)imageRect;
+- (NSPoint)toView:(double)x y:(double)y;
+- (void)reportScale;
 @end
 
 @interface BugleEditorWindow : NSWindow
@@ -58,27 +89,41 @@ static BugleEditor *g_editor = nil;
 
 @interface BugleEditor : NSObject <NSWindowDelegate, NSTextFieldDelegate>
 @property(nonatomic, strong) BugleEditorWindow *window;
+@property(nonatomic, strong) NSScrollView *scroll;
 @property(nonatomic, strong) BugleEditorCanvas *canvas;
 @property(nonatomic) bugle_editor_callback_t cb;
 @property(nonatomic) void *ctx;
 @property(nonatomic) bugle_editor_free_t freeCtx;
 @property(nonatomic) CGImageRef image;  // owned
-@property(nonatomic) CGFloat imgW, imgH;
+@property(nonatomic) CGFloat imgW, imgH;  // size of the shown image
+@property(nonatomic) CGFloat originX, originY;  // edited pixel (0, 0) in the shown image
 @property(nonatomic, strong) NSData *overlay;  // doubles, see bugle_editor_set_overlay
 @property(nonatomic, strong) NSSegmentedControl *tools;
 @property(nonatomic, strong) NSSegmentedControl *widths;
 @property(nonatomic, strong) NSMutableArray<BugleEditorSwatch *> *swatches;
+@property(nonatomic, strong) NSMutableArray<NSPopUpButton *> *menus;
+@property(nonatomic, strong) NSPopUpButton *zoomButton;
 @property(nonatomic, strong) NSButton *undoButton, *redoButton;
 @property(nonatomic) int32_t tool;
 @property(nonatomic) BOOL dirty;
 @property(nonatomic) BOOL closing;
 @property(nonatomic) BOOL busy;  // a save is running: no closing
 @property(nonatomic, strong) NSTextField *field;  // label being typed, or nil
+@property(nonatomic) CGFloat fieldLineHeight;
+@property(nonatomic) NSPoint fieldAnchor;  // edited-image pixels
+@property(nonatomic) CGFloat fieldFontPx;  // edited-image pixels
 @property(nonatomic) CGFloat lastScale;
+@property(nonatomic) BOOL scalePending;
+@property(nonatomic) BOOL fitMode;       // zoom follows the window size
+@property(nonatomic) CGFloat fixedZoom;  // points per shown-image pixel when not fitting
 - (void)emit:(int32_t)kind x:(double)x y:(double)y arg:(int32_t)arg text:(const char *)text;
 - (void)command:(int32_t)cmd;
 - (void)endText:(BOOL)commit;
 - (void)teardown;
+- (void)layoutCanvas;
+- (void)zoomStep:(int32_t)mode;
+- (void)setZoom:(CGFloat)z fit:(BOOL)fit anchor:(NSPoint)anchor;
+- (void)updateZoomTitle;
 @end
 
 // ---------------------------------------------------------------------------
@@ -104,21 +149,45 @@ static BugleEditor *g_editor = nil;
 @end
 
 // ---------------------------------------------------------------------------
-// Canvas
+// Canvas (the scroll view's document view)
 // ---------------------------------------------------------------------------
+
+static void draw_head(NSPoint tail, NSPoint tip, CGFloat width, NSColor *color) {
+    CGFloat dx = tip.x - tail.x, dy = tip.y - tail.y, len = hypot(dx, dy);
+    if (len <= 0.5) return;
+    dx /= len;
+    dy /= len;
+    CGFloat head = MIN(MAX(width * 4.5, 10), len), half = head * 0.45;
+    NSPoint base = NSMakePoint(tip.x - dx * head, tip.y - dy * head);
+    NSBezierPath *tri = [NSBezierPath bezierPath];
+    [tri moveToPoint:NSMakePoint(tip.x + dx * width * 0.5, tip.y + dy * width * 0.5)];
+    [tri lineToPoint:NSMakePoint(base.x - dy * half, base.y + dx * half)];
+    [tri lineToPoint:NSMakePoint(base.x + dy * half, base.y - dx * half)];
+    [tri closePath];
+    [color setFill];
+    [tri fill];
+}
 
 @implementation BugleEditorCanvas
 - (BOOL)isFlipped { return YES; }
 - (BOOL)acceptsFirstResponder { return YES; }
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
 
-/// Points per image pixel at the current size.
-- (CGFloat)zoom {
+/// Points per shown-image pixel that fit the whole image in the visible area.
+- (CGFloat)fitZoom {
     BugleEditor *e = self.editor;
     if (!e || e.imgW <= 0 || e.imgH <= 0) return 1;
-    CGFloat sx = (NSWidth(self.bounds) - 2 * kCanvasMargin) / e.imgW;
-    CGFloat sy = (NSHeight(self.bounds) - 2 * kCanvasMargin) / e.imgH;
+    NSSize clip = e.scroll ? e.scroll.contentView.bounds.size : self.bounds.size;
+    CGFloat sx = (clip.width - 2 * kCanvasMargin) / e.imgW;
+    CGFloat sy = (clip.height - 2 * kCanvasMargin) / e.imgH;
     return MAX(MIN(sx, sy), 0.01);
+}
+
+/// Points per shown-image pixel at the current zoom.
+- (CGFloat)zoom {
+    BugleEditor *e = self.editor;
+    if (!e) return 1;
+    return e.fitMode ? [self fitZoom] : e.fixedZoom;
 }
 
 - (NSRect)imageRect {
@@ -128,17 +197,21 @@ static BugleEditor *g_editor = nil;
     return NSMakeRect(floor((NSWidth(self.bounds) - w) / 2), floor((NSHeight(self.bounds) - h) / 2), w, h);
 }
 
+/// Edited-image pixel → canvas point.
 - (NSPoint)toView:(double)x y:(double)y {
+    BugleEditor *e = self.editor;
     NSRect r = [self imageRect];
     CGFloat z = [self zoom];
-    return NSMakePoint(r.origin.x + x * z, r.origin.y + y * z);
+    return NSMakePoint(r.origin.x + (x + e.originX) * z, r.origin.y + (y + e.originY) * z);
 }
 
+/// Event location → edited-image pixel.
 - (NSPoint)toImage:(NSEvent *)event {
+    BugleEditor *e = self.editor;
     NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
     NSRect r = [self imageRect];
     CGFloat z = [self zoom];
-    return NSMakePoint((p.x - r.origin.x) / z, (p.y - r.origin.y) / z);
+    return NSMakePoint((p.x - r.origin.x) / z - e.originX, (p.y - r.origin.y) / z - e.originY);
 }
 
 - (void)setFrameSize:(NSSize)size {
@@ -146,23 +219,36 @@ static BugleEditor *g_editor = nil;
     [self reportScale];
 }
 
+/// Tell Rust the new image-pixels-per-point on a later main-loop turn, so a
+/// zoom change caused by something Rust did (a new image size) never calls
+/// back into Rust while it is still busy.
 - (void)reportScale {
     BugleEditor *e = self.editor;
-    CGFloat z = [self zoom];
-    if (!e || fabs(z - e.lastScale) < 1e-6) return;
-    e.lastScale = z;
-    [e emit:EV_SCALE x:1.0 / z y:0 arg:0 text:NULL];
+    if (!e || e.scalePending) return;
+    e.scalePending = YES;
+    __weak BugleEditor *weak = e;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        BugleEditor *ed = weak;
+        if (!ed) return;
+        ed.scalePending = NO;
+        // Pixels of the shown image and of the edited one are the same size.
+        CGFloat z = [ed.canvas zoom];
+        [ed updateZoomTitle];
+        if (fabs(z - ed.lastScale) < 1e-9) return;
+        ed.lastScale = z;
+        [ed emit:EV_SCALE x:1.0 / z y:0 arg:0 text:NULL];
+    });
 }
 
 - (void)resetCursorRects {
     NSCursor *c = self.editor.tool == 0 ? [NSCursor arrowCursor] : [NSCursor crosshairCursor];
-    [self addCursorRect:[self imageRect] cursor:c];
+    [self addCursorRect:NSIntersectionRect([self imageRect], self.visibleRect) cursor:c];
 }
 
 - (void)drawRect:(NSRect)dirty {
     BugleEditor *e = self.editor;
     [[NSColor colorWithWhite:0.13 alpha:1] setFill];
-    NSRectFill(self.bounds);
+    NSRectFill(dirty);
     if (!e) return;
     NSRect r = [self imageRect];
     CGContextRef cg = [NSGraphicsContext currentContext].CGContext;
@@ -171,7 +257,9 @@ static BugleEditor *g_editor = nil;
         [[NSColor colorWithWhite:0 alpha:0.5] setFill];
         NSRectFill(NSInsetRect(r, -1, -1));
         CGContextSaveGState(cg);
-        CGContextSetInterpolationQuality(cg, kCGInterpolationHigh);
+        // Smooth when scaled down, sharp pixels when zoomed in.
+        CGContextSetInterpolationQuality(cg, [self zoom] * self.window.backingScaleFactor > 1.5 ? kCGInterpolationNone
+                                                                                              : kCGInterpolationHigh);
         CGContextTranslateCTM(cg, r.origin.x, r.origin.y + r.size.height);
         CGContextScaleCTM(cg, 1, -1);
         CGContextDrawImage(cg, CGRectMake(0, 0, r.size.width, r.size.height), e.image);
@@ -200,7 +288,8 @@ static BugleEditor *g_editor = nil;
         i += np * 2;
         switch (kind) {
             case PRIM_POLYLINE:
-            case PRIM_ARROW: {
+            case PRIM_ARROW:
+            case PRIM_ARROW2: {
                 if (np < 1) break;
                 NSBezierPath *path = [NSBezierPath bezierPath];
                 path.lineWidth = width;
@@ -211,22 +300,10 @@ static BugleEditor *g_editor = nil;
                 for (size_t k = 1; k < np; k++) [path lineToPoint:[self toView:p[2 * k] y:p[2 * k + 1]]];
                 [color setStroke];
                 [path stroke];
-                if (kind == PRIM_ARROW && np >= 2) {
+                if (kind != PRIM_POLYLINE && np >= 2) {
                     NSPoint a = [self toView:p[0] y:p[1]], b = [self toView:p[2] y:p[3]];
-                    CGFloat dx = b.x - a.x, dy = b.y - a.y, len = hypot(dx, dy);
-                    if (len > 0.5) {
-                        dx /= len;
-                        dy /= len;
-                        CGFloat head = MIN(MAX(width * 4.5, 10), len), half = head * 0.45;
-                        NSPoint base = NSMakePoint(b.x - dx * head, b.y - dy * head);
-                        NSBezierPath *tri = [NSBezierPath bezierPath];
-                        [tri moveToPoint:NSMakePoint(b.x + dx * width * 0.5, b.y + dy * width * 0.5)];
-                        [tri lineToPoint:NSMakePoint(base.x - dy * half, base.y + dx * half)];
-                        [tri lineToPoint:NSMakePoint(base.x + dy * half, base.y - dx * half)];
-                        [tri closePath];
-                        [color setFill];
-                        [tri fill];
-                    }
+                    draw_head(a, b, width, color);
+                    if (kind == PRIM_ARROW2) draw_head(b, a, width, color);
                 }
                 break;
             }
@@ -287,12 +364,31 @@ static int32_t mouse_flags(NSEvent *e) { return (e.modifierFlags & NSEventModifi
     [e emit:EV_DOWN x:p.x y:p.y arg:mouse_flags(event) | ((int32_t)MIN(event.clickCount, 3) << 8) text:NULL];
 }
 - (void)mouseDragged:(NSEvent *)event {
+    // Zoomed in: dragging past the edge scrolls.
+    [self autoscroll:event];
     NSPoint p = [self toImage:event];
     [self.editor emit:EV_DRAG x:p.x y:p.y arg:mouse_flags(event) text:NULL];
 }
 - (void)mouseUp:(NSEvent *)event {
     NSPoint p = [self toImage:event];
     [self.editor emit:EV_UP x:p.x y:p.y arg:mouse_flags(event) text:NULL];
+}
+
+- (void)magnifyWithEvent:(NSEvent *)event {
+    BugleEditor *e = self.editor;
+    CGFloat z = [self zoom] * (1 + event.magnification);
+    [e setZoom:z fit:NO anchor:[self convertPoint:event.locationInWindow fromView:nil]];
+}
+
+/// Two-finger double tap: fit ↔ actual size.
+- (void)smartMagnifyWithEvent:(NSEvent *)event {
+    BugleEditor *e = self.editor;
+    if (e.fitMode) {
+        CGFloat backing = MAX(1.0, self.window.backingScaleFactor);
+        [e setZoom:1.0 / backing fit:NO anchor:[self convertPoint:event.locationInWindow fromView:nil]];
+    } else {
+        [e zoomStep:ZOOM_FIT];
+    }
 }
 
 - (void)keyDown:(NSEvent *)event {
@@ -355,6 +451,14 @@ static int32_t mouse_flags(NSEvent *e) { return (e.modifierFlags & NSEventModifi
         [e command:CMD_COPY];
     } else if ([key isEqualToString:@"w"]) {
         [self performClose:nil];
+    } else if ([key isEqualToString:@"="] || [key isEqualToString:@"+"]) {
+        [e zoomStep:ZOOM_IN];
+    } else if ([key isEqualToString:@"-"]) {
+        [e zoomStep:ZOOM_OUT];
+    } else if ([key isEqualToString:@"0"]) {
+        [e zoomStep:ZOOM_FIT];
+    } else if ([key isEqualToString:@"1"]) {
+        [e zoomStep:ZOOM_ACTUAL];
     } else {
         return [super performKeyEquivalent:event];
     }
@@ -378,33 +482,187 @@ static int32_t mouse_flags(NSEvent *e) { return (e.modifierFlags & NSEventModifi
 
 - (void)command:(int32_t)cmd { [self emit:EV_COMMAND x:0 y:0 arg:cmd text:NULL]; }
 
-- (void)toolPicked:(NSSegmentedControl *)sender { [self emit:EV_TOOL x:0 y:0 arg:(int32_t)sender.selectedSegment text:NULL]; }
+- (void)toolPicked:(NSSegmentedControl *)sender {
+    if (self.field) [self endText:YES];
+    [self emit:EV_TOOL x:0 y:0 arg:(int32_t)sender.selectedSegment text:NULL];
+}
 - (void)widthPicked:(NSSegmentedControl *)sender { [self emit:EV_WIDTH x:0 y:0 arg:(int32_t)sender.selectedSegment text:NULL]; }
 - (void)colorPicked:(NSButton *)sender { [self emit:EV_COLOR x:0 y:0 arg:(int32_t)sender.tag text:NULL]; }
+- (void)menuPicked:(NSMenuItem *)sender {
+    if (self.field) [self endText:YES];
+    [self emit:EV_MENU x:0 y:0 arg:(int32_t)sender.tag text:NULL];
+}
 - (void)buttonCommand:(NSButton *)sender {
     if (self.field) [self endText:YES];
     [self command:(int32_t)sender.tag];
 }
 
+// ---- zoom ----
+
+- (CGFloat)backing { return MAX(1.0, self.window.backingScaleFactor); }
+
+/// Size the canvas for the zoom: the visible area when fitting, the scaled
+/// image plus margins (at least the visible area) otherwise.
+- (void)layoutCanvas {
+    NSSize clip = self.scroll.contentView.bounds.size;
+    NSSize size = clip;
+    if (!self.fitMode) {
+        CGFloat z = self.fixedZoom;
+        size.width = MAX(clip.width, ceil(self.imgW * z + 2 * kCanvasMargin));
+        size.height = MAX(clip.height, ceil(self.imgH * z + 2 * kCanvasMargin));
+    }
+    // Fitting never scrolls; showing scrollers only when zoomed keeps
+    // always-visible scroll bars from resizing the area being fitted.
+    self.scroll.hasHorizontalScroller = !self.fitMode;
+    self.scroll.hasVerticalScroller = !self.fitMode;
+    if (!NSEqualSizes(self.canvas.frame.size, size)) [self.canvas setFrameSize:size];
+    // A label being typed stays over its spot (this may run inside the
+    // callback, so the field is moved, never finished, here).
+    [self placeField];
+    [self.canvas setNeedsDisplayInRect:self.canvas.visibleRect];
+    [self.window invalidateCursorRectsForView:self.canvas];
+    [self.canvas reportScale];
+}
+
+- (void)clipResized:(NSNotification *)note { [self layoutCanvas]; }
+
+/// Change the zoom, keeping the image point under `anchor` (a canvas point;
+/// NaN for the middle of the visible area) where it is on screen.
+- (void)setZoom:(CGFloat)z fit:(BOOL)fit anchor:(NSPoint)anchor {
+    CGFloat backing = [self backing];
+    if (!fit) {
+        CGFloat most = kZoomStops[kZoomStopCount - 1] / 100.0 / backing;
+        if (self.imgW > 0 && self.imgH > 0) most = MIN(most, kMaxCanvasSide / MAX(self.imgW, self.imgH));
+        z = MIN(MAX(z, MIN(kZoomStops[0] / 100.0 / backing, most)), most);
+    }
+    NSRect vis = self.canvas.visibleRect;
+    NSPoint a = isnan(anchor.x) ? NSMakePoint(NSMidX(vis), NSMidY(vis)) : anchor;
+    CGFloat oldZ = [self.canvas zoom];
+    NSRect r = [self.canvas imageRect];
+    CGFloat ix = (a.x - r.origin.x) / oldZ, iy = (a.y - r.origin.y) / oldZ;
+    CGFloat offX = a.x - vis.origin.x, offY = a.y - vis.origin.y;
+    self.fitMode = fit;
+    if (!fit) self.fixedZoom = z;
+    [self layoutCanvas];
+    if (!fit) {
+        NSRect nr = [self.canvas imageRect];
+        CGFloat nz = [self.canvas zoom];
+        [self.canvas scrollPoint:NSMakePoint(nr.origin.x + ix * nz - offX, nr.origin.y + iy * nz - offY)];
+    }
+    [self updateZoomTitle];
+}
+
+- (void)zoomStep:(int32_t)mode {
+    CGFloat backing = [self backing];
+    CGFloat pct = [self.canvas zoom] * backing * 100;
+    CGFloat target = pct;
+    switch (mode) {
+        case ZOOM_FIT:
+            return [self setZoom:0 fit:YES anchor:NSMakePoint(NAN, NAN)];
+        case ZOOM_ACTUAL:
+            target = 100;
+            break;
+        case ZOOM_IN:
+            target = kZoomStops[kZoomStopCount - 1];
+            for (int i = 0; i < kZoomStopCount; i++) {
+                if (kZoomStops[i] > pct * 1.01) {
+                    target = kZoomStops[i];
+                    break;
+                }
+            }
+            break;
+        case ZOOM_OUT:
+            target = kZoomStops[0];
+            for (int i = kZoomStopCount - 1; i >= 0; i--) {
+                if (kZoomStops[i] < pct * 0.99) {
+                    target = kZoomStops[i];
+                    break;
+                }
+            }
+            break;
+        default:
+            return;
+    }
+    [self setZoom:target / 100.0 / backing fit:NO anchor:NSMakePoint(NAN, NAN)];
+}
+
+- (void)zoomPicked:(NSMenuItem *)sender { [self zoomStep:(int32_t)sender.tag]; }
+
+- (void)updateZoomTitle {
+    if (!self.zoomButton || self.zoomButton.numberOfItems == 0) return;
+    CGFloat pct = [self.canvas zoom] * [self backing] * 100;
+    NSString *t = self.fitMode ? [NSString stringWithFormat:@"Fit (%.0f%%)", pct] : [NSString stringWithFormat:@"%.0f%%", pct];
+    [self.zoomButton itemAtIndex:0].title = t;
+}
+
 // ---- label text field ----
 
-- (void)beginTextAt:(NSPoint)at fontPx:(double)fontPx initial:(NSString *)initial color:(NSColor *)color {
-    if (self.field) {
-        // Replaced without a report: this runs inside the callback, which
-        // must not be re-entered.
-        NSTextField *old = self.field;
-        self.field = nil;
-        old.delegate = nil;
-        [old removeFromSuperview];
+static NSUInteger line_count(NSString *s) {
+    NSUInteger n = 1;
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (c == '\r' && i + 1 < s.length && [s characterAtIndex:i + 1] == '\n') continue;
+        if (c == '\n' || c == '\r' || c == 0x2028 || c == 0x2029) n++;
     }
-    CGFloat z = [self.canvas zoom];
-    CGFloat size = MAX(9, fontPx * z);
-    NSFont *font = [NSFont fontWithName:@"Arial-BoldMT" size:size] ?: [NSFont boldSystemFontOfSize:size];
-    NSPoint o = [self.canvas toView:at.x y:at.y];
-    CGFloat h = ceil([[NSLayoutManager new] defaultLineHeightForFont:font]) + 4;
-    CGFloat w = MAX(120, NSWidth(self.canvas.bounds) - o.x - 8);
-    NSTextField *f = [[NSTextField alloc] initWithFrame:NSMakeRect(o.x - 2, o.y - 2, w, h)];
-    f.font = font;
+    return n;
+}
+
+/// Size the field to what is typed: one row per line, as wide as the
+/// longest line plus room for the next characters (the renderer does not
+/// wrap, so neither does the field; it grows instead of clipping).
+- (void)fitField {
+    NSTextField *f = self.field;
+    if (!f) return;
+    NSString *s = (f.currentEditor ? f.currentEditor.string : f.stringValue) ?: @"";
+    NSString *flat = [[s stringByReplacingOccurrencesOfString:@"\r\n" withString:@"\n"]
+        stringByReplacingOccurrencesOfString:@"\r" withString:@"\n"];
+    NSDictionary *attrs = @{NSFontAttributeName : f.font};
+    CGFloat widest = [f.placeholderString sizeWithAttributes:attrs].width;
+    for (NSString *line in [flat componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+        widest = MAX(widest, [line sizeWithAttributes:attrs].width);
+    }
+    NSRect fr = f.frame;
+    fr.size.width = ceil(widest + 2 * self.fieldLineHeight);
+    fr.size.height = line_count(s) * self.fieldLineHeight + 4;
+    if (!NSEqualRects(fr, f.frame)) f.frame = fr;
+    // Zoomed in, keep the caret's end of the field in view.
+    if (f.currentEditor) [f.currentEditor scrollRangeToVisible:f.currentEditor.selectedRange];
+}
+
+/// Put the field over its anchor at the current zoom and image origin.
+- (void)placeField {
+    NSTextField *f = self.field;
+    if (!f) return;
+    CGFloat size = MAX(9, self.fieldFontPx * [self.canvas zoom]);
+    if (fabs(f.font.pointSize - size) > 0.01) {
+        NSFont *font = [NSFont fontWithName:@"Arial-BoldMT" size:size] ?: [NSFont boldSystemFontOfSize:size];
+        self.fieldLineHeight = ceil([[NSLayoutManager new] defaultLineHeightForFont:font]);
+        f.font = font;
+        // The field editor of a field being typed in keeps its own font.
+        NSText *editor = f.currentEditor;
+        if (editor) editor.font = font;
+    }
+    NSPoint o = [self.canvas toView:self.fieldAnchor.x y:self.fieldAnchor.y];
+    [f setFrameOrigin:NSMakePoint(o.x - 2, o.y - 2)];
+    [self fitField];
+}
+
+/// Drop the field without reporting it (the text was reported some other way).
+- (void)discardField {
+    NSTextField *old = self.field;
+    if (!old) return;
+    self.field = nil;
+    old.delegate = nil;
+    [old removeFromSuperview];
+}
+
+- (void)beginTextAt:(NSPoint)at fontPx:(double)fontPx initial:(NSString *)initial color:(NSColor *)color {
+    // Replaced without a report: this runs inside the callback, which must
+    // not be re-entered.
+    [self discardField];
+    self.fieldAnchor = at;
+    self.fieldFontPx = fontPx;
+    NSTextField *f = [[NSTextField alloc] initWithFrame:NSZeroRect];
     f.textColor = color;
     f.stringValue = initial ?: @"";
     f.bordered = NO;
@@ -412,12 +670,16 @@ static int32_t mouse_flags(NSEvent *e) { return (e.modifierFlags & NSEventModifi
     f.drawsBackground = YES;
     f.backgroundColor = [NSColor colorWithWhite:0 alpha:0.35];
     f.focusRingType = NSFocusRingTypeNone;
-    f.placeholderString = @"Type, then Return";
+    f.placeholderString = @"Type; ⇧↩ new line, ↩ done";
+    // Several lines, each as long as it is typed: the renderer does not wrap.
+    f.usesSingleLineMode = NO;
+    f.lineBreakMode = NSLineBreakByClipping;
     f.cell.wraps = NO;
-    f.cell.scrollable = YES;
+    f.cell.scrollable = NO;
     f.delegate = self;
     [self.canvas addSubview:f];
     self.field = f;
+    [self placeField];
     [self.window makeFirstResponder:f];
 }
 
@@ -435,7 +697,18 @@ static int32_t mouse_flags(NSEvent *e) { return (e.modifierFlags & NSEventModifi
 
 - (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)sel {
     if (sel == @selector(insertNewline:)) {
-        [self endText:YES];
+        // ⇧↩ (and ⌥↩, below) start a new line; a plain ↩ finishes.
+        if (NSApp.currentEvent.modifierFlags & (NSEventModifierFlagShift | NSEventModifierFlagOption)) {
+            [textView insertNewlineIgnoringFieldEditor:self];
+            [self fitField];
+        } else {
+            [self endText:YES];
+        }
+        return YES;
+    }
+    if (sel == @selector(insertNewlineIgnoringFieldEditor:)) {
+        [textView insertNewlineIgnoringFieldEditor:self];
+        [self fitField];
         return YES;
     }
     if (sel == @selector(cancelOperation:)) {
@@ -443,6 +716,10 @@ static int32_t mouse_flags(NSEvent *e) { return (e.modifierFlags & NSEventModifi
         return YES;
     }
     return NO;
+}
+
+- (void)controlTextDidChange:(NSNotification *)note {
+    if (note.object == self.field) [self fitField];
 }
 
 - (void)controlTextDidEndEditing:(NSNotification *)note {
@@ -485,6 +762,7 @@ static int32_t mouse_flags(NSEvent *e) { return (e.modifierFlags & NSEventModifi
     self.closing = YES;
     __attribute__((objc_precise_lifetime)) BugleEditor *keep = self;
     if (g_editor == self) g_editor = nil;
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
     NSWindow *w = self.window;
     if (w.attachedSheet) [w endSheet:w.attachedSheet];
     w.delegate = nil;
@@ -526,14 +804,26 @@ static NSButton *symbol_button(NSString *symbol, NSString *tip, BugleEditor *tar
     return b;
 }
 
+static NSPopUpButton *pull_down(CGFloat width) {
+    NSPopUpButton *b = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0, 0, width, 24) pullsDown:YES];
+    b.bezelStyle = NSBezelStyleTexturedRounded;
+    // Check marks come from Rust only (`bugle_editor_set_menu`).
+    ((NSPopUpButtonCell *)b.cell).altersStateOfSelectedItem = NO;
+    [b.widthAnchor constraintEqualToConstant:width].active = YES;
+    [b addItemWithTitle:@""];
+    return b;
+}
+
 /// Open the editor for an image of `img_w` x `img_h` pixels. `tool_labels`
 /// and `tool_symbols` (SF Symbol names) describe the tool buttons, `colors`
-/// (0xRRGGBBAA) the swatches, `width_labels` the stroke sizes. Returns 1, or
-/// 0 when an editor is already open (the context is not taken then).
+/// (0xRRGGBBAA) the swatches, `width_labels` the stroke sizes, `n_menus` the
+/// number of toolbar pull-down menus (filled by `bugle_editor_set_menu`).
+/// Returns 1, or 0 when an editor is already open (the context is not taken
+/// then).
 int32_t bugle_editor_open(const char *title, uint32_t img_w, uint32_t img_h, const char *const *tool_labels,
                           const char *const *tool_symbols, int32_t n_tools, const uint32_t *colors, int32_t n_colors,
-                          const char *const *width_labels, int32_t n_widths, bugle_editor_callback_t cb, void *ctx,
-                          bugle_editor_free_t free_ctx) {
+                          const char *const *width_labels, int32_t n_widths, int32_t n_menus, bugle_editor_callback_t cb,
+                          void *ctx, bugle_editor_free_t free_ctx) {
     @autoreleasepool {
         if (g_editor || !cb || img_w == 0 || img_h == 0) return 0;
         NSApplication *app = [NSApplication sharedApplication];
@@ -543,45 +833,10 @@ int32_t bugle_editor_open(const char *title, uint32_t img_w, uint32_t img_h, con
         e.freeCtx = free_ctx;
         e.imgW = img_w;
         e.imgH = img_h;
+        e.fitMode = YES;
+        e.fixedZoom = 1;
 
-        // Size the canvas so the image shows at its natural (Retina) size
-        // when it fits, and scaled down to most of the screen when not.
-        NSScreen *screen = [NSScreen mainScreen] ?: [NSScreen screens].firstObject;
-        NSRect vf = screen.visibleFrame;
-        CGFloat backing = MAX(1.0, screen.backingScaleFactor);
-        CGFloat maxW = NSWidth(vf) * 0.86 - 2 * kCanvasMargin, maxH = NSHeight(vf) * 0.86 - kToolbarHeight - 2 * kCanvasMargin - 28;
-        CGFloat natW = img_w / backing, natH = img_h / backing;
-        CGFloat fit = MIN(1.0, MIN(maxW / natW, maxH / natH));
-        CGFloat cw = MAX(860, ceil(natW * fit) + 2 * kCanvasMargin), ch = MAX(380, ceil(natH * fit) + 2 * kCanvasMargin);
-        NSRect content = NSMakeRect(0, 0, cw, ch + kToolbarHeight);
-
-        BugleEditorWindow *win = [[BugleEditorWindow alloc]
-            initWithContentRect:content
-                      styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable |
-                                NSWindowStyleMaskMiniaturizable
-                        backing:NSBackingStoreBuffered
-                          defer:NO];
-        win.releasedWhenClosed = NO;
-        win.title = str(title);
-        win.minSize = NSMakeSize(860, 360);
-        win.editor = e;
-        win.delegate = e;
-        e.window = win;
-
-        NSView *root = [[NSView alloc] initWithFrame:content];
-        BugleEditorCanvas *canvas = [[BugleEditorCanvas alloc] initWithFrame:NSMakeRect(0, 0, cw, ch)];
-        canvas.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-        canvas.wantsLayer = YES;
-        canvas.editor = e;
-        e.canvas = canvas;
-        [root addSubview:canvas];
-
-        NSVisualEffectView *bar = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, ch, cw, kToolbarHeight)];
-        bar.material = NSVisualEffectMaterialTitlebar;
-        bar.blendingMode = NSVisualEffectBlendingModeWithinWindow;
-        bar.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
-        [root addSubview:bar];
-
+        // ---- toolbar (built first: its width sets the window's minimum) ----
         NSSegmentedControl *tools = [[NSSegmentedControl alloc] initWithFrame:NSZeroRect];
         tools.segmentCount = n_tools;
         tools.trackingMode = NSSegmentSwitchTrackingSelectOne;
@@ -592,7 +847,7 @@ int32_t bugle_editor_open(const char *title, uint32_t img_w, uint32_t img_h, con
             if (img) [tools setImage:img forSegment:i];
             else [tools setLabel:label forSegment:i];
             [tools setToolTip:label forSegment:i];
-            [tools setWidth:30 forSegment:i];
+            [tools setWidth:28 forSegment:i];
         }
         tools.target = e;
         tools.action = @selector(toolPicked:);
@@ -604,7 +859,7 @@ int32_t bugle_editor_open(const char *title, uint32_t img_w, uint32_t img_h, con
         e.swatches = [NSMutableArray array];
         for (int32_t i = 0; i < n_colors; i++) {
             uint32_t c = colors[i];
-            BugleEditorSwatch *s = [[BugleEditorSwatch alloc] initWithFrame:NSMakeRect(0, 0, 22, 22)];
+            BugleEditorSwatch *s = [[BugleEditorSwatch alloc] initWithFrame:NSMakeRect(0, 0, 21, 22)];
             s.color = [NSColor colorWithSRGBRed:((c >> 24) & 0xFF) / 255.0
                                           green:((c >> 16) & 0xFF) / 255.0
                                            blue:((c >> 8) & 0xFF) / 255.0
@@ -614,7 +869,7 @@ int32_t bugle_editor_open(const char *title, uint32_t img_w, uint32_t img_h, con
             s.tag = i;
             s.target = e;
             s.action = @selector(colorPicked:);
-            [s.widthAnchor constraintEqualToConstant:22].active = YES;
+            [s.widthAnchor constraintEqualToConstant:21].active = YES;
             [s.heightAnchor constraintEqualToConstant:22].active = YES;
             [swatches addArrangedSubview:s];
             [e.swatches addObject:s];
@@ -626,29 +881,110 @@ int32_t bugle_editor_open(const char *title, uint32_t img_w, uint32_t img_h, con
         widths.segmentStyle = NSSegmentStyleTexturedRounded;
         for (int32_t i = 0; i < n_widths; i++) {
             [widths setLabel:str(width_labels[i]) forSegment:i];
-            [widths setWidth:26 forSegment:i];
+            [widths setWidth:24 forSegment:i];
         }
         [widths setToolTip:@"Stroke and text size" forSegment:0];
         widths.target = e;
         widths.action = @selector(widthPicked:);
         e.widths = widths;
 
+        NSMutableArray<NSView *> *row = [NSMutableArray arrayWithObjects:tools, swatches, widths, nil];
+        e.menus = [NSMutableArray array];
+        for (int32_t i = 0; i < MAX(0, MIN(n_menus, 8)); i++) {
+            NSPopUpButton *m = pull_down(kMenuWidth);
+            m.enabled = NO;
+            [e.menus addObject:m];
+            [row addObject:m];
+        }
+
         e.undoButton = symbol_button(@"arrow.uturn.backward", @"Undo (⌘Z)", e, CMD_UNDO);
         e.redoButton = symbol_button(@"arrow.uturn.forward", @"Redo (⇧⌘Z)", e, CMD_REDO);
         NSView *spacer = [[NSView alloc] initWithFrame:NSZeroRect];
         [spacer setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
-        NSButton *copy = text_button(@"Copy", e, CMD_COPY);
-        copy.toolTip = @"Copy the annotated image (⌘C)";
+        NSButton *copy = symbol_button(@"doc.on.doc", @"Copy the annotated image (⌘C)", e, CMD_COPY);
         NSButton *save = text_button(@"Save", e, CMD_SAVE);
         save.toolTip = @"Save an annotated copy (⌘S)";
         save.keyEquivalent = @"";
+        [row addObjectsFromArray:@[ e.undoButton, e.redoButton, spacer, copy, save ]];
 
-        NSStackView *stack = [NSStackView stackViewWithViews:@[ tools, swatches, widths, e.undoButton, e.redoButton, spacer, copy, save ]];
+        NSStackView *stack = [NSStackView stackViewWithViews:row];
         stack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-        stack.spacing = 10;
+        stack.spacing = 8;
         stack.distribution = NSStackViewDistributionFill;  // the spacer takes the slack: Copy and Save sit right
-        stack.edgeInsets = NSEdgeInsetsMake(0, 12, 0, 12);
+        stack.edgeInsets = NSEdgeInsetsMake(0, 10, 0, 10);
         [stack setCustomSpacing:4 afterView:e.undoButton];
+        [stack setCustomSpacing:4 afterView:copy];
+        CGFloat minW = MAX(640, ceil(stack.fittingSize.width));
+
+        // Size the canvas so the image shows at its natural (Retina) size
+        // when it fits, and scaled down to most of the screen when not.
+        NSScreen *screen = [NSScreen mainScreen] ?: [NSScreen screens].firstObject;
+        NSRect vf = screen.visibleFrame;
+        CGFloat backing = MAX(1.0, screen.backingScaleFactor);
+        CGFloat maxW = NSWidth(vf) * 0.86 - 2 * kCanvasMargin, maxH = NSHeight(vf) * 0.86 - kToolbarHeight - 2 * kCanvasMargin - 28;
+        CGFloat natW = img_w / backing, natH = img_h / backing;
+        CGFloat fit = MIN(1.0, MIN(maxW / natW, maxH / natH));
+        CGFloat cw = MAX(minW, ceil(natW * fit) + 2 * kCanvasMargin), ch = MAX(380, ceil(natH * fit) + 2 * kCanvasMargin);
+        NSRect content = NSMakeRect(0, 0, cw, ch + kToolbarHeight);
+
+        BugleEditorWindow *win = [[BugleEditorWindow alloc]
+            initWithContentRect:content
+                      styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable |
+                                NSWindowStyleMaskMiniaturizable
+                        backing:NSBackingStoreBuffered
+                          defer:NO];
+        win.releasedWhenClosed = NO;
+        win.title = str(title);
+        win.contentMinSize = NSMakeSize(minW, 300);
+        win.editor = e;
+        win.delegate = e;
+        e.window = win;
+
+        NSView *root = [[NSView alloc] initWithFrame:content];
+        NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, cw, ch)];
+        scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        scroll.hasVerticalScroller = YES;
+        scroll.hasHorizontalScroller = YES;
+        scroll.autohidesScrollers = YES;
+        scroll.borderType = NSNoBorder;
+        scroll.drawsBackground = YES;
+        scroll.backgroundColor = [NSColor colorWithWhite:0.13 alpha:1];
+        BugleEditorCanvas *canvas = [[BugleEditorCanvas alloc] initWithFrame:NSMakeRect(0, 0, cw, ch)];
+        canvas.editor = e;
+        scroll.documentView = canvas;
+        e.scroll = scroll;
+        e.canvas = canvas;
+        scroll.contentView.postsFrameChangedNotifications = YES;
+        [[NSNotificationCenter defaultCenter] addObserver:e
+                                                 selector:@selector(clipResized:)
+                                                     name:NSViewFrameDidChangeNotification
+                                                   object:scroll.contentView];
+        [root addSubview:scroll];
+
+        // Zoom control, floating in the canvas's bottom-right corner.
+        NSPopUpButton *zoom = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(cw - 124, 12, 112, 24) pullsDown:YES];
+        zoom.bezelStyle = NSBezelStyleRounded;
+        zoom.controlSize = NSControlSizeSmall;
+        zoom.font = [NSFont systemFontOfSize:[NSFont smallSystemFontSize]];
+        zoom.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+        zoom.toolTip = @"Zoom (⌘+, ⌘−, ⌘1 actual size, ⌘0 fit; pinch)";
+        [zoom addItemWithTitle:@"Fit"];
+        NSArray *zoomItems = @[ @[ @"Zoom In  ⌘+", @(ZOOM_IN) ], @[ @"Zoom Out  ⌘−", @(ZOOM_OUT) ],
+                                @[ @"Actual Size  ⌘1", @(ZOOM_ACTUAL) ], @[ @"Zoom to Fit  ⌘0", @(ZOOM_FIT) ] ];
+        for (NSArray *z in zoomItems) {
+            NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:z[0] action:@selector(zoomPicked:) keyEquivalent:@""];
+            it.target = e;
+            it.tag = [z[1] intValue];
+            [zoom.menu addItem:it];
+        }
+        e.zoomButton = zoom;
+        [root addSubview:zoom];
+
+        NSVisualEffectView *bar = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, ch, cw, kToolbarHeight)];
+        bar.material = NSVisualEffectMaterialTitlebar;
+        bar.blendingMode = NSVisualEffectBlendingModeWithinWindow;
+        bar.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+        [root addSubview:bar];
         // A stack view made this way positions itself by constraints only.
         [bar addSubview:stack];
         [NSLayoutConstraint activateConstraints:@[
@@ -661,17 +997,19 @@ int32_t bugle_editor_open(const char *title, uint32_t img_w, uint32_t img_h, con
         win.contentView = root;
         [win center];
         g_editor = e;
+        [e layoutCanvas];
+        [e updateZoomTitle];
         [win makeFirstResponder:canvas];
         [app activateIgnoringOtherApps:YES];
         [win makeKeyAndOrderFront:nil];
-        [canvas reportScale];
         return 1;
     }
 }
 
 /// Replace the image on the canvas. `rgba` is copied (RGBA8, not
-/// premultiplied, `w * h * 4` bytes).
-void bugle_editor_set_image(const uint8_t *rgba, uint32_t w, uint32_t h) {
+/// premultiplied, `w * h * 4` bytes). (`origin_x`, `origin_y`) is where the
+/// edited image's pixel (0, 0) lies in this one.
+void bugle_editor_set_image(const uint8_t *rgba, uint32_t w, uint32_t h, double origin_x, double origin_y) {
     @autoreleasepool {
         BugleEditor *e = g_editor;
         if (!e || !rgba || w == 0 || h == 0) return;
@@ -687,7 +1025,25 @@ void bugle_editor_set_image(const uint8_t *rgba, uint32_t w, uint32_t h) {
         if (!img) return;
         if (e.image) CGImageRelease(e.image);
         e.image = img;
-        [e.canvas setNeedsDisplay:YES];
+        BOOL moved = e.imgW != w || e.imgH != h || e.originX != origin_x || e.originY != origin_y;
+        // Where edited pixel (0, 0) is on screen, to keep it there.
+        NSPoint before = [e.canvas toView:0 y:0];
+        NSPoint scrolled = e.canvas.visibleRect.origin;
+        e.imgW = w;
+        e.imgH = h;
+        e.originX = origin_x;
+        e.originY = origin_y;
+        if (moved) {
+            [e layoutCanvas];
+            if (!e.fitMode) {
+                // Zoomed: a crop or canvas change must not shift what is under
+                // the pointer.
+                NSPoint after = [e.canvas toView:0 y:0];
+                [e.canvas scrollPoint:NSMakePoint(scrolled.x + after.x - before.x, scrolled.y + after.y - before.y)];
+            }
+        } else {
+            [e.canvas setNeedsDisplayInRect:e.canvas.visibleRect];
+        }
     }
 }
 
@@ -700,7 +1056,8 @@ void bugle_editor_set_overlay(const double *values, size_t n) {
         BugleEditor *e = g_editor;
         if (!e) return;
         e.overlay = (values && n) ? [NSData dataWithBytes:values length:n * sizeof(double)] : nil;
-        [e.canvas setNeedsDisplay:YES];
+        // Only what is on screen: a zoomed canvas can be far larger.
+        [e.canvas setNeedsDisplayInRect:e.canvas.visibleRect];
     }
 }
 
@@ -726,6 +1083,58 @@ void bugle_editor_set_state(int32_t tool, int32_t color, int32_t width, int32_t 
             e.tool = tool;
             [e.window invalidateCursorRectsForView:e.canvas];
         }
+    }
+}
+
+/// Replace toolbar menu `index`. `items` holds one line per item: a flag
+/// (`x` checked, `o` unchecked, `h` heading, `-` separator) and the title.
+/// Picking item i (counting every line) reports EV_MENU with
+/// `index << 16 | i`.
+void bugle_editor_set_menu(int32_t index, const char *title, const char *tip, const char *items, int32_t enabled) {
+    @autoreleasepool {
+        BugleEditor *e = g_editor;
+        if (!e || index < 0 || index >= (int32_t)e.menus.count) return;
+        NSPopUpButton *b = e.menus[index];
+        NSMenu *m = [[NSMenu alloc] init];
+        m.autoenablesItems = NO;
+        // A pull-down shows its first item as the button title.
+        [m addItem:[[NSMenuItem alloc] initWithTitle:str(title) action:nil keyEquivalent:@""]];
+        NSString *all = str(items);
+        NSArray<NSString *> *lines = all.length ? [all componentsSeparatedByString:@"\n"] : @[];
+        int32_t i = 0;
+        for (NSString *line in lines) {
+            int32_t tag = (index << 16) | (i++ & 0xFFFF);
+            if (line.length == 0) continue;
+            unichar flag = [line characterAtIndex:0];
+            NSString *t = [line substringFromIndex:1];
+            NSMenuItem *it;
+            if (flag == '-') {
+                it = [NSMenuItem separatorItem];
+            } else if (flag == 'h') {
+                if (@available(macOS 14.0, *)) {
+                    it = [NSMenuItem sectionHeaderWithTitle:t];
+                } else {
+                    it = [[NSMenuItem alloc] initWithTitle:t action:nil keyEquivalent:@""];
+                    it.enabled = NO;
+                }
+            } else {
+                it = [[NSMenuItem alloc] initWithTitle:t action:@selector(menuPicked:) keyEquivalent:@""];
+                it.target = e;
+                it.tag = tag;
+                it.state = flag == 'x' ? NSControlStateValueOn : NSControlStateValueOff;
+            }
+            [m addItem:it];
+        }
+        b.menu = m;
+        b.toolTip = str(tip);
+        b.enabled = enabled != 0;
+    }
+}
+
+/// Zoom as the keyboard shortcuts do (ZOOM_*).
+void bugle_editor_zoom(int32_t mode) {
+    @autoreleasepool {
+        [g_editor zoomStep:mode];
     }
 }
 
@@ -771,6 +1180,9 @@ void bugle_editor_focus(void) {
 /// smoke tests, which cannot click.
 void bugle_editor_inject(int32_t kind, double x, double y, int32_t arg, const char *text) {
     @autoreleasepool {
+        // Injected text stands for what the field would have reported: the
+        // field goes, as it would have.
+        if (kind == EV_TEXT) [g_editor discardField];
         [g_editor emit:kind x:x y:y arg:arg text:text];
     }
 }

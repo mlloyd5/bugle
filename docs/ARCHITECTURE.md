@@ -59,7 +59,7 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `select_rect_begin_ex`, `select_rect_switch` | the selection overlay with an optional timeout and a Space "switch" result (not while dragging); a switch from either overlay leaves Bugle active so the other can open at once |
 | `pin_image_blocking`, `pin_image_show` | floating borderless window, drag/resize/close; blocking or fire-and-forget |
 | `toast_show` | non-activating `NSPanel` with `NSVisualEffectView`, thumbnail + two lines, fades out |
-| `editor_open` (`shim/editor.m`) | markup editor window: toolbar, canvas scaled to fit, label text field, unsaved-changes sheet; reports input in image pixels through a callback and draws the image and overlay primitives it is handed |
+| `editor_open` (`shim/editor.m`) | markup editor window: toolbar with pull-down menus, canvas in an `NSScrollView` (fit, zoom stops, pinch, ⌘+/⌘−/⌘1/⌘0), multi-line label text field, unsaved-changes sheet; reports input in edited-image pixels through a callback and draws the image (told where the edited image's origin lies in it), overlay primitives and menus it is handed |
 | `panel_show` (`shim/panel.m`) | quick-access panel: non-activating, never-key `NSPanel`, thumbnail, buttons, close; reports clicks through a callback |
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
@@ -84,7 +84,12 @@ variants, which never nest a run loop.
 ### `bugle-markup`
 `Annotation` documents (serde) and a renderer. Shapes are rasterised from signed
 distance functions so strokes are anti-aliased without a vector library; text uses
-`ab_glyph` with a system font (Arial Bold → Helvetica → Geneva).
+`ab_glyph` with a system font (Arial Bold → Helvetica → Geneva), one line per
+`text_lines` entry (`\n`, `\r\n`, a lone `\r`, U+2028/U+2029). The canvas
+shadow blurs a one-channel mask with three box blurs (running sums), so its
+cost does not grow with the blur radius. `Shape::translate` and
+`Annotation::source_origin` (where source pixel (0, 0) lands after crop and
+canvas) let an editor keep shapes in original-image pixels.
 
 
 ### `bugle-ai`
@@ -404,16 +409,37 @@ off the main thread.
 
 The markup editor follows the same split. `markup_editor.rs` is the
 platform-free part: `Editor::handle` turns the window's events (pointer in
-image pixels, tool, colour, size, commands, typed text) into edits of a
-`Vec<Shape>` with snapshot undo, and answers with `Effects` saying what to
-refresh. `editor_window.rs` is the glue: it renders `Editor::document` with
-`Engine::render_annotations` and hands the pixels to the window, so the preview
-is the renderer's output; only the shape being dragged (and the selection
-marks) go to the window as overlay primitives, and a shape being moved is left
-out of the render meanwhile. Save runs `Engine::apply_annotations` on a thread
-and the window closes only once it succeeded; `shim/editor.m` frees the Rust
-handler on a later main-loop turn, so closing from inside the callback is safe.
-`--smoke-test` drives it through `editor_inject`.
+image pixels, tool, colour, size, menu picks, commands, typed text) into edits
+of the shapes, the crop and the canvas choice, with snapshot undo over all
+three, and answers with `Effects` saying what to refresh. Shapes and the crop
+stay in original-image pixels; `Editor::document` translates the shapes by the
+crop for the renderer and adds the canvas, except while the crop tool is
+picked, when the whole image is shown with the crop as an overlay.
+`Editor::menus` describes the toolbar's style menu (arrow or redaction styles,
+for the tool or the selected shape) and canvas menu (padding, background).
+`editor_window.rs` is the glue: it renders `Editor::document` with
+`Engine::render_annotations` on a per-window preview thread (only the newest
+waiting document is rendered, stale results are dropped) and hands the pixels
+and `Annotation::source_origin` to the window, so the preview is the
+renderer's output. Only the shape being dragged (and the selection or crop
+marks) go to the window as overlay primitives; a shape being moved is left out
+of the render meanwhile. After an edit that moves something from the overlay
+into the image (a shape released or finished, the crop tool left) the overlay
+waits for that render, until the next pointer input; while dragging it never
+waits. Renders, saves and copies run under `catch_unwind`, and every preview
+job answers, so a renderer failure is a toast rather than a frozen picture or
+a window stuck busy. Each picture travels with its own size and
+`source_origin`, so a click maps onto what is on screen; what can lag by one
+render is the edit state Rust applies it to (tool, crop), and image pixels
+per point lag by one main-loop turn: the window owns the zoom and reports it
+on a later turn, so nothing it does in reply to Rust calls back into Rust.
+Zoomed in, a new picture of another size or origin is scrolled so the image
+stays put under the pointer, and the zoom is capped so the canvas stays
+within 8192 points.
+Save runs `Engine::apply_annotations` on a thread and the window closes only
+once it succeeded; `shim/editor.m` frees the Rust handler on a later
+main-loop turn, so closing from inside the callback is safe. `--smoke-test`
+drives it through `editor_inject` and `editor_zoom`.
 
 ## Feature ideas
 
@@ -425,11 +451,9 @@ earn its keep.
 * **Audio mixing extras** — per-source levels and ducking work on the mixed
   track; still open: levels for the two-track (unmixed) output, and setting
   them from the menu-bar app instead of the config file.
-* **Markup editor extras** — crop and canvas (padding, background) in the
-  window, multi-line labels, arrow and redaction styles, zoom, a preview
-  render off the main thread for very large captures, and opening a second
-  editor. Also: keep the quick-access panel's thumbnails stacked when several
-  captures arrive in a row.
+* **Markup editor extras** — opening a second editor (the window shim keeps
+  one editor today). Also: keep the quick-access panel's thumbnails stacked
+  when several captures arrive in a row.
 * **Window picker extras** — Space in the Scrolling Capture selection, and the
   picker for `bugle capture` in a terminal (it needs a run loop of its own).
 * **Packaging extras** — the final bundle id; notification thumbnails

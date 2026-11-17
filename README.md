@@ -30,7 +30,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | OCR with bounding boxes | Apple Vision `VNRecognizeTextRequest` (accurate, language correction) | ✅ |
 | Scrolling capture | Vision `VNTranslationalImageRegistrationRequest` + row-profile fallback | ✅ (needs Accessibility) |
 | Annotation | Pure-Rust renderer: arrows (4 styles), boxes, ellipses, lines, freehand, text, highlight, counters, pixelate/blur/black-out/secure-blur, spotlight, crop, padding + gradient background + shadow | ✅ |
-| Markup editor | `bugle-app` window: toolbar and canvas in AppKit, editing logic in Rust, preview and saved file drawn by the annotation renderer | ✅ |
+| Markup editor | `bugle-app` window: toolbar and zoomable canvas in AppKit, editing logic in Rust, crop, canvas, arrow and redaction styles, multi-line labels; preview (on its own thread) and saved file drawn by the annotation renderer | ✅ |
 | Pin to screen | Floating AppKit panel (drag, scroll-to-resize, Esc/double-click closes) | ✅ |
 | GIF recording | In-process frame grab loop + `image` GIF encoder | ✅ |
 | Video recording | `screencapture -v` (H.264 .mov → remuxed .mp4), microphone, click highlight | ✅ |
@@ -294,7 +294,8 @@ Coordinates are image pixels. Styles can be set per shape or document-wide.
 
 Shapes: `rectangle`, `ellipse`, `line`, `arrow` (standard/double/slim/fancy),
 `freehand`, `text`, `highlight`, `counter`, `redact` (pixelate/blur/black_out/secure_blur),
-`spotlight`, `image`. Background presets: sunset, ocean, forest, candy, mono, midnight,
+`spotlight`, `image`. A `text` label breaks into lines at `\n` (also `\r\n`, a
+lone `\r`, U+2028 and U+2029). Background presets: sunset, ocean, forest, candy, mono, midnight,
 peach, mint, any `#hex`, or `gradient:#a,#b[,angle]`.
 
 ## Menu-bar app
@@ -416,7 +417,7 @@ itself when run from [the app bundle](#app-bundle)).
 
 *Annotate* on the quick-access panel and *Annotate Latest* in the menu (bind it
 with `annotate_latest` in `[hotkeys]`) open the newest screenshot in a window:
-a toolbar above the image, which is scaled to fit and never cropped.
+a toolbar above the image, which is scaled to fit until you zoom.
 
 | Tool | Key | Draws |
 |---|---|---|
@@ -424,17 +425,28 @@ a toolbar above the image, which is scaled to fit and never cropped.
 | Arrow, Line | A, L | drag; Shift snaps to 45° steps |
 | Rectangle, Ellipse | R, O | drag; Shift makes a square or circle |
 | Pen | P | freehand stroke |
-| Text | T | click, type, Return (Esc cancels) |
+| Text | T | click, type, Return (⇧Return or ⌥Return starts a new line; Esc cancels) |
 | Highlight | H | marker-pen band in the current colour |
 | Numbered step | N | click to place 1, 2, 3… |
-| Redact | B | pixelates the area |
+| Redact | B | hides the area: pixelate, blur, black out or secure blur |
 | Spotlight | S | dims everything outside the area |
+| Crop | C | drag the part to keep; drag inside it to move it, a corner to resize it; Delete removes the crop |
 
 The swatches and S/M/L set the colour and the stroke or text size for new
-shapes, and restyle the selected one. Strokes and text are sized relative to
+shapes, and restyle the selected one. The **style** menu does the same for
+arrows (standard, double-headed, slim, tapered) and redactions. The
+**canvas** menu puts padding (small, medium, large) and a background
+(transparent, white or a gradient preset) around the image; picking a
+background turns medium padding on. While the crop tool is picked the whole
+image shows with the cropped-away part dimmed; the crop and canvas show as
+soon as you pick another tool, and shapes keep their place in the original
+image, so the crop can change later. Strokes and text are sized relative to
 the image, so they look the same on a Retina capture as on a small one. ⌘Z and
-⇧⌘Z undo and redo; Esc backs out of a drag, then the selection, then the tool,
-and never closes the window.
+⇧⌘Z undo and redo (crop and canvas changes too); Esc backs out of a drag,
+then the selection, then the tool, and never closes the window. ⌘+ and ⌘−
+zoom in and out (10% to 800%), ⌘1 shows actual pixels and ⌘0 fits the
+window again; pinching, a two-finger double tap and the zoom menu in the
+corner do the same, and a zoomed image scrolls.
 
 **Save** (⌘S) writes an annotated copy as a new history item (kind
 `annotated`, named and synced like any other capture) and leaves the original
@@ -445,12 +457,18 @@ unsaved shapes asks first. One editor is open at a time.
 What you see is what is saved: finished shapes are drawn by the same renderer
 as `bugle annotate`, and a saved document can use everything that command
 can. Only the shape under the pointer is drawn by the window, so an arrow
-head or a redaction can look slightly different while you drag it. Crop,
-padding and backgrounds are `bugle annotate` only for now.
+head or a redaction can look slightly different while you drag it. The
+preview renders on a thread of its own, so drawing on a very large capture
+stays responsive (handing the finished picture to the window still copies it
+on the main thread); while it renders, the old picture stays up. A preview
+that cannot be drawn, or a canvas too large to render, is reported in a
+toast.
 
-The editor's window, shapes, selection and undo are checked by
-`bugle-app --smoke-test`, which feeds it synthetic events rather than clicks
-(and saves a copy too when `BUGLE_SMOKE_SAVE` is set).
+The editor's window, shapes, selection, menus, crop, canvas, zoom and undo are
+checked by `bugle-app --smoke-test`, which feeds it synthetic events rather
+than clicks (keeping window captures in the temp directory when
+`BUGLE_SMOKE_KEEP` is set, and saving a copy too when `BUGLE_SMOKE_SAVE` is
+set).
 
 ## Configuration
 

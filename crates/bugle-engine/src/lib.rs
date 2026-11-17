@@ -295,7 +295,7 @@ impl Engine {
     // -----------------------------------------------------------------------
 
     fn with_renderer<T>(&self, f: impl FnOnce(&Renderer) -> Result<T>) -> Result<T> {
-        let mut guard = self.renderer.lock().unwrap();
+        let mut guard = self.renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.is_none() {
             let a = &self.config.markup;
             let defaults = Style {

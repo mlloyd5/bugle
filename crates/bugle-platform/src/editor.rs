@@ -4,8 +4,16 @@
 //! The window is a view and nothing more. It reports input as
 //! [`EditorEvent`]s in image pixel coordinates and draws what it is given:
 //! the image ([`editor_set_image`]), an overlay of simple primitives on top
-//! ([`editor_set_overlay`]) and the toolbar state ([`editor_set_state`]).
-//! What a click means is the caller's business.
+//! ([`editor_set_overlay`]), the toolbar state ([`editor_set_state`]) and
+//! the toolbar's menus ([`editor_set_menu`]). What a click means is the
+//! caller's business. The one thing the window decides for itself is the
+//! zoom (fit, actual size, pinch, ⌘+/⌘−), which it reports as
+//! [`EditorEvent::Scale`].
+//!
+//! The image shown may be larger than the one being edited (a canvas
+//! around it) or a part of it (a crop): [`editor_set_image`] says where the
+//! edited image's pixel (0, 0) lies in it, and every coordinate in and out
+//! of the window stays in the edited image's pixels.
 //!
 //! Every function here is main-thread only and needs a running AppKit loop.
 //! One editor at a time.
@@ -33,11 +41,14 @@ extern "C" {
         n_colors: i32,
         width_labels: *const *const c_char,
         n_widths: i32,
+        n_menus: i32,
         cb: RawCallback,
         ctx: *mut c_void,
         free_ctx: RawFree,
     ) -> i32;
-    fn bugle_editor_set_image(rgba: *const u8, w: u32, h: u32);
+    fn bugle_editor_set_image(rgba: *const u8, w: u32, h: u32, origin_x: f64, origin_y: f64);
+    fn bugle_editor_set_menu(index: i32, title: *const c_char, tip: *const c_char, items: *const c_char, enabled: i32);
+    fn bugle_editor_zoom(mode: i32);
     fn bugle_editor_set_overlay(values: *const f64, n: usize);
     fn bugle_editor_set_state(tool: i32, color: i32, width: i32, can_undo: i32, can_redo: i32, dirty: i32);
     fn bugle_editor_begin_text(x: f64, y: f64, font_px: f64, initial: *const c_char, rgba: u32);
@@ -80,6 +91,8 @@ pub enum EditorEvent {
     Key(char),
     /// The zoom changed: this many image pixels per screen point.
     Scale(f64),
+    /// An item of one of the toolbar menus set with [`editor_set_menu`].
+    Menu { menu: usize, item: usize },
 }
 
 impl EditorEvent {
@@ -106,6 +119,7 @@ impl EditorEvent {
             7 => Self::Text(text.unwrap_or_default()),
             8 => Self::Key(char::from_u32(u32::try_from(arg).ok()?)?),
             9 if x.is_finite() && x > 0.0 => Self::Scale(x),
+            10 if arg >= 0 => Self::Menu { menu: (arg >> 16) as usize, item: (arg & 0xFFFF) as usize },
             _ => return None,
         })
     }
@@ -122,6 +136,7 @@ impl EditorEvent {
             Self::Text(t) => (7, 0.0, 0.0, 0, Some(t)),
             Self::Key(c) => (8, 0.0, 0.0, *c as i32, None),
             Self::Scale(s) => (9, *s, 0.0, 0, None),
+            Self::Menu { menu, item } => (10, 0.0, 0.0, ((*menu as i32 & 0x7FFF) << 16) | (*item as i32 & 0xFFFF), None),
         }
     }
 }
@@ -133,7 +148,8 @@ impl EditorEvent {
 pub enum EditorPrim {
     /// A stroked path through the points (two points: a straight line).
     Polyline { points: Vec<Point>, color: [u8; 4], width: f64 },
-    Arrow { from: Point, to: Point, color: [u8; 4], width: f64 },
+    /// A line with a head at `to`, and at `from` too when `double`.
+    Arrow { from: Point, to: Point, color: [u8; 4], width: f64, double: bool },
     Rect { rect: Rect, color: [u8; 4], width: f64 },
     Ellipse { rect: Rect, color: [u8; 4], width: f64 },
     Fill { rect: Rect, color: [u8; 4] },
@@ -159,8 +175,8 @@ impl EditorPrim {
                 head(0.0, *color, *width, points.len());
                 out.extend(points.iter().flat_map(|p| [p.x, p.y]));
             }
-            Self::Arrow { from, to, color, width } => {
-                head(1.0, *color, *width, 2);
+            Self::Arrow { from, to, color, width, double } => {
+                head(if *double { 7.0 } else { 1.0 }, *color, *width, 2);
                 out.extend([from.x, from.y, to.x, to.y]);
             }
             Self::Rect { rect, color, width } => {
@@ -185,6 +201,63 @@ impl EditorPrim {
             }
         }
     }
+}
+
+/// A toolbar pull-down menu, replaced as a whole by [`editor_set_menu`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EditorMenu {
+    /// What the button shows (usually the current choice).
+    pub title: String,
+    pub tip: String,
+    pub items: Vec<EditorMenuItem>,
+    /// A disabled menu shows its title greyed out and does not open.
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum EditorMenuItem {
+    /// A choice, with a check mark when `checked`.
+    Choice { title: String, checked: bool },
+    /// A greyed-out heading above a group of choices.
+    Heading(String),
+    Separator,
+}
+
+impl EditorMenuItem {
+    pub fn choice(title: impl Into<String>, checked: bool) -> Self {
+        Self::Choice { title: title.into(), checked }
+    }
+}
+
+impl EditorMenu {
+    /// The wire form of the items: one line per item, a flag character
+    /// (`x` checked, `o` unchecked, `h` heading, `-` separator) followed by
+    /// the title. Item indices in [`EditorEvent::Menu`] count every line.
+    fn encode_items(&self) -> String {
+        let clean = |t: &str| t.replace(['\n', '\r', '\0'], " ");
+        let lines: Vec<String> = self
+            .items
+            .iter()
+            .map(|i| match i {
+                EditorMenuItem::Choice { title, checked } => format!("{}{}", if *checked { 'x' } else { 'o' }, clean(title)),
+                EditorMenuItem::Heading(t) => format!("h{}", clean(t)),
+                EditorMenuItem::Separator => "-".into(),
+            })
+            .collect();
+        lines.join("\n")
+    }
+}
+
+/// A zoom step for [`editor_zoom`]; the window also takes these from the
+/// keyboard (⌘+, ⌘−, ⌘1, ⌘0), its zoom menu and trackpad pinches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorZoom {
+    In = 0,
+    Out = 1,
+    /// One image pixel per screen pixel.
+    Actual = 2,
+    /// The whole image in the window (the default).
+    Fit = 3,
 }
 
 /// A tool button: its tooltip and SF Symbol name.
@@ -228,7 +301,9 @@ unsafe extern "C" fn free(ctx: *mut c_void) {
 
 /// Open the editor window for an image of `size` pixels and bring it to the
 /// front. `colors` are RGBA swatches, `widths` the labels of the stroke
-/// sizes. `handler` runs on the main thread for every event and is dropped
+/// sizes, `menus` the number of toolbar menus (filled in with
+/// [`editor_set_menu`]). `handler` runs on the main thread for every event
+/// and is dropped
 /// when the window closes, however it closes. Fails when an editor is
 /// already open (see [`editor_active`]).
 pub fn editor_open(
@@ -237,6 +312,7 @@ pub fn editor_open(
     tools: &[EditorTool],
     colors: &[[u8; 4]],
     widths: &[&str],
+    menus: usize,
     handler: impl FnMut(EditorEvent) + 'static,
 ) -> Result<()> {
     let title = cstr(title)?;
@@ -261,6 +337,7 @@ pub fn editor_open(
             packed.len() as i32,
             width_ptrs.as_ptr(),
             width_ptrs.len() as i32,
+            menus.min(8) as i32,
             call,
             ctx,
             free,
@@ -274,9 +351,26 @@ pub fn editor_open(
     Ok(())
 }
 
-/// Show `img` on the canvas. No-op when no editor is open.
-pub fn editor_set_image(img: &RgbaImage) {
-    unsafe { bugle_editor_set_image(img.as_raw().as_ptr(), img.width(), img.height()) }
+/// Show `img` on the canvas, with pixel (0, 0) of the edited image at
+/// `origin` in it (zero when `img` is the edited image itself). Pointer
+/// input, the overlay and the text field stay in edited-image pixels. No-op
+/// when no editor is open.
+pub fn editor_set_image(img: &RgbaImage, origin: Point) {
+    let (x, y) = if origin.x.is_finite() && origin.y.is_finite() { (origin.x, origin.y) } else { (0.0, 0.0) };
+    unsafe { bugle_editor_set_image(img.as_raw().as_ptr(), img.width(), img.height(), x, y) }
+}
+
+/// Replace toolbar menu `index` (of the `menus` given to [`editor_open`]).
+pub fn editor_set_menu(index: usize, menu: &EditorMenu) {
+    let c = |s: &str| CString::new(s.replace('\0', "")).unwrap_or_default();
+    let (title, tip, items) = (c(&menu.title), c(&menu.tip), c(&menu.encode_items()));
+    let index = i32::try_from(index).unwrap_or(-1);
+    unsafe { bugle_editor_set_menu(index, title.as_ptr(), tip.as_ptr(), items.as_ptr(), menu.enabled as i32) }
+}
+
+/// Change the zoom as the keyboard shortcuts do.
+pub fn editor_zoom(zoom: EditorZoom) {
+    unsafe { bugle_editor_zoom(zoom as i32) }
 }
 
 /// Replace what is drawn above the image; an empty slice clears it.
@@ -352,6 +446,8 @@ mod tests {
             EditorEvent::Text("héllo".into()),
             EditorEvent::Key('v'),
             EditorEvent::Scale(2.0),
+            EditorEvent::Menu { menu: 0, item: 3 },
+            EditorEvent::Menu { menu: 1, item: 17 },
         ];
         for e in all {
             let (kind, x, y, arg, text) = e.to_raw();
@@ -366,6 +462,7 @@ mod tests {
         assert_eq!(EditorEvent::from_raw(9, 0.0, 0.0, 0, None), None);
         assert_eq!(EditorEvent::from_raw(9, f64::NAN, 0.0, 0, None), None);
         assert_eq!(EditorEvent::from_raw(42, 0.0, 0.0, 0, None), None);
+        assert_eq!(EditorEvent::from_raw(10, 0.0, 0.0, -1, None), None);
         assert_eq!(EditorEvent::from_raw(7, 0.0, 0.0, 0, None), Some(EditorEvent::Text(String::new())));
     }
 
@@ -385,5 +482,28 @@ mod tests {
         v.clear();
         EditorPrim::Handle { at: Point { x: 7.0, y: 8.0 } }.encode(&mut v);
         assert_eq!(v, vec![6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 7.0, 8.0]);
+        v.clear();
+        let (from, to) = (Point { x: 1.0, y: 2.0 }, Point { x: 3.0, y: 4.0 });
+        EditorPrim::Arrow { from, to, color: [0; 4], width: 2.0, double: true }.encode(&mut v);
+        assert_eq!(v[0], 7.0);
+        v.clear();
+        EditorPrim::Arrow { from, to, color: [0; 4], width: 2.0, double: false }.encode(&mut v);
+        assert_eq!(v[0], 1.0);
+    }
+
+    #[test]
+    fn menus_encode_one_line_per_item() {
+        let m = EditorMenu {
+            title: "Style".into(),
+            tip: String::new(),
+            items: vec![
+                EditorMenuItem::Heading("Padding".into()),
+                EditorMenuItem::choice("None", false),
+                EditorMenuItem::choice("Small\nstep", true),
+                EditorMenuItem::Separator,
+            ],
+            enabled: true,
+        };
+        assert_eq!(m.encode_items(), "hPadding\noNone\nxSmall step\n-");
     }
 }

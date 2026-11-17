@@ -27,7 +27,8 @@ mod editor;
 #[cfg(target_os = "macos")]
 pub use editor::{
     editor_active, editor_begin_text, editor_close, editor_focus, editor_inject, editor_open, editor_set_busy, editor_set_image,
-    editor_set_overlay, editor_set_state, EditorCommand, EditorEvent, EditorPrim, EditorState, EditorTool,
+    editor_set_menu, editor_set_overlay, editor_set_state, editor_zoom, EditorCommand, EditorEvent, EditorMenu, EditorMenuItem,
+    EditorPrim, EditorState, EditorTool, EditorZoom,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
