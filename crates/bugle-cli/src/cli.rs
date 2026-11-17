@@ -418,6 +418,11 @@ pub struct EditArgs {
     /// Needs a recording made with --cursor-events.
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "2", value_name = "FACTOR")]
     pub zoom: Option<f64>,
+    /// The zoom of one click, by its time in the recording: `--click-zoom 4.2=3`
+    /// (seconds or m:ss, then the factor; 1 leaves that click out). Repeatable;
+    /// overrides --zoom for that click, and without --zoom only these clicks zoom.
+    #[arg(long, value_name = "TIME=FACTOR", value_parser = parse_click_zoom)]
+    pub click_zoom: Vec<bugle_engine::ClickZoom>,
     /// Draw the pointer along a smoothed path (recordings made with --hide-cursor).
     #[arg(long)]
     pub smooth_cursor: bool,
@@ -530,6 +535,19 @@ fn parse_pin_frame(s: &str) -> Result<Rect> {
         [x, y, w, h] if *w >= 0.0 && *h >= 0.0 => Ok(Rect::new(*x, *y, *w, *h)),
         _ => bail!("bad frame '{s}'; expected x,y,w,h"),
     }
+}
+
+/// `TIME=FACTOR` for `bugle edit --click-zoom`: the time as --start takes it
+/// (but not counted from the end), the factor a number (checked by the edit).
+fn parse_click_zoom(s: &str) -> Result<bugle_engine::ClickZoom> {
+    let bad = || anyhow!("bad click zoom '{s}'; expected TIME=FACTOR, e.g. 4.2=3");
+    let (t, z) = s.split_once('=').ok_or_else(bad)?;
+    let t = bugle_engine::edit::parse_time(t).map_err(|_| bad())?;
+    let zoom = z.trim().parse::<f64>().map_err(|_| bad())?;
+    if t < 0.0 || !zoom.is_finite() {
+        return Err(bad());
+    }
+    Ok(bugle_engine::ClickZoom { t, zoom })
 }
 
 fn parse_point(s: &str) -> Result<Point> {
@@ -773,6 +791,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 output: a.output,
                 label: a.label,
                 zoom: a.zoom,
+                click_zooms: a.click_zoom,
                 smooth_cursor: a.smooth_cursor,
             };
             let media = tokio::task::spawn_blocking({
@@ -1090,6 +1109,20 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["bugle", "edit", "--list-presets"]).unwrap();
         assert!(matches!(cli.cmd, Cmd::Edit(EditArgs { list_presets: true, .. })));
+    }
+
+    #[test]
+    fn click_zooms_take_a_time_and_a_factor() {
+        let zooms = |args: &[&str]| match Cli::try_parse_from(args).unwrap().cmd {
+            Cmd::Edit(a) => a.click_zoom,
+            other => panic!("unexpected {other:?}"),
+        };
+        let z = |t: f64, zoom: f64| bugle_engine::ClickZoom { t, zoom };
+        assert_eq!(zooms(&["bugle", "edit", "--click-zoom", "4.2=3", "--click-zoom=1:05=1"]), vec![z(4.2, 3.0), z(65.0, 1.0)]);
+        assert_eq!(zooms(&["bugle", "edit"]), vec![]);
+        for bad in ["4.2", "=2", "4.2=", "x=2", "4.2=two", "-1=2"] {
+            assert!(Cli::try_parse_from(["bugle", "edit", "--click-zoom", bad]).is_err(), "{bad}");
+        }
     }
 
     #[test]

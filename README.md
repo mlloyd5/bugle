@@ -43,8 +43,8 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | Menu-bar app, global hotkeys | `bugle-app`: `NSStatusItem` via `tray-icon`, Carbon hotkeys via `global-hotkey`, in-app overlays | ✅ |
 | Sync to your own storage | folder copy/move, or SigV4 uploads (multipart for large files) to any S3-compatible bucket; a destination per media kind; subtitles follow their video | ✅ |
 | Trim and export recordings (presets: trim, several cuts in one export, H.264/HEVC, 1080p/720p/540p, frame rate, GIF) | `AVAssetExportSession` + video composition, `AVAssetImageGenerator` → GIF, `AVAssetWriter` for GIF → MP4 | ✅ (CLI/API, and the video editor window) |
-| Auto-zoom on clicks, smoothed pointer | pointer/click event track recorded next to the video (`clip.mp4.events.json`); frames re-rendered in Rust (`AVAssetReader` → `AVAssetWriter`, audio copied back in) | ✅ (CLI/API, and the video editor window); track timing measured on real recordings, zoom checked with hand-written clicks, live clicks not exercised |
-| Video editor | `bugle-app` window for videos and GIFs: preview, timeline with in/out handles and cuts, playback, zoom and pointer options, preset, export through the same edit pipeline | ✅ driven by synthetic events in `--smoke-test`; mouse and keyboard input not exercised |
+| Auto-zoom on clicks (a level for all, or per click), smoothed pointer | pointer/click event track recorded next to the video (`clip.mp4.events.json`); frames re-rendered in Rust (`AVAssetReader` → `AVAssetWriter`, audio copied back in) | ✅ (CLI/API, and the video editor window); track timing measured on real recordings, zoom checked with hand-written clicks, live clicks not exercised |
+| Video editor | `bugle-app` window for videos and GIFs: preview, timeline with audio waveform, click markers, in/out handles and cuts, playback, zoom (per click too) and pointer options, preset, export through the same edit pipeline | ✅ driven by synthetic events in `--smoke-test`; mouse and keyboard input not exercised |
 | `Bugle.app` bundle | `cargo xtask bundle` (hardened runtime, ad-hoc or Developer ID) | ✅ ad-hoc; Developer ID signing and notarization not yet exercised |
 | Disk image, universal binary | `cargo xtask dmg` (`hdiutil`, `/Applications` link), `--universal` (`lipo`) | ✅ DMG; universal needs both Rust targets installed |
 | System notifications | `UNUserNotificationCenter` from Bugle.app, alongside the toast (`[general] system_notifications`), with the capture's thumbnail attached | built; reading the authorization verified from the bundle, posting and the attached thumbnail unverified |
@@ -220,6 +220,7 @@ bugle edit latest -p high --fps 15            # re-encode at 15 fps
 bugle edit latest -p gif-small                # recording → chat-sized GIF
 bugle edit demo.gif -p hevc                   # GIF → HEVC .mp4
 bugle edit latest --zoom                      # zoom 2x on every click (--zoom=1.5 for less)
+bugle edit latest --zoom --click-zoom 4.2=3 --click-zoom 9=1   # the click at 4.2 s 3x, the one at 9 s not at all
 bugle edit latest --smooth-cursor --zoom      # --hide-cursor recordings: smoothed pointer drawn in
 bugle edit --list-presets
 
@@ -260,7 +261,11 @@ clock the track shares). `bugle edit
 --zoom` (2x) or `--zoom=FACTOR` uses it to ease in on each click inside the
 recorded area (fully zoomed as it happens, held 1.5 s after the last of a run of
 clicks, then eased out; nearby clicks pan from one to the next; the click that
-stops the recording is ignored). `--hide-cursor` records without the pointer
+stops the recording is ignored). `--click-zoom TIME=FACTOR` (repeatable) sets
+the zoom of one click, named by its time in the recording (within 0.05 s; an
+error lists the clicks there are), overriding `--zoom` for it: `1` leaves that
+click out, and without `--zoom` only the named clicks zoom. Within a run of
+clicks the view changes level along with the pan. `--hide-cursor` records without the pointer
 (ScreenCaptureKit recorder) and implies the track; `--smooth-cursor` then draws
 the pointer back along a smoothed path that still lands exactly on each click.
 These edits re-render every frame (at the recording's frame rate, at least
@@ -513,7 +518,7 @@ timeline below it and a row of controls.
 
 | Control | Key | Does |
 |---|---|---|
-| Timeline | click, drag | moves the playhead; drag the tabs at either end of the highlighted range to move the in and out points |
+| Timeline | click, drag | moves the playhead (a click snaps it onto a click marker it lands next to; a drag scrubs freely); drag the tabs at either end of the highlighted range to move the in and out points. Across the track: the recording's audio waveform (every audio track mixed). Under it: a diamond for each click auto-zoom follows, filled when the click zooms, hollow when it does not, larger for the click at the playhead |
 | Play | Space | plays the clip from the playhead (from the in point when the playhead is outside it), jumps over cuts, stops at the out point |
 | Set In, Set Out | I, O | start or end the clip at the playhead |
 | Cut | C | starts a cut at the playhead (the button becomes *End Cut*); pressed again, removes the part between the two (struck out on the timeline; touching cuts merge) |
@@ -521,8 +526,9 @@ timeline below it and a row of controls.
 | | ← → | one frame back or forward |
 | | ↑ ↓ (Home, End) | to the in or out point |
 | Zoom | | zoom in on clicks, 1.5× to 3× (recordings made with `cursor_events` or `hide_cursor`) |
+| Click | | the zoom of the click at the playhead (from its ease-in until its zoom is over): *Default* (what *Zoom* says), *Off* or 1.5× to 3×; so with *Zoom* off only the clicks given a level zoom (`bugle edit --click-zoom`) |
 | Smooth pointer | | draw the pointer along a smoothed path (recordings made with `hide_cursor`; on by default for them) |
-| Preset | | the export format, the presets of `bugle edit`; *Lossless (copy)* keeps the frames as recorded, so it turns zoom and smoothing off (turning either on goes back to *Original*); a GIF has no *Lossless* (its cuts are always exact) |
+| Preset | | the export format, the presets of `bugle edit`; *Lossless (copy)* keeps the frames as recorded, so it turns zoom, click zooms and smoothing off (turning any on goes back to *Original*); a GIF has no *Lossless* (its cuts are always exact) |
 | Export | ⌘E | writes the clip as a new history item |
 
 The preview shows what the export will: frames are decoded exactly at the

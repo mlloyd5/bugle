@@ -203,7 +203,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_video",
-            description: "Trim a recording (video or GIF) and export it with a preset: original (same format; copied when the cut starts on a keyframe, otherwise re-encoded so nothing before the cut stays in the file), lossless (always copied; may keep up to one keyframe interval before the cut in the file, hidden), high, hevc, 1080p, 720p, 540p, gif, gif-small. Times are seconds; negative counts from the end. cuts removes several ranges in one export (the parts left are joined). Saves a new media item (parent = the source when it is a history item). Recordings made with cursor_events (or hide_cursor) can be auto-zoomed on clicks (zoom) and, with hide_cursor, get a smoothed pointer drawn in (smooth_cursor).",
+            description: "Trim a recording (video or GIF) and export it with a preset: original (same format; copied when the cut starts on a keyframe, otherwise re-encoded so nothing before the cut stays in the file), lossless (always copied; may keep up to one keyframe interval before the cut in the file, hidden), high, hevc, 1080p, 720p, 540p, gif, gif-small. Times are seconds; negative counts from the end. cuts removes several ranges in one export (the parts left are joined). Saves a new media item (parent = the source when it is a history item). Recordings made with cursor_events (or hide_cursor) can be auto-zoomed on clicks (zoom, or a level per click with click_zooms) and, with hide_cursor, get a smoothed pointer drawn in (smooth_cursor).",
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -215,6 +215,14 @@ pub fn catalog() -> Vec<ToolSpec> {
                     "fps":{"type":"integer","description":"output frame rate: re-encodes a video (not with lossless), resamples a GIF"},
                     "max_size":{"type":"integer","description":"long edge of GIF output in pixels"},
                     "zoom":{"type":"number","exclusiveMinimum":1,"maximum":4,"description":"zoom in on clicks to this factor (e.g. 2); needs a recording made with cursor_events"},
+                    "click_zooms":{
+                        "type":"array",
+                        "description":"zoom level of single clicks, overriding zoom for them (without zoom, only these clicks zoom); each names a click of the recording by its time (within 0.05 s)",
+                        "items":{"type":"object","required":["t","zoom"],"properties":{
+                            "t":{"type":"number","minimum":0,"description":"the click's time in the recording, seconds"},
+                            "zoom":{"type":"number","minimum":1,"maximum":4,"description":"factor for this click; 1 leaves it out"}
+                        }}
+                    },
                     "smooth_cursor":{"type":"boolean","description":"draw the pointer along a smoothed path; needs a recording made with hide_cursor"},
                     "output":{"type":"string"},
                     "label":{"type":"string"}
@@ -531,10 +539,15 @@ pub(crate) mod tests {
         assert_eq!(status_for(&err), 400);
         use bugle_core::events::{CursorEvent, EventKind, EventTrack, MouseButton};
         let click = CursorEvent { t: 0.25, kind: EventKind::Down, button: Some(MouseButton::Left), x: 2.0, y: 2.0 };
-        EventTrack::new(bugle_core::Rect::new(0.0, 0.0, 8.0, 6.0), true, 0.4, vec![click]).save(&EventTrack::sidecar_path(&src)).unwrap();
+        EventTrack::new(bugle_core::Rect::new(0.0, 0.0, 8.0, 6.0), true, 1.0, vec![click]).save(&EventTrack::sidecar_path(&src)).unwrap();
         let out = run(&engine, "edit_video", json!({"source": src, "zoom": 2, "preset": "gif"})).await.unwrap();
         assert!(out.json["media"]["source"].as_str().unwrap().contains("zoom 2x"), "{}", out.json);
         let err = run(&engine, "edit_video", json!({"source": src, "zoom": 9})).await.err().unwrap();
+        assert_eq!(status_for(&err), 400);
+        // A level for the one click; a time that names no click is a 400.
+        let out = run(&engine, "edit_video", json!({"source": src, "click_zooms": [{"t": 0.25, "zoom": 3}], "preset": "gif"})).await.unwrap();
+        assert!(out.json["media"]["source"].as_str().unwrap().contains("click zoom 0.25s 3x"), "{}", out.json);
+        let err = run(&engine, "edit_video", json!({"source": src, "click_zooms": [{"t": 0.1, "zoom": 3}]})).await.err().unwrap();
         assert_eq!(status_for(&err), 400);
         let err = run(&engine, "edit_video", json!({"source": src, "smooth_cursor": true})).await.err().unwrap();
         assert_eq!(status_for(&err), 400, "the pointer is in the frames");

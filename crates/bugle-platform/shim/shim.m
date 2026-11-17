@@ -1218,6 +1218,88 @@ int32_t bugle_audio_track_count(const char *path) {
     }
 }
 
+// Loudest sample of every enabled audio track mixed together, in `n` equal
+// buckets of `duration` seconds (decoded mono at a low rate: enough for a
+// timeline waveform). Returns 1 with `out` filled (0 for silence, full scale
+// 1, clamped), 0 when there is no audio (`out` zeroed), 2 when `*cancel`
+// (checked once per sample buffer; may be NULL) turned true, -1 on error.
+int32_t bugle_audio_peaks(const char *path, double duration, float *out, int32_t n, const volatile bool *cancel) {
+    @autoreleasepool {
+        clear_error();
+        if (!path || !out || n <= 0 || !(duration > 0)) {
+            set_error(@"audio peaks: bad arguments");
+            return -1;
+        }
+        memset(out, 0, sizeof(float) * (size_t)n);
+        NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
+        NSMutableArray<AVAssetTrack *> *audio = [NSMutableArray array];
+        for (AVAssetTrack *t in [asset tracksWithMediaType:AVMediaTypeAudio]) {
+            if (t.enabled) [audio addObject:t];
+        }
+        if (audio.count == 0) return 0;
+        NSError *err = nil;
+        AVAssetReader *r = [[AVAssetReader alloc] initWithAsset:asset error:&err];
+        if (!r) { set_error(@"could not read %s: %@", path, err.localizedDescription); return -1; }
+        const double rate = 8000;
+        NSDictionary *pcm = @{
+            AVFormatIDKey: @(kAudioFormatLinearPCM),
+            AVSampleRateKey: @(rate),
+            AVNumberOfChannelsKey: @1,
+            AVLinearPCMBitDepthKey: @32,
+            AVLinearPCMIsFloatKey: @YES,
+            AVLinearPCMIsBigEndianKey: @NO,
+            AVLinearPCMIsNonInterleaved: @NO,
+        };
+        AVAssetReaderAudioMixOutput *o = [AVAssetReaderAudioMixOutput assetReaderAudioMixOutputWithAudioTracks:audio audioSettings:pcm];
+        if (![r canAddOutput:o]) { set_error(@"could not decode the audio of %s", path); return -1; }
+        [r addOutput:o];
+        if (![r startReading]) { set_error(@"could not read %s: %@", path, r.error.localizedDescription); return -1; }
+        const double per = duration / n;
+        NSMutableData *buf = [NSMutableData data];
+        CMSampleBufferRef sb;
+        if (cancel && *cancel) { [r cancelReading]; return 2; }
+        while ((sb = [o copyNextSampleBuffer])) {
+            if (cancel && *cancel) {
+                CFRelease(sb);
+                [r cancelReading];
+                return 2;
+            }
+            CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
+            double t0 = CMTIME_IS_NUMERIC(pts) ? CMTimeGetSeconds(pts) : 0;
+            CMItemCount frames = CMSampleBufferGetNumSamples(sb);
+            CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
+            size_t bytes = (size_t)frames * sizeof(float);
+            BOOL past = NO;
+            if (bb && frames > 0 && CMBlockBufferGetDataLength(bb) >= bytes) {
+                if (buf.length < bytes) buf.length = bytes;
+                if (CMBlockBufferCopyDataBytes(bb, 0, bytes, buf.mutableBytes) == kCMBlockBufferNoErr) {
+                    const float *v = buf.bytes;
+                    for (CMItemCount k = 0; k < frames; k++) {
+                        double t = t0 + (double)k / rate;
+                        if (t < 0) continue;
+                        int64_t i = (int64_t)(t / per);
+                        if (i >= n) { past = YES; break; }
+                        float a = fminf(fabsf(v[k]), 1.0f);
+                        if (a > out[i]) out[i] = a;
+                    }
+                }
+            }
+            CFRelease(sb);
+            if (past) {
+                // Audio past the end of the video: nothing more to draw.
+                [r cancelReading];
+                return 1;
+            }
+        }
+        if (r.status == AVAssetReaderStatusFailed) {
+            set_error(@"decoding the audio of %s failed: %@", path, r.error.localizedDescription);
+            return -1;
+        }
+        return 1;
+    }
+}
+
 int32_t bugle_video_track_count(const char *path) {
     @autoreleasepool {
         NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
