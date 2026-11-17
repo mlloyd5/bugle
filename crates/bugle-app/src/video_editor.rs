@@ -128,6 +128,11 @@ impl VideoEditor {
         (self.in_t, self.out_t)
     }
 
+    /// Whether an export is running.
+    pub fn busy(&self) -> bool {
+        self.busy
+    }
+
     /// While an export runs every event is ignored.
     pub fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
@@ -232,20 +237,45 @@ impl VideoEditor {
                 }
                 VideoEditorCommand::Escape => Effects::default(),
             },
+            // A lossless copy keeps the frames as recorded, so zoom and
+            // smoothing cannot go with it: turning either on leaves the
+            // lossless preset for the default one, and choosing lossless
+            // turns both off.
             VideoEditorEvent::Zoom(i) if i < ZOOMS.len() && (self.caps.zoom || i == 0) => {
                 self.zoom = i;
+                if i != 0 {
+                    self.leave_lossless();
+                }
                 self.rerender(now)
             }
             VideoEditorEvent::Smooth(on) if self.caps.smooth => {
                 self.smooth = on;
+                if on {
+                    self.leave_lossless();
+                }
                 self.rerender(now)
             }
             VideoEditorEvent::Preset(i) if i < PRESETS.len() => {
                 self.preset = i;
+                if self.lossless() && (self.zoom != 0 || self.smooth) {
+                    self.zoom = 0;
+                    self.smooth = false;
+                    return self.rerender(now);
+                }
                 state
             }
             // A choice the window should not have offered: put it back.
             VideoEditorEvent::Zoom(_) | VideoEditorEvent::Smooth(_) | VideoEditorEvent::Preset(_) => state,
+        }
+    }
+
+    fn lossless(&self) -> bool {
+        PRESETS.get(self.preset) == Some(&ExportPreset::Lossless)
+    }
+
+    fn leave_lossless(&mut self) {
+        if self.lossless() {
+            self.preset = 0;
         }
     }
 
@@ -475,12 +505,37 @@ mod tests {
     }
 
     #[test]
+    fn lossless_and_rerendering_options_exclude_each_other() {
+        let now = Instant::now();
+        let lossless = PRESETS.iter().position(|p| *p == ExportPreset::Lossless).unwrap();
+        let mut e = editor(ALL);
+        e.handle(E::Zoom(1), now);
+        let fx = e.handle(E::Preset(lossless), now);
+        assert!(fx.state && fx.frame.is_some(), "the frame is drawn again without the effects");
+        assert_eq!(e.options(), (None, false), "lossless turns zoom and smoothing off");
+        let r = e.request();
+        assert_eq!(r.preset, ExportPreset::Lossless);
+        assert!(!r.uses_events(), "a lossless request can always be exported");
+        assert!(!e.state().smooth && e.state().zoom == 0);
+
+        e.handle(E::Smooth(true), now);
+        assert_eq!(e.request().preset, ExportPreset::Original, "smoothing leaves lossless");
+        e.handle(E::Smooth(false), now);
+        e.handle(E::Preset(lossless), now);
+        e.handle(E::Zoom(2), now);
+        assert_eq!((e.request().preset, e.options().0), (ExportPreset::Original, Some(2.0)), "zoom leaves lossless");
+        e.handle(E::Preset(lossless), now);
+        e.handle(E::Zoom(0), now);
+        assert_eq!(e.request().preset, ExportPreset::Lossless, "zoom off keeps lossless");
+    }
+
+    #[test]
     fn busy_ignores_everything() {
         let now = Instant::now();
         let mut e = editor(ALL);
         e.handle(E::Command(C::PlayPause), now);
         e.set_busy(true);
-        assert!(!e.is_playing() && e.state().busy);
+        assert!(!e.is_playing() && e.state().busy && e.busy());
         for ev in [E::Seek(3.0), E::Command(C::MarkIn), E::Command(C::Export), E::Zoom(1), E::Preset(3)] {
             assert!(nothing(&e.handle(ev, now)), "{ev:?}");
         }

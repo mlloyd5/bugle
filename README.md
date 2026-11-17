@@ -474,10 +474,11 @@ set).
 
 ### Video editor
 
-*Edit* on the quick-access panel after a recording and *Edit Latest
-Recording* in the menu (bind it with `edit_latest` in `[hotkeys]`) open the
-newest video (`.mp4`, `.mov`, `.m4v`) in a window: the frame at the playhead,
-a timeline below it and a row of controls.
+*Edit* on the quick-access panel after a recording opens that recording;
+*Edit Latest Recording* in the menu (bind it with `edit_latest` in
+`[hotkeys]`) opens the newest video in the history. Either way the video
+(`.mp4`, `.mov`, `.m4v`) opens in a window: the frame at the playhead, a
+timeline below it and a row of controls.
 
 | Control | Key | Does |
 |---|---|---|
@@ -488,7 +489,7 @@ a timeline below it and a row of controls.
 | | ↑ ↓ (Home, End) | to the in or out point |
 | Zoom | | zoom in on clicks, 1.5× to 3× (recordings made with `cursor_events` or `hide_cursor`) |
 | Smooth pointer | | draw the pointer along a smoothed path (recordings made with `hide_cursor`; on by default for them) |
-| Preset | | the export format, the presets of `bugle edit` |
+| Preset | | the export format, the presets of `bugle edit`; *Lossless (copy)* keeps the frames as recorded, so it turns zoom and smoothing off (turning either on goes back to *Original*) |
 | Export | ⌘E | writes the clip as a new history item |
 
 The preview shows what the export will: frames are decoded exactly at the
@@ -501,6 +502,7 @@ shows the quick-access panel for the new file; the window stays open with
 your settings if the export fails. A recording without an event track can be
 trimmed and exported, with the zoom and pointer options greyed out. One video
 editor is open at a time; it opens videos, not GIFs (`bugle edit` trims those).
+Quit waits for a running export: it is refused until the export finishes.
 `bugle-app --smoke-test` opens it on a synthetic recording and drives it with
 synthetic events (exporting with `BUGLE_SMOKE_SAVE`).
 

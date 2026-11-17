@@ -258,15 +258,10 @@ fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<N
             if engine.config.general.shutter_sound {
                 bugle_platform::play_sound("Tink");
             }
-            let thumb = if media.kind == MediaKind::Video {
-                bugle_platform::video_frame(&media.path, 0.0).ok().and_then(|f| bugle_engine::encode_png_bounded(&f, 112).ok())
-            } else {
-                image::open(&media.path).ok().and_then(|i| bugle_engine::encode_png_bounded(&i.to_rgba8(), 112).ok())
-            };
             Ok(Some(Notice {
                 title: format!("Recording saved ({:.0}s)", media.duration_seconds.unwrap_or(0.0)),
                 subtitle: saved_subtitle(engine, &media),
-                thumb,
+                thumb: notice_thumb(&media),
                 open: Some(media.path.clone()),
             }))
         }
@@ -313,6 +308,16 @@ fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<N
             }))
         }
     }
+}
+
+/// A small thumbnail of a recording (its first frame) or a GIF/image, for
+/// the quick-access panel or a toast.
+pub(crate) fn notice_thumb(media: &bugle_core::MediaItem) -> Option<Vec<u8>> {
+    let img = match media.kind {
+        MediaKind::Video => bugle_platform::video_frame(&media.path, 0.0).ok(),
+        _ => image::open(&media.path).ok().map(|i| i.to_rgba8()),
+    };
+    img.and_then(|i| bugle_engine::encode_png_bounded(&i, 112).ok())
 }
 
 /// Whether an error means the user cancelled the area selection. Matches the
@@ -683,6 +688,12 @@ impl App {
     }
 
     fn quit(&mut self, control_flow: &mut ControlFlow) {
+        // Quitting mid-export would drop the clip and could leave a
+        // temporary file in the save folder.
+        if video_editor_window::export_running() {
+            bugle_platform::video_editor_focus();
+            return self.toast_error("Edit Video: an export is running; quit once it has finished");
+        }
         if self.is_recording() {
             match self.engine.record_stop() {
                 Ok(m) => tracing::info!("recording saved to {}", m.path.display()),

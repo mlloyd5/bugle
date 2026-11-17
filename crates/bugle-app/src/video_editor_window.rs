@@ -191,7 +191,7 @@ impl Session {
             let result = guarded("export", || engine.edit(&req)).map(|item| Notice {
                 title: format!("Edited recording saved ({:.1}s)", item.duration_seconds.unwrap_or(0.0)),
                 subtitle: saved_subtitle(&engine, &item),
-                thumb: thumbnail(&item),
+                thumb: crate::notice_thumb(&item),
                 open: Some(item.path.clone()),
             });
             proxy.send(AppEvent::VideoEditor(VideoEditorMsg::Exported { generation, result }));
@@ -208,20 +208,16 @@ impl Session {
     }
 }
 
-/// A small thumbnail of an exported video or GIF, for the panel or toast.
-fn thumbnail(item: &bugle_core::MediaItem) -> Option<Vec<u8>> {
-    let img = match item.kind {
-        bugle_core::MediaKind::Video => bugle_platform::video_frame(&item.path, 0.0).ok(),
-        _ => image::open(&item.path).ok().map(|i| i.to_rgba8()),
-    };
-    img.and_then(|i| bugle_engine::encode_png_bounded(&i, 112).ok())
+/// Whether the open video editor (if any) is exporting.
+pub(crate) fn export_running() -> bool {
+    CURRENT.with(|c| c.borrow().upgrade()).is_some_and(|s| s.try_borrow().map_or(true, |s| s.editor.busy()))
 }
 
 impl App {
     /// The most recent video in the history, for *Edit Latest Recording*.
     pub(crate) fn edit_latest_recording(&mut self) {
-        let recent = self.engine.history.recent(50).unwrap_or_default();
-        match recent.iter().find(|m| m.kind == bugle_core::MediaKind::Video && m.path.exists()) {
+        let all = self.engine.history.all().unwrap_or_default();
+        match all.iter().rev().find(|m| m.kind == bugle_core::MediaKind::Video && m.path.exists()) {
             Some(m) => self.open_video_editor(&m.id.clone()),
             None => self.toast_error("Edit Video: no video recording in the history yet"),
         }

@@ -139,12 +139,14 @@ typedef enum { DRAG_NONE, DRAG_PLAYHEAD, DRAG_IN, DRAG_OUT } DragKind;
     [knob fill];
 }
 
-- (void)report:(NSEvent *)event {
+- (void)report:(NSEvent *)event kind:(DragKind)kind {
     NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
     double t = [self timeAt:p.x];
     BugleVideoEditor *e = self.editor;
-    // Move what is dragged at once; Rust's answer (clamped) replaces it.
-    switch (self.drag) {
+    // Move what is dragged at once. During a drag the handle follows the
+    // pointer; on mouse-up the drag is already over, so Rust's clamped answer
+    // (which arrives inside the emit) replaces the local position.
+    switch (kind) {
         case DRAG_IN:
             self.inPoint = fmin(t, self.outPoint);
             [e emit:VEV_IN value:t arg:0];
@@ -171,14 +173,15 @@ typedef enum { DRAG_NONE, DRAG_PLAYHEAD, DRAG_IN, DRAG_OUT } DragKind;
     if (di <= kHandleGrab && di <= dout) self.drag = DRAG_IN;
     else if (dout <= kHandleGrab) self.drag = DRAG_OUT;
     else self.drag = DRAG_PLAYHEAD;
-    [self report:event];
+    [self report:event kind:self.drag];
 }
 
-- (void)mouseDragged:(NSEvent *)event { [self report:event]; }
+- (void)mouseDragged:(NSEvent *)event { [self report:event kind:self.drag]; }
 
 - (void)mouseUp:(NSEvent *)event {
-    [self report:event];
+    DragKind kind = self.drag;
     self.drag = DRAG_NONE;
+    [self report:event kind:kind];
 }
 
 - (void)resetCursorRects {
