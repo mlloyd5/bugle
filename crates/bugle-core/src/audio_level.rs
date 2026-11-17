@@ -87,12 +87,15 @@ pub fn meter_bar(db: f64, width: usize) -> String {
     (0..width).map(|i| if i < lit { '▮' } else { '▯' }).collect()
 }
 
-/// A menu line for one source: name, bar, peak in dB (or "silent" at the
-/// bottom of the meter) and a clip mark.
+/// A menu line for one source: name, bar, a clip mark (`!` in a slot kept
+/// when not clipping) and the peak in dB (or "silent" at the bottom of the
+/// meter), right-aligned in a fixed number of characters. The padding is
+/// figure spaces (digit width), so the line keeps its width as the value
+/// changes and an open menu does not resize ten times a second.
 pub fn meter_label(name: &str, level: &TrackLevel) -> String {
     let value = if level.peak_db <= METER_RANGE_DB { "silent".to_string() } else { format!("{:.0} dB", level.peak_db.round() + 0.0) };
-    let clip = if level.clipping() { "  clip" } else { "" };
-    format!("{name}  {}  {value}{clip}", meter_bar(level.peak_db, 12))
+    let clip = if level.clipping() { '!' } else { '\u{2007}' };
+    format!("{name}  {}{clip} {value:\u{2007}>6}", meter_bar(level.peak_db, 12))
 }
 
 /// The status-item suffix: one glyph per captured source (microphone first,
@@ -152,12 +155,15 @@ mod tests {
         assert_eq!(meter_bar(-30.0, 4), "▮▮▯▯");
         assert_eq!(meter_bar(FLOOR_DB, 4), "▯▯▯▯");
         let quiet = TrackLevel { peak_db: FLOOR_DB, rms_db: FLOOR_DB };
-        assert_eq!(meter_label("Microphone", &quiet), "Microphone  ▯▯▯▯▯▯▯▯▯▯▯▯  silent");
+        assert_eq!(meter_label("Microphone", &quiet), "Microphone  ▯▯▯▯▯▯▯▯▯▯▯▯\u{2007} silent");
         let loud = TrackLevel { peak_db: -0.2, rms_db: -6.0 };
         assert!(loud.clipping());
-        assert_eq!(meter_label("System Audio", &loud), "System Audio  ▮▮▮▮▮▮▮▮▮▮▮▮  0 dB  clip");
+        assert_eq!(meter_label("System Audio", &loud), "System Audio  ▮▮▮▮▮▮▮▮▮▮▮▮! \u{2007}\u{2007}0 dB");
         let mid = TrackLevel::from_linear(0.1, 0.05);
-        assert_eq!(meter_label("Microphone", &mid), "Microphone  ▮▮▮▮▮▮▮▮▯▯▯▯  -20 dB");
+        assert_eq!(meter_label("Microphone", &mid), "Microphone  ▮▮▮▮▮▮▮▮▯▯▯▯\u{2007} -20 dB");
+        // Every value takes the same number of characters.
+        let width = |db: f64| meter_label("M", &TrackLevel { peak_db: db, rms_db: db }).chars().count();
+        assert!([-100.0, -45.0, -6.0, -0.2, 0.0].iter().all(|&db| width(db) == width(-18.0)));
     }
 
     #[test]

@@ -16,6 +16,20 @@ pub type bugle_mix_fn =
         frames: i32,
     ) -> i32;
 
+/// See `bugle_level_t` in `shim.h`. Only the tests drive the meter
+/// ballistics from Rust; the recorder keeps its state in the shim.
+#[cfg(test)]
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct bugle_level_t {
+    pub seen: i32,
+    pub unreadable: i32,
+    pub updated: f64,
+    pub covers: f64,
+    pub peak: f64,
+    pub mean_square: f64,
+}
+
 #[repr(C)]
 #[derive(Default)]
 pub struct bugle_video_info_t {
@@ -171,7 +185,7 @@ extern "C" {
         video: i32,
     ) -> *mut c_char;
     pub fn bugle_fixture_audio_level(
-        int16: i32,
+        format: i32,
         channels: i32,
         interleaved: i32,
         samples: *const f32,
@@ -237,4 +251,12 @@ extern "C" {
     pub fn bugle_sck_record_session_start(handle: *mut c_void) -> f64;
     pub fn bugle_sck_record_warnings(handle: *mut c_void) -> *mut c_char;
     pub fn bugle_sck_record_stop(handle: *mut c_void) -> i32;
+}
+
+// The level meter's ballistics, for tests (see `bugle_level_t`).
+#[cfg(test)]
+extern "C" {
+    pub fn bugle_level_add(level: *mut bugle_level_t, now: f64, peak: f64, mean_square: f64, seconds: f64);
+    pub fn bugle_level_at(level: *const bugle_level_t, now: f64) -> bugle_level_t;
+    pub fn bugle_level_constants(out: *mut f64);
 }

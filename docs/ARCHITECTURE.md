@@ -168,8 +168,14 @@ recorder state machine, and exposes one method per user-facing action:
   runs, each audio buffer (system audio on the stream's queue, the microphone
   on its capture queue) is also measured before it is written: its peak and
   mean square update a per-source meter in the shim (peak falling at 20 dB/s,
-  mean square averaged with a 0.3 s time constant), read without resetting
-  it, so the menu bar and API callers see the same values.
+  mean square averaged with a 0.3 s time constant; a buffer's samples count
+  for its own duration, so the average decays only over time no buffer
+  covers), read without resetting it, so the menu bar and API callers see the
+  same values. The ballistics (`bugle_level_add`/`bugle_level_at`) are plain C
+  functions that tests drive with explicit times, and a test checks their
+  constants against `bugle_core::audio_level`'s. A source whose buffers the
+  meter cannot read (big-endian, 24-bit packed, unsigned) is reported absent,
+  not silent.
   `SckRecorder::audio_levels` turns them into `bugle_core::audio_level`
   (dBFS, floored at -100), and `record_status` reports them as
   `audio_levels` while the recording is active. The audio is
@@ -365,8 +371,10 @@ callers get the in-app overlay too. Feedback is a transient toast (`toast_show`)
 plus the shutter sound; the status item title shows `● m:ss` while recording.
 With audio levels in the record status, `level_meter.rs` appends one block
 glyph per source to that title and inserts a disabled line per source under
-*Stop Recording* (bar, peak dB, `clip` near full scale); while recording, the
-event loop wakes every 100 ms instead of every second to redraw them.
+*Stop Recording* (bar, `!` near full scale, peak dB padded with figure spaces
+so the line keeps its width); while a recording reports levels, the event loop
+wakes every 100 ms instead of every second to redraw them, and the title and
+recording entries are set only when they change.
 When the process runs from `Bugle.app`, an *Open at Login* check item
 (`login.rs`) registers the bundle with `SMAppService`. Its check mark is
 re-read on the periodic tick (every 5 s) and set only for an enabled item; a

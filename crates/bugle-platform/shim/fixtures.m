@@ -154,15 +154,16 @@ char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double sec
     }
 }
 
-int32_t bugle_fixture_audio_level(int32_t int16, int32_t channels, int32_t interleaved, const float *samples,
+int32_t bugle_fixture_audio_level(int32_t format, int32_t channels, int32_t interleaved, const float *samples,
                                   int32_t frames, double rate, double *out) {
-    if (channels < 1 || channels > 8 || frames < 1 || !(rate > 0) || !samples || !out) return -1;
-    UInt32 bps = int16 ? 2 : 4;
+    if (format < 0 || format > 4 || channels < 1 || channels > 8 || frames < 1 || !(rate > 0) || !samples || !out) return -1;
+    BOOL isFloat = format == 0 || format == 2;
+    UInt32 bps = format == 1 || format == 4 ? 2 : format == 2 ? 8 : 4;
     AudioStreamBasicDescription asbd = {0};
     asbd.mSampleRate = rate;
     asbd.mFormatID = kAudioFormatLinearPCM;
-    asbd.mFormatFlags = (int16 ? kAudioFormatFlagIsSignedInteger : kAudioFormatFlagIsFloat) | kAudioFormatFlagIsPacked |
-                        (interleaved ? 0 : kAudioFormatFlagIsNonInterleaved);
+    asbd.mFormatFlags = (isFloat ? kAudioFormatFlagIsFloat : kAudioFormatFlagIsSignedInteger) | kAudioFormatFlagIsPacked |
+                        (interleaved ? 0 : kAudioFormatFlagIsNonInterleaved) | (format == 4 ? kAudioFormatFlagIsBigEndian : 0);
     asbd.mBitsPerChannel = bps * 8;
     asbd.mChannelsPerFrame = (UInt32)channels;
     asbd.mFramesPerPacket = 1;
@@ -177,8 +178,13 @@ int32_t bugle_fixture_audio_level(int32_t int16, int32_t channels, int32_t inter
         for (int32_t i = 0; i < frames; i++) {
             float v = samples[(size_t)c * frames + i];
             size_t k = interleaved ? (size_t)i * channels + c : (size_t)c * frames + i;
-            if (int16) ((int16_t *)data)[k] = (int16_t)lrintf(fmaxf(-1.0f, fminf(v, 32767.0f / 32768.0f)) * 32768.0f);
-            else ((float *)data)[k] = v;
+            double x = fmax(-1.0, fmin(v, 1.0));
+            switch (format) {
+                case 0: ((float *)data)[k] = v; break;
+                case 1: case 4: ((int16_t *)data)[k] = (int16_t)lrint(fmin(x * 32768.0, 32767.0)); break;
+                case 2: ((double *)data)[k] = v; break;
+                case 3: ((int32_t *)data)[k] = (int32_t)llrint(fmin(x * 2147483648.0, 2147483647.0)); break;
+            }
         }
     }
     abl->mNumberBuffers = nbuf;

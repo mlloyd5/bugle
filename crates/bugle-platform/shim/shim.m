@@ -2193,22 +2193,15 @@ void bugle_open_path(const char *path) {
 // the stop time so the video track covers the whole recording.
 // ---------------------------------------------------------------------------
 
-// Live level of one audio source, for the menu-bar meter and record_status.
-// Measured as the samples arrive (before any gain or ducking, which happen
-// after the recording stops). `peak` holds the largest magnitude and falls at
-// BUGLE_PEAK_FALL_DB_PER_S once the signal drops; `meanSquare` is averaged
-// with time constant BUGLE_RMS_TAU_S. Reads decay both to the current time
-// without changing them, so any number of readers see the same values. These
-// match bugle_core::audio_level's constants.
+// Live level of one audio source (bugle_level_t), for the menu-bar meter and
+// record_status. Measured as the samples arrive (before any gain or ducking,
+// which happen after the recording stops). `peak` holds the largest magnitude
+// and falls at BUGLE_PEAK_FALL_DB_PER_S once the signal drops; `mean_square`
+// is averaged with time constant BUGLE_RMS_TAU_S. Reads decay both to the
+// current time without changing them, so any number of readers see the same
+// values. A test checks these match bugle_core::audio_level's constants.
 #define BUGLE_PEAK_FALL_DB_PER_S 20.0
 #define BUGLE_RMS_TAU_S 0.3
-
-typedef struct {
-    BOOL seen;          // a buffer has been measured
-    double updated;     // host seconds of the last update
-    double peak;        // linear, 1.0 = full scale
-    double meanSquare;
-} BugleLevel;
 
 static double host_seconds(void) {
     return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()));
@@ -2260,12 +2253,37 @@ int32_t bugle_audio_buffer_stats(const void *buffer, double *peak, double *sumSq
     return 1;
 }
 
-// `l` decayed to `now` with no new samples.
-static BugleLevel level_decayed(BugleLevel l, double now) {
+void bugle_level_constants(double *out) {
+    out[0] = BUGLE_PEAK_FALL_DB_PER_S;
+    out[1] = BUGLE_RMS_TAU_S;
+}
+
+// Each buffer's samples stand for the `seconds` before it arrived, so the
+// average decays only over time no buffer covers (a gap, or the wait after
+// the last one); the peak falls for all the time since it was set.
+void bugle_level_add(bugle_level_t *l, double now, double peak, double mean_square, double seconds) {
+    seconds = fmax(0, seconds);
+    l->unreadable = 0;
+    if (!l->seen) {
+        *l = (bugle_level_t){.seen = 1, .updated = now, .covers = seconds, .peak = peak, .mean_square = mean_square};
+        return;
+    }
+    double dt = fmax(0, now - l->updated);
+    l->peak = fmax(l->peak * pow(10.0, -BUGLE_PEAK_FALL_DB_PER_S * dt / 20.0), peak);
+    double ms = l->mean_square * exp(-fmax(0, dt - seconds) / BUGLE_RMS_TAU_S);
+    // The buffer's own mean square enters the average with the weight of its duration.
+    l->mean_square = ms + (1.0 - exp(-seconds / BUGLE_RMS_TAU_S)) * (mean_square - ms);
+    l->updated = now;
+    l->covers = seconds;
+}
+
+bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
+    bugle_level_t l = *in;
     if (!l.seen) return l;
     double dt = fmax(0, now - l.updated);
     l.peak *= pow(10.0, -BUGLE_PEAK_FALL_DB_PER_S * dt / 20.0);
-    l.meanSquare *= exp(-dt / BUGLE_RMS_TAU_S);
+    l.mean_square *= exp(-fmax(0, dt - l.covers) / BUGLE_RMS_TAU_S);
+    l.covers = fmax(0, l.covers - dt);
     l.updated = now;
     return l;
 }
@@ -2294,8 +2312,8 @@ static BugleLevel level_decayed(BugleLevel l, double now) {
 @property (nonatomic, strong) NSString *failure;   // guarded by `lock`
 @property (nonatomic) BOOL captureRequested;        // startCapture was called
 @property (nonatomic, strong) NSMutableArray<NSString *> *warnings;
-@property (nonatomic) BugleLevel systemLevel;      // guarded by `lock`
-@property (nonatomic) BugleLevel micLevel;         // guarded by `lock`
+@property (nonatomic) bugle_level_t systemLevel;   // guarded by `lock`
+@property (nonatomic) bugle_level_t micLevel;      // guarded by `lock`
 @end
 
 @implementation BugleSckRecorder
@@ -2347,19 +2365,17 @@ static BugleLevel level_decayed(BugleLevel l, double now) {
 }
 
 - (void)meter:(CMSampleBufferRef)sb mic:(BOOL)mic {
-    double peak, sumSquares, seconds;
-    size_t count;
-    if (!bugle_audio_buffer_stats(sb, &peak, &sumSquares, &count, &seconds) || count == 0) return;
+    double peak = 0, sumSquares = 0, seconds = 0;
+    size_t count = 0;
+    BOOL ok = bugle_audio_buffer_stats(sb, &peak, &sumSquares, &count, &seconds) != 0;
+    if (ok && count == 0) return;
     double now = host_seconds();
     [self.lock lock];
-    BugleLevel l = level_decayed(mic ? self.micLevel : self.systemLevel, now);
-    // The buffer's own mean square enters the average with the weight of
-    // its duration; the first buffer starts it.
-    double ms = sumSquares / (double)count;
-    l.meanSquare = l.seen ? l.meanSquare + (1.0 - exp(-seconds / BUGLE_RMS_TAU_S)) * (ms - l.meanSquare) : ms;
-    l.peak = fmax(l.peak, peak);
-    l.seen = YES;
-    l.updated = now;
+    bugle_level_t l = mic ? self.micLevel : self.systemLevel;
+    // A format the meter cannot read: report the source as unmetered rather
+    // than silent.
+    if (ok) bugle_level_add(&l, now, peak, sumSquares / (double)count, seconds);
+    else l.unreadable = 1;
     if (mic) self.micLevel = l; else self.systemLevel = l;
     [self.lock unlock];
 }
@@ -2763,14 +2779,15 @@ int32_t bugle_sck_record_levels(void *handle, float *out) {
     BugleSckRecorder *rec = (__bridge BugleSckRecorder *)handle;
     double now = host_seconds();
     [rec.lock lock];
-    int32_t present = (rec.audioInput ? 1 : 0) | (rec.micInput ? 2 : 0);
-    BugleLevel sys = level_decayed(rec.systemLevel, now);
-    BugleLevel mic = level_decayed(rec.micLevel, now);
+    bugle_level_t sysNow = rec.systemLevel, micNow = rec.micLevel;
+    int32_t present = (rec.audioInput && !sysNow.unreadable ? 1 : 0) | (rec.micInput && !micNow.unreadable ? 2 : 0);
     [rec.lock unlock];
+    bugle_level_t sys = bugle_level_at(&sysNow, now);
+    bugle_level_t mic = bugle_level_at(&micNow, now);
     out[0] = (float)sys.peak;
-    out[1] = (float)sqrt(fmax(0, sys.meanSquare));
+    out[1] = (float)sqrt(fmax(0, sys.mean_square));
     out[2] = (float)mic.peak;
-    out[3] = (float)sqrt(fmax(0, mic.meanSquare));
+    out[3] = (float)sqrt(fmax(0, mic.mean_square));
     return present;
 }
 

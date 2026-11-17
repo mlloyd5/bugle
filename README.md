@@ -321,7 +321,7 @@ Open History Folder · Start/Stop Agent API · Preferences… (opens the config
 file) · Open at Login (only when running from `Bugle.app`) · Quit. While recording, the status item shows `● m:ss`;
 a recording with system audio or the microphone (the ScreenCaptureKit recorder) adds a live level meter: one
 bar glyph per source after the time (microphone first) and, under Stop Recording, a line per source with its
-peak in dB and a `clip` mark near full scale. Levels are measured as recorded, before any gain or ducking.
+peak in dB and a `!` clip mark near full scale. Levels are measured as recorded, before any gain or ducking.
 Other actions
 report through a small toast in the top-right corner (thumbnail and file name;
 click to open).

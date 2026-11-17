@@ -138,7 +138,8 @@ Values are dBFS (0 = full scale), floored at -100 for silence, measured as
 recorded (before `microphone_gain`, `system_audio_gain` and ducking). The peak
 falls at 20 dB/s once the signal drops and the RMS is averaged over 0.3 s, so
 polling a few times a second is enough. A source the recording does not
-capture (or a microphone that could not be opened) is `null`; the field is
+capture (a microphone that could not be opened, or one whose sample format
+the meter cannot read) is `null`; the field is
 absent when idle, finishing, recording a GIF, or on the `screencapture`
 recorder, which does not report levels.
 

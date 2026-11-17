@@ -504,10 +504,13 @@ struct App {
     history_mtime: Option<SystemTime>,
     proxy: Proxy,
     last_tick: Instant,
-    /// Whether the status item shows a recording (the meter then redraws
-    /// every [`level_meter::INTERVAL`]), and when it last did.
-    recording_shown: bool,
+    /// Whether the recording on show has a level meter (it then redraws every
+    /// [`level_meter::INTERVAL`]), and when it last did.
+    metering: bool,
     last_meter: Instant,
+    /// What the status item and recording entries show now, so a redraw
+    /// changes only what moved: (title, recording).
+    recording_shown: Option<(Option<String>, bool)>,
     quick: quick_access::QuickAccess,
     /// Numbers editor windows, so a late save or preview reaches only its own.
     editor_generation: u64,
@@ -644,28 +647,33 @@ impl App {
     fn update_recording_ui(&mut self) {
         let st = self.engine.record_status();
         let recording = st.state != RecordingState::Idle;
-        self.items.stop.set_enabled(recording);
-        self.items.record.set_enabled(!recording);
-        self.items.record_gif.set_enabled(!recording);
-        self.items.record_window.set_enabled(!recording);
-        if recording {
+        let title = recording.then(|| {
             let secs = st.elapsed_seconds as u64;
             let meter = st.audio_levels.as_ref().and_then(bugle_core::audio_level::meter_title);
             let meter = meter.map(|m| format!(" {m}")).unwrap_or_default();
-            self.tray.set_title(Some(format!("● {}:{:02}{meter}", secs / 60, secs % 60)));
-        } else {
-            self.tray.set_title(None::<&str>);
+            format!("● {}:{:02}{meter}", secs / 60, secs % 60)
+        });
+        let shown = (title, recording);
+        if self.recording_shown.as_ref() != Some(&shown) {
+            if self.recording_shown.as_ref().map(|s| s.1) != Some(recording) {
+                self.items.stop.set_enabled(recording);
+                self.items.record.set_enabled(!recording);
+                self.items.record_gif.set_enabled(!recording);
+                self.items.record_window.set_enabled(!recording);
+            }
+            self.tray.set_title(shown.0.as_deref());
+            self.recording_shown = Some(shown);
         }
         if let Err(e) = self.items.meter.update(&self.items.menu, st.audio_levels.as_ref()) {
             tracing::warn!("level meter: {e:#}");
         }
-        self.recording_shown = recording;
+        self.metering = st.audio_levels.is_some();
         self.last_meter = Instant::now();
     }
 
     /// How long the event loop may sleep before the next [`App::tick`].
     fn wake_interval(&self) -> Duration {
-        if self.recording_shown {
+        if self.metering {
             level_meter::INTERVAL
         } else {
             Duration::from_secs(1)
@@ -764,14 +772,14 @@ impl App {
     /// bar, recent list.
     fn tick(&mut self) {
         self.quick_tick();
-        if self.recording_shown && self.last_meter.elapsed() >= level_meter::INTERVAL {
+        let housekeeping = self.last_tick.elapsed() >= Duration::from_millis(900);
+        if housekeeping || (self.metering && self.last_meter.elapsed() >= level_meter::INTERVAL) {
             self.update_recording_ui();
         }
-        if self.last_tick.elapsed() < Duration::from_millis(900) {
+        if !housekeeping {
             return;
         }
         self.last_tick = Instant::now();
-        self.update_recording_ui();
         if !self.busy {
             // Panels hidden for a recording that ended without a Done
             // (stopped through the HTTP API, say) come back too.
@@ -887,8 +895,9 @@ fn main() -> Result<()> {
         history_mtime: None,
         proxy: proxy.clone(),
         last_tick: Instant::now() - Duration::from_secs(5),
-        recording_shown: false,
+        metering: false,
         last_meter: Instant::now(),
+        recording_shown: None,
         quick: quick_access::QuickAccess::new(engine.config.quick_access.clone()),
         editor_generation: 0,
         video_editor_generation: 0,
