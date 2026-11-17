@@ -27,11 +27,11 @@ const DETECT_RELEASE_MS: f32 = 60.0;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioMixConfig {
-    /// Microphone level in the mixed track: a linear factor on its default
-    /// share of the mix (`1/n` of `n` sources), so 1.0 = the default share.
+    /// Microphone level: in the mixed track a linear factor on its default
+    /// share of the mix (`1/n` of `n` sources), on its own track a factor on
+    /// the track as recorded; 1.0 = unchanged.
     pub microphone_gain: f32,
-    /// System-audio level in the mixed track: a linear factor on its default
-    /// share of the mix (`1/n` of `n` sources), so 1.0 = the default share.
+    /// System-audio level, on the same terms as `microphone_gain`.
     pub system_audio_gain: f32,
     /// Lower system audio while the microphone is active.
     pub ducking: bool,

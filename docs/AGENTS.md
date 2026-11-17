@@ -97,7 +97,7 @@ curl -s -H "$H" -H 'content-type: application/json' \
 | `annotate` | `source`, `annotation`, `output`, `copy`, `inline_image` | `media` + image |
 | `annotate_schema` | – | example document |
 | `scroll_capture` | `rect`, `max_frames`, `step_lines`, `settle_ms`, `horizontal`, `output`, `inline_image` | `media`, `stats` |
-| `record_start` | `target`, `format` (mp4/mov/gif), `fps`, `microphone`, `system_audio`, `mix_audio`, `microphone_gain`, `system_audio_gain`, `ducking`, `ducking_amount_db` (levels of the mixed track; defaults from `[recordings]`), `max_seconds`, `highlight_clicks`, `cursor_events` (writes `<file>.events.json`), `hide_cursor` (pointer left out of the frames; implies `cursor_events`), `output`, `label` | status |
+| `record_start` | `target`, `format` (mp4/mov/gif), `fps`, `microphone`, `system_audio`, `mix_audio`, `microphone_gain`, `system_audio_gain`, `ducking`, `ducking_amount_db` (levels of the mixed track, or of each separate track without `mix_audio`; defaults from `[recordings]`), `max_seconds`, `highlight_clicks`, `cursor_events` (writes `<file>.events.json`), `hide_cursor` (pointer left out of the frames; implies `cursor_events`), `output`, `label` | status |
 | `record_stop` | – | `media` |
 | `record_status` | – | status |
 | `transcribe` | `source`, `provider`, `language` | `transcript`, `srt` |
