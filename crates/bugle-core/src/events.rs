@@ -1,5 +1,6 @@
 //! Cursor and click event tracks: the sidecar a recording made with
-//! `cursor_events` gets next to its video (`clip.mp4` → `clip.events.json`).
+//! `cursor_events` gets next to its video, named after the whole file name
+//! (`clip.mp4` → `clip.mp4.events.json`, so `clip.mov` beside it has its own).
 //!
 //! The file is one JSON object:
 //!
@@ -10,6 +11,7 @@
 //!   "area": {"x": 0, "y": 30, "w": 1280, "h": 720},
 //!   "cursor_in_video": true,
 //!   "duration": 12.4,
+//!   "fps": 30,
 //!   "events": [
 //!     {"t": 0.0,  "type": "move", "x": 640.0, "y": 360.0},
 //!     {"t": 1.52, "type": "down", "button": "left", "x": 702.5, "y": 118.0},
@@ -20,13 +22,18 @@
 //!
 //! * `area` is the recorded area in global screen points (top-left origin);
 //!   for a window recording, the window's frame when the recording started.
-//! * `x`/`y` are points relative to the area's top-left corner. They can lie
-//!   outside `0..w` / `0..h` when the pointer leaves the area.
+//! * `x`/`y` are points relative to the area's top-left corner (for a window
+//!   recording, to the window's top-left corner at that moment, so a window
+//!   that moves keeps the mapping). They can lie outside `0..w` / `0..h` when
+//!   the pointer leaves the area.
 //! * `t` is seconds on the video's timeline (0 = first frame).
 //! * `type` is `move`, `down` or `up`; `button` (`left`, `right`, `middle`)
 //!   is given for `down`/`up`. Readers ignore unknown event types and fields.
 //! * `cursor_in_video` says whether the frames show the pointer (false for
 //!   recordings made with `hide_cursor`, whose edits draw it back).
+//! * `fps` (optional) is the frame rate the recording was made at.
+//! * `area_changed` (optional, default false) is true when a recorded window
+//!   was resized, after which positions no longer map onto the frames.
 //!
 //! A reader accepts any `version` 1 file; a later version bumps the number
 //! only for changes an older reader would misread.
@@ -88,6 +95,10 @@ pub struct EventTrack {
     pub cursor_in_video: bool,
     #[serde(default)]
     pub duration: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub area_changed: bool,
     #[serde(default)]
     pub events: Vec<CursorEvent>,
 }
@@ -102,12 +113,23 @@ fn invalid(msg: impl Into<String>) -> BugleError {
 
 impl EventTrack {
     pub fn new(area: Rect, cursor_in_video: bool, duration: f64, events: Vec<CursorEvent>) -> Self {
-        Self { format: EVENTS_FORMAT.into(), version: EVENTS_VERSION, area, cursor_in_video, duration, events }
+        Self {
+            format: EVENTS_FORMAT.into(),
+            version: EVENTS_VERSION,
+            area,
+            cursor_in_video,
+            duration,
+            fps: None,
+            area_changed: false,
+            events,
+        }
     }
 
-    /// The sidecar next to a video: `clip.mp4` → `clip.events.json`.
+    /// The sidecar next to a video: `clip.mp4` → `clip.mp4.events.json`.
     pub fn sidecar_path(video: &Path) -> PathBuf {
-        video.with_extension("events.json")
+        let mut s = video.as_os_str().to_owned();
+        s.push(".events.json");
+        PathBuf::from(s)
     }
 
     /// Parse and validate a track. Events are put in time order; unknown
@@ -132,6 +154,7 @@ impl EventTrack {
         }
         t.events.retain(|e| e.kind != EventKind::Other);
         t.events.sort_by(|a, b| a.t.total_cmp(&b.t));
+        t.fps = t.fps.filter(|f| f.is_finite() && *f > 0.0);
         Ok(t)
     }
 
@@ -219,6 +242,9 @@ mod tests {
         // Older writers without the optional fields.
         let t = EventTrack::parse(r#"{"format":"bugle-events","version":1,"area":{"x":0,"y":0,"w":10,"h":10}}"#).unwrap();
         assert!(t.cursor_in_video && t.events.is_empty() && t.duration == 0.0);
+        assert!(t.fps.is_none() && !t.area_changed);
+        let t = EventTrack::parse(r#"{"format":"bugle-events","version":1,"area":{"x":0,"y":0,"w":10,"h":10},"fps":-3,"area_changed":true}"#).unwrap();
+        assert!(t.fps.is_none() && t.area_changed);
     }
 
     #[test]
@@ -242,7 +268,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let video = dir.path().join("clip.v2.mp4");
         let side = EventTrack::sidecar_path(&video);
-        assert_eq!(side, dir.path().join("clip.v2.events.json"));
+        assert_eq!(side, dir.path().join("clip.v2.mp4.events.json"));
+        assert_ne!(EventTrack::sidecar_path(&dir.path().join("clip.v2.mov")), side, "one sidecar per file");
         let t = EventTrack::parse(SAMPLE).unwrap();
         t.save(&side).unwrap();
         assert_eq!(EventTrack::load(&side).unwrap(), t);

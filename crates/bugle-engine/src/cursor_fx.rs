@@ -24,6 +24,7 @@
 
 use bugle_core::events::EventTrack;
 use image::RgbaImage;
+use std::borrow::Cow;
 
 /// Zoom factors accepted by an edit.
 pub const MIN_ZOOM: f64 = 1.0;
@@ -211,37 +212,46 @@ pub fn viewport(w: f64, h: f64, level: f64, focus: (f64, f64)) -> Viewport {
     Viewport { x, y, w: vw, h: vh }
 }
 
-/// Scale the `vp` part of `src` up to `src`'s size (bilinear).
-pub fn crop_scale(src: &RgbaImage, vp: &Viewport) -> RgbaImage {
-    let (w, h) = src.dimensions();
-    let (sx, sy) = (vp.w / w as f64, vp.h / h as f64);
+/// Bilinear taps along one axis: for each output index, the two source
+/// indices and the weight (0..=256) of the second.
+fn taps(n_out: u32, n_src: u32, start: f64, len: f64) -> Vec<(usize, usize, u32)> {
+    let s = len / n_out as f64;
     // Samples stay inside the viewport, so nothing outside it bleeds in at
     // the edges.
-    let (x_lo, y_lo) = (vp.x.max(0.0), vp.y.max(0.0));
-    let x_hi = (vp.x + vp.w - 1.0).min(w as f64 - 1.0).max(x_lo);
-    let y_hi = (vp.y + vp.h - 1.0).min(h as f64 - 1.0).max(y_lo);
+    let lo = start.max(0.0);
+    let hi = (start + len - 1.0).min(n_src as f64 - 1.0).max(lo);
+    (0..n_out)
+        .map(|o| {
+            let f = (start + (o as f64 + 0.5) * s - 0.5).clamp(lo, hi);
+            let i0 = f.floor() as usize;
+            (i0, (i0 + 1).min(n_src as usize - 1), ((f - i0 as f64) * 256.0).round() as u32)
+        })
+        .collect()
+}
+
+/// Scale the `vp` part of `src` up to `src`'s size (bilinear, 8-bit fixed
+/// point weights; taps computed once per row and column).
+pub fn crop_scale(src: &RgbaImage, vp: &Viewport) -> RgbaImage {
+    let (w, h) = src.dimensions();
+    let cols = taps(w, w, vp.x, vp.w);
+    let rows = taps(h, h, vp.y, vp.h);
     let raw = src.as_raw();
     let stride = w as usize * 4;
-    let mut out = RgbaImage::new(w, h);
-    for (oy, row) in out.rows_mut().enumerate() {
-        let fy = (vp.y + (oy as f64 + 0.5) * sy - 0.5).clamp(y_lo, y_hi);
-        let y0 = fy.floor() as usize;
-        let y1 = (y0 + 1).min(h as usize - 1);
-        let ky = fy - y0 as f64;
-        for (ox, px) in row.enumerate() {
-            let fx = (vp.x + (ox as f64 + 0.5) * sx - 0.5).clamp(x_lo, x_hi);
-            let x0 = fx.floor() as usize;
-            let x1 = (x0 + 1).min(w as usize - 1);
-            let kx = fx - x0 as f64;
+    let mut out = vec![0u8; raw.len()];
+    for (row_out, &(y0, y1, ky)) in out.chunks_exact_mut(stride).zip(&rows) {
+        let (r0, r1) = (&raw[y0 * stride..][..stride], &raw[y1 * stride..][..stride]);
+        let (wy1, wy0) = (ky, 256 - ky);
+        for (px, &(x0, x1, kx)) in row_out.as_chunks_mut::<4>().0.iter_mut().zip(&cols) {
+            let (wx1, wx0) = (kx, 256 - kx);
+            let (a, b) = (x0 * 4, x1 * 4);
             for c in 0..4 {
-                let p = |x: usize, y: usize| raw[y * stride + x * 4 + c] as f64;
-                let top = p(x0, y0) + (p(x1, y0) - p(x0, y0)) * kx;
-                let bot = p(x0, y1) + (p(x1, y1) - p(x0, y1)) * kx;
-                px[c] = (top + (bot - top) * ky).round().clamp(0.0, 255.0) as u8;
+                let top = r0[a + c] as u32 * wx0 + r0[b + c] as u32 * wx1;
+                let bot = r1[a + c] as u32 * wx0 + r1[b + c] as u32 * wx1;
+                px[c] = ((top * wy0 + bot * wy1 + (1 << 15)) >> 16) as u8;
             }
         }
     }
-    out
+    RgbaImage::from_raw(w, h, out).expect("same size as the source")
 }
 
 /// The pointer: an arrow with its tip at (0, 0), in points.
@@ -317,7 +327,7 @@ impl<'a> Effects<'a> {
     /// `zoom` is the factor (> 1 to zoom); `smooth` draws a smoothed pointer.
     /// A track whose frames lack the pointer always gets it drawn.
     pub fn new(track: &'a EventTrack, zoom: Option<f64>, smooth: bool) -> Self {
-        let zoom = zoom.filter(|z| *z > 1.0).map(|z| ZoomPlan::new(track.clicks(), z));
+        let zoom = zoom.filter(|z| *z > 1.0).map(|z| ZoomPlan::new(zoom_clicks(track), z));
         let cursor = match (track.cursor_in_video, smooth) {
             (true, _) => None,
             (false, true) => Some(CursorPath::smoothed(track)),
@@ -326,24 +336,45 @@ impl<'a> Effects<'a> {
         Self { track, zoom, cursor }
     }
 
-    /// Render the frame shown at track time `t`.
-    pub fn apply(&self, frame: RgbaImage, t: f64) -> RgbaImage {
+    /// Render the frame shown at track time `t`; borrowed back unchanged
+    /// when nothing applies at `t`.
+    pub fn apply<'f>(&self, frame: &'f RgbaImage, t: f64) -> Cow<'f, RgbaImage> {
         let (w, h) = (frame.width() as f64, frame.height() as f64);
         let (ppx, ppy) = (w / self.track.area.w, h / self.track.area.h);
         let (level, focus) = self.zoom.as_ref().map(|z| z.at(t)).unwrap_or((1.0, None));
         let (mut out, vp) = match focus {
             Some(f) if level > 1.0 + 1e-6 => {
                 let vp = viewport(w, h, level, (f.0 * ppx, f.1 * ppy));
-                (crop_scale(&frame, &vp), vp)
+                (Cow::Owned(crop_scale(frame, &vp)), vp)
             }
-            _ => (frame, Viewport { x: 0.0, y: 0.0, w, h }),
+            _ => (Cow::Borrowed(frame), Viewport { x: 0.0, y: 0.0, w, h }),
         };
         if let Some((px, py)) = self.cursor.as_ref().and_then(|c| c.at(t)) {
             let k = w / vp.w;
-            draw_cursor(&mut out, ((px * ppx - vp.x) * k, (py * ppy - vp.y) * k), ppx * k);
+            draw_cursor(out.to_mut(), ((px * ppx - vp.x) * k, (py * ppy - vp.y) * k), ppx * k);
         }
         out
     }
+}
+
+/// Margin (points) around the recorded area within which a click still
+/// counts for zooming.
+pub const CLICK_MARGIN: f64 = 8.0;
+/// Clicks this close to the end (seconds) are left out of zooming: it is
+/// usually the click that stopped the recording.
+pub const END_CLICK_GUARD: f64 = 0.3;
+
+/// The clicks auto-zoom follows: inside the recorded area (give or take
+/// [`CLICK_MARGIN`]) and not in the last [`END_CLICK_GUARD`] seconds.
+pub fn zoom_clicks(track: &EventTrack) -> Vec<(f64, f64, f64)> {
+    let (w, h) = (track.area.w, track.area.h);
+    let end = if track.duration > 0.0 { track.duration - END_CLICK_GUARD } else { f64::INFINITY };
+    track
+        .clicks()
+        .filter(|&(t, x, y)| {
+            t <= end && (-CLICK_MARGIN..=w + CLICK_MARGIN).contains(&x) && (-CLICK_MARGIN..=h + CLICK_MARGIN).contains(&y)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -506,17 +537,51 @@ mod tests {
         let t = track(vec![CursorEvent::moved(0.0, 75.0, 25.0), down(1.0, 75.0, 25.0)], true);
         let fx = Effects::new(&t, Some(2.0), false);
         assert!(fx.cursor.is_none(), "the frames show the pointer already");
-        let out = fx.apply(frame.clone(), 1.0);
+        let out = fx.apply(&frame, 1.0);
         assert!(out.pixels().all(|p| p[2] == 255 && p[0] == 0), "zoomed into the blue half");
-        assert_eq!(fx.apply(frame.clone(), 9.0), frame, "zoomed out again");
+        assert!(matches!(fx.apply(&frame, 9.0), Cow::Borrowed(_)), "zoomed out again: the frame as is");
 
         // Without the pointer in the frames it is drawn, scaled with the zoom.
         let t = track(vec![CursorEvent::moved(0.0, 75.0, 25.0), down(1.0, 75.0, 25.0)], false);
         let fx = Effects::new(&t, Some(2.0), true);
-        let out = fx.apply(frame.clone(), 1.0);
+        let out = fx.apply(&frame, 1.0);
         // The click is centred: tip at (100, 50); 4 px/pt now.
         assert!(out.get_pixel(100 + 12, 50 + 40)[2] < 30, "black arrow body");
-        let plain = Effects::new(&t, None, false).apply(frame.clone(), 1.0);
+        let plain = Effects::new(&t, None, false).apply(&frame, 1.0);
         assert!(plain.get_pixel(150 + 6, 50 + 20)[2] < 30, "drawn at 2 px/pt without zoom");
+    }
+
+    #[test]
+    fn zoom_ignores_clicks_outside_the_area_and_the_stopping_click() {
+        // Area 100x50, duration 10.
+        let t = track(
+            vec![
+                down(1.0, 50.0, 25.0),
+                down(2.0, -5.0, 54.0),   // just outside, within the margin
+                down(3.0, 300.0, 25.0),  // elsewhere on the screen
+                down(4.0, 50.0, -40.0),  // the menu bar above the area
+                down(9.8, 50.0, 25.0),   // the click that stopped the recording
+            ],
+            true,
+        );
+        assert_eq!(zoom_clicks(&t), vec![(1.0, 50.0, 25.0), (2.0, -5.0, 54.0)]);
+        let p = Effects::new(&t, Some(2.0), false).zoom.unwrap();
+        assert_eq!(p.at(9.8).0, 1.0);
+        assert_eq!(p.at(3.0).0, 2.0, "still the run of the first two clicks");
+        assert_eq!(p.at(3.0).1, Some((-5.0, 54.0)));
+    }
+
+    #[test]
+    fn fixed_point_scaling_matches_the_exact_bilinear_result() {
+        // A horizontal ramp, zoomed 2x on its middle: every output pixel is
+        // within 1 of the exact interpolation.
+        let src = RgbaImage::from_fn(64, 8, |x, _| Rgba([(x * 4) as u8, 0, 255 - (x * 4) as u8, 255]));
+        let vp = Viewport { x: 16.0, y: 2.0, w: 32.0, h: 4.0 };
+        let out = crop_scale(&src, &vp);
+        for ox in 0..64 {
+            let f = (16.0 + (ox as f64 + 0.5) * 0.5 - 0.5).clamp(16.0, 47.0);
+            let exact = f * 4.0;
+            assert!((out.get_pixel(ox, 3)[0] as f64 - exact).abs() <= 1.0, "{ox}: {} vs {exact}", out.get_pixel(ox, 3)[0]);
+        }
     }
 }

@@ -347,6 +347,24 @@ pub fn mouse_buttons() -> u32 {
     unsafe { ffi::bugle_mouse_buttons() as u32 }
 }
 
+/// Now on the host clock, in seconds: the clock ScreenCaptureKit stamps
+/// frames with (see [`SckRecorder::session_start`]).
+pub fn host_time_now() -> f64 {
+    unsafe { ffi::bugle_host_time_now() }
+}
+
+/// A window's current frame (global points), `None` once it is gone.
+pub fn window_frame(window_id: u32) -> Option<Rect> {
+    let (mut x, mut y, mut w, mut h) = (0.0, 0.0, 0.0, 0.0);
+    (unsafe { ffi::bugle_window_frame(window_id, &mut x, &mut y, &mut w, &mut h) } == 0).then_some(Rect { x, y, w, h })
+}
+
+/// Whether child process `pid` has exited. Does not reap it, so its
+/// `std::process::Child` can still be waited on.
+pub fn child_exited(pid: u32) -> bool {
+    unsafe { ffi::bugle_child_exited(pid as i32) == 1 }
+}
+
 pub fn clipboard_write_png(png: &[u8]) -> Result<()> {
     if unsafe { ffi::bugle_clipboard_write_image(png.as_ptr(), png.len()) } != 0 {
         bail!("clipboard write failed");
@@ -935,6 +953,11 @@ impl SckRecorder {
         Ok(Self { handle })
     }
 
+    /// Host-clock time ([`host_time_now`]) of the movie's time 0.
+    pub fn session_start(&self) -> Option<f64> {
+        Some(unsafe { ffi::bugle_sck_record_session_start(self.handle) }).filter(|s| s.is_finite())
+    }
+
     /// Video frames written so far.
     pub fn frames(&self) -> u64 {
         unsafe { ffi::bugle_sck_record_frames(self.handle) }.max(0) as u64
@@ -991,6 +1014,54 @@ pub fn open_path(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_frames_keep_their_colour_through_write_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = [190u8, 60, 35];
+        let close = |p: &image::Rgba<u8>, what: &str| {
+            for i in 0..3 {
+                assert!((p[i] as i32 - c[i] as i32).abs() <= 4, "{what}: {:?} vs {c:?}", p);
+            }
+        };
+        let mut src = dir.path().join("0.mp4");
+        let mut frame = RgbaImage::from_pixel(160, 120, image::Rgba([c[0], c[1], c[2], 255]));
+        // Four generations, as repeated effects edits would make.
+        for gen in 1..=4 {
+            let mut w = VideoFrameWriter::create(&src, 160, 120, 10, true).unwrap();
+            for _ in 0..5 {
+                w.append(&frame).unwrap();
+            }
+            w.finish().unwrap();
+            let mut r = SequentialFrameReader::open(&src, 0.0, 0.0).unwrap();
+            let (pts, f) = r.next_frame().unwrap().unwrap();
+            assert!(pts.abs() < 1e-6);
+            close(f.get_pixel(80, 60), &format!("generation {gen}, sequential reader"));
+            // The generator colour-matches into the bitmap's colour space: a
+            // small fixed offset that does not grow across generations.
+            let g = VideoFrameReader::open(&src, 0.0).unwrap().frame_at(0.25).unwrap();
+            let g = g.get_pixel(80, 60);
+            assert!((0..3).all(|i| (g[i] as i32 - c[i] as i32).abs() <= 12), "generator: {g:?}");
+            let n = 1 + std::iter::from_fn(|| r.next_frame().unwrap()).count();
+            assert_eq!(n, 5);
+            frame = f;
+            src = dir.path().join(format!("{gen}.mp4"));
+        }
+    }
+
+    #[test]
+    fn host_clock_and_child_watch() {
+        let a = host_time_now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let d = host_time_now() - a;
+        assert!(d > 0.015 && d < 0.5, "{d}");
+        let mut child = std::process::Command::new("/bin/sleep").arg("0.1").spawn().unwrap();
+        assert!(!child_exited(child.id()));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(child_exited(child.id()));
+        // Not reaped: the owner still gets the status.
+        assert!(child.try_wait().unwrap().unwrap().success());
+    }
 
     #[test]
     fn registration_recovers_vertical_shift() {

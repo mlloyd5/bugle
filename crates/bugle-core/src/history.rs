@@ -256,6 +256,10 @@ impl History {
         self.append(format!("DELETE {}\n", item.id).as_bytes())?;
         if remove_file && item.path.exists() {
             std::fs::remove_file(&item.path).with_context(|| format!("removing {}", item.path.display()))?;
+            // The cursor event track belongs to the file.
+            if let Some(events) = item.events.as_ref().filter(|p| p.is_file()) {
+                std::fs::remove_file(events).with_context(|| format!("removing {}", events.display()))?;
+            }
         }
         Ok(true)
     }

@@ -83,7 +83,7 @@ impl Engine {
             Ok(Some(s)) => s,
             _ => return,
         };
-        if stored.path != item.path || stored.url != item.url || stored.synced_as != item.synced_as {
+        if stored.path != item.path || stored.url != item.url || stored.synced_as != item.synced_as || stored.events != item.events {
             if let Err(e) = self.history.update(item) {
                 tracing::warn!("could not record the sync of {}: {e:#}", item.path.display());
             }
@@ -110,8 +110,28 @@ impl Engine {
         let mut report = self.sync_file(&dest, mode, item, &Naming::Local, true)?;
         if self.config.sync.sidecars && item.is_video() {
             report.sidecars = self.sync_sidecars_of(&original, item);
+            report.sidecars.extend(self.sync_event_track_of(&dest, mode, item));
         }
         Ok(Some(report))
+    }
+
+    /// Send a video's cursor event track along under the video's synced
+    /// name (`clip 2.mp4` → `clip 2.mp4.events.json`); a move updates
+    /// `item.events`. Failures are logged.
+    fn sync_event_track_of(&self, dest: &SyncDestination, mode: SyncMode, item: &mut MediaItem) -> Option<SyncReport> {
+        let path = item.events.clone().filter(|p| p.is_file())?;
+        let name = format!("{}.events.json", item.synced_as.as_deref()?);
+        let mut track = MediaItem::new(item.kind, &path);
+        match self.sync_file(dest, mode, &mut track, &Naming::Sidecar { name, replace: true }, false) {
+            Ok(r) => {
+                item.events = Some(track.path);
+                Some(r)
+            }
+            Err(e) => {
+                tracing::warn!("sync of the event track {} failed: {e:#}", path.display());
+                None
+            }
+        }
     }
 
     /// `bugle sync <source>`: sync an existing capture on demand, whatever
@@ -1500,6 +1520,29 @@ mod tests {
         let (_, r) = engine.sync_media(lone.to_str().unwrap()).unwrap();
         assert_eq!(r.destination, folder_label(&cloud));
         assert_eq!(std::fs::read(cloud.join("rec 2.vtt")).unwrap(), b"lone");
+    }
+
+    #[test]
+    fn event_tracks_follow_their_video_and_go_with_it_on_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_in(tmp.path(), SyncMode::Move);
+        let save = engine.config.save_dir();
+        let cloud = tmp.path().join("cloud");
+        write(&cloud.join("rec.mp4"), b"someone else's");
+        let mut video = MediaItem::new(MediaKind::Video, write(&save.join("rec.mp4"), b"mp4"));
+        video.events = Some(write(&save.join("rec.mp4.events.json"), b"{}"));
+        engine.history.push(&video).unwrap();
+        let (video, report) = engine.sync_media(&video.id).unwrap();
+        assert_eq!(video.path, cloud.join("rec 2.mp4"));
+        let moved = cloud.join("rec 2.mp4.events.json");
+        assert_eq!(video.events.as_deref(), Some(moved.as_path()));
+        assert!(moved.exists() && !save.join("rec.mp4.events.json").exists());
+        assert_eq!(report.sidecars.len(), 1);
+        assert_eq!(engine.history.get(&video.id).unwrap().unwrap().events.as_deref(), Some(moved.as_path()));
+
+        assert!(engine.history.delete(&video.id, true).unwrap());
+        assert!(!moved.exists() && !video.path.exists());
+        assert_eq!(std::fs::read(cloud.join("rec.mp4")).unwrap(), b"someone else's");
     }
 
     #[test]

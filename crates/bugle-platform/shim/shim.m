@@ -12,6 +12,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <ApplicationServices/ApplicationServices.h>
 #include "shim.h"
+#include <sys/wait.h>
 
 // ---------------------------------------------------------------------------
 // Errors / memory
@@ -539,6 +540,35 @@ int32_t bugle_mouse_buttons(void) {
     if (CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonRight)) m |= 2;
     if (CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonCenter)) m |= 4;
     return m;
+}
+
+double bugle_host_time_now(void) { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock())); }
+
+int32_t bugle_window_frame(uint32_t window_id, double *x, double *y, double *w, double *h) {
+    @autoreleasepool {
+        CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, window_id);
+        if (!list) return -1;
+        int32_t rc = -1;
+        if (CFArrayGetCount(list) > 0) {
+            NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(list, 0);
+            CGRect r;
+            if ([info[(id)kCGWindowNumber] unsignedIntValue] == window_id &&
+                CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)info[(id)kCGWindowBounds], &r)) {
+                *x = r.origin.x; *y = r.origin.y; *w = r.size.width; *h = r.size.height;
+                rc = 0;
+            }
+        }
+        CFRelease(list);
+        return rc;
+    }
+}
+
+int32_t bugle_child_exited(int32_t pid) {
+    // WNOWAIT leaves the child to be reaped by its owner.
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    if (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOHANG | WNOWAIT) != 0) return -1;
+    return info.si_pid == pid ? 1 : 0;
 }
 
 // Clipboard, sound and workspace calls below run on whichever thread the
@@ -1425,6 +1455,14 @@ void bugle_frames_close(void *handle) {
     }
 }
 
+static NSDictionary *bt709_properties(void) {
+    return @{
+        AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+        AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+        AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+    };
+}
+
 @interface BugleFrameWriter : NSObject
 @property(strong) AVAssetWriter *writer;
 @property(strong) AVAssetWriterInput *input;
@@ -1467,6 +1505,9 @@ void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int
             AVVideoWidthKey: @(w),
             AVVideoHeightKey: @(h),
             AVVideoCompressionPropertiesKey: compression,
+            // Tagged explicitly: untagged small movies are read back with
+            // the SD (601) matrix and shift colour on every round trip.
+            AVVideoColorPropertiesKey: bt709_properties(),
         };
         AVAssetWriterInput *input = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:video];
         input.expectsMediaDataInRealTime = NO;
@@ -1604,7 +1645,10 @@ void *bugle_seq_open(const char *path, double start, double end) {
         NSError *err = nil;
         AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&err];
         if (!reader) { set_error(@"could not read %s: %@", path, err.localizedDescription); return NULL; }
-        NSDictionary *settings = @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)};
+        NSDictionary *settings = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+            AVVideoColorPropertiesKey: bt709_properties(),
+        };
         AVAssetReaderTrackOutput *out = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:track outputSettings:settings];
         out.alwaysCopiesSampleData = NO;
         if (![reader canAddOutput:out]) { set_error(@"could not decode the video track"); return NULL; }
@@ -2214,6 +2258,15 @@ void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t wi
         }
         return (__bridge_retained void *)rec;
     }
+}
+
+double bugle_sck_record_session_start(void *handle) {
+    if (!handle) return NAN;
+    BugleSckRecorder *rec = (__bridge BugleSckRecorder *)handle;
+    [rec.lock lock];
+    double s = rec.sessionStarted ? CMTimeGetSeconds(rec.sessionStart) : NAN;
+    [rec.lock unlock];
+    return s;
 }
 
 int64_t bugle_sck_record_frames(void *handle) {

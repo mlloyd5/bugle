@@ -154,7 +154,7 @@ pub fn catalog() -> Vec<ToolSpec> {
                     "mix_audio":{"type":"boolean","description":"fold microphone and system audio into one track"},
                     "max_seconds":{"type":"number","description":"auto-stop"},
                     "highlight_clicks":{"type":"boolean"},
-                    "cursor_events":{"type":"boolean","description":"log pointer moves and clicks to <name>.events.json next to the recording (for edit_video zoom / smooth_cursor)"},
+                    "cursor_events":{"type":"boolean","description":"log pointer moves and clicks to <file>.events.json next to the recording (for edit_video zoom / smooth_cursor)"},
                     "hide_cursor":{"type":"boolean","description":"leave the pointer out of the frames (implies cursor_events; edit_video smooth_cursor draws it back)"},
                     "output":{"type":"string"},
                     "label":{"type":"string"}

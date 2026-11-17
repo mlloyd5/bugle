@@ -3,26 +3,39 @@
 //! A thread polls the pointer position and the mouse-button state
 //! ([`POLL_HZ`]; no permission needed, no events posted or intercepted) and
 //! logs a `move` when the pointer moved and a `down`/`up` when a button
-//! changed. A press shorter than one poll interval can be missed.
+//! changed. A press shorter than one poll interval can be missed. Events are
+//! stamped on the host clock (the clock ScreenCaptureKit stamps frames with)
+//! and placed on the video's timeline when the recording is finalised, by a
+//! [`VideoClock`] that says where the video's time 0 is:
 //!
-//! The log starts just before the recorder does, and the recorder's own
-//! startup delay is unknown, so the track is aligned on the *end*: the video
-//! ends when the recording is stopped, which is when the log stops too (or
-//! at `max_seconds`). The difference between the log's length and the
-//! video's is how much later the video started; event times are shifted by
-//! it (at most [`MAX_ALIGN_SHIFT`]).
+//! * the stream recorder reports the host time its movie starts at;
+//! * the GIF recorder stamps every frame it grabs, so frame `k` (shown from
+//!   `k / fps`) maps to the moment it was grabbed, even when grabs fall
+//!   behind the frame rate;
+//! * the system recorder (`screencapture -v`, a child process) reports
+//!   nothing, but its movie ends when it is interrupted, or when it exits by
+//!   itself at its deadline (the log thread watches for that without reaping
+//!   it), so the start is that end minus the video track's duration.
+//!
+//! None of this depends on how long finalising the file takes. Events before
+//! the video starts collapse into the starting position; events after it
+//! ends are dropped.
+//!
+//! For a window recording the pointer is logged relative to the window's
+//! current origin (polled with it), since the recorders follow the window;
+//! a resize sets `area_changed`, after which positions no longer map.
 
 use bugle_core::events::{CursorEvent, EventKind, EventTrack, MouseButton};
 use bugle_core::Rect;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const POLL_HZ: f64 = 60.0;
 /// Pointer moves shorter than this (points) are not logged.
 const MIN_MOVE: f64 = 0.25;
-/// Largest start offset the end alignment trusts.
-pub const MAX_ALIGN_SHIFT: f64 = 2.0;
+/// A window counts as resized when a side changes by more than this (points).
+const RESIZE_TOLERANCE: f64 = 1.0;
 
 const BUTTONS: [(u32, MouseButton); 3] = [(1, MouseButton::Left), (2, MouseButton::Right), (4, MouseButton::Middle)];
 
@@ -56,70 +69,118 @@ impl Sampler {
     }
 }
 
-/// How far to shift a log of `log_seconds` onto a video lasting
-/// `video_seconds` that ended when the log did.
-pub fn align_shift(log_seconds: f64, video_seconds: f64) -> f64 {
-    let s = log_seconds - video_seconds;
-    if s.is_finite() && (0.0..=MAX_ALIGN_SHIFT).contains(&s) {
-        s
-    } else {
-        0.0
+/// Where the video's time 0 is on the host clock.
+#[derive(Clone)]
+pub enum VideoClock {
+    /// Time 0 is this host time (stream recorder).
+    StartsAt(f64),
+    /// Frame `k`, shown from `k / fps`, was grabbed at host time `times[k]`
+    /// (GIF recorder).
+    Frames { times: Arc<Mutex<Vec<f64>>>, fps: f64 },
+    /// The video ends at the stop time given to [`EventLog::finish`], or
+    /// when the watched child exited by itself (system recorder).
+    EndAligned,
+}
+
+/// Video time of host time `t` for frames grabbed at `times` (sorted),
+/// shown at `fps`: piecewise linear between grabs, negative before the
+/// first one.
+pub fn frames_time(t: f64, times: &[f64], fps: f64) -> f64 {
+    let Some(&first) = times.first() else { return t };
+    if t < first {
+        return t - first;
+    }
+    let k = times.partition_point(|&g| g <= t) - 1;
+    match times.get(k + 1) {
+        Some(&next) if next > times[k] => (k as f64 + ((t - times[k]) / (next - times[k])).clamp(0.0, 1.0)) / fps,
+        _ => k as f64 / fps + (t - times[k]),
     }
 }
 
-/// Move events `shift` seconds earlier. Events before 0 are dropped, but the
-/// position they leave the pointer at is kept as a `move` at 0.
-pub fn shift_events(events: Vec<CursorEvent>, shift: f64) -> Vec<CursorEvent> {
+/// Put events (already on the video's timeline) into `0..=duration`: the
+/// position they leave the pointer at before 0 becomes a `move` at 0, the
+/// first `move` at the start is placed at exactly 0, and events after the
+/// end are dropped. A button released after the start but pressed before it
+/// keeps its `up` only.
+pub fn place_events(events: Vec<CursorEvent>, duration: f64) -> Vec<CursorEvent> {
     let mut out = Vec::with_capacity(events.len());
     let mut before: Option<(f64, f64)> = None;
     for e in events {
-        let t = e.t - shift;
-        if t < 0.0 {
+        if e.t < 0.0 {
             before = Some((e.x, e.y));
-        } else {
-            if let Some((x, y)) = before.take() {
-                if t > 0.0 {
-                    out.push(CursorEvent::moved(0.0, x, y));
-                }
-            }
-            out.push(CursorEvent { t, ..e });
+            continue;
         }
+        if e.t > duration {
+            break;
+        }
+        if let Some((x, y)) = before.take() {
+            if !(e.t == 0.0 && e.kind == EventKind::Move) {
+                out.push(CursorEvent::moved(0.0, x, y));
+            }
+        }
+        out.push(e);
     }
     if let Some((x, y)) = before {
         out.push(CursorEvent::moved(0.0, x, y));
     }
+    // The first sample is where the pointer was when the video started.
+    if let Some(first) = out.first_mut().filter(|e| e.kind == EventKind::Move && e.t < 0.1) {
+        first.t = 0.0;
+    }
     out
+}
+
+/// What the log thread hands back.
+#[derive(Default)]
+struct Logged {
+    started: f64,
+    events: Vec<CursorEvent>,
+    child_exited_at: Option<f64>,
+    area_changed: bool,
 }
 
 /// A running event log. Dropping it stops the thread.
 pub struct EventLog {
     area: Rect,
     cursor_in_video: bool,
+    fps: Option<f64>,
+    clock: VideoClock,
     stop: Arc<AtomicBool>,
-    handle: Option<std::thread::JoinHandle<(Vec<CursorEvent>, f64)>>,
+    child: Arc<AtomicU32>,
+    handle: Option<std::thread::JoinHandle<Logged>>,
 }
 
 impl EventLog {
-    /// Start logging the pointer relative to `area` (global points). Stops
-    /// by itself after `max_seconds`.
-    pub fn start(area: Rect, cursor_in_video: bool, max_seconds: Option<f64>) -> std::io::Result<Self> {
+    /// Start logging the pointer relative to `area` (global points), or to
+    /// window `window`'s current origin. Runs until finished or dropped.
+    pub fn start(area: Rect, window: Option<u32>) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
-        let stop2 = stop.clone();
+        let child = Arc::new(AtomicU32::new(0));
+        let (stop2, child2) = (stop.clone(), child.clone());
         let handle = std::thread::Builder::new().name("bugle-events".into()).spawn(move || {
-            let t0 = Instant::now();
             let interval = Duration::from_secs_f64(1.0 / POLL_HZ);
-            let mut next = t0;
+            let mut next = Instant::now();
+            let mut log = Logged { started: bugle_platform::host_time_now(), ..Default::default() };
             let mut s = Sampler::default();
-            loop {
-                let t = t0.elapsed().as_secs_f64();
-                if let Some(m) = max_seconds.filter(|m| *m > 0.0 && t >= *m) {
-                    return (s.events, m);
+            let mut origin = (area.x, area.y);
+            let mut polls: u64 = 0;
+            while !stop2.load(Ordering::Relaxed) {
+                if let Some(id) = window.filter(|_| polls.is_multiple_of(2)) {
+                    if let Some(f) = bugle_platform::window_frame(id) {
+                        origin = (f.x, f.y);
+                        if (f.w - area.w).abs() > RESIZE_TOLERANCE || (f.h - area.h).abs() > RESIZE_TOLERANCE {
+                            log.area_changed = true;
+                        }
+                    }
                 }
-                if stop2.load(Ordering::Relaxed) {
-                    return (s.events, t);
-                }
+                polls += 1;
+                let t = bugle_platform::host_time_now();
                 let p = bugle_platform::cursor_position();
-                s.feed(t, p.x - area.x, p.y - area.y, bugle_platform::mouse_buttons());
+                s.feed(t, p.x - origin.0, p.y - origin.1, bugle_platform::mouse_buttons());
+                let pid = child2.load(Ordering::Relaxed);
+                if pid != 0 && log.child_exited_at.is_none() && bugle_platform::child_exited(pid) {
+                    log.child_exited_at = Some(t);
+                }
                 next += interval;
                 let now = Instant::now();
                 if next > now {
@@ -128,27 +189,59 @@ impl EventLog {
                     next = now;
                 }
             }
+            log.events = s.events;
+            log
         })?;
-        Ok(Self { area, cursor_in_video, stop, handle: Some(handle) })
+        Ok(Self { area, cursor_in_video: true, fps: None, clock: VideoClock::EndAligned, stop, child, handle: Some(handle) })
     }
 
-    /// Record whether the frames show the pointer (known once the recorder
-    /// is chosen).
-    pub fn set_cursor_in_video(&mut self, shown: bool) {
-        self.cursor_in_video = shown;
+    /// Say how the video is timed, whether its frames show the pointer and
+    /// its frame rate (known once the recorder runs).
+    pub fn attach(&mut self, clock: VideoClock, cursor_in_video: bool, fps: Option<f64>) {
+        self.clock = clock;
+        self.cursor_in_video = cursor_in_video;
+        self.fps = fps;
     }
 
-    /// Stop logging and build the track for a video lasting `video_seconds`.
-    pub fn finish(mut self, video_seconds: f64) -> EventTrack {
+    /// Note when child `pid` (the system recorder) exits by itself.
+    pub fn watch_child(&self, pid: u32) {
+        self.child.store(pid, Ordering::Relaxed);
+    }
+
+    /// Stop logging and build the track for a video whose track lasts
+    /// `video_seconds`. `stopped_at` is the host time the recorder was told
+    /// to stop (only used for [`VideoClock::EndAligned`]).
+    pub fn finish(mut self, video_seconds: f64, stopped_at: Option<f64>) -> EventTrack {
         self.stop.store(true, Ordering::Relaxed);
-        let (events, log_seconds) = self.handle.take().and_then(|h| h.join().ok()).unwrap_or_default();
-        let shift = align_shift(log_seconds, video_seconds);
-        let mut events = shift_events(events, shift);
-        // The first sample is where the pointer was when the video started.
-        if let Some(first) = events.first_mut().filter(|e| e.kind == EventKind::Move) {
-            first.t = 0.0;
-        }
-        EventTrack::new(self.area, self.cursor_in_video, video_seconds, events)
+        let log = self.handle.take().and_then(|h| h.join().ok()).unwrap_or_default();
+        let (to_video, duration): (Box<dyn Fn(f64) -> f64>, f64) = match &self.clock {
+            VideoClock::StartsAt(s) => {
+                let s = *s;
+                (Box::new(move |t| t - s), video_seconds)
+            }
+            VideoClock::Frames { times, fps } => {
+                let times = times.lock().map(|v| v.clone()).unwrap_or_default();
+                tracing::trace!("event track: GIF frames grabbed at host times {times:?}");
+                let (fps, n) = (*fps, times.len());
+                (Box::new(move |t| frames_time(t, &times, fps)), n as f64 / fps)
+            }
+            VideoClock::EndAligned => {
+                // Interrupted: the video ends then; otherwise it ended when
+                // the child exited by itself. Unknown: assume it started
+                // with the log.
+                let start = match stopped_at.or(log.child_exited_at) {
+                    Some(end) => end - video_seconds,
+                    None => log.started,
+                };
+                (Box::new(move |t| t - start), video_seconds)
+            }
+        };
+        tracing::debug!("event track: host time {:.4} is video time {:.4} (log started then)", log.started, to_video(log.started));
+        let events = log.events.into_iter().map(|e| CursorEvent { t: to_video(e.t), ..e }).collect();
+        let mut track = EventTrack::new(self.area, self.cursor_in_video, duration, place_events(events, duration));
+        track.fps = self.fps;
+        track.area_changed = log.area_changed;
+        track
     }
 }
 
@@ -191,40 +284,71 @@ mod tests {
     }
 
     #[test]
-    fn alignment_trusts_small_positive_offsets_only() {
-        assert_eq!(align_shift(10.3, 10.0), 10.3 - 10.0);
-        assert_eq!(align_shift(10.0, 10.2), 0.0, "video longer than the log");
-        assert_eq!(align_shift(30.0, 10.0), 0.0, "implausible");
-        assert_eq!(align_shift(f64::NAN, 1.0), 0.0);
+    fn frames_map_grab_times_onto_the_frame_timeline() {
+        // 10 fps, but grabs fell behind: 0.0, 0.1, 0.3, 0.6.
+        let times = [100.0, 100.1, 100.3, 100.6];
+        let v = |t| frames_time(t, &times, 10.0);
+        assert!((v(100.0) - 0.0).abs() < 1e-9);
+        assert!((v(100.2) - 0.15).abs() < 1e-9, "halfway between grabs 1 and 2");
+        assert!((v(100.6) - 0.3).abs() < 1e-9);
+        assert!((v(99.5) + 0.5).abs() < 1e-9, "before the first grab: negative");
+        assert!((v(100.7) - 0.4).abs() < 1e-9, "after the last: real time");
+        assert_eq!(frames_time(5.0, &[], 10.0), 5.0);
     }
 
     #[test]
-    fn shifting_keeps_the_starting_position() {
-        let ev = vec![CursorEvent::moved(0.0, 1.0, 1.0), CursorEvent::moved(0.2, 2.0, 2.0), CursorEvent::moved(0.5, 3.0, 3.0)];
-        let out = shift_events(ev.clone(), 0.3);
-        assert_eq!(out, vec![CursorEvent::moved(0.0, 2.0, 2.0), CursorEvent::moved(0.2, 3.0, 3.0)]);
-        assert_eq!(shift_events(ev.clone(), 0.0), ev);
+    fn placing_keeps_the_starting_position_and_cuts_the_end() {
+        let ev = vec![
+            CursorEvent::moved(-0.5, 1.0, 1.0),
+            CursorEvent::moved(-0.1, 2.0, 2.0),
+            CursorEvent::moved(0.2, 3.0, 3.0),
+            CursorEvent::moved(1.5, 4.0, 4.0),
+        ];
+        assert_eq!(place_events(ev.clone(), 1.0), vec![CursorEvent::moved(0.0, 2.0, 2.0), CursorEvent::moved(0.2, 3.0, 3.0)]);
         // Everything before 0: the last position remains.
-        assert_eq!(shift_events(ev, 1.0), vec![CursorEvent::moved(0.0, 3.0, 3.0)]);
-        // An event landing exactly on 0 needs no seed.
-        let ev = vec![CursorEvent::moved(0.0, 1.0, 1.0), CursorEvent::moved(0.5, 2.0, 2.0)];
-        assert_eq!(shift_events(ev, 0.5), vec![CursorEvent::moved(0.0, 2.0, 2.0)]);
+        assert_eq!(place_events(ev[..2].to_vec(), 1.0), vec![CursorEvent::moved(0.0, 2.0, 2.0)]);
+        // A first sample just after 0 is moved onto 0; one on 0 needs no seed.
+        assert_eq!(place_events(vec![CursorEvent::moved(0.02, 5.0, 5.0)], 1.0), vec![CursorEvent::moved(0.0, 5.0, 5.0)]);
+        let ev = vec![CursorEvent::moved(-0.2, 1.0, 1.0), CursorEvent::moved(0.0, 2.0, 2.0)];
+        assert_eq!(place_events(ev, 1.0), vec![CursorEvent::moved(0.0, 2.0, 2.0)]);
+    }
+
+    fn fake_log(events: Vec<CursorEvent>, clock: VideoClock, exited: Option<f64>) -> EventLog {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn(move || Logged { started: 1000.0, events, child_exited_at: exited, area_changed: false });
+        EventLog { area: Rect::new(0.0, 0.0, 10.0, 10.0), cursor_in_video: true, fps: Some(30.0), clock, stop, child: Default::default(), handle: Some(handle) }
+    }
+
+    #[test]
+    fn clocks_place_events_independently_of_finalising_time() {
+        let down = |t| CursorEvent { t, kind: EventKind::Down, button: Some(MouseButton::Left), x: 1.0, y: 1.0 };
+        let ev = || vec![CursorEvent::moved(1000.0, 0.0, 0.0), down(1001.5)];
+        // Stream recorder: the movie starts 0.25 s after the log.
+        let t = fake_log(ev(), VideoClock::StartsAt(1000.25), None).finish(3.0, Some(1003.25));
+        assert_eq!(t.clicks().map(|c| c.0).collect::<Vec<_>>(), vec![1.25]);
+        assert_eq!(t.fps, Some(30.0));
+        // System recorder stopped at 1003.4 with a 3.2 s video: starts at 1000.2.
+        let t = fake_log(ev(), VideoClock::EndAligned, None).finish(3.2, Some(1003.4));
+        assert!((t.clicks().next().unwrap().0 - 1.3).abs() < 1e-9);
+        // ... or it exited by itself at its deadline (no stop time).
+        let t = fake_log(ev(), VideoClock::EndAligned, Some(1002.2)).finish(2.0, None);
+        assert!((t.clicks().next().unwrap().0 - 1.3).abs() < 1e-9);
+        // GIF: frames grabbed every 0.1 s from 1000.5 at 10 fps.
+        let times = Arc::new(Mutex::new((0..20).map(|k| 1000.5 + k as f64 * 0.1).collect::<Vec<_>>()));
+        let t = fake_log(ev(), VideoClock::Frames { times, fps: 10.0 }, None).finish(99.0, None);
+        assert!((t.duration - 2.0).abs() < 1e-9, "20 frames at 10 fps");
+        assert!((t.clicks().next().unwrap().0 - 1.0).abs() < 1e-9);
+        assert_eq!(t.events[0], CursorEvent::moved(0.0, 0.0, 0.0));
     }
 
     #[test]
     fn log_runs_and_stops() {
-        let log = EventLog::start(Rect::new(0.0, 0.0, 100.0, 100.0), false, None).unwrap();
+        let log = EventLog::start(Rect::new(0.0, 0.0, 100.0, 100.0), None).unwrap();
         std::thread::sleep(Duration::from_millis(80));
-        let t = log.finish(0.05);
-        assert!(!t.cursor_in_video);
+        let now = bugle_platform::host_time_now();
+        let t = log.finish(0.05, Some(now));
         assert_eq!(t.duration, 0.05);
         assert_eq!(t.events.first().map(|e| e.t), Some(0.0), "starts with the pointer position");
-        // Auto-stop at max_seconds.
-        let log = EventLog::start(Rect::new(0.0, 0.0, 10.0, 10.0), true, Some(0.05)).unwrap();
-        std::thread::sleep(Duration::from_millis(120));
-        let t0 = Instant::now();
-        let t = log.finish(0.05);
-        assert!(t0.elapsed() < Duration::from_millis(50), "already stopped");
         assert!(t.events.iter().all(|e| e.t <= 0.05));
     }
 }
