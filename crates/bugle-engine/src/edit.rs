@@ -43,7 +43,7 @@ use image::{AnimationDecoder, Delay, Frame, ImageDecoder, RgbaImage};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Shortest clip an edit may produce, in seconds.
 pub const MIN_CLIP_SECONDS: f64 = 0.05;
@@ -255,6 +255,27 @@ fn effects_fps(requested: Option<u32>, recorded: Option<f64>, nominal: f64) -> u
     (base.round() as u32).clamp(1, 60)
 }
 
+/// The recording's clicks for an error message: the [`NEAREST_LISTED`]
+/// nearest `t` (in time order) and how many there are in all.
+fn nearest_clicks(clicks: &[f64], t: f64) -> String {
+    if clicks.is_empty() {
+        return "the recording has no clicks".into();
+    }
+    let mut near: Vec<f64> = clicks.to_vec();
+    near.sort_by(|a, b| (a - t).abs().total_cmp(&(b - t).abs()));
+    near.truncate(NEAREST_LISTED);
+    near.sort_by(f64::total_cmp);
+    let list: Vec<String> = near.iter().map(|t| format!("{t:.2}")).collect();
+    if clicks.len() <= NEAREST_LISTED {
+        format!("the recording's clicks are at: {}", list.join(", "))
+    } else {
+        format!("the recording has {} clicks; the nearest are at: {}", clicks.len(), list.join(", "))
+    }
+}
+
+/// Most clicks an unmatched-click error lists.
+const NEAREST_LISTED: usize = 10;
+
 /// Check the event-track options against the track (if any).
 fn check_effects(req: &EditRequest, track: Option<&EventTrack>, source: &Path) -> std::result::Result<(), BugleError> {
     if let Some(z) = req.zoom {
@@ -297,12 +318,11 @@ fn check_effects(req: &EditRequest, track: Option<&EventTrack>, source: &Path) -
         let clicks: Vec<f64> = zoom_clicks(track).iter().map(|c| c.0).collect();
         let matched = match_click_zooms(&clicks, &req.click_zooms);
         if let Some((c, _)) = req.click_zooms.iter().zip(&matched).find(|(_, m)| m.is_none()) {
-            let list: Vec<String> = clicks.iter().map(|t| format!("{t:.2}")).collect();
             return Err(BugleError::Invalid(format!(
-                "no click to zoom at {:.2}s (within {:.2}s); the recording's clicks are at: {}",
+                "no click to zoom at {:.2}s (within {:.2}s); {}",
                 c.t,
                 crate::cursor_fx::CLICK_MATCH,
-                if list.is_empty() { "none".to_string() } else { list.join(", ") }
+                nearest_clicks(&clicks, c.t)
             )));
         }
     }
@@ -783,10 +803,10 @@ impl EditSource {
 
     /// The audio's loudest level in each of `buckets` equal slices of the
     /// video (every audio track mixed, full scale 1): the editor's timeline
-    /// waveform. `None` without audio. Decodes all of it: off the main
-    /// thread.
-    pub fn audio_peaks(&self, buckets: usize) -> Result<Option<Vec<f32>>> {
-        bugle_platform::audio_peaks(&self.item.path, self.duration(), buckets)
+    /// waveform. `None` without audio, or once `cancel` is set. Decodes all
+    /// of it: off the main thread.
+    pub fn audio_peaks(&self, buckets: usize, cancel: Option<&AtomicBool>) -> Result<Option<Vec<f32>>> {
+        bugle_platform::audio_peaks(&self.item.path, self.duration(), buckets, cancel)
     }
 
     /// Pointer smoothing is possible: zooming is, and the frames lack the
@@ -1064,6 +1084,15 @@ mod tests {
         cfg.general.save_dir = tmp.join("save").display().to_string();
         cfg.general.history_path = Some(tmp.join("history.jsonl").display().to_string());
         Engine::new(cfg, false).unwrap()
+    }
+
+    #[test]
+    fn an_unmatched_click_lists_only_the_nearest() {
+        assert_eq!(nearest_clicks(&[], 1.0), "the recording has no clicks");
+        assert_eq!(nearest_clicks(&[1.0, 2.5], 9.0), "the recording's clicks are at: 1.00, 2.50");
+        let many: Vec<f64> = (0..300).map(f64::from).collect();
+        let msg = nearest_clicks(&many, 100.2);
+        assert_eq!(msg, "the recording has 300 clicks; the nearest are at: 96.00, 97.00, 98.00, 99.00, 100.00, 101.00, 102.00, 103.00, 104.00, 105.00");
     }
 
     fn invalid(e: &anyhow::Error) -> bool {
@@ -1723,7 +1752,7 @@ mod tests {
         es.check(&off).unwrap();
         let at_click = frames.frame(1.05, es.effects(&off).as_ref()).unwrap();
         assert!(near(at_click.get_pixel(3, 30), RED), "that click is not zoomed");
-        assert_eq!(es.audio_peaks(10).unwrap(), None, "a silent movie has no waveform");
+        assert_eq!(es.audio_peaks(10, None).unwrap(), None, "a silent movie has no waveform");
 
         // An unreadable track is reported, and refused only when needed.
         std::fs::write(EventTrack::sidecar_path(&src), b"{}").unwrap();

@@ -44,6 +44,7 @@ use bugle_core::{BugleError, DisplayInfo, OcrLine, Point, Rect, WindowInfo};
 use image::RgbaImage;
 use std::ffi::{CStr, CString};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 #[cfg(not(target_os = "macos"))]
 compile_error!("bugle-platform currently supports macOS only");
@@ -607,16 +608,18 @@ pub const AUDIO_PEAKS_MAX: usize = 1 << 16;
 
 /// The loudest sample of a movie's audio (every enabled track mixed) in each
 /// of `buckets` equal slices of its first `duration` seconds, full scale 1:
-/// a timeline waveform. `None` when the movie has no audio.
-pub fn audio_peaks(path: &Path, duration: f64, buckets: usize) -> Result<Option<Vec<f32>>> {
+/// a timeline waveform. `None` when the movie has no audio, or when `cancel`
+/// was set before the decode finished (it is checked once per sample buffer).
+pub fn audio_peaks(path: &Path, duration: f64, buckets: usize, cancel: Option<&AtomicBool>) -> Result<Option<Vec<f32>>> {
     if !(duration.is_finite() && duration > 0.0) || buckets == 0 || buckets > AUDIO_PEAKS_MAX {
         bail!("audio peaks: bad duration {duration} or bucket count {buckets}");
     }
     let p = path_cstr(path)?;
     let mut out = vec![0f32; buckets];
-    match unsafe { ffi::bugle_audio_peaks(p.as_ptr(), duration, out.as_mut_ptr(), buckets as i32) } {
+    let cancel = cancel.map_or(std::ptr::null(), |c| c.as_ptr() as *const bool);
+    match unsafe { ffi::bugle_audio_peaks(p.as_ptr(), duration, out.as_mut_ptr(), buckets as i32, cancel) } {
         1 => Ok(Some(out)),
-        0 => Ok(None),
+        0 | 2 => Ok(None),
         _ => bail!("{}", last_error()),
     }
 }
@@ -1496,19 +1499,22 @@ mod tests {
         // Track 0 sounds in the first second, track 1 in the second.
         let two = tmp.path().join("two.mp4");
         write_tone_fixture(&two, &ToneFixture { tracks: 2, seconds: 2.0, ..Default::default() }).unwrap();
-        let p = audio_peaks(&two, 4.0, 8).unwrap().unwrap();
+        let p = audio_peaks(&two, 4.0, 8, None).unwrap().unwrap();
         assert_eq!(p.len(), 8);
         for (i, v) in p.iter().enumerate().take(4) {
             assert!((0.35..=0.8).contains(v), "bucket {i}: {p:?}");
         }
         assert!(p[5..].iter().all(|v| *v < 0.01), "nothing after the audio ends: {p:?}");
         // Only the first second asked for: all of it in the buckets.
-        let p = audio_peaks(&two, 1.0, 4).unwrap().unwrap();
+        let p = audio_peaks(&two, 1.0, 4, None).unwrap().unwrap();
         assert!(p.iter().all(|v| *v > 0.35), "{p:?}");
+        // A cancelled read stops with nothing.
+        assert_eq!(audio_peaks(&two, 4.0, 8, Some(&AtomicBool::new(true))).unwrap(), None);
+        assert!(audio_peaks(&two, 4.0, 8, Some(&AtomicBool::new(false))).unwrap().is_some());
         // Silence is flat.
         let quiet = tmp.path().join("quiet.mp4");
         write_tone_fixture(&quiet, &ToneFixture { tracks: 1, amplitude: 0.0, ..Default::default() }).unwrap();
-        assert!(audio_peaks(&quiet, 1.0, 10).unwrap().unwrap().iter().all(|v| *v < 0.01));
+        assert!(audio_peaks(&quiet, 1.0, 10, None).unwrap().unwrap().iter().all(|v| *v < 0.01));
         // A movie without audio has no waveform.
         let silent = tmp.path().join("silent.mp4");
         let mut w = VideoFrameWriter::create(&silent, 64, 64, 10, true).unwrap();
@@ -1516,8 +1522,8 @@ mod tests {
             w.append(&RgbaImage::new(64, 64)).unwrap();
         }
         w.finish().unwrap();
-        assert_eq!(audio_peaks(&silent, 0.5, 10).unwrap(), None);
-        assert!(audio_peaks(&silent, 0.0, 10).is_err() && audio_peaks(&silent, 1.0, 0).is_err());
+        assert_eq!(audio_peaks(&silent, 0.5, 10, None).unwrap(), None);
+        assert!(audio_peaks(&silent, 0.0, 10, None).is_err() && audio_peaks(&silent, 1.0, 0, None).is_err());
     }
 
     #[test]

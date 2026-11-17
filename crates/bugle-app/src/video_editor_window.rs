@@ -15,6 +15,7 @@ use bugle_platform::{VideoEditorCommand, VideoEditorEvent};
 use image::RgbaImage;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -115,10 +116,12 @@ fn spawn_preview(src: Arc<EditSource>, proxy: Proxy, generation: u64) -> Option<
 
 /// Read the recording's audio peaks on a thread and send them to the loop
 /// (nothing for a recording without audio; a failure is only logged: the
-/// timeline is usable without a waveform).
-fn spawn_waveform(src: Arc<EditSource>, proxy: Proxy, generation: u64) {
+/// timeline is usable without a waveform). Setting `cancel` (the window
+/// closed) stops the decode early and sends nothing.
+fn spawn_waveform(src: Arc<EditSource>, proxy: Proxy, generation: u64, cancel: Arc<AtomicBool>) {
     let spawned = std::thread::Builder::new().name("bugle-video-waveform".into()).spawn(move || {
-        match guarded("waveform", || src.audio_peaks(WAVEFORM_BUCKETS)) {
+        match guarded("waveform", || src.audio_peaks(WAVEFORM_BUCKETS, Some(&cancel))) {
+            Ok(_) if cancel.load(Ordering::Relaxed) => {}
             Ok(Some(peaks)) => proxy.send(AppEvent::VideoEditor(VideoEditorMsg::Waveform { generation, peaks })),
             Ok(None) => {}
             Err(e) => tracing::warn!("video editor: no waveform ({e})"),
@@ -142,6 +145,14 @@ struct Session {
     seq: u64,
     /// The last preview error toasted, so a failing decode is reported once.
     last_error: Option<String>,
+    /// Set when the window closes: stops the waveform thread's decode.
+    waveform_cancel: Arc<AtomicBool>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.waveform_cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Session {
@@ -264,6 +275,7 @@ impl App {
         let generation = self.video_editor_generation;
         let caps = Caps { zoom: src.can_zoom(), smooth: src.can_smooth() };
         let editor = VideoEditor::new(src.source.clone(), src.duration(), src.info.nominal_fps, caps, src.zoom_clicks());
+        let waveform_cancel = Arc::new(AtomicBool::new(false));
         let session = Rc::new(RefCell::new(Session {
             editor,
             preview: spawn_preview(src.clone(), self.proxy.clone(), generation),
@@ -273,6 +285,7 @@ impl App {
             generation,
             seq: 0,
             last_error: None,
+            waveform_cancel: waveform_cancel.clone(),
         }));
         let zoom_labels: Vec<&str> = ZOOMS.iter().map(|z| z.0).collect();
         let click_labels: Vec<&str> = CLICK_ZOOMS.iter().map(|z| z.0).collect();
@@ -294,7 +307,7 @@ impl App {
             return self.toast_error(&format!("Edit Video: {e:#}"));
         }
         CURRENT.with(|c| *c.borrow_mut() = Rc::downgrade(&session));
-        spawn_waveform(src.clone(), self.proxy.clone(), generation);
+        spawn_waveform(src.clone(), self.proxy.clone(), generation, waveform_cancel);
         tracing::info!(
             "video editor: opened {} ({:.2}s, {}×{}, zoom {}, smoothing {})",
             file_name(&src.item.path),

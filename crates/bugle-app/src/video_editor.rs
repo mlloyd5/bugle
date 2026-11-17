@@ -190,10 +190,18 @@ impl VideoEditor {
         choice.or(self.options().0).unwrap_or(1.0)
     }
 
-    /// The click the click menu is about: the one the view zooms for at the
+    /// The click the click menu is about: the one whose marker the playhead
+    /// is on (within half a frame), else the one the view zooms for at the
     /// playhead (the last whose ease-in has begun, until its zoom would be
-    /// over), whether or not it is zoomed.
+    /// over), whether or not it is zoomed. The first rule lets the first of
+    /// two clicks less than [`ZOOM_IN`] apart (a double-click) be chosen.
     pub fn selected_click(&self) -> Option<usize> {
+        let on = self.clicks.partition_point(|c| *c < self.playhead - self.step / 2.0);
+        if self.clicks.get(on).is_some_and(|c| *c <= self.playhead + self.step / 2.0) {
+            // Of two clicks within the same frame, the nearer one.
+            let next = self.clicks.get(on + 1).filter(|c| (*c - self.playhead).abs() < (self.clicks[on] - self.playhead).abs());
+            return Some(if next.is_some() { on + 1 } else { on });
+        }
         let i = self.clicks.partition_point(|c| c - ZOOM_IN <= self.playhead).checked_sub(1)?;
         (self.playhead <= self.clicks[i] + ZOOM_HOLD + ZOOM_OUT).then_some(i)
     }
@@ -643,6 +651,33 @@ mod tests {
         plain.handle(E::Seek(2.0), now);
         plain.handle(E::ClickZoom(c("2×")), now);
         assert!(plain.click_zooms().is_empty() && plain.state().clicks.is_empty() && plain.state().click_zoom.is_none());
+    }
+
+    #[test]
+    fn a_playhead_on_a_click_selects_that_click() {
+        let now = Instant::now();
+        let c = |name: &str| CLICK_ZOOMS.iter().position(|z| z.0 == name).unwrap();
+        let selected = |e: &VideoEditor| e.state().clicks.iter().position(|m| m.selected);
+        // The fixture's clicks, each from its own marker.
+        let mut e = editor(Caps { zoom: true, smooth: false });
+        for (i, t) in [2.0, 3.0, 8.0].into_iter().enumerate() {
+            e.handle(E::Seek(t), now);
+            assert_eq!(selected(&e), Some(i), "playhead on {t}");
+        }
+        // A double-click: the second press is within the first's ease-in.
+        let mut e = VideoEditor::new("x", 10.0, 25.0, Caps { zoom: true, smooth: false }, vec![2.0, 2.3]);
+        e.handle(E::Seek(2.0), now);
+        assert_eq!(selected(&e), Some(0));
+        e.handle(E::ClickZoom(c("2×")), now);
+        e.handle(E::Seek(2.3), now);
+        assert_eq!(selected(&e), Some(1));
+        e.handle(E::ClickZoom(c("3×")), now);
+        assert_eq!(e.click_zooms(), vec![ClickZoom { t: 2.0, zoom: 2.0 }, ClickZoom { t: 2.3, zoom: 3.0 }]);
+        // Half a frame off the marker still counts; between them, the ease-in rule.
+        e.handle(E::Seek(2.0 + 0.4 / 25.0), now);
+        assert_eq!(selected(&e), Some(0));
+        e.handle(E::Seek(2.1), now);
+        assert_eq!(selected(&e), Some(1));
     }
 
     #[test]

@@ -2,6 +2,7 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 typedef struct {
     uint8_t *data;   // RGBA8, non-premultiplied, row-major, malloc'd
@@ -131,8 +132,9 @@ int32_t bugle_export_mp4(const char *in_path, const char *out_path);
 int32_t bugle_export_mov(const char *in_path, const char *out_path);
 int32_t bugle_audio_track_count(const char *path);
 // Peak level of all audio tracks mixed, in `n` equal buckets of `duration`
-// seconds. 1 filled, 0 no audio, -1 error.
-int32_t bugle_audio_peaks(const char *path, double duration, float *out, int32_t n);
+// seconds. 1 filled, 0 no audio, 2 stopped because `*cancel` (may be NULL)
+// became true, -1 error.
+int32_t bugle_audio_peaks(const char *path, double duration, float *out, int32_t n, const volatile bool *cancel);
 // Processes one block of aligned audio at `sample_rate`: `tracks[i]` holds
 // `frames` interleaved frames of `channels` floats for track i; writes
 // `n_out` runs of as many frames into `out`, one after the other (output

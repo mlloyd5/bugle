@@ -69,6 +69,9 @@ typedef enum { DRAG_NONE, DRAG_PLAYHEAD, DRAG_IN, DRAG_OUT } DragKind;
 @property(nonatomic, weak) BugleVideoEditor *editor;
 @property(nonatomic) double duration, playhead, inPoint, outPoint;
 @property(nonatomic) DragKind drag;
+/// The pointer has not moved since mouse-down: a click, which snaps the
+/// playhead onto a nearby marker. A drag scrubs freely.
+@property(nonatomic) BOOL snapping;
 // Peak levels (float, 0..1) in equal slices of the recording; nil: none.
 @property(nonatomic, copy) NSData *waveform;
 // Click markers: times and zoom levels (double each), and the selected one.
@@ -225,7 +228,7 @@ typedef enum { DRAG_NONE, DRAG_PLAYHEAD, DRAG_IN, DRAG_OUT } DragKind;
             [e emit:VEV_OUT value:t arg:0];
             break;
         case DRAG_PLAYHEAD:
-            t = [self snap:t x:p.x];
+            if (self.snapping) t = [self snap:t x:p.x];
             self.playhead = t;
             [e emit:VEV_SEEK value:t arg:0];
             break;
@@ -243,10 +246,14 @@ typedef enum { DRAG_NONE, DRAG_PLAYHEAD, DRAG_IN, DRAG_OUT } DragKind;
     if (di <= kHandleGrab && di <= dout) self.drag = DRAG_IN;
     else if (dout <= kHandleGrab) self.drag = DRAG_OUT;
     else self.drag = DRAG_PLAYHEAD;
+    self.snapping = YES;
     [self report:event kind:self.drag];
 }
 
-- (void)mouseDragged:(NSEvent *)event { [self report:event kind:self.drag]; }
+- (void)mouseDragged:(NSEvent *)event {
+    self.snapping = NO;
+    [self report:event kind:self.drag];
+}
 
 - (void)mouseUp:(NSEvent *)event {
     DragKind kind = self.drag;

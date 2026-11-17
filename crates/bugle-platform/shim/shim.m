@@ -1221,8 +1221,9 @@ int32_t bugle_audio_track_count(const char *path) {
 // Loudest sample of every enabled audio track mixed together, in `n` equal
 // buckets of `duration` seconds (decoded mono at a low rate: enough for a
 // timeline waveform). Returns 1 with `out` filled (0 for silence, full scale
-// 1, clamped), 0 when there is no audio (`out` zeroed), -1 on error.
-int32_t bugle_audio_peaks(const char *path, double duration, float *out, int32_t n) {
+// 1, clamped), 0 when there is no audio (`out` zeroed), 2 when `*cancel`
+// (checked once per sample buffer; may be NULL) turned true, -1 on error.
+int32_t bugle_audio_peaks(const char *path, double duration, float *out, int32_t n, const volatile bool *cancel) {
     @autoreleasepool {
         clear_error();
         if (!path || !out || n <= 0 || !(duration > 0)) {
@@ -1257,7 +1258,13 @@ int32_t bugle_audio_peaks(const char *path, double duration, float *out, int32_t
         const double per = duration / n;
         NSMutableData *buf = [NSMutableData data];
         CMSampleBufferRef sb;
+        if (cancel && *cancel) { [r cancelReading]; return 2; }
         while ((sb = [o copyNextSampleBuffer])) {
+            if (cancel && *cancel) {
+                CFRelease(sb);
+                [r cancelReading];
+                return 2;
+            }
             CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
             double t0 = CMTIME_IS_NUMERIC(pts) ? CMTimeGetSeconds(pts) : 0;
             CMItemCount frames = CMSampleBufferGetNumSamples(sb);

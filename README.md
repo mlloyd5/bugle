@@ -510,7 +510,7 @@ timeline below it and a row of controls.
 
 | Control | Key | Does |
 |---|---|---|
-| Timeline | click, drag | moves the playhead (it snaps onto a click marker it lands next to); drag the tabs at either end of the highlighted range to move the in and out points. Behind the range: the recording's audio waveform (every audio track mixed). Under it: a diamond for each click auto-zoom follows, filled when the click zooms, hollow when it does not, larger for the click at the playhead |
+| Timeline | click, drag | moves the playhead (a click snaps it onto a click marker it lands next to; a drag scrubs freely); drag the tabs at either end of the highlighted range to move the in and out points. Across the track: the recording's audio waveform (every audio track mixed). Under it: a diamond for each click auto-zoom follows, filled when the click zooms, hollow when it does not, larger for the click at the playhead |
 | Play | Space | plays the clip from the playhead (from the in point when the playhead is outside it), stops at the out point |
 | Set In, Set Out | I, O | start or end the clip at the playhead |
 | | ← → | one frame back or forward |
