@@ -375,6 +375,23 @@ pub(crate) fn smoke(proxy: &Proxy) {
     send(VideoEditorEvent::Preset(PRESETS.iter().position(|p| *p == bugle_engine::ExportPreset::P720).unwrap_or(0)));
     command(VideoEditorCommand::PlayPause);
     snap("video-editor-playing");
+    // A markup editor opened over the video editor and closed again hands
+    // the keyboard focus back to the video editor, not to another app.
+    let png = std::env::temp_dir().join("bugle-smoke-focus.png");
+    match RgbaImage::from_pixel(240, 160, image::Rgba([60, 120, 200, 255])).save(&png) {
+        Ok(()) => {
+            proxy.send(AppEvent::Editor(crate::editor_window::EditorMsg::Open(png.display().to_string())));
+            std::thread::sleep(Duration::from_millis(700));
+            let during = bugle_platform::key_window_title();
+            proxy.send(AppEvent::Editor(crate::editor_window::EditorMsg::Close));
+            std::thread::sleep(Duration::from_millis(400));
+            let after = bugle_platform::key_window_title();
+            let ok = after.as_deref().is_some_and(|t| t.starts_with("Edit Video"));
+            eprintln!("smoke test: key window with a markup editor over the video editor: {during:?}, after closing it: {after:?} (want Edit Video…: {ok})");
+            let _ = std::fs::remove_file(&png);
+        }
+        Err(e) => eprintln!("smoke test: editor focus step skipped ({e})"),
+    }
     command(VideoEditorCommand::Escape);
     if std::env::var_os("BUGLE_SMOKE_SAVE").is_some() {
         // The window closes itself once the export is written.

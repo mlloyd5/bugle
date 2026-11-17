@@ -500,6 +500,20 @@ pub fn is_main_thread() -> bool {
     unsafe { ffi::bugle_is_main_thread() == 1 }
 }
 
+/// The title of Bugle's key window, or `None` when Bugle is not the active
+/// app or none of its windows is key.
+/// For smoke tests. From a thread other than the main one it waits for the
+/// main thread, which must be running its loop.
+pub fn key_window_title() -> Option<String> {
+    let mut buf = vec![0u8; 512];
+    let found = unsafe { ffi::bugle_key_window_title(buf.as_mut_ptr().cast(), buf.len()) };
+    if found == 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+}
+
 /// Whether a selection overlay is currently on screen.
 pub fn select_rect_active() -> bool {
     unsafe { ffi::bugle_select_rect_active() == 1 }

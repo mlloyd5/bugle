@@ -105,6 +105,19 @@ int32_t bugle_is_main_thread(void);
 #ifdef __OBJC__
 #import <AppKit/AppKit.h>
 void bugle_draw_overlay_hint(NSRect bounds, NSString *text);
+// The newest open markup editor's window, and the video editor's, or nil.
+NSWindow *bugle_markup_editor_front_window(void);
+NSWindow *bugle_video_editor_window(void);
+#endif
+// Called by an editor window (markup or video) once it is off screen: puts
+// the keyboard focus on another open Bugle editor, or, when none is left,
+// hands it back to the app the user came from. Main thread only.
+void bugle_editor_window_closed(void);
+// The title of Bugle's key window (UTF-8, truncated to `cap - 1` bytes and
+// NUL-terminated); 0 when Bugle is not the active app or has no key window. Any thread: hops to the
+// main thread, so never call it from the main thread's blocked waiters.
+int32_t bugle_key_window_title(char *buf, size_t cap);
+#ifdef __OBJC__
 #endif
 int32_t bugle_select_rect_active(void);
 void bugle_select_rect_cancel(void);

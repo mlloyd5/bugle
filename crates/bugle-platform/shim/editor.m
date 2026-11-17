@@ -25,6 +25,7 @@
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 #include <stdint.h>
+#include "shim.h"
 
 typedef void (*bugle_editor_callback_t)(void *ctx, int32_t kind, double x, double y, int32_t arg, const char *text);
 typedef void (*bugle_editor_free_t)(void *ctx);
@@ -780,9 +781,9 @@ static NSUInteger line_count(NSString *s) {
     self.cb = NULL;
     self.ctx = NULL;
     self.freeCtx = NULL;
-    // Hand keyboard focus back to the app the user came from, unless another
-    // editor is still open (it takes the focus instead).
-    if (g_editors.count == 0) [NSApp deactivate];
+    // Focus goes to another open editor (markup or video), else back to the
+    // app the user came from.
+    bugle_editor_window_closed();
     dispatch_async(dispatch_get_main_queue(), ^{
         if (ctx && f) f(ctx);
         (void)keep;
@@ -1192,6 +1193,8 @@ int32_t bugle_editor_is_open(int32_t ident) { return editor_for(ident) ? 1 : 0; 
 
 /// How many editors are open.
 int32_t bugle_editor_count(void) { return (int32_t)g_editors.count; }
+
+NSWindow *bugle_markup_editor_front_window(void) { return g_editors.lastObject.window; }
 
 /// Bring editor `ident` to the front.
 void bugle_editor_focus(int32_t ident) {
