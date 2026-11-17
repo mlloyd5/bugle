@@ -3,6 +3,18 @@
 
 use libc::{c_char, c_double, c_void, size_t};
 
+/// See `bugle_mix_fn` in `shim.h`.
+pub type bugle_mix_fn =
+    extern "C" fn(
+        ctx: *mut c_void,
+        tracks: *const *const f32,
+        n_tracks: i32,
+        channels: i32,
+        sample_rate: i32,
+        out: *mut f32,
+        frames: i32,
+    ) -> i32;
+
 #[repr(C)]
 #[derive(Default)]
 pub struct bugle_video_info_t {
@@ -117,8 +129,11 @@ extern "C" {
     pub fn bugle_select_rect_blocking(x: *mut f64, y: *mut f64, w: *mut f64, h: *mut f64) -> i32;
     pub fn bugle_pin_image_blocking(png: *const u8, len: size_t, x: f64, y: f64, w: f64, h: f64, opacity: f64);
     pub fn bugle_select_rect_begin(cb: bugle_select_callback_t, ctx: *mut c_void) -> i32;
+    pub fn bugle_select_rect_begin_ex(cb: bugle_select_callback_t, ctx: *mut c_void, allow_switch: i32, timeout_seconds: f64) -> i32;
     pub fn bugle_select_rect_active() -> i32;
     pub fn bugle_select_rect_cancel();
+    pub fn bugle_select_rect_switch();
+    pub fn bugle_app_deactivate();
     pub fn bugle_pin_image_show(png: *const u8, len: size_t, x: f64, y: f64, w: f64, h: f64, opacity: f64) -> i32;
     pub fn bugle_toast_show(
         png: *const u8,
@@ -133,7 +148,12 @@ extern "C" {
     pub fn bugle_export_mp4(in_path: *const c_char, out_path: *const c_char) -> i32;
     pub fn bugle_export_mov(in_path: *const c_char, out_path: *const c_char) -> i32;
     pub fn bugle_audio_track_count(path: *const c_char) -> i32;
-    pub fn bugle_mix_audio_tracks(in_path: *const c_char, out_path: *const c_char) -> i32;
+    pub fn bugle_mix_audio_tracks(
+        in_path: *const c_char,
+        out_path: *const c_char,
+        process: bugle_mix_fn,
+        ctx: *mut c_void,
+    ) -> i32;
     pub fn bugle_video_track_count(path: *const c_char) -> i32;
     pub fn bugle_fixture_write_tones(
         out_path: *const c_char,

@@ -89,7 +89,7 @@ curl -s -H "$H" -H 'content-type: application/json' \
 | `annotate` | `source`, `annotation`, `output`, `copy`, `inline_image` | `media` + image |
 | `annotate_schema` | – | example document |
 | `scroll_capture` | `rect`, `max_frames`, `step_lines`, `settle_ms`, `horizontal`, `output`, `inline_image` | `media`, `stats` |
-| `record_start` | `target`, `format` (mp4/mov/gif), `fps`, `microphone`, `system_audio`, `mix_audio`, `max_seconds`, `highlight_clicks`, `cursor_events` (writes `<file>.events.json`), `hide_cursor` (pointer left out of the frames; implies `cursor_events`), `output`, `label` | status |
+| `record_start` | `target`, `format` (mp4/mov/gif), `fps`, `microphone`, `system_audio`, `mix_audio`, `microphone_gain`, `system_audio_gain`, `ducking`, `ducking_amount_db` (levels of the mixed track; defaults from `[recordings]`), `max_seconds`, `highlight_clicks`, `cursor_events` (writes `<file>.events.json`), `hide_cursor` (pointer left out of the frames; implies `cursor_events`), `output`, `label` | status |
 | `record_stop` | – | `media` |
 | `record_status` | – | status |
 | `transcribe` | `source`, `provider`, `language` | `transcript`, `srt` |
@@ -125,3 +125,23 @@ effects edit's output has none.
 `source` accepts a media id (or prefix), `latest`, or a file path.
 Target coordinates are screen points (top-left origin); annotation and OCR
 coordinates are image pixels.
+
+`target.kind` is one of `screen`, `window`, `area`, `interactive` (the user
+drags a rectangle), `pick_window` and `all_screens`. `pick_window` (for
+`capture` and `record_start`) asks the user to click a window in the menu-bar
+app's hover-highlight picker, for when the agent cannot tell which window is
+meant. It works only when the Bugle menu-bar app serves the API (*Start Agent
+API* in its menu, or `bugle-app --serve`); `bugle serve` and `bugle mcp`
+answer with an error naming that, HTTP status 503. The usual `Host` and token
+checks run first: with a token configured, a client without it never gets the
+overlay on screen; with the default (no token, loopback bind) any local
+process that can reach the port can raise it, as it can call every other
+action. The picker closes after 30 seconds; a cancel or timeout is HTTP 409
+(`selection cancelled`). Requests are not queued: while another pick or area
+selection is open, or for 3 seconds after the user dismissed a picker, a
+`pick_window` request is refused with HTTP 409 and an error starting with
+`busy:`; retry later. Abandoning the HTTP request does not close a picker
+that is already up (the user, or its 30-second timeout, does). Space does not
+switch to the area selection for API requests: the result is always a window.
+`pick_window` works whatever `[screenshots] window_picker` says, since the
+caller asked for it. A `delay` counts from the click, not from the request.

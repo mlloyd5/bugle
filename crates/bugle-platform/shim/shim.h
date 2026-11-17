@@ -86,6 +86,21 @@ int32_t bugle_select_rect_blocking(double *x, double *y, double *w, double *h);
 // selection or window picker is already up (cb is then never called).
 typedef void (*bugle_select_callback_t)(void *ctx, int32_t ok, double x, double y, double w, double h);
 int32_t bugle_select_rect_begin(bugle_select_callback_t cb, void *ctx);
+// Like bugle_select_rect_begin, plus: with `allow_switch`, Space (while not
+// dragging) ends the selection with ok=2 and leaves Bugle active, so the host
+// can open the window picker; `timeout_seconds` > 0 cancels (ok=0) after that
+// long.
+int32_t bugle_select_rect_begin_ex(bugle_select_callback_t cb, void *ctx, int32_t allow_switch, double timeout_seconds);
+// What Space does (ok=2), when allowed and not dragging; no-op otherwise.
+void bugle_select_rect_switch(void);
+// [NSApp deactivate]: hand focus back after a switch that led nowhere.
+void bugle_app_deactivate(void);
+// Draws a one-line hint centred near the bottom of an overlay view (shared by
+// the selection overlay and the window picker).
+#ifdef __OBJC__
+#import <AppKit/AppKit.h>
+void bugle_draw_overlay_hint(NSRect bounds, NSString *text);
+#endif
 int32_t bugle_select_rect_active(void);
 void bugle_select_rect_cancel(void);
 void bugle_pin_image_blocking(const uint8_t *png, size_t len, double x, double y, double w, double h, double opacity);
@@ -97,9 +112,14 @@ int32_t bugle_export_audio_m4a(const char *in_path, const char *out_path);
 int32_t bugle_export_mp4(const char *in_path, const char *out_path);
 int32_t bugle_export_mov(const char *in_path, const char *out_path);
 int32_t bugle_audio_track_count(const char *path);
-// Fold all audio tracks into one AAC track (video copied as is). 0 on
-// success, 1 (nothing written) with fewer than two audio tracks.
-int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path);
+// Mixes one block of aligned audio at `sample_rate`: `tracks[i]` holds
+// `frames` interleaved frames of `channels` floats for track i; writes as
+// many into `out`. Non-zero aborts the mix.
+typedef int32_t (*bugle_mix_fn)(void *ctx, const float *const *tracks, int32_t n_tracks, int32_t channels,
+                                int32_t sample_rate, float *out, int32_t frames);
+// Fold all audio tracks into one AAC track through `process` (video copied
+// as is). 0 on success, 1 (nothing written) with fewer than two audio tracks.
+int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, bugle_mix_fn process, void *ctx);
 int32_t bugle_video_track_count(const char *path);
 
 // Test fixtures (shim/fixtures.m, its own object file: nothing in the app
@@ -171,13 +191,16 @@ int32_t bugle_sck_record_stop(void *handle);
 // Window picker overlay (picker.m). `cb` gets kind 0 for every pointer move
 // (global top-left points), then exactly one final call: 1 = clicked at
 // (x, y), 2 = cancelled (Esc, right click, timeout, Bugle losing active
-// status, bugle_pick_cancel). The
+// status, bugle_pick_cancel), 3 = Space pressed with `allow_switch` set (the
+// host opens the area selection instead; Bugle stays active). The
 // final call arrives on a later main-queue turn, after the overlay is gone.
 // Returns 0 (cb never called) when a picker or selection is already active.
 // Main thread only, needs a running AppKit loop.
 typedef void (*bugle_pick_callback_t)(void *ctx, int32_t kind, double x, double y);
-int32_t bugle_pick_begin(bugle_pick_callback_t cb, void *ctx, double timeout_seconds);
+int32_t bugle_pick_begin(bugle_pick_callback_t cb, void *ctx, double timeout_seconds, int32_t allow_switch);
 // Highlight a global top-left rect with a centred label; w or h <= 0 clears.
 void bugle_pick_highlight(double x, double y, double w, double h, const char *label);
 int32_t bugle_pick_active(void);
 void bugle_pick_cancel(void);
+// What Space does (kind 3), when the picker was opened with allow_switch.
+void bugle_pick_switch(void);

@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use bugle_core::audio_mix::AudioMixOverrides;
 use bugle_markup::{Annotation, Shape, Style};
 use bugle_core::{
     BugleError, CaptureOptions, CaptureRequest, CaptureTarget, Config, DescribeRequest, ImageFormat, OcrOptions, Point, RecordRequest,
@@ -276,6 +277,23 @@ pub struct RecordArgs {
     /// Fold the microphone and system audio into one audio track.
     #[arg(long)]
     pub mix_audio: bool,
+    /// Microphone level in the mixed track: a linear factor on its default
+    /// share of the mix (1/2 with two sources), so 1.0 = the default share.
+    #[arg(long, value_name = "GAIN")]
+    pub mic_gain: Option<f32>,
+    /// System-audio level in the mixed track: a linear factor on its default
+    /// share of the mix (1/2 with two sources), so 1.0 = the default share.
+    #[arg(long, value_name = "GAIN")]
+    pub system_gain: Option<f32>,
+    /// Lower system audio while the microphone is active (mixed track).
+    #[arg(long, overrides_with = "no_duck")]
+    pub duck: bool,
+    /// Do not duck system audio, whatever the config says.
+    #[arg(long, overrides_with = "duck")]
+    pub no_duck: bool,
+    /// How far ducking lowers system audio, in dB.
+    #[arg(long, value_name = "DB")]
+    pub duck_amount: Option<f32>,
     /// Stop automatically after N seconds.
     #[arg(long, short = 's')]
     pub seconds: Option<f64>,
@@ -613,6 +631,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                     microphone: a.mic,
                     system_audio: a.system_audio,
                     mix_audio: a.mix_audio,
+                    mix: AudioMixOverrides {
+                        microphone_gain: a.mic_gain,
+                        system_audio_gain: a.system_gain,
+                        ducking: if a.duck { Some(true) } else if a.no_duck { Some(false) } else { None },
+                        ducking_amount_db: a.duck_amount,
+                    },
                     max_seconds: a.seconds,
                     highlight_clicks: a.clicks,
                     cursor_events: a.cursor_events,

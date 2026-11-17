@@ -34,7 +34,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | Pin to screen | Floating AppKit panel (drag, scroll-to-resize, Esc/double-click closes) | ✅ |
 | GIF recording | In-process frame grab loop + `image` GIF encoder | ✅ |
 | Video recording | `screencapture -v` (H.264 .mov → remuxed .mp4), microphone, click highlight | ✅ |
-| System audio in recordings | ScreenCaptureKit `SCStream` audio tap + `AVAssetWriter` (H.264 + AAC .mp4), microphone as a second track or mixed into one (`--mix-audio`) | ✅ (macOS 14+) |
+| System audio in recordings | ScreenCaptureKit `SCStream` audio tap + `AVAssetWriter` (H.264 + AAC .mp4), microphone as a second track or mixed into one (`--mix-audio`) with per-source levels, optional ducking of system audio under the microphone and a peak limiter | ✅ (macOS 14+) |
 | Describe image / video frames with a vision model | OpenAI-compatible, Ollama, Anthropic, command | ✅ |
 | Transcribe / subtitles (SRT, VTT) | whisper.cpp server, OpenAI-compatible, command | ✅ |
 | History | JSON-lines file, ids, delete | ✅ |
@@ -45,6 +45,8 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | Trim and export recordings (presets: trim, H.264/HEVC, 1080p/720p/540p, frame rate, GIF) | `AVAssetExportSession` + video composition, `AVAssetImageGenerator` → GIF, `AVAssetWriter` for GIF → MP4 | ✅ (headless: CLI/API) |
 | Auto-zoom on clicks, smoothed pointer | pointer/click event track recorded next to the video (`clip.mp4.events.json`); frames re-rendered in Rust (`AVAssetReader` → `AVAssetWriter`, audio copied back in) | ✅ headless (CLI/API); track timing measured on real recordings, zoom checked with hand-written clicks, live clicks not exercised |
 | `Bugle.app` bundle | `cargo xtask bundle` (hardened runtime, ad-hoc or Developer ID) | ✅ ad-hoc; Developer ID signing and notarization not yet exercised |
+| Disk image, universal binary | `cargo xtask dmg` (`hdiutil`, `/Applications` link), `--universal` (`lipo`) | ✅ DMG; universal needs both Rust targets installed |
+| System notifications | `UNUserNotificationCenter` from Bugle.app, alongside the toast (`[general] system_notifications`) | built; reading the authorization verified from the bundle, posting unverified |
 | Open at Login | `SMAppService.mainAppService` | built, status read verified; registering not yet exercised |
 
 ## Build
@@ -63,6 +65,8 @@ line tools; no Xcode project is needed.
 ```bash
 cargo xtask bundle                 # → dist/Bugle.app, ad-hoc signed
 cargo xtask bundle --zip           # also dist/Bugle-<version>.zip
+cargo xtask dmg                    # also dist/Bugle-<version>.dmg (= bundle --dmg)
+cargo xtask bundle --universal     # arm64 + x86_64 in one bundle
 cargo xtask verify --smoke-test    # re-check a bundle and launch it briefly
 ```
 
@@ -77,8 +81,35 @@ the app is not sandboxed), then checked with `plutil -lint` (Info.plist and the
 entitlements embedded in each signature), `codesign --verify --deep --strict`,
 `iconutil` and `--version`. Only a bundle that passes replaces `dist/Bugle.app`.
 
-The binaries are built for the host architecture only (arm64 on Apple silicon,
-x86_64 on Intel); the bundle does not launch on the other kind of Mac.
+By default the binaries are built for the host architecture only (arm64 on
+Apple silicon, x86_64 on Intel), and the bundle does not launch on the other
+kind of Mac. `--universal` builds both (`--target aarch64-apple-darwin` and
+`--target x86_64-apple-darwin`) and merges each executable with
+`lipo -create`; verification then requires `lipo -archs` to report
+`arm64 x86_64` for both, and runs `--version` on each slice the Mac can
+execute (the x86_64 slice through Rosetta on Apple silicon, when installed;
+otherwise it says the slice was not executed). Every xtask build sets
+`MACOSX_DEPLOYMENT_TARGET=13.0`, the shim's minimum. It needs the Rust standard
+library for both targets and stops before building, naming the command, when
+one is missing:
+
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+```
+
+(Homebrew's `rust` formula has no rustup and cannot add targets; use a rustup
+toolchain for universal builds.)
+
+`--dmg` (or `cargo xtask dmg`, which takes the same options) writes
+`Bugle-<version>.dmg` from the finished staged bundle: a compressed (UDZO),
+read-only HFS+ image named "Bugle <version>" holding `Bugle.app` and an
+`Applications` link for drag-to-install. With a Developer ID identity the image
+is signed as well, and with `--notarize` it is notarized and stapled too. It is
+checked with `hdiutil verify`, then mounted read-only (out of sight, under the
+target directory) to check the link, `codesign --verify --deep --strict` the
+bundle on it and its architectures. Only after all of that are `dist/Bugle.app`
+and then the previous image replaced, so a failing image leaves both as they
+were.
 
 When Bugle.app is launched from Finder, the Dock, `open` or as a login item,
 the Screen Recording, Microphone and Accessibility prompts and System Settings
@@ -104,6 +135,9 @@ ln -sf /Applications/Bugle.app/Contents/MacOS/bugle ~/.local/bin/bugle
 | `--bundle-id ID` | `BUGLE_BUNDLE_ID` | `bundle_id` under `[workspace.metadata.bugle]` in the root `Cargo.toml` (the CLI is signed as `<id>.cli`) |
 | `--build-number N` | `BUGLE_BUILD_NUMBER` | the workspace version |
 | `--out DIR` | — | `dist/` |
+| `--universal` | — | off (host architecture) |
+| `--dmg` | — | off (`cargo xtask dmg` turns it on) |
+| `--zip` | — | off |
 
 The default bundle id is provisional until the project's final domain is
 chosen; it is defined only in `Cargo.toml`. macOS keys permission grants and the
@@ -166,6 +200,7 @@ bugle record start area --rect 0,30,1280,720 -f gif --fps 10 -s 8
 bugle record start window --app Xcode -f mp4 --mic --subtitles   # Ctrl-C to stop
 bugle record start screen -f mp4 --system-audio -s 30              # ScreenCaptureKit backend
 bugle record start screen --system-audio --mic --mix-audio --clicks # one audio track, clicks shown
+bugle record start screen --system-audio --mic --mix-audio --mic-gain 1.5 --duck  # voice over, system audio ducked
 bugle record start screen --cursor-events -s 30   # also writes <file>.events.json (pointer + clicks)
 bugle record start screen --hide-cursor -s 30     # pointer left out of the frames, logged instead
 
@@ -274,12 +309,25 @@ menu bar and listens for global hotkeys. Everything it does goes through the sam
 history, and play the shutter sound when `general.shutter_sound` is on.
 
 Menu: Capture Area · Capture Window · Capture Screen ·
-Scrolling Capture · Record Video · Record GIF · Stop Recording · Annotate Latest
+Scrolling Capture · Record Video · Record GIF · Record Window · Stop Recording · Annotate Latest
 (opens the markup editor) · OCR Latest (copies the text) · Pin Latest · Recent Captures (last five, click to open) ·
 Open History Folder · Start/Stop Agent API · Preferences… (opens the config
 file) · Open at Login (only when running from `Bugle.app`) · Quit. While recording, the status item shows `● m:ss`. Other actions
 report through a small toast in the top-right corner (thumbnail and file name;
 click to open).
+
+With `system_notifications = true` under `[general]`, Bugle.app also posts to
+Notification Center (`UNUserNotificationCenter`), named and badged as Bugle:
+every finished menu or hotkey action (capture, recording, OCR, pin, sync —
+whether the quick-access panel or the toast shows it; clicking a saved file's
+notification opens it), a markup-editor save that falls back to the toast, and
+every error. Immediate feedback to a click in the panel or the editor (such as
+"Copied to clipboard") and the agent API's start message stay in-app only.
+macOS asks for permission at the first launch with the switch on. The panel or
+toast is shown either way: an unbundled `bugle-app`, a denied permission or
+the switch left off (the default) means in-app feedback only. While not
+authorized the app re-reads the setting every few seconds without prompting,
+so turning Bugle on in System Settings → Notifications applies within seconds.
 
 After a capture or recording, the **quick-access panel** takes the toast's
 place, in the bottom-right corner by default: the thumbnail (click to open)
@@ -314,6 +362,20 @@ them. Set
 `[screenshots] window_picker = false` to capture the front-most window at once
 instead, as `bugle capture window` and the API do.
 
+Space switches between the window picker and the area selection while either
+is up, so *Capture Area* and *Capture Window* are one gesture apart; the hint
+at the bottom of the screen says which mode is on. In the area selection Space
+only works before you start dragging. *Record Video*, *Record GIF* and *Record
+Window* use the same pair of overlays: Record Window starts in the picker and
+records the window you click (MP4), the other two start in the area selection.
+A picked window is recorded by id, the way `record_start` with a window target
+records it, not as the screen area under it. The two overlays together close after two minutes
+(each picker turn still after 30 seconds; never in the middle of a drag).
+With `window_picker = false` the menu items do without the picker: Space does
+nothing, Capture Area and the Record items use the plain area selection, and
+*Record Window* records the front-most window at once. An API caller that asks
+for `pick_window` explicitly still gets the picker.
+
 Hotkeys live in the `[hotkeys]` section of the config file and are parsed as
 `modifier+modifier+key` (`cmd`, `shift`, `alt`/`option`, `ctrl`; letters,
 digits, `F1`…`F24`, `space`, …). Defaults:
@@ -326,7 +388,7 @@ digits, `F1`…`F24`, `space`, …). Defaults:
 | `ocr_latest` | ⌘⇧2 | OCR the latest capture to the clipboard |
 | `pin_latest` | ⌘⇧P | pin the latest capture |
 | `capture_window`, `scroll_capture`, `record_gif` | — | unbound until set |
-| `stop_recording`, `sync_latest`, `open_folder`, `toggle_api`, `preferences`, `quit` | — | unbound until set |
+| `record_window`, `stop_recording`, `sync_latest`, `open_folder`, `toggle_api`, `preferences`, `quit` | — | unbound until set |
 
 Every menu item except *Recent Captures* can be bound; the keys are the names
 above. An empty string unbinds an action. Unknown keys, values that are not
@@ -337,7 +399,14 @@ toast at launch; the config still loads. ⌘⇧3/4/5 are also the system screens
 shortcuts; disable those in System Settings → Keyboard → Keyboard Shortcuts →
 Screenshots (or pick other keys) so they do not fire twice. The agent API started
 from the menu uses `[api]` from the config and serves the in-app overlay for
-`select_area`, `pin` and interactive captures — no helper processes.
+`select_area`, `pin` and interactive captures — no helper processes. It also
+offers the window picker: a `capture` or `record_start` whose target is
+`{"kind":"pick_window"}` shows the picker and uses the window the user clicks
+(Space does not switch to the area selection there), whatever
+`window_picker` says. One overlay request is served at a time: a second pick
+while one is open, or one within 3 seconds of the user dismissing the picker,
+is refused with HTTP 409 instead of queuing. `bugle serve` and `bugle mcp`
+cannot show the picker and answer with an error (HTTP 503) that says so.
 
 Screen Recording permission is requested on first launch (granted to the
 terminal or app that launched `bugle-app` when run from a shell, or to Bugle
@@ -401,7 +470,7 @@ Any OpenAI-compatible server works for `kind = "openai"` (LM Studio, vLLM,
 OpenRouter, Groq…). `kind = "command"` wraps a local executable, e.g. `whisper-cli`.
 
 The other sections: `[general]` (save folder, filename template, clipboard),
-`[screenshots]`, `[recordings]` (backend, audio), `[ocr]`, `[markup]` defaults,
+`[screenshots]`, `[recordings]` (backend, audio, mix levels and ducking), `[ocr]`, `[markup]` defaults,
 `[api]` (bind address, token, CORS), `[hotkeys]` and `[quick_access]` for the
 menu-bar app and `[sync]` below.
 

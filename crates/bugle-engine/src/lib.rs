@@ -19,7 +19,7 @@ use bugle_markup::{Annotation, Renderer, Style};
 use bugle_core::naming;
 use bugle_core::{
     BugleError, Config, DescribeRequest, DescribeResult, History, ImageFormat, MediaItem, MediaKind, OcrOptions, OcrResult,
-    Rect, SubtitleFormat, Transcript,
+    Rect, SubtitleFormat, Transcript, WindowInfo,
 };
 use image::{DynamicImage, RgbaImage};
 use std::collections::HashMap;
@@ -40,7 +40,16 @@ pub trait UiHost: Send + Sync {
     fn select_area(&self) -> Result<Option<Rect>>;
     /// Float a PNG above all windows and return without waiting.
     fn pin(&self, png: Vec<u8>, frame: Option<Rect>, opacity: f64) -> Result<()>;
+    /// Show the hover-highlight window picker; `None` when the user cancels.
+    /// Hosts without a picker keep the default, which refuses.
+    fn pick_window(&self) -> Result<Option<WindowInfo>> {
+        Err(BugleError::NoUiHost("this UI host has no window picker".into()).into())
+    }
 }
+
+/// Why a `pick_window` target fails outside the menu-bar app.
+pub const NO_UI_HOST_PICK: &str = "target kind=pick_window needs the Bugle menu-bar app: start the Agent API from its \
+     menu (or `bugle-app --serve`) instead of `bugle serve` / `bugle mcp`, or pass a window id from list_windows";
 
 pub struct Engine {
     pub config: Config,
@@ -64,6 +73,9 @@ impl Engine {
         std::fs::create_dir_all(config.save_dir()).ok();
         if let Err(e) = config.sync.validate() {
             tracing::warn!("{e:#}; media that would sync there is not synced until the config is fixed");
+        }
+        if let Err(e) = config.recordings.mix.validate() {
+            tracing::warn!("[recordings] {e}; mixed recordings are refused until the config is fixed");
         }
         for w in config.sync.warnings() {
             tracing::warn!("{w}");
@@ -467,6 +479,23 @@ impl Engine {
         Ok(media)
     }
 
+    /// Let the user click a window with the UI host's picker (the menu-bar
+    /// app). Fails with [`BugleError::NoUiHost`] when no host is installed,
+    /// [`BugleError::Cancelled`] when the user cancels.
+    pub fn pick_window(&self) -> Result<WindowInfo> {
+        let host = self.ui_host.as_ref().ok_or_else(|| BugleError::NoUiHost(NO_UI_HOST_PICK.into()))?;
+        host.pick_window()?.ok_or_else(|| BugleError::Cancelled.into())
+    }
+
+    /// Refuse a `pick_window` target up front when there is no UI host, so
+    /// the caller hears why before any permission prompt or delay.
+    pub fn check_target_host(&self, target: &bugle_core::CaptureTarget) -> Result<()> {
+        if *target == bugle_core::CaptureTarget::PickWindow && self.ui_host.is_none() {
+            return Err(BugleError::NoUiHost(NO_UI_HOST_PICK.into()).into());
+        }
+        Ok(())
+    }
+
     /// Interactive rectangle selection.
     pub fn select_area(&self) -> Result<Option<Rect>> {
         if self.main_thread_ui {
@@ -739,6 +768,79 @@ mod tests {
         assert!(crop_region(&img, Some(Rect::new(200.0, 0.0, 10.0, 10.0))).is_err());
         let (c, off) = crop_region(&img, Some(Rect::new(90.0, 10.0, 50.0, 20.0))).unwrap();
         assert_eq!((c.width(), c.height(), off), (10, 20, (90.0, 10.0)));
+    }
+
+    fn temp_engine() -> (tempfile::TempDir, Engine) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.general.save_dir = dir.path().join("out").display().to_string();
+        config.general.history_path = Some(dir.path().join("history.jsonl").display().to_string());
+        let engine = Engine::new(config, false).unwrap();
+        (dir, engine)
+    }
+
+    /// A host that answers the picker with a fixed result.
+    struct FakeHost(Option<WindowInfo>);
+
+    impl UiHost for FakeHost {
+        fn select_area(&self) -> Result<Option<Rect>> {
+            Ok(None)
+        }
+        fn pin(&self, _: Vec<u8>, _: Option<Rect>, _: f64) -> Result<()> {
+            Ok(())
+        }
+        fn pick_window(&self) -> Result<Option<WindowInfo>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// A host that only implements the required methods.
+    struct OldHost;
+
+    impl UiHost for OldHost {
+        fn select_area(&self) -> Result<Option<Rect>> {
+            Ok(None)
+        }
+        fn pin(&self, _: Vec<u8>, _: Option<Rect>, _: f64) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn is_no_host(e: &anyhow::Error) -> bool {
+        matches!(e.downcast_ref::<BugleError>(), Some(BugleError::NoUiHost(_)))
+    }
+
+    #[test]
+    fn pick_window_without_a_host_says_what_to_do() {
+        let (_dir, engine) = temp_engine();
+        let e = engine.pick_window().unwrap_err();
+        assert!(is_no_host(&e), "{e:#}");
+        let msg = format!("{e:#}");
+        assert!(msg.contains("menu-bar app") && msg.contains("list_windows"), "{msg}");
+    }
+
+    #[test]
+    fn pick_window_goes_through_the_host() {
+        let (_dir, mut engine) = temp_engine();
+        let w = WindowInfo {
+            id: 42,
+            pid: 7,
+            owner: "App".into(),
+            title: "Doc".into(),
+            frame: Rect::new(0.0, 0.0, 400.0, 300.0),
+            layer: 0,
+            on_screen: true,
+            alpha: 1.0,
+        };
+        engine.ui_host = Some(Arc::new(FakeHost(Some(w))));
+        assert_eq!(engine.pick_window().unwrap().id, 42);
+
+        engine.ui_host = Some(Arc::new(FakeHost(None)));
+        let e = engine.pick_window().unwrap_err();
+        assert!(matches!(e.downcast_ref::<BugleError>(), Some(BugleError::Cancelled)), "{e:#}");
+
+        engine.ui_host = Some(Arc::new(OldHost));
+        assert!(is_no_host(&engine.pick_window().unwrap_err()));
     }
 
     #[test]

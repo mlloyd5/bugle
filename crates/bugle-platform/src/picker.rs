@@ -14,10 +14,11 @@ mod ffi {
     pub type bugle_pick_callback_t = unsafe extern "C" fn(ctx: *mut c_void, kind: i32, x: f64, y: f64);
 
     extern "C" {
-        pub fn bugle_pick_begin(cb: bugle_pick_callback_t, ctx: *mut c_void, timeout_seconds: f64) -> i32;
+        pub fn bugle_pick_begin(cb: bugle_pick_callback_t, ctx: *mut c_void, timeout_seconds: f64, allow_switch: i32) -> i32;
         pub fn bugle_pick_highlight(x: f64, y: f64, w: f64, h: f64, label: *const c_char);
         pub fn bugle_pick_active() -> i32;
         pub fn bugle_pick_cancel();
+        pub fn bugle_pick_switch();
     }
 }
 
@@ -31,6 +32,10 @@ pub enum PickEvent {
     /// Esc, right click, timeout, switching to another app, or
     /// [`window_pick_cancel`].
     Cancelled,
+    /// Space, when the picker was opened with `allow_switch`: the user wants
+    /// the area selection instead. Bugle is left active so the selection
+    /// overlay can open at once.
+    Switch,
 }
 
 type PickCb = Box<dyn FnMut(PickEvent)>;
@@ -45,21 +50,26 @@ unsafe extern "C" fn pick_trampoline(ctx: *mut libc::c_void, kind: i32, x: f64, 
         cb(PickEvent::Moved(p));
     } else {
         let mut cb: Box<PickCb> = unsafe { Box::from_raw(ctx as *mut PickCb) };
-        cb(if kind == 1 { PickEvent::Clicked(p) } else { PickEvent::Cancelled });
+        cb(match kind {
+            1 => PickEvent::Clicked(p),
+            3 => PickEvent::Switch,
+            _ => PickEvent::Cancelled,
+        });
     }
 }
 
 /// Show the picker overlay on every screen and return at once. `handler`
 /// runs on the main thread for every pointer move and then exactly once with
 /// a final event. The overlay closes itself after `timeout` so it can never
-/// strand the desktop. Returns `false` (and drops `handler` without calling
+/// strand the desktop. With `allow_switch`, Space ends it with
+/// [`PickEvent::Switch`]. Returns `false` (and drops `handler` without calling
 /// it) when a picker or area selection is already on screen. Main thread
 /// only, needs a running AppKit loop.
-pub fn window_pick_begin(timeout: Duration, handler: impl FnMut(PickEvent) + 'static) -> bool {
+pub fn window_pick_begin(timeout: Duration, allow_switch: bool, handler: impl FnMut(PickEvent) + 'static) -> bool {
     let boxed: Box<PickCb> = Box::new(Box::new(handler));
     let ctx = Box::into_raw(boxed);
     let secs = timeout.as_secs_f64().max(0.5);
-    let started = unsafe { ffi::bugle_pick_begin(pick_trampoline, ctx as *mut libc::c_void, secs) } == 1;
+    let started = unsafe { ffi::bugle_pick_begin(pick_trampoline, ctx as *mut libc::c_void, secs, allow_switch as i32) } == 1;
     if !started {
         drop(unsafe { Box::from_raw(ctx) });
     }
@@ -82,4 +92,10 @@ pub fn window_pick_active() -> bool {
 /// Dismiss the picker; the handler gets [`PickEvent::Cancelled`]. Main thread only.
 pub fn window_pick_cancel() {
     unsafe { ffi::bugle_pick_cancel() }
+}
+
+/// Do what Space does: end with [`PickEvent::Switch`] when the picker was
+/// opened with `allow_switch`, otherwise nothing. Main thread only.
+pub fn window_pick_switch() {
+    unsafe { ffi::bugle_pick_switch() }
 }

@@ -39,6 +39,10 @@ pub struct GeneralConfig {
     pub copy_to_clipboard: bool,
     /// Where the history file lives.
     pub history_path: Option<String>,
+    /// `bugle-app` run from Bugle.app: also post finished actions and errors
+    /// to Notification Center. macOS asks for permission the first time;
+    /// denied or unbundled, only the panel or toast is shown.
+    pub system_notifications: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +90,9 @@ pub struct RecordingConfig {
     /// Fold the microphone and system-audio tracks into one when both are
     /// recorded (otherwise they are two AAC tracks).
     pub mix_audio: bool,
+    /// Levels and ducking for the mixed track (flat `[recordings]` keys).
+    #[serde(flatten)]
+    pub mix: crate::audio_mix::AudioMixConfig,
     pub highlight_clicks: bool,
     /// Write a pointer/click event track next to every recording.
     pub cursor_events: bool,
@@ -207,6 +214,7 @@ impl Default for GeneralConfig {
             shutter_sound: false,
             copy_to_clipboard: false,
             history_path: None,
+            system_notifications: false,
         }
     }
 }
@@ -232,6 +240,7 @@ impl Default for RecordingConfig {
             microphone: false,
             system_audio: false,
             mix_audio: false,
+            mix: Default::default(),
             highlight_clicks: false,
             cursor_events: false,
             hide_cursor: false,
@@ -299,7 +308,7 @@ pub struct HotkeyConfig {
     /// Pin the latest capture to the screen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pin_latest: Option<String>,
-    /// Bindings for the other menu items (`stop_recording`, `sync_latest`,
+    /// Bindings for the other menu items (`record_window`, `stop_recording`, `sync_latest`,
     /// `open_folder`, `toggle_api`, `preferences`, `quit`), plus any value
     /// that is not a string. `bugle-app` owns the list of valid names and
     /// warns about unknown keys and non-string values.
