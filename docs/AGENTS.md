@@ -89,12 +89,12 @@ curl -s -H "$H" -H 'content-type: application/json' \
 | `annotate` | `source`, `annotation`, `output`, `copy`, `inline_image` | `media` + image |
 | `annotate_schema` | – | example document |
 | `scroll_capture` | `rect`, `max_frames`, `step_lines`, `settle_ms`, `horizontal`, `output`, `inline_image` | `media`, `stats` |
-| `record_start` | `target`, `format` (mp4/mov/gif), `fps`, `microphone`, `system_audio`, `mix_audio`, `microphone_gain`, `system_audio_gain`, `ducking`, `ducking_amount_db` (levels of the mixed track; defaults from `[recordings]`), `max_seconds`, `highlight_clicks`, `output`, `label` | status |
+| `record_start` | `target`, `format` (mp4/mov/gif), `fps`, `microphone`, `system_audio`, `mix_audio`, `microphone_gain`, `system_audio_gain`, `ducking`, `ducking_amount_db` (levels of the mixed track; defaults from `[recordings]`), `max_seconds`, `highlight_clicks`, `cursor_events` (writes `<file>.events.json`), `hide_cursor` (pointer left out of the frames; implies `cursor_events`), `output`, `label` | status |
 | `record_stop` | – | `media` |
 | `record_status` | – | status |
 | `transcribe` | `source`, `provider`, `language` | `transcript`, `srt` |
 | `subtitles` | `source`, `format` (srt/vtt), `provider`, `language`, `output` | `path`, `segments`, `text` |
-| `edit_video` | `source`, `start`, `end` (seconds, negative = from the end), `preset` (original/lossless/high/hevc/1080p/720p/540p/gif/gif-small), `fps` (re-encodes video; resamples GIF), `max_size` (GIF long edge), `output`, `label` | `media` (parent = source when it is a history item) |
+| `edit_video` | `source`, `start`, `end` (seconds, negative = from the end), `preset` (original/lossless/high/hevc/1080p/720p/540p/gif/gif-small), `fps` (re-encodes video; resamples GIF), `max_size` (GIF long edge), `zoom` (factor above 1, at most 4: zoom in on clicks), `smooth_cursor` (draw a smoothed pointer; `hide_cursor` recordings), `output`, `label` | `media` (parent = source when it is a history item) |
 | `complete` | `prompt`, `provider`, `system` | `text` |
 | `history` | `limit` | media list |
 | `get_media` | `source`, `inline_image`, `max_edge` | media (+ image) |
@@ -112,6 +112,15 @@ file. `lossless` always copies: faster and without quality loss, but a cut
 between keyframes keeps up to one keyframe interval (2 s for Bugle's own
 recordings) before the start in the file, hidden by an edit list and
 recoverable. One engine runs at most two edits at a time; a third is refused.
+
+`zoom` and `smooth_cursor` read the recording's event track (made by
+`record_start` with `cursor_events` or `hide_cursor`); without one they are a
+400. They re-render every frame (at the recording's frame rate, at least 30
+fps), so `lossless` is refused with them and `original`/`high` encode H.264
+(`hevc`: HEVC); the audio tracks are copied back in untouched. Zoom follows
+clicks inside the recorded area only. The track is `<file>.events.json` (the
+whole file name, so `clip.mp4` and `clip.mov` each have their own), and an
+effects edit's output has none.
 
 `source` accepts a media id (or prefix), `latest`, or a file path.
 Target coordinates are screen points (top-left origin); annotation and OCR

@@ -229,6 +229,8 @@ fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<N
                 mix: Default::default(),
                 max_seconds: None,
                 highlight_clicks: false,
+                cursor_events: false,
+                hide_cursor: false,
                 output: None,
                 label: None,
             };

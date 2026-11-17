@@ -51,9 +51,12 @@ ducking_threshold_db = -40.0  # mic peak level (dBFS, as recorded, before
 ducking_attack_ms = 10.0  # fade down
 ducking_release_ms = 500.0  # fade back up once the mic is quiet
 highlight_clicks = false  # stream backend: macOS 15+
+cursor_events = false     # write <file>.events.json (pointer + clicks) for `bugle edit --zoom`
+hide_cursor = false       # leave the pointer out of the frames (stream backend; implies
+                          # cursor_events; `bugle edit --smooth-cursor` draws it back)
 retina = true
 # auto: ScreenCaptureKit (SCStream + AVAssetWriter, H.264 + AAC .mp4) when system
-#       audio is requested, otherwise `screencapture -v`
+#       audio, hide_cursor or cursor_events is requested, otherwise `screencapture -v`
 # stream | system: always use that recorder
 backend = "auto"
 

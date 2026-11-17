@@ -66,6 +66,15 @@ int32_t bugle_register_translation(const uint8_t *ref_rgba, size_t ref_len, int3
 
 int32_t bugle_post_scroll(double x, double y, int32_t dx_lines, int32_t dy_lines);
 void bugle_cursor_position(double *x, double *y);
+// Pressed mouse buttons: bit 0 left, 1 right, 2 middle.
+int32_t bugle_mouse_buttons(void);
+// Seconds on the host clock (CMClockGetHostTimeClock), which stamps
+// ScreenCaptureKit samples.
+double bugle_host_time_now(void);
+// Current frame of one window (global points); 0 ok, -1 when it is gone.
+int32_t bugle_window_frame(uint32_t window_id, double *x, double *y, double *w, double *h);
+// 1 when child `pid` has exited (not reaped, so its owner can still wait), 0 if not, -1 on error.
+int32_t bugle_child_exited(int32_t pid);
 
 int32_t bugle_clipboard_write_image(const uint8_t *png, size_t len);
 int32_t bugle_clipboard_write_text(const char *text);
@@ -151,6 +160,16 @@ void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int
 int32_t bugle_writer_append(void *handle, const uint8_t *rgba, size_t len, int32_t w, int32_t h);
 int32_t bugle_writer_finish(void *handle, double timeout);   // finalises and releases the handle
 void bugle_writer_cancel(void *handle);      // discards the file and releases the handle
+// Sequential decoder over [start, end) (end <= start: the whole track).
+// `next` returns frames in presentation order with their time in `pts`; a
+// NULL image with no error pending is the end of the range.
+void *bugle_seq_open(const char *path, double start, double end);
+bugle_image_t bugle_seq_next(void *handle, double *pts);
+void bugle_seq_close(void *handle);
+// Video track of `video_path` + audio of `audio_path` over [start, end),
+// copied into one movie. 0 ok, 1 nothing written (no audio there), -1 error.
+int32_t bugle_mux_audio(const char *video_path, const char *audio_path, double start, double end, const char *out_path,
+                        int32_t mp4, double timeout);
 void bugle_play_sound(const char *name);
 void bugle_open_path(const char *path);
 
@@ -164,6 +183,8 @@ void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t wi
                              int32_t system_audio, int32_t microphone, int32_t show_cursor, int32_t show_clicks,
                              double max_seconds, const char *out_path);
 int64_t bugle_sck_record_frames(void *handle);
+// Host-clock time (seconds) of the movie's time 0; NaN before it starts.
+double bugle_sck_record_session_start(void *handle);
 char *bugle_sck_record_warnings(void *handle);   // malloc'd, NULL when none
 int32_t bugle_sck_record_stop(void *handle);
 

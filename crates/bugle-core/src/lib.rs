@@ -5,6 +5,7 @@
 
 pub mod audio_mix;
 pub mod config;
+pub mod events;
 pub mod geometry;
 pub mod history;
 pub mod media_item;
@@ -12,6 +13,7 @@ pub mod naming;
 pub mod spec;
 
 pub use config::Config;
+pub use events::EventTrack;
 pub use geometry::{Point, Rect, Size};
 pub use history::History;
 pub use media_item::{MediaItem, MediaKind};

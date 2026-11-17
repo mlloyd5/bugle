@@ -5,7 +5,9 @@
 //! milliseconds; async front ends wrap them in `spawn_blocking`.
 
 pub mod capture;
+pub mod cursor_fx;
 pub mod edit;
+mod event_log;
 pub mod record;
 pub mod scroll;
 pub mod stitch;

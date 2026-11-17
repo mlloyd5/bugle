@@ -250,7 +250,7 @@ pub struct ScrollArgs {
 #[derive(Subcommand, Debug)]
 pub enum RecordCmd {
     /// Start a recording; blocks until Ctrl-C (or --seconds).
-    Start(RecordArgs),
+    Start(Box<RecordArgs>),
     /// Explains how to stop a recording: Ctrl-C in the `record start`
     /// terminal, or the `record_stop` action of a running API/MCP server.
     Stop,
@@ -300,6 +300,13 @@ pub struct RecordArgs {
     /// Highlight mouse clicks.
     #[arg(long)]
     pub clicks: bool,
+    /// Log pointer moves and clicks to `<file>.events.json` next to the recording
+    /// (used by `bugle edit --zoom / --smooth-cursor`).
+    #[arg(long)]
+    pub cursor_events: bool,
+    /// Leave the pointer out of the frames (implies --cursor-events; an edit draws it back).
+    #[arg(long)]
+    pub hide_cursor: bool,
     #[arg(long, short = 'o')]
     pub output: Option<String>,
     #[arg(long, short = 'l')]
@@ -394,6 +401,13 @@ pub struct EditArgs {
     /// Long edge of GIF output, in pixels.
     #[arg(long)]
     pub max_size: Option<u32>,
+    /// Zoom in on clicks: `--zoom` (2x) or `--zoom=FACTOR` (above 1, at most 4).
+    /// Needs a recording made with --cursor-events.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "2", value_name = "FACTOR")]
+    pub zoom: Option<f64>,
+    /// Draw the pointer along a smoothed path (recordings made with --hide-cursor).
+    #[arg(long)]
+    pub smooth_cursor: bool,
     #[arg(long, short = 'o')]
     pub output: Option<String>,
     #[arg(long)]
@@ -625,6 +639,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                     },
                     max_seconds: a.seconds,
                     highlight_clicks: a.clicks,
+                    cursor_events: a.cursor_events,
+                    hide_cursor: a.hide_cursor,
                     output: a.output,
                     label: a.label,
                 };
@@ -736,6 +752,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 max_size: a.max_size,
                 output: a.output,
                 label: a.label,
+                zoom: a.zoom,
+                smooth_cursor: a.smooth_cursor,
             };
             let media = tokio::task::spawn_blocking({
                 let e = engine.clone();
@@ -1035,6 +1053,18 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["bugle", "edit", "--list-presets"]).unwrap();
         assert!(matches!(cli.cmd, Cmd::Edit(EditArgs { list_presets: true, .. })));
+    }
+
+    #[test]
+    fn zoom_takes_its_factor_only_after_an_equals_sign() {
+        let edit = |args: &[&str]| match Cli::try_parse_from(args).unwrap().cmd {
+            Cmd::Edit(a) => (a.source, a.zoom),
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(edit(&["bugle", "edit", "--zoom", "latest"]), ("latest".into(), Some(2.0)));
+        assert_eq!(edit(&["bugle", "edit", "abc", "--zoom=1.5"]), ("abc".into(), Some(1.5)));
+        assert_eq!(edit(&["bugle", "edit", "--zoom"]), ("latest".into(), Some(2.0)));
+        assert_eq!(edit(&["bugle", "edit"]), ("latest".into(), None));
     }
 
     #[test]

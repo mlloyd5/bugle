@@ -142,7 +142,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "record_start",
-            description: "Start a screen recording (mp4/mov via screencapture or, with system_audio, the ScreenCaptureKit recorder; gif via a frame grab loop). Only one recording at a time.",
+            description: "Start a screen recording (mp4/mov via screencapture or, with system_audio, hide_cursor or cursor_events, the ScreenCaptureKit recorder; gif via a frame grab loop). Only one recording at a time.",
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -158,6 +158,8 @@ pub fn catalog() -> Vec<ToolSpec> {
                     "ducking_amount_db":{"type":"number","minimum":0,"maximum":60,"description":"how far ducking lowers system audio, in dB"},
                     "max_seconds":{"type":"number","description":"auto-stop"},
                     "highlight_clicks":{"type":"boolean"},
+                    "cursor_events":{"type":"boolean","description":"log pointer moves and clicks to <file>.events.json next to the recording (for edit_video zoom / smooth_cursor)"},
+                    "hide_cursor":{"type":"boolean","description":"leave the pointer out of the frames (implies cursor_events; edit_video smooth_cursor draws it back)"},
                     "output":{"type":"string"},
                     "label":{"type":"string"}
                 }
@@ -201,7 +203,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_video",
-            description: "Trim a recording (video or GIF) and export it with a preset: original (same format; copied when the cut starts on a keyframe, otherwise re-encoded so nothing before the cut stays in the file), lossless (always copied; may keep up to one keyframe interval before the cut in the file, hidden), high, hevc, 1080p, 720p, 540p, gif, gif-small. Times are seconds; negative counts from the end. Saves a new media item (parent = the source when it is a history item).",
+            description: "Trim a recording (video or GIF) and export it with a preset: original (same format; copied when the cut starts on a keyframe, otherwise re-encoded so nothing before the cut stays in the file), lossless (always copied; may keep up to one keyframe interval before the cut in the file, hidden), high, hevc, 1080p, 720p, 540p, gif, gif-small. Times are seconds; negative counts from the end. Saves a new media item (parent = the source when it is a history item). Recordings made with cursor_events (or hide_cursor) can be auto-zoomed on clicks (zoom) and, with hide_cursor, get a smoothed pointer drawn in (smooth_cursor).",
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -211,6 +213,8 @@ pub fn catalog() -> Vec<ToolSpec> {
                     "preset":{"type":"string","enum":bugle_engine::ExportPreset::ALL.iter().map(|p| p.name()).collect::<Vec<_>>(),"default":"original"},
                     "fps":{"type":"integer","description":"output frame rate: re-encodes a video (not with lossless), resamples a GIF"},
                     "max_size":{"type":"integer","description":"long edge of GIF output in pixels"},
+                    "zoom":{"type":"number","exclusiveMinimum":1,"maximum":4,"description":"zoom in on clicks to this factor (e.g. 2); needs a recording made with cursor_events"},
+                    "smooth_cursor":{"type":"boolean","description":"draw the pointer along a smoothed path; needs a recording made with hide_cursor"},
                     "output":{"type":"string"},
                     "label":{"type":"string"}
                 }
@@ -513,6 +517,19 @@ pub(crate) mod tests {
         assert_eq!(out.json["media"]["parent"], json!(id));
         let err = run(&engine, "edit_video", json!({"source": src, "preset": "lossless"})).await.err().unwrap();
         assert_eq!(status_for(&err), 400);
+
+        // zoom needs the recording's event track: a 400 without one.
+        let err = run(&engine, "edit_video", json!({"source": src, "zoom": 2})).await.err().unwrap();
+        assert_eq!(status_for(&err), 400);
+        use bugle_core::events::{CursorEvent, EventKind, EventTrack, MouseButton};
+        let click = CursorEvent { t: 0.25, kind: EventKind::Down, button: Some(MouseButton::Left), x: 2.0, y: 2.0 };
+        EventTrack::new(bugle_core::Rect::new(0.0, 0.0, 8.0, 6.0), true, 0.4, vec![click]).save(&EventTrack::sidecar_path(&src)).unwrap();
+        let out = run(&engine, "edit_video", json!({"source": src, "zoom": 2, "preset": "gif"})).await.unwrap();
+        assert!(out.json["media"]["source"].as_str().unwrap().contains("zoom 2x"), "{}", out.json);
+        let err = run(&engine, "edit_video", json!({"source": src, "zoom": 9})).await.err().unwrap();
+        assert_eq!(status_for(&err), 400);
+        let err = run(&engine, "edit_video", json!({"source": src, "smooth_cursor": true})).await.err().unwrap();
+        assert_eq!(status_for(&err), 400, "the pointer is in the frames");
     }
 
     #[test]

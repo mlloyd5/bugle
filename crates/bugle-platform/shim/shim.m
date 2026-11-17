@@ -12,6 +12,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <ApplicationServices/ApplicationServices.h>
 #include "shim.h"
+#include <sys/wait.h>
 
 // ---------------------------------------------------------------------------
 // Errors / memory
@@ -530,6 +531,44 @@ void bugle_cursor_position(double *x, double *y) {
     if (ev) CFRelease(ev);
     *x = p.x;
     *y = p.y;
+}
+
+int32_t bugle_mouse_buttons(void) {
+    // Reads the session's button state; needs no permission and posts nothing.
+    int32_t m = 0;
+    if (CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonLeft)) m |= 1;
+    if (CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonRight)) m |= 2;
+    if (CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonCenter)) m |= 4;
+    return m;
+}
+
+double bugle_host_time_now(void) { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock())); }
+
+int32_t bugle_window_frame(uint32_t window_id, double *x, double *y, double *w, double *h) {
+    @autoreleasepool {
+        CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, window_id);
+        if (!list) return -1;
+        int32_t rc = -1;
+        if (CFArrayGetCount(list) > 0) {
+            NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(list, 0);
+            CGRect r;
+            if ([info[(id)kCGWindowNumber] unsignedIntValue] == window_id &&
+                CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)info[(id)kCGWindowBounds], &r)) {
+                *x = r.origin.x; *y = r.origin.y; *w = r.size.width; *h = r.size.height;
+                rc = 0;
+            }
+        }
+        CFRelease(list);
+        return rc;
+    }
+}
+
+int32_t bugle_child_exited(int32_t pid) {
+    // WNOWAIT leaves the child to be reaped by its owner.
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    if (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOHANG | WNOWAIT) != 0) return -1;
+    return info.si_pid == pid ? 1 : 0;
 }
 
 // Clipboard, sound and workspace calls below run on whichever thread the
@@ -1689,6 +1728,14 @@ void bugle_frames_close(void *handle) {
     }
 }
 
+static NSDictionary *bt709_properties(void) {
+    return @{
+        AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+        AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+        AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+    };
+}
+
 @interface BugleFrameWriter : NSObject
 @property(strong) AVAssetWriter *writer;
 @property(strong) AVAssetWriterInput *input;
@@ -1731,6 +1778,9 @@ void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int
             AVVideoWidthKey: @(w),
             AVVideoHeightKey: @(h),
             AVVideoCompressionPropertiesKey: compression,
+            // Tagged explicitly: untagged small movies are read back with
+            // the SD (601) matrix and shift colour on every round trip.
+            AVVideoColorPropertiesKey: bt709_properties(),
         };
         AVAssetWriterInput *input = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:video];
         input.expectsMediaDataInRealTime = NO;
@@ -1844,6 +1894,158 @@ void bugle_writer_cancel(void *handle) {
         BugleFrameWriter *fw = (__bridge_transfer BugleFrameWriter *)handle;
         [fw.writer cancelWriting];
         [[NSFileManager defaultManager] removeItemAtURL:fw.url error:nil];
+    }
+}
+
+// Sequential frame reader: AVAssetReader decodes the video track over a
+// time range in presentation order (one decode per frame, unlike the
+// random-access generator above). The first frame may start before the range
+// (it is the one shown at its start). The preferred transform is not applied.
+@interface BugleSeqReader : NSObject
+@property(strong) AVAssetReader *reader;
+@property(strong) AVAssetReaderTrackOutput *output;
+@end
+@implementation BugleSeqReader
+@end
+
+void *bugle_seq_open(const char *path, double start, double end) {
+    @autoreleasepool {
+        clear_error();
+        if (!path) { set_error(@"reader: NULL path"); return NULL; }
+        AVURLAsset *asset = precise_asset(path);
+        AVAssetTrack *track = first_video_track(asset);
+        if (!track) { set_error(@"the source has no video track"); return NULL; }
+        NSError *err = nil;
+        AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&err];
+        if (!reader) { set_error(@"could not read %s: %@", path, err.localizedDescription); return NULL; }
+        NSDictionary *settings = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+            AVVideoColorPropertiesKey: bt709_properties(),
+        };
+        AVAssetReaderTrackOutput *out = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:track outputSettings:settings];
+        out.alwaysCopiesSampleData = NO;
+        if (![reader canAddOutput:out]) { set_error(@"could not decode the video track"); return NULL; }
+        [reader addOutput:out];
+        if (isfinite(start) && isfinite(end) && start >= 0 && end > start) {
+            reader.timeRange = CMTimeRangeFromTimeToTime(CMTimeMakeWithSeconds(start, 60000), CMTimeMakeWithSeconds(end, 60000));
+        }
+        if (![reader startReading]) { set_error(@"could not read %s: %@", path, reader.error.localizedDescription); return NULL; }
+        BugleSeqReader *r = [[BugleSeqReader alloc] init];
+        r.reader = reader;
+        r.output = out;
+        return (__bridge_retained void *)r;
+    }
+}
+
+bugle_image_t bugle_seq_next(void *handle, double *pts) {
+    @autoreleasepool {
+        clear_error();
+        if (!handle || !pts) { set_error(@"reader: NULL argument"); return (bugle_image_t){0}; }
+        BugleSeqReader *r = (__bridge BugleSeqReader *)handle;
+        for (;;) {
+            CMSampleBufferRef sb = [r.output copyNextSampleBuffer];
+            if (!sb) {
+                if (r.reader.status == AVAssetReaderStatusFailed) {
+                    set_error(@"decoding failed: %@", r.reader.error.localizedDescription ?: @"unknown error");
+                }
+                return (bugle_image_t){0};
+            }
+            CVImageBufferRef ib = CMSampleBufferGetImageBuffer(sb);
+            if (!ib) { CFRelease(sb); continue; }
+            *pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb));
+            CVPixelBufferLockBaseAddress(ib, kCVPixelBufferLock_ReadOnly);
+            size_t w = CVPixelBufferGetWidth(ib), h = CVPixelBufferGetHeight(ib), stride = CVPixelBufferGetBytesPerRow(ib);
+            const uint8_t *base = CVPixelBufferGetBaseAddress(ib);
+            size_t len = rgba_len((int64_t)w, (int64_t)h);
+            uint8_t *buf = (len && base) ? malloc(len) : NULL;
+            if (buf) {
+                for (size_t y = 0; y < h; y++) {
+                    const uint8_t *src = base + y * stride;
+                    uint8_t *dst = buf + y * w * 4;
+                    for (size_t x = 0; x < w; x++) {
+                        dst[x * 4 + 0] = src[x * 4 + 2];
+                        dst[x * 4 + 1] = src[x * 4 + 1];
+                        dst[x * 4 + 2] = src[x * 4 + 0];
+                        dst[x * 4 + 3] = 255;
+                    }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(ib, kCVPixelBufferLock_ReadOnly);
+            CFRelease(sb);
+            if (!buf) { set_error(@"reader: could not convert a %zux%zu frame", w, h); return (bugle_image_t){0}; }
+            return (bugle_image_t){buf, (int32_t)w, (int32_t)h};
+        }
+    }
+}
+
+void bugle_seq_close(void *handle) {
+    if (!handle) return;
+    @autoreleasepool {
+        BugleSeqReader *r = (__bridge_transfer BugleSeqReader *)handle;
+        [r.reader cancelReading];
+    }
+}
+
+// Copy the video track of `video_path` and the audio tracks of `audio_path`
+// over [start, end) (placed at 0) into one movie, without re-encoding.
+// Returns 1 (nothing written) when the audio source has no audio there.
+int32_t bugle_mux_audio(const char *video_path, const char *audio_path, double start, double end, const char *out_path,
+                        int32_t mp4, double timeout) {
+    @autoreleasepool {
+        clear_error();
+        if (!video_path || !audio_path || !out_path) { set_error(@"mux: NULL path"); return -1; }
+        if (!isfinite(start) || !isfinite(end) || start < 0 || end <= start) {
+            set_error(@"invalid time range %g..%g s", start, end);
+            return -1;
+        }
+        AVURLAsset *v = precise_asset(video_path), *a = precise_asset(audio_path);
+        AVAssetTrack *vt = first_video_track(v);
+        if (!vt) { set_error(@"%s has no video track", video_path); return -1; }
+        AVMutableComposition *comp = [AVMutableComposition composition];
+        NSError *err = nil;
+        AVMutableCompositionTrack *cv = [comp addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid];
+        if (![cv insertTimeRange:vt.timeRange ofTrack:vt atTime:kCMTimeZero error:&err]) {
+            set_error(@"mux: could not copy the video: %@", err.localizedDescription);
+            return -1;
+        }
+        cv.preferredTransform = vt.preferredTransform;
+        CMTime s = CMTimeMakeWithSeconds(start, 60000);
+        CMTimeRange want = CMTimeRangeFromTimeToTime(s, CMTimeMakeWithSeconds(end, 60000));
+        int added = 0;
+        for (AVAssetTrack *t in [a tracksWithMediaType:AVMediaTypeAudio]) {
+            if (!t.enabled) continue;
+            CMTimeRange have = CMTimeRangeGetIntersection(want, t.timeRange);
+            if (CMTIMERANGE_IS_INVALID(have) || CMTIMERANGE_IS_EMPTY(have)) continue;
+            AVMutableCompositionTrack *ca = [comp addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid];
+            if (![ca insertTimeRange:have ofTrack:t atTime:CMTimeSubtract(have.start, s) error:&err]) {
+                set_error(@"mux: could not copy an audio track: %@", err.localizedDescription);
+                return -1;
+            }
+            added++;
+        }
+        if (added == 0) return 1;
+        AVAssetExportSession *x = [[AVAssetExportSession alloc] initWithAsset:comp presetName:AVAssetExportPresetPassthrough];
+        if (!x) { set_error(@"mux: could not create export session"); return -1; }
+        NSURL *out = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
+        [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+        x.outputURL = out;
+        x.outputFileType = mp4 ? AVFileTypeMPEG4 : AVFileTypeQuickTimeMovie;
+        x.shouldOptimizeForNetworkUse = YES;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        [x exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
+        if (!wait_bounded(sem, timeout)) {
+            [x cancelExport];
+            wait_bounded(sem, 10);
+            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+            set_error(@"mux timed out after %.0f s and was cancelled", timeout);
+            return -1;
+        }
+        if (x.status != AVAssetExportSessionStatusCompleted) {
+            set_error(@"mux failed: %@", x.error.localizedDescription ?: @"unknown error");
+            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+            return -1;
+        }
+        return 0;
     }
 }
 
@@ -2329,6 +2531,15 @@ void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t wi
         }
         return (__bridge_retained void *)rec;
     }
+}
+
+double bugle_sck_record_session_start(void *handle) {
+    if (!handle) return NAN;
+    BugleSckRecorder *rec = (__bridge BugleSckRecorder *)handle;
+    [rec.lock lock];
+    double s = rec.sessionStarted ? CMTimeGetSeconds(rec.sessionStart) : NAN;
+    [rec.lock unlock];
+    return s;
 }
 
 int64_t bugle_sck_record_frames(void *handle) {
