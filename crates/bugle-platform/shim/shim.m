@@ -1044,11 +1044,14 @@ int32_t bugle_pin_image_show(const uint8_t *png, size_t len, double x, double y,
 
 int32_t bugle_pin_close_all(void) {
     @autoreleasepool {
-        NSArray<NSWindow *> *open = [g_pins copy];
-        for (NSWindow *win in open) {
-            if ([win.contentView isKindOfClass:[BuglePinView class]]) [(BuglePinView *)win.contentView closePin];
+        int32_t closed = 0;
+        for (NSWindow *win in [g_pins copy]) {
+            if ([win.contentView isKindOfClass:[BuglePinView class]]) {
+                [(BuglePinView *)win.contentView closePin];
+                closed++;
+            }
         }
-        return (int32_t)open.count;
+        return closed;
     }
 }
 

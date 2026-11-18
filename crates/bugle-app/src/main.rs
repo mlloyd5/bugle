@@ -843,7 +843,15 @@ fn main() -> Result<()> {
         .init();
 
     let config_path = cli.config.clone().unwrap_or_else(Config::default_path);
-    let config = Config::load_from(&config_path)?;
+    let mut config = Config::load_from(&config_path)?;
+    // The smoke test never reads the user's history (a stale entry there hid
+    // a failing step): unless the config names one, it gets an empty file.
+    let smoke_history = (cli.smoke_test && config.general.history_path.is_none())
+        .then(|| std::env::temp_dir().join(format!("bugle-smoke-history-{}.jsonl", std::process::id())));
+    if let Some(p) = &smoke_history {
+        let _ = std::fs::remove_file(p);
+        config.general.history_path = Some(p.display().to_string());
+    }
 
     // The event loop must exist before anything touches NSApplication.
     let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
@@ -989,6 +997,9 @@ fn main() -> Result<()> {
                 if let Some(api) = app.api.take() {
                     api.stop();
                 }
+                if let Some(p) = &smoke_history {
+                    let _ = std::fs::remove_file(p);
+                }
                 if SMOKE_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
                     eprintln!("smoke test: FAILED");
                     std::process::exit(1);
@@ -1040,35 +1051,51 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
     t0
 }
 
-/// Set by a `--smoke-test` step that fails outright; the run then exits 1.
+/// Set by [`smoke_fail`]; the run then exits 1.
 static SMOKE_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// `--smoke-test` step: pin a synthetic PNG (in the temp directory, not added
-/// to history, so the step does not depend on what the history's latest item
-/// is or whether its file still exists) through `Engine::pin` and the UI
-/// host, check with the window server that one window of the image's size
-/// appeared, close it, and check it is gone. Any error fails the run.
+/// Report a `--smoke-test` step that failed outright (an unexpected error or
+/// a wrong result, not a capability this machine lacks): prints the
+/// `FAILED` line and makes the run exit 1 once it has finished.
+pub(crate) fn smoke_fail(step: &str, err: impl std::fmt::Display) {
+    eprintln!("smoke test: {step} FAILED ({err})");
+    SMOKE_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// `--smoke-test` step: pin a synthetic PNG (a temp file, not added to
+/// history, so the step does not depend on what the history holds) through
+/// `Engine::pin` and the UI host, check with the window server that one
+/// window of the image's size appeared, close it, and check it is gone. Any
+/// error fails the run.
 fn smoke_pin(engine: &Engine, proxy: &Proxy) {
     const SIZE: (u32, u32) = (237, 151);
-    let pins = || {
-        bugle_platform::windows(true).map(|ws| {
-            ws.iter()
-                .filter(|w| w.pid == std::process::id() as i32 && w.frame.w == SIZE.0 as f64 && w.frame.h == SIZE.1 as f64)
-                .count()
-        })
+    let pins = || -> Result<usize> {
+        Ok(bugle_platform::windows(true)?
+            .iter()
+            .filter(|w| w.pid == std::process::id() as i32 && w.frame.w == SIZE.0 as f64 && w.frame.h == SIZE.1 as f64)
+            .count())
     };
-    let path = std::env::temp_dir().join("bugle-smoke-pin.png");
+    // Poll until `want` such windows are on screen, for at most 2 s.
+    let wait_for = |want: usize| -> Result<usize> {
+        let t = Instant::now();
+        loop {
+            let n = pins()?;
+            if n == want || t.elapsed() > Duration::from_secs(2) {
+                return Ok(n);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
     let run = || -> Result<()> {
-        image::RgbaImage::from_pixel(SIZE.0, SIZE.1, image::Rgba([230, 140, 30, 255])).save(&path)?;
+        let png = tempfile::Builder::new().prefix("bugle-smoke-pin-").suffix(".png").tempfile()?;
+        image::RgbaImage::from_pixel(SIZE.0, SIZE.1, image::Rgba([230, 140, 30, 255])).save(png.path())?;
         let before = pins()?;
-        engine.pin(&path.display().to_string(), None, 1.0, false)?;
-        std::thread::sleep(Duration::from_millis(400));
-        let shown = pins()?;
+        engine.pin(&png.path().display().to_string(), None, 1.0, false)?;
+        let shown = wait_for(1)?;
         let (tx, rx) = mpsc::channel();
         proxy.send(AppEvent::Ui(UiRequest::ClosePins(tx)));
         let closed = rx.recv_timeout(Duration::from_secs(2)).context("closing the pins timed out")?;
-        std::thread::sleep(Duration::from_millis(300));
-        let after = pins()?;
+        let after = wait_for(0)?;
         eprintln!(
             "smoke test: pin {}×{} windows before {before}, shown {shown} (want 1), closed {closed} (want 1), after {after} (want 0)",
             SIZE.0, SIZE.1
@@ -1079,10 +1106,8 @@ fn smoke_pin(engine: &Engine, proxy: &Proxy) {
         Ok(())
     };
     if let Err(e) = run() {
-        eprintln!("smoke test: pin FAILED ({e:#})");
-        SMOKE_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+        smoke_fail("pin", format!("{e:#}"));
     }
-    let _ = std::fs::remove_file(&path);
 }
 
 /// `--smoke-test` step: open the *Audio Levels* prompt from its menu item,

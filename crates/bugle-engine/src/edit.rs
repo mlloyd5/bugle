@@ -734,6 +734,31 @@ fn for_each_gif_frame(path: &Path, mut visit: impl FnMut(RgbaImage, f64, f64) ->
     Ok(())
 }
 
+/// The frames of a GIF shown at `n` evenly spaced times (the middle of `n`
+/// equal slices, as `sample_video_frames` takes them from a video), one
+/// decoded frame in memory at a time. A frame that covers several of those
+/// times is returned once, so a short GIF can give fewer than `n`.
+pub(crate) fn sample_gif_frames(path: &Path, n: usize) -> Result<Vec<RgbaImage>> {
+    let meta = GifMeta::read(path)?;
+    let n = n.max(1);
+    let mut times = (0..n).map(|i| meta.duration * (i as f64 + 0.5) / n as f64).peekable();
+    let mut out = vec![];
+    for_each_gif_frame(path, |img, s, d| {
+        let mut shown = false;
+        while times.next_if(|&t| t < s + d).is_some() {
+            shown = true;
+        }
+        if shown {
+            out.push(img);
+        }
+        Ok(times.peek().is_some())
+    })?;
+    if out.is_empty() {
+        anyhow::bail!("could not extract any frames from {}", path.display());
+    }
+    Ok(out)
+}
+
 /// A GIF's timeline, from its frame headers alone: the pixels are neither
 /// decompressed nor composited, so this is cheap enough for the main thread.
 #[derive(Debug, Clone, Copy)]
@@ -1392,6 +1417,22 @@ mod tests {
         }
         sink.finish().unwrap();
         p
+    }
+
+    #[test]
+    fn gif_frames_are_sampled_across_the_clip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = fixture_gif(tmp.path());
+        let centre = |f: &RgbaImage| {
+            let px = f.get_pixel(f.width() / 2, f.height() / 2);
+            [px[0], px[1], px[2]]
+        };
+        // 0.6 s: samples at 0.1, 0.3 and 0.5 s are frames 1, 3 and 5.
+        let three: Vec<[u8; 3]> = sample_gif_frames(&p, 3).unwrap().iter().map(centre).collect();
+        assert_eq!(three, vec![RED, GREEN, BLUE]);
+        // More samples than frames: each frame once.
+        assert_eq!(sample_gif_frames(&p, 12).unwrap().len(), 6);
+        assert_eq!(sample_gif_frames(&p, 1).unwrap().iter().map(centre).collect::<Vec<_>>(), vec![GREEN]);
     }
 
     /// (delay in centiseconds, colour of the centre pixel) per frame.
