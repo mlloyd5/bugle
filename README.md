@@ -61,6 +61,9 @@ The binaries are `target/release/bugle` (CLI + servers) and `target/release/bugl
 Objective-C shim (`crates/bugle-platform/shim/shim.m`) with the Xcode command
 line tools; no Xcode project is needed.
 
+`cargo xtask check` runs `cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo test --workspace` and exits non-zero if either fails; run it before sending a change.
+
 ### App bundle
 
 ```bash

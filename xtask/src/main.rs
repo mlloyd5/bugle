@@ -11,6 +11,7 @@
 //! * `dmg` is `bundle --dmg`.
 //! * `verify` re-runs the checks on an existing bundle.
 //! * `icon` writes the `.icns` and a 1024 px PNG preview.
+//! * `check` runs clippy (warnings are errors) and the workspace tests.
 
 mod icns;
 mod plist;
@@ -62,6 +63,9 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Run `cargo clippy --workspace --all-targets -- -D warnings` and
+    /// `cargo test --workspace`; fails if either does.
+    Check,
 }
 
 #[derive(Args)]
@@ -130,6 +134,26 @@ fn main() -> Result<()> {
             std::fs::write(out.join(format!("{ICON_NAME}-1024.png")), icns::png(&icns::render(1024))?)?;
             println!("wrote {}/{ICON_NAME}.icns and {ICON_NAME}-1024.png", out.display());
             Ok(())
+        }
+        Cmd::Check => check(),
+    }
+}
+
+/// Clippy, then the tests (run even if clippy failed, so one pass shows both).
+fn check() -> Result<()> {
+    let clippy = run(cargo().args(["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]));
+    let test = run(cargo().args(["test", "--workspace"]));
+    match (clippy, test) {
+        (Ok(()), Ok(())) => {
+            println!("check: clippy and tests passed");
+            Ok(())
+        }
+        (clippy, test) => {
+            let failed: Vec<&str> = [("clippy", clippy.is_err()), ("tests", test.is_err())]
+                .into_iter()
+                .filter_map(|(name, err)| err.then_some(name))
+                .collect();
+            bail!("check failed: {}", failed.join(" and "))
         }
     }
 }

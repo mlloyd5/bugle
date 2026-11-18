@@ -156,6 +156,8 @@ impl Engine {
     /// Without one, a recognised image extension on `output` decides, then
     /// the configured default. An explicit format that disagrees with the
     /// extension wins and the extension is corrected.
+    // Three internal callers, each passing different values; a struct would only rename these positions.
+    #[allow(clippy::too_many_arguments)]
     pub fn save_image(
         &self,
         img: &RgbaImage,
