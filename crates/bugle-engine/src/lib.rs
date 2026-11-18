@@ -554,6 +554,7 @@ impl Engine {
         serde_json::json!({
             "screen_recording": bugle_platform::screen_access_preflight(),
             "accessibility": bugle_platform::accessibility_trusted(false),
+            "microphone": bugle_platform::microphone_access(),
         })
     }
 }

@@ -13,6 +13,7 @@ mod icon;
 mod level_meter;
 mod login;
 mod markup_editor;
+mod meter_smoke;
 mod notifications;
 mod picker;
 mod quick_access;
@@ -53,8 +54,8 @@ struct Cli {
     #[arg(short, long)]
     verbose: bool,
     /// Show the overlay, a toast, a pin, the quick-access panel, the
-    /// markup editor and the video editor, then exit. Exercises the in-app UI plumbing without
-    /// needing a keyboard.
+    /// markup editor and the video editor, make a 2 s recording with the level meter (status
+    /// menu open), then exit. Exercises the in-app UI plumbing without needing a keyboard.
     #[arg(long, hide = true)]
     smoke_test: bool,
     /// Open the markup editor at launch for a media id, `latest` or an
@@ -119,6 +120,8 @@ enum AppEvent {
     VideoEditor(video_editor_window::VideoEditorMsg),
     /// The answer to an *Audio Levels* prompt (`None`: cancelled).
     AudioPrompt(audio_menu::Field, Option<String>),
+    /// Open the status menu and sample it (`--smoke-test`).
+    MeterProbe(meter_smoke::ProbeRequest),
     Quit,
 }
 
@@ -978,6 +981,7 @@ fn main() -> Result<()> {
                 AppEvent::Editor(m) => app.on_editor(m),
                 AppEvent::VideoEditor(m) => app.on_video_editor(m),
                 AppEvent::AudioPrompt(field, text) => app.on_audio_prompt(field, text),
+                AppEvent::MeterProbe(req) => meter_smoke::open_probe(&app.tray, &app.items.menu, req),
                 AppEvent::Quit => app.quit(control_flow),
             },
             Event::LoopDestroyed => {
@@ -1028,6 +1032,7 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
         editor_window::smoke(&proxy);
         video_editor_window::smoke(&proxy);
         smoke_audio_prompt(&proxy);
+        meter_smoke::smoke(&engine, &proxy);
         std::thread::sleep(Duration::from_millis(1500));
         proxy.send(AppEvent::Quit);
     });

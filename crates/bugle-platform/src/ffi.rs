@@ -96,6 +96,7 @@ extern "C" {
     pub fn bugle_screen_access_preflight() -> i32;
     pub fn bugle_screen_access_request() -> i32;
     pub fn bugle_accessibility_trusted(prompt: i32) -> i32;
+    pub fn bugle_microphone_access() -> i32;
 
     pub fn bugle_list_displays(out: *mut bugle_display_t, max: i32) -> i32;
     pub fn bugle_list_windows(out: *mut bugle_window_t, max: i32, on_screen_only: i32) -> i32;

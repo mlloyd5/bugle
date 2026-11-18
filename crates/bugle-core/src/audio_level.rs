@@ -90,8 +90,10 @@ pub fn meter_bar(db: f64, width: usize) -> String {
 /// A menu line for one source: name, bar, a clip mark (`!` in a slot kept
 /// when not clipping) and the peak in dB (or "silent" at the bottom of the
 /// meter), right-aligned in a fixed number of characters. The padding is
-/// figure spaces (digit width), so the line keeps its width as the value
-/// changes and an open menu does not resize ten times a second.
+/// figure spaces (digit width), which keeps the character count; the menu
+/// font's digits are proportional and "silent" is narrower than a value, so
+/// the drawn line still varies by a few points (`--smoke-test` measures the
+/// open menu's width).
 pub fn meter_label(name: &str, level: &TrackLevel) -> String {
     let value = if level.peak_db <= METER_RANGE_DB { "silent".to_string() } else { format!("{:.0} dB", level.peak_db.round() + 0.0) };
     let clip = if level.clipping() { '!' } else { '\u{2007}' };

@@ -391,9 +391,27 @@ plus the shutter sound; the status item title shows `● m:ss` while recording.
 With audio levels in the record status, `level_meter.rs` appends one block
 glyph per source to that title and inserts a disabled line per source under
 *Stop Recording* (bar, `!` near full scale, peak dB padded with figure spaces
-so the line keeps its width); while a recording reports levels, the event loop
-wakes every 100 ms instead of every second to redraw them, and the title and
-recording entries are set only when they change.
+to a fixed number of characters; the menu font's digits are proportional and
+`silent` is narrower than a dB value, so an open menu still changes width by a
+few points as the value moves, 319 to 329 pt in `--smoke-test` runs); while a
+recording reports levels, the event loop wakes every 100 ms instead of every
+second to redraw them, and the title and recording entries are set only when
+they change. The redraw goes on while the status menu is open: tao's wake-up
+timer, its run-loop observers and its event-proxy source are all registered
+in `kCFRunLoopCommonModes`, which includes the `NSEventTrackingRunLoopMode`
+the menu tracks in, and a click on the status item opens the menu from
+NSApplication's event dispatch, outside the event-loop handler, so the
+handler keeps running during tracking. `--smoke-test` checks it on a real
+recording (`meter_smoke.rs`): about 2 s of a 320×200 corner of the main
+display with system audio (and the microphone only when access is already
+granted and a device delivers it), a quiet `afplay` sound for the meter to
+show, the record status polled for levels in -100..0 dBFS, and the status menu
+opened as a click opens it (`status_menu_probe`, `shim/status_menu.m`) for
+1.5 s while a common-modes timer samples the status item title and menu
+titles; it checks the meter lines sit under *Stop Recording*, the title's
+glyphs match the lines, and both change while the menu tracks, then that the
+stopped file has video and audio and no temporary file is left beside it, and
+deletes it.
 When the process runs from `Bugle.app`, an *Open at Login* check item
 (`login.rs`) registers the bundle with `SMAppService`. Its check mark is
 re-read on the periodic tick (every 5 s) and set only for an enabled item; a
