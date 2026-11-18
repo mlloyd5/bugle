@@ -673,7 +673,7 @@ look at what it took.
 
 ## Architecture
 
-Eight crates plus an `xtask` for packaging; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the details.
+Eight crates plus an `xtask` for packaging and checks; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the details.
 
 ```
 bugle-core      types, config, naming, history (no OS calls)
@@ -685,7 +685,7 @@ bugle-engine    Engine: capture, scroll stitch, record, annotate, OCR, AI action
 bugle-api       action catalog → HTTP (axum) and MCP (stdio)
 bugle-cli       the `bugle` binary
 bugle-app       the `bugle-app` menu-bar binary: status item, hotkeys, toasts
-xtask           `cargo xtask bundle`: assemble, sign and verify Bugle.app
+xtask           `cargo xtask bundle`: assemble, sign and verify Bugle.app; `cargo xtask check`: clippy + tests
 ```
 
 ## Why "Bugle"?
