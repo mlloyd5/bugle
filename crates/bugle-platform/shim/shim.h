@@ -124,6 +124,8 @@ int32_t bugle_select_rect_active(void);
 void bugle_select_rect_cancel(void);
 void bugle_pin_image_blocking(const uint8_t *png, size_t len, double x, double y, double w, double h, double opacity);
 int32_t bugle_pin_image_show(const uint8_t *png, size_t len, double x, double y, double w, double h, double opacity);
+/// Close every pin window this process shows; returns how many. Main thread.
+int32_t bugle_pin_close_all(void);
 void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const char *subtitle, const char *open_path,
                       double seconds);
 
