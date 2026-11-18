@@ -39,9 +39,10 @@ mod video_editor;
 #[cfg(target_os = "macos")]
 pub use video_editor::{
     video_editor_active, video_editor_close, video_editor_focus, video_editor_inject, video_editor_open, video_editor_set_frame,
-    video_editor_set_state, video_editor_set_waveform, video_editor_waveform, ClickMarker, VideoEditorCommand, VideoEditorEvent,
-    VideoEditorState,
+    video_editor_set_state, video_editor_set_waveform, ClickMarker, VideoEditorCommand, VideoEditorEvent, VideoEditorState,
 };
+#[cfg(target_os = "macos")]
+pub use video_editor::{video_editor_track_frame, video_editor_waveform};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bugle_core::audio_level::{AudioLevels, TrackLevel};

@@ -65,6 +65,7 @@ extern "C" {
     fn bugle_video_editor_set_clicks(times: *const f64, levels: *const f64, n: i32, selected: i32);
     fn bugle_video_editor_set_waveform(peaks: *const f32, n: i32);
     fn bugle_video_editor_waveform(out: *mut f32, cap: i32) -> i32;
+    fn bugle_video_editor_track_frame(out: *mut f64) -> i32;
     fn bugle_video_editor_close();
     fn bugle_video_editor_active() -> i32;
     fn bugle_video_editor_focus();
@@ -343,6 +344,19 @@ pub fn video_editor_waveform() -> Option<Vec<f32>> {
     // Replaced in between: keep what fitted.
     out.truncate(usize::try_from(n).ok()?);
     Some(out)
+}
+
+/// Where the open video editor's timeline draws its waveform, in points
+/// from its window frame's top-left corner, and the window frame's size:
+/// `(track, (width, height))`. `None` with no video editor open. Any
+/// thread: it waits for the main loop. For smoke tests, to find the
+/// waveform in a capture of the window.
+pub fn video_editor_track_frame() -> Option<(bugle_core::Rect, (f64, f64))> {
+    let mut v = [0f64; 6];
+    if unsafe { bugle_video_editor_track_frame(v.as_mut_ptr()) } != 1 {
+        return None;
+    }
+    Some((bugle_core::Rect::new(v[0], v[1], v[2], v[3]), (v[4], v[5])))
 }
 
 /// Close the video editor. May be called from inside the handler, which is
