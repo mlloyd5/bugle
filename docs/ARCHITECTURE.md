@@ -392,26 +392,32 @@ With audio levels in the record status, `level_meter.rs` appends one block
 glyph per source to that title and inserts a disabled line per source under
 *Stop Recording* (bar, `!` near full scale, peak dB padded with figure spaces
 to a fixed number of characters; the menu font's digits are proportional and
-`silent` is narrower than a dB value, so an open menu still changes width by a
-few points as the value moves, 319 to 329 pt in `--smoke-test` runs); while a
-recording reports levels, the event loop wakes every 100 ms instead of every
-second to redraw them, and the title and recording entries are set only when
-they change. The redraw goes on while the status menu is open: tao's wake-up
-timer, its run-loop observers and its event-proxy source are all registered
-in `kCFRunLoopCommonModes`, which includes the `NSEventTrackingRunLoopMode`
-the menu tracks in, and a click on the status item opens the menu from
+`silent` is narrower than a dB value, so the line's width still shifts by a
+few points as the value moves); while a recording reports levels, the event
+loop wakes every 100 ms instead of every second to redraw them, and the title
+and recording entries are set only when they change. The redraw goes on while
+the status menu is open. That rests on tao 0.37's source: its wake-up timer,
+its run-loop observers and its event-proxy source are all registered in
+`kCFRunLoopCommonModes`, which includes the `NSEventTrackingRunLoopMode` the
+menu tracks in, and a click on the status item opens the menu from
 NSApplication's event dispatch, outside the event-loop handler, so the
-handler keeps running during tracking. `--smoke-test` checks it on a real
-recording (`meter_smoke.rs`): about 2 s of a 320×200 corner of the main
-display with system audio (and the microphone only when access is already
-granted and a device delivers it), a quiet `afplay` sound for the meter to
-show, the record status polled for levels in -100..0 dBFS, and the status menu
+handler keeps running during tracking. `--smoke-test` measures something
+consistent with it on a real recording (`meter_smoke.rs`, run last): about
+2 s of a 320×200 corner of the main display with system audio, a quiet
+`afplay` sound for the meter to show, and the record status polled for
+levels in -100..0 dBFS. Once the app shows the recording, the status menu is
 opened as a click opens it (`status_menu_probe`, `shim/status_menu.m`) for
-1.5 s while a common-modes timer samples the status item title and menu
-titles; it checks the meter lines sit under *Stop Recording*, the title's
-glyphs match the lines, and both change while the menu tracks, then that the
-stopped file has video and audio and no temporary file is left beside it, and
-deletes it.
+1.5 s. The probe reads the open menu once and then closes it, so its own
+timers wake the run loop only twice. The app logs each meter redraw
+(`level_meter::watch`), and the step requires more redraws while the menu is
+open than the probe's wake-ups, meter lines and title glyphs that move with
+the sound, and an open menu that shows what the app last set. It then checks
+that the stopped file has video and audio and that no temporary file is left
+beside it. The step is skipped when `[sync]` would copy or upload a video,
+records the microphone only with `BUGLE_SMOKE_MICROPHONE=1`, and removes the
+recording even after a failure. A recording started behind the app's back
+(the agent API, MCP) shows in the menu bar on the app's next housekeeping
+tick, up to about a second late.
 When the process runs from `Bugle.app`, an *Open at Login* check item
 (`login.rs`) registers the bundle with `SMAppService`. Its check mark is
 re-read on the periodic tick (every 5 s) and set only for an enabled item; a

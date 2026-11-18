@@ -4,12 +4,38 @@
 //! whatever recording is running, however it was started.
 
 use anyhow::Result;
-use bugle_core::audio_level::{meter_label, AudioLevels};
-use std::time::Duration;
+use bugle_core::audio_level::{meter_label, meter_title, AudioLevels};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tray_icon::menu::{Menu, MenuItem};
 
 /// How often the meter is redrawn while recording.
 pub const INTERVAL: Duration = Duration::from_millis(100);
+
+/// One redraw of the meter, as logged for `--smoke-test` ([`watch`]): when
+/// (Unix seconds), the status-title glyphs, and the menu lines set.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Update {
+    pub at: f64,
+    pub glyphs: String,
+    pub lines: Vec<String>,
+}
+
+static WATCHING: AtomicBool = AtomicBool::new(false);
+static UPDATES: Mutex<Vec<Update>> = Mutex::new(Vec::new());
+
+/// Start (clearing the log) or stop logging meter redraws. Off unless a
+/// smoke test turns it on.
+pub fn watch(on: bool) {
+    UPDATES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    WATCHING.store(on, Ordering::Relaxed);
+}
+
+/// The redraws logged since [`watch`] turned logging on.
+pub fn updates() -> Vec<Update> {
+    UPDATES.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
 
 pub struct LevelMeter {
     mic: MenuItem,
@@ -53,11 +79,22 @@ impl LevelMeter {
             }
             self.shown = want;
         }
-        if let Some(l) = mic {
-            self.mic.set_text(meter_label("Microphone", &l));
+        let mut lines = Vec::new();
+        for (item, name, level) in [(&self.mic, "Microphone", mic), (&self.system, "System Audio", system)] {
+            if let Some(l) = level {
+                let text = meter_label(name, &l);
+                item.set_text(&text);
+                lines.push(text);
+            }
         }
-        if let Some(l) = system {
-            self.system.set_text(meter_label("System Audio", &l));
+        if WATCHING.load(Ordering::Relaxed) && !lines.is_empty() {
+            let at = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            let glyphs = levels.and_then(meter_title).unwrap_or_default();
+            let mut log = UPDATES.lock().unwrap_or_else(|e| e.into_inner());
+            // Bounded: a smoke step logs a few seconds at most.
+            if log.len() < 10_000 {
+                log.push(Update { at, glyphs, lines });
+            }
         }
         Ok(())
     }

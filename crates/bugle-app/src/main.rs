@@ -981,7 +981,10 @@ fn main() -> Result<()> {
                 AppEvent::Editor(m) => app.on_editor(m),
                 AppEvent::VideoEditor(m) => app.on_video_editor(m),
                 AppEvent::AudioPrompt(field, text) => app.on_audio_prompt(field, text),
-                AppEvent::MeterProbe(req) => meter_smoke::open_probe(&app.tray, &app.items.menu, req),
+                AppEvent::MeterProbe(req) => {
+                    app.update_recording_ui();
+                    meter_smoke::open_probe(&app.tray, &app.items.menu, req)
+                }
                 AppEvent::Quit => app.quit(control_flow),
             },
             Event::LoopDestroyed => {
@@ -1032,7 +1035,8 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
         editor_window::smoke(&proxy);
         video_editor_window::smoke(&proxy);
         smoke_audio_prompt(&proxy);
-        meter_smoke::smoke(&engine, &proxy);
+        // Last: it records. Its failures, for the run's failure report:
+        if let Err(e) = meter_smoke::smoke(&engine, &proxy) { eprintln!("smoke test: level meter: FAIL: {e}") }
         std::thread::sleep(Duration::from_millis(1500));
         proxy.send(AppEvent::Quit);
     });
