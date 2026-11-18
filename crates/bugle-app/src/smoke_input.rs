@@ -428,7 +428,7 @@ fn prompt(_proxy: &Proxy, c: &mut Checks) {
         format!("{first:?} then {typed:?}"),
     );
     input::key(T, Key::Char('a'), Mods::COMMAND);
-    if std::env::var_os("BUGLE_SMOKE_CLIPBOARD").is_some() {
+    if std::env::var_os("BUGLE_SMOKE_CLIPBOARD").is_some_and(|v| v == "1") {
         let paste = input::paste(T, "37");
         let pasted = field();
         match paste {
