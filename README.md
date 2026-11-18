@@ -61,6 +61,9 @@ The binaries are `target/release/bugle` (CLI + servers) and `target/release/bugl
 Objective-C shim (`crates/bugle-platform/shim/shim.m`) with the Xcode command
 line tools; no Xcode project is needed.
 
+`cargo xtask check` runs `cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo test --workspace` and exits non-zero if either fails; run it before sending a change.
+
 ### App bundle
 
 ```bash
@@ -670,7 +673,7 @@ look at what it took.
 
 ## Architecture
 
-Eight crates plus an `xtask` for packaging; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the details.
+Eight crates plus an `xtask` for packaging and checks; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the details.
 
 ```
 bugle-core      types, config, naming, history (no OS calls)
@@ -682,7 +685,7 @@ bugle-engine    Engine: capture, scroll stitch, record, annotate, OCR, AI action
 bugle-api       action catalog → HTTP (axum) and MCP (stdio)
 bugle-cli       the `bugle` binary
 bugle-app       the `bugle-app` menu-bar binary: status item, hotkeys, toasts
-xtask           `cargo xtask bundle`: assemble, sign and verify Bugle.app
+xtask           `cargo xtask bundle`: assemble, sign and verify Bugle.app; `cargo xtask check`: clippy + tests
 ```
 
 ## Why "Bugle"?

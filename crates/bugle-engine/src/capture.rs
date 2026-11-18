@@ -110,8 +110,8 @@ impl Engine {
         }
         wins.into_iter()
             .find(|w| {
-                let title_ok = t.as_ref().map_or(true, |t| w.title.to_ascii_lowercase().contains(t.as_str()));
-                let owner_ok = o.as_ref().map_or(true, |o| w.owner.to_ascii_lowercase().contains(o.as_str()));
+                let title_ok = t.as_ref().is_none_or(|t| w.title.to_ascii_lowercase().contains(t.as_str()));
+                let owner_ok = o.as_ref().is_none_or(|o| w.owner.to_ascii_lowercase().contains(o.as_str()));
                 title_ok && owner_ok
             })
             .ok_or_else(|| {
