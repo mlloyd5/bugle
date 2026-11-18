@@ -44,7 +44,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | Sync to your own storage | folder copy/move, or SigV4 uploads (multipart for large files) to any S3-compatible bucket; a destination per media kind; subtitles follow their video | ✅ |
 | Trim and export recordings (presets: trim, several cuts in one export, H.264/HEVC, 1080p/720p/540p, frame rate, GIF) | `AVAssetExportSession` + video composition, `AVAssetImageGenerator` → GIF, `AVAssetWriter` for GIF → MP4 | ✅ (CLI/API, and the video editor window) |
 | Auto-zoom on clicks (a level for all, or per click), smoothed pointer | pointer/click event track recorded next to the video (`clip.mp4.events.json`); frames re-rendered in Rust (`AVAssetReader` → `AVAssetWriter`, audio copied back in) | ✅ (CLI/API, and the video editor window); track timing measured on real recordings, zoom checked with hand-written clicks, live clicks not exercised |
-| Video editor | `bugle-app` window for videos and GIFs: preview, timeline with audio waveform, click markers, in/out handles and cuts, playback, zoom (per click too) and pointer options, preset, export through the same edit pipeline | ✅ driven by synthetic events in `--smoke-test`, timeline waveform checked on a synthetic tone (levels handed to it, and drawn in a window capture); mouse and keyboard input not exercised |
+| Video editor | `bugle-app` window for videos and GIFs: preview, timeline with audio waveform, click markers, in/out handles and cuts, playback, zoom (per click too) and pointer options, preset, export through the same edit pipeline | ✅ driven by synthetic events in `--smoke-test`, also as in-process mouse and key events through AppKit (see Video editor); timeline waveform checked on a synthetic tone (levels handed to it, and drawn in a window capture); a person's hardware mouse and keyboard not exercised |
 | `Bugle.app` bundle | `cargo xtask bundle` (hardened runtime, ad-hoc or Developer ID) | ✅ ad-hoc; Developer ID signing and notarization not yet exercised |
 | Disk image, universal binary | `cargo xtask dmg` (`hdiutil`, `/Applications` link), `--universal` (`lipo`) | ✅ DMG; universal needs both Rust targets installed |
 | System notifications | `UNUserNotificationCenter` from Bugle.app, alongside the toast (`[general] system_notifications`), with the capture's thumbnail attached | built; reading the authorization verified from the bundle, posting and the attached thumbnail unverified |
@@ -509,7 +509,11 @@ The editor's window, shapes, selection, menus, crop, canvas, zoom and undo are
 checked by `bugle-app --smoke-test`, which feeds it synthetic events rather
 than clicks (keeping window captures in the temp directory when
 `BUGLE_SMOKE_KEEP` is set, and saving a copy too when `BUGLE_SMOKE_SAVE` is
-set).
+set). It also draws a rectangle with a synthetic mouse drag on the canvas,
+undoes and redoes it with ⌘Z / ⇧⌘Z and types a two-line label (⇧Return,
+then Return), with mouse and key events built inside the app and sent to the
+window, so the window's own hit-testing and key handling take part; they are
+not a person's hardware input (the window server's part is left out).
 
 ### Video editor
 
@@ -557,6 +561,23 @@ as its audio), checks the levels handed to the timeline against the tones
 and against a second read of the file, checks a capture of the window shows
 the waveform at those heights, and drives it with synthetic events
 (exporting with `BUGLE_SMOKE_SAVE`).
+
+A second pass sends the window mouse and key events built inside the app,
+so its own hit-testing and key handling take part, and checks the playhead,
+in and out points, cuts and choices after each step. It clicks the timeline
+to seek (and 3 pt from a click marker, which snaps; a drag ending there does
+not), drags the in and out handles, presses Space, I, O, C, Delete, forward
+delete, the arrows, Home, End and Esc, clicks Set In, Set Out, Cut, Restore,
+play and *Smooth pointer*, and closes with ⌘W, or with ⌘E (which exports)
+under `BUGLE_SMOKE_SAVE`; the Export button is not clicked. The preset, zoom
+and click-zoom pop-ups are opened with a click, closed again without a
+choice, and the item is then chosen through the menu
+(`performActionForItemAtIndex:`), not by pointing in the open menu. These
+events never pass through the window server, so they are not the same as a
+person's mouse and keyboard. The same pass types into a text prompt (⌘A,
+Return, Esc; ⌘V only with `BUGLE_SMOKE_CLIPBOARD=1`, since it goes through
+the real clipboard). A check that fails or cannot run is printed as
+`FAILED`.
 
 ## Configuration
 

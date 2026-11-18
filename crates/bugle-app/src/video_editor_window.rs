@@ -243,6 +243,18 @@ impl Session {
     }
 }
 
+/// Smoke test: the open video editor's state as its window was last given
+/// it. Main thread only.
+pub(crate) fn smoke_state() -> Option<bugle_platform::VideoEditorState> {
+    CURRENT.with(|c| c.borrow().upgrade()).and_then(|s| s.try_borrow().ok().map(|s| s.editor.state()))
+}
+
+/// Smoke test: write the synthetic recording and its event track (see
+/// `write_smoke_recording`) for the input steps in `smoke_input.rs`.
+pub(crate) fn write_input_smoke_recording(path: &std::path::Path, side: &std::path::Path) -> anyhow::Result<()> {
+    write_smoke_recording(path, side)
+}
+
 /// Whether the open video editor (if any) is exporting.
 pub(crate) fn export_running() -> bool {
     CURRENT.with(|c| c.borrow().upgrade()).is_some_and(|s| s.try_borrow().map_or(true, |s| s.editor.busy()))

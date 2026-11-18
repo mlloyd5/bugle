@@ -409,7 +409,13 @@ and returns, and the answer arrives later as an `AppEvent::AudioPrompt`, so
 hotkeys (Stop Recording too), menu clicks and worker results go on while it
 is open; clicking *Custom…* again brings the open prompt to the front.
 `--smoke-test` clicks the microphone's *Custom…* twice, checks one prompt
-opened, cancels it (nothing is saved) and checks Bugle let go of the focus. A
+opened, cancels it (nothing is saved) and checks Bugle let go of the focus;
+its input pass (below) also types into a prompt of its own, whose answer goes
+nowhere. Return in the field answers OK through the field's delegate
+(`insertNewline:`), a hardening: a synthetic Return key-down sent while the
+field is editing goes to the field editor, which only ends editing, and the
+default button is never pressed (observed with synthetic delivery and
+reproduced on a bare panel; a hardware Return was not checked). A
 change applies to the next recordings, from the menu, hotkeys or the in-app
 API alike (`Engine::set_recording_levels`), and is written back to
 `[recordings]` with `toml_edit`, replacing only that key so the rest of the
@@ -587,6 +593,42 @@ timeline's levels back (`video_editor_waveform`) to check their shape, scale
 and match with a second read of the file, measures the drawn waveform in a
 capture of the window (`video_editor_track_frame` locates the track), and
 drives it through `video_editor_inject`.
+
+`--smoke-test` then drives the windows through AppKit as well
+(`smoke_input.rs` in the app, `bugle_platform::smoke_input` over
+`shim/smoke_input.m`). The mouse and key events are built in the process
+(`+[NSEvent mouseEventWithType:…]`, `+[NSEvent keyEventWithType:…]`) and
+handed to Bugle's own window: mouse events through `-[NSWindow sendEvent:]`,
+which hit-tests the mouse-down and sends the drags and mouse-up to the view
+that took it. A key event is posted at the head of the queue and taken off
+it again (so it is `NSApp.currentEvent`, which the markup label's Return
+handler reads for Shift and Option), then sent through
+`-[NSApplication sendEvent:]` when the window is key (key equivalents, then
+the first responder), else the same two steps on the window by hand; the
+route is printed with each check. A click queues its mouse-up at the head
+of the queue before sending the mouse-down, so a control with a tracking
+loop of its own would take it from there instead of blocking; on macOS 26
+`NSButton` runs none and acts on the mouse-up the window sends it, so that
+path has not run. A pop-up button is clicked (found by the window's
+hit-testing; the check requires its menu to have opened) and, since an open
+menu runs a modal tracking session of its own, the menu is closed again
+without a choice and the item is then chosen with
+`-[NSMenu performActionForItemAtIndex:]`. Read-backs give the aim
+(`bugle_video_editor_smoke_rect`: the timeline track and each control in
+window coordinates; `bugle_editor_smoke_point`: an image pixel of the newest
+markup editor) and the result (the session's state and shapes, the prompt's
+field and answer, read on the main thread through `smoke_input::on_main`).
+A step that cannot run or panics counts as a failed check, and
+`smoke_input::smoke` returns whether all passed. The ⌘V step is opt-in
+(`BUGLE_SMOKE_CLIPBOARD=1`) because it uses the general pasteboard: in one
+main-thread turn it stands down unless the pasteboard holds only plain text,
+copies that, writes its text, presses ⌘V, and puts the copy back only if the
+change count is still its own. Nothing goes through the window server: the
+real pointer does not move, no Accessibility permission is involved, and
+other apps see none of the events (only the opt-in paste step touches
+something they share, the pasteboard). That is also what these checks leave
+out: pointer-to-window routing, activation by a click, the keyboard layout
+and input method.
 
 ## Feature ideas
 

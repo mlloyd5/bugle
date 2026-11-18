@@ -44,7 +44,7 @@ typedef void (*bugle_prompt_free_t)(void *ctx);
 }
 @end
 
-@interface BuglePrompt : NSObject <NSWindowDelegate>
+@interface BuglePrompt : NSObject <NSWindowDelegate, NSTextFieldDelegate>
 @property(nonatomic, strong) BuglePromptPanel *panel;
 @property(nonatomic, strong) NSTextField *field;
 @property(nonatomic) bugle_prompt_callback_t cb;
@@ -68,6 +68,23 @@ static NSTextField *label(NSString *text, NSFont *font) {
 
 - (void)ok:(id)sender { [self finish:YES]; }
 - (void)cancel:(id)sender { [self finish:NO]; }
+
+// Return (or Enter) in the field answers OK: a hardening, not a confirmed
+// bug fix. With the default button alone, a synthetic Return key-down sent
+// to the panel while the field is editing (through -[NSApp sendEvent:],
+// -postEvent:, or posted, dequeued and sent) never pressed OK: the field
+// editor took it and only ended editing. The same happens on a bare
+// NSPanel with an NSTextField and a default button, so it is AppKit's
+// behaviour for such events; whether a hardware Return behaves the same was
+// not checked. Taking insertNewline: here, as the markup editor's label
+// field does, makes Return answer OK either way.
+- (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)sel {
+    if (sel == @selector(insertNewline:)) {
+        [self finish:YES];
+        return YES;
+    }
+    return NO;
+}
 
 // The title-bar close button.
 - (BOOL)windowShouldClose:(NSWindow *)sender {
@@ -114,7 +131,9 @@ static NSTextField *label(NSString *text, NSFont *font) {
     NSTextField *body = label(message, [NSFont systemFontOfSize:NSFont.smallSystemFontSize]);
     NSTextField *field = [NSTextField textFieldWithString:initial];
     field.translatesAutoresizingMaskIntoConstraints = NO;
-    // Return in the field presses OK (the default button), Esc presses Cancel.
+    field.delegate = self;
+    // Return presses OK (see doCommandBySelector above; OK is also the
+    // default button), Esc presses Cancel.
     NSButton *ok = [NSButton buttonWithTitle:@"OK" target:self action:@selector(ok:)];
     ok.keyEquivalent = @"\r";
     NSButton *cancel = [NSButton buttonWithTitle:@"Cancel" target:self action:@selector(cancel:)];
@@ -201,4 +220,21 @@ void bugle_prompt_answer(int32_t ok, const char *text) {
         if (t) p.field.stringValue = t;
         [p finish:ok != 0];
     });
+}
+
+/// The open prompt's panel, or nil. Main thread only.
+NSWindow *bugle_prompt_window(void) { return g_prompt.panel; }
+
+/// Smoke test: the text in the open prompt's field, as UTF-8 truncated to
+/// `cap - 1` bytes and NUL-terminated (while it is being edited, the field
+/// editor's text). Returns 1, or 0 with no prompt open. Main thread only.
+int32_t bugle_prompt_smoke_text(char *buf, size_t cap) {
+    @autoreleasepool {
+        BuglePrompt *p = g_prompt;
+        if (!p || !buf || cap == 0) return 0;
+        NSText *editor = p.field.currentEditor;
+        NSString *s = (editor ? editor.string : p.field.stringValue) ?: @"";
+        strlcpy(buf, s.UTF8String ?: "", cap);
+        return 1;
+    }
 }
