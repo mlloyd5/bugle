@@ -17,6 +17,7 @@ mod notifications;
 mod picker;
 mod quick_access;
 mod quick_panel;
+mod smoke_input;
 mod video_editor;
 mod video_editor_window;
 
@@ -1028,6 +1029,7 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
         editor_window::smoke(&proxy);
         video_editor_window::smoke(&proxy);
         smoke_audio_prompt(&proxy);
+        smoke_input::smoke(&proxy);
         std::thread::sleep(Duration::from_millis(1500));
         proxy.send(AppEvent::Quit);
     });

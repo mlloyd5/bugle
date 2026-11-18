@@ -93,6 +93,11 @@ fn open_window_for(source: &str) -> Option<EditorId> {
     })
 }
 
+/// Smoke test: the shapes of the newest editor's document. Main thread only.
+pub(crate) fn smoke_shapes() -> Option<Vec<bugle_markup::Shape>> {
+    SESSIONS.with(|r| r.borrow().newest_first().next().and_then(|(_, s)| s.try_borrow().ok().map(|s| s.editor.final_document().shapes)))
+}
+
 /// One preview to render: its sequence number and the document.
 type PreviewJob = (u64, Annotation);
 

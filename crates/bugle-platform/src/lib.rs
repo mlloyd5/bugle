@@ -23,6 +23,8 @@ pub mod login_item;
 #[cfg(target_os = "macos")]
 pub mod notify;
 #[cfg(target_os = "macos")]
+pub mod smoke_input;
+#[cfg(target_os = "macos")]
 mod prompt;
 #[cfg(target_os = "macos")]
 pub use prompt::{prompt_active, prompt_answer, prompt_text};
