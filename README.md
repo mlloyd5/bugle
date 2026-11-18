@@ -44,7 +44,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | Sync to your own storage | folder copy/move, or SigV4 uploads (multipart for large files) to any S3-compatible bucket; a destination per media kind; subtitles follow their video | ✅ |
 | Trim and export recordings (presets: trim, several cuts in one export, H.264/HEVC, 1080p/720p/540p, frame rate, GIF) | `AVAssetExportSession` + video composition, `AVAssetImageGenerator` → GIF, `AVAssetWriter` for GIF → MP4 | ✅ (CLI/API, and the video editor window) |
 | Auto-zoom on clicks (a level for all, or per click), smoothed pointer | pointer/click event track recorded next to the video (`clip.mp4.events.json`); frames re-rendered in Rust (`AVAssetReader` → `AVAssetWriter`, audio copied back in) | ✅ (CLI/API, and the video editor window); track timing measured on real recordings, zoom checked with hand-written clicks, live clicks not exercised |
-| Video editor | `bugle-app` window for videos and GIFs: preview, timeline with audio waveform, click markers, in/out handles and cuts, playback, zoom (per click too) and pointer options, preset, export through the same edit pipeline | ✅ driven by synthetic events in `--smoke-test`; mouse and keyboard input not exercised |
+| Video editor | `bugle-app` window for videos and GIFs: preview, timeline with audio waveform, click markers, in/out handles and cuts, playback, zoom (per click too) and pointer options, preset, export through the same edit pipeline | ✅ driven by synthetic events in `--smoke-test`, waveform checked on a synthetic tone; mouse and keyboard input not exercised |
 | `Bugle.app` bundle | `cargo xtask bundle` (hardened runtime, ad-hoc or Developer ID) | ✅ ad-hoc; Developer ID signing and notarization not yet exercised |
 | Disk image, universal binary | `cargo xtask dmg` (`hdiutil`, `/Applications` link), `--universal` (`lipo`) | ✅ DMG; universal needs both Rust targets installed |
 | System notifications | `UNUserNotificationCenter` from Bugle.app, alongside the toast (`[general] system_notifications`), with the capture's thumbnail attached | built; reading the authorization verified from the bundle, posting and the attached thumbnail unverified |
@@ -549,8 +549,9 @@ beyond that only every second (third, ...) frame is shown while scrubbing a
 very long GIF. The export always uses every frame. *Original* exports a GIF
 again.
 Quit waits for a running export: it is refused until the export finishes.
-`bugle-app --smoke-test` opens it on a synthetic recording and drives it with
-synthetic events (exporting with `BUGLE_SMOKE_SAVE`).
+`bugle-app --smoke-test` opens it on a synthetic recording (two tone bursts
+as its audio), checks the timeline's waveform has their shape, and drives it
+with synthetic events (exporting with `BUGLE_SMOKE_SAVE`).
 
 ## Configuration
 

@@ -64,6 +64,7 @@ extern "C" {
     );
     fn bugle_video_editor_set_clicks(times: *const f64, levels: *const f64, n: i32, selected: i32);
     fn bugle_video_editor_set_waveform(peaks: *const f32, n: i32);
+    fn bugle_video_editor_waveform(out: *mut f32, cap: i32) -> i32;
     fn bugle_video_editor_close();
     fn bugle_video_editor_active() -> i32;
     fn bugle_video_editor_focus();
@@ -329,6 +330,19 @@ pub fn video_editor_set_state(s: &VideoEditorState) {
 pub fn video_editor_set_waveform(peaks: &[f32]) {
     let n = i32::try_from(peaks.len()).unwrap_or(0);
     unsafe { bugle_video_editor_set_waveform(peaks.as_ptr(), n) }
+}
+
+/// The levels the open video editor's timeline draws as its waveform (empty:
+/// none), or `None` with no video editor open. Any thread: it waits for the
+/// main loop. For smoke tests, which cannot look at the window.
+pub fn video_editor_waveform() -> Option<Vec<f32>> {
+    let n = unsafe { bugle_video_editor_waveform(std::ptr::null_mut(), 0) };
+    let mut out = vec![0f32; usize::try_from(n).ok()?];
+    let cap = i32::try_from(out.len()).unwrap_or(i32::MAX);
+    let n = unsafe { bugle_video_editor_waveform(out.as_mut_ptr(), cap) };
+    // Replaced in between: keep what fitted.
+    out.truncate(usize::try_from(n).ok()?);
+    Some(out)
 }
 
 /// Close the video editor. May be called from inside the handler, which is

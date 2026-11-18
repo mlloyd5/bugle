@@ -685,6 +685,23 @@ void bugle_video_editor_set_waveform(const float *peaks, int32_t n) {
     }
 }
 
+/// Copy up to `cap` of the levels the timeline draws as its waveform into
+/// `out`; returns how many it holds (0: none), or -1 with no video editor
+/// open. Any thread (reads on the main thread). For smoke tests.
+int32_t bugle_video_editor_waveform(float *out, int32_t cap) {
+    __block int32_t n = -1;
+    void (^read)(void) = ^{
+        BugleVideoEditor *e = g_video_editor;
+        if (!e) return;
+        NSData *w = e.timeline.waveform;
+        n = (int32_t)MIN(w.length / sizeof(float), (NSUInteger)INT32_MAX);
+        if (out && cap > 0 && n > 0) memcpy(out, w.bytes, (size_t)MIN(n, cap) * sizeof(float));
+    };
+    if ([NSThread isMainThread]) read();
+    else dispatch_sync(dispatch_get_main_queue(), read);
+    return n;
+}
+
 /// Close the video editor. Safe to call from inside the callback.
 void bugle_video_editor_close(void) {
     @autoreleasepool {
