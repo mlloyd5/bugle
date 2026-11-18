@@ -685,6 +685,48 @@ void bugle_video_editor_set_waveform(const float *peaks, int32_t n) {
     }
 }
 
+/// Copy up to `cap` of the levels the timeline draws as its waveform into
+/// `out`; returns how many it holds (0: none), or -1 with no video editor
+/// open. Any thread (reads on the main thread). For smoke tests.
+int32_t bugle_video_editor_waveform(float *out, int32_t cap) {
+    __block int32_t n = -1;
+    void (^read)(void) = ^{
+        @autoreleasepool {
+            BugleVideoEditor *e = g_video_editor;
+            if (!e) return;
+            NSData *w = e.timeline.waveform;
+            n = (int32_t)MIN(w.length / sizeof(float), (NSUInteger)INT32_MAX);
+            if (out && cap > 0 && n > 0) memcpy(out, w.bytes, (size_t)MIN(n, cap) * sizeof(float));
+        }
+    };
+    if ([NSThread isMainThread]) read();
+    else dispatch_sync(dispatch_get_main_queue(), read);
+    return n;
+}
+
+/// The timeline's track (where the waveform is drawn) in points from the
+/// window frame's top-left corner, as x, y, width, height, then the window
+/// frame's width and height: 6 values into `out`. Returns 0 with no video
+/// editor open. Any thread (reads on the main thread). For smoke tests.
+int32_t bugle_video_editor_track_frame(double *out) {
+    __block int32_t found = 0;
+    void (^read)(void) = ^{
+        @autoreleasepool {
+            BugleVideoEditor *e = g_video_editor;
+            if (!e || !out) return;
+            // Window base coordinates: bottom-left of the whole frame.
+            NSRect r = [e.timeline convertRect:[e.timeline track] toView:nil];
+            NSSize f = e.window.frame.size;
+            double v[6] = {NSMinX(r), f.height - NSMaxY(r), NSWidth(r), NSHeight(r), f.width, f.height};
+            memcpy(out, v, sizeof v);
+            found = 1;
+        }
+    };
+    if ([NSThread isMainThread]) read();
+    else dispatch_sync(dispatch_get_main_queue(), read);
+    return found;
+}
+
 /// Close the video editor. Safe to call from inside the callback.
 void bugle_video_editor_close(void) {
     @autoreleasepool {
@@ -712,5 +754,42 @@ void bugle_video_editor_focus(void) {
 void bugle_video_editor_inject(int32_t kind, double value, int32_t arg) {
     @autoreleasepool {
         [g_video_editor emit:kind value:value arg:arg];
+    }
+}
+
+/// Smoke test: where part `which` of the video editor is, in window
+/// coordinates (points, origin at the bottom left): 0 the timeline's track
+/// (time 0 at its left edge, the end at its right), 1 play, 2 Set In,
+/// 3 Set Out, 4 Cut, 5 Restore, 6 the zoom menu, 7 the click menu,
+/// 8 Smooth pointer, 9 the preset menu, 10 Export. Writes x, y, width,
+/// height to `out` and returns 1; 0 with no video editor open. Main thread
+/// only.
+int32_t bugle_video_editor_smoke_rect(int32_t which, double *out) {
+    @autoreleasepool {
+        BugleVideoEditor *e = g_video_editor;
+        if (!e || !out) return 0;
+        NSView *view = nil;
+        NSRect r = NSZeroRect;
+        switch (which) {
+            case 0: view = e.timeline; r = [e.timeline track]; break;
+            case 1: view = e.playButton; break;
+            case 2: view = e.inButton; break;
+            case 3: view = e.outButton; break;
+            case 4: view = e.cutButton; break;
+            case 5: view = e.uncutButton; break;
+            case 6: view = e.zoomPopup; break;
+            case 7: view = e.clickPopup; break;
+            case 8: view = e.smoothBox; break;
+            case 9: view = e.presetPopup; break;
+            case 10: view = e.exportButton; break;
+            default: return 0;
+        }
+        if (which != 0) r = view.bounds;
+        NSRect w = [view convertRect:r toView:nil];
+        out[0] = NSMinX(w);
+        out[1] = NSMinY(w);
+        out[2] = NSWidth(w);
+        out[3] = NSHeight(w);
+        return 1;
     }
 }

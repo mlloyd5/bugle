@@ -18,6 +18,7 @@ mod notifications;
 mod picker;
 mod quick_access;
 mod quick_panel;
+mod smoke_input;
 mod video_editor;
 mod video_editor_window;
 
@@ -107,6 +108,8 @@ enum UiRequest {
     PickWindow(picker::Request),
     /// Space or Esc for the open overlay, without a keyboard (`--smoke-test`).
     PickControl(picker::Control),
+    /// Close every pin window; answers how many were open (`--smoke-test`).
+    ClosePins(Sender<usize>),
 }
 
 enum AppEvent {
@@ -655,6 +658,9 @@ impl App {
                 picker::begin(req);
             }
             UiRequest::PickControl(c) => picker::control(c),
+            UiRequest::ClosePins(reply) => {
+                let _ = reply.send(bugle_platform::pin_close_all());
+            }
         }
     }
 
@@ -841,7 +847,15 @@ fn main() -> Result<()> {
         .init();
 
     let config_path = cli.config.clone().unwrap_or_else(Config::default_path);
-    let config = Config::load_from(&config_path)?;
+    let mut config = Config::load_from(&config_path)?;
+    // The smoke test never reads the user's history (a stale entry there hid
+    // a failing step): unless the config names one, it gets an empty file.
+    let smoke_history = (cli.smoke_test && config.general.history_path.is_none())
+        .then(|| std::env::temp_dir().join(format!("bugle-smoke-history-{}.jsonl", std::process::id())));
+    if let Some(p) = &smoke_history {
+        let _ = std::fs::remove_file(p);
+        config.general.history_path = Some(p.display().to_string());
+    }
 
     // The event loop must exist before anything touches NSApplication.
     let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
@@ -991,6 +1005,13 @@ fn main() -> Result<()> {
                 if let Some(api) = app.api.take() {
                     api.stop();
                 }
+                if let Some(p) = &smoke_history {
+                    let _ = std::fs::remove_file(p);
+                }
+                if SMOKE_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
+                    eprintln!("smoke test: FAILED");
+                    std::process::exit(1);
+                }
             }
             _ => {}
         }
@@ -1016,10 +1037,7 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
         std::thread::sleep(Duration::from_millis(400));
         let r = engine.select_area();
         eprintln!("smoke test: select_area → {r:?}");
-        match engine.pin("latest", None, 1.0, false) {
-            Ok(m) => eprintln!("smoke test: pinned {}", m.path.display()),
-            Err(e) => eprintln!("smoke test: pin skipped ({e:#})"),
-        }
+        smoke_pin(&engine, &proxy);
         // The picker must close itself: give it a short timeout and check
         // that the answer comes back. A click during the test only reports
         // the window, nothing is captured.
@@ -1035,12 +1053,75 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
         editor_window::smoke(&proxy);
         video_editor_window::smoke(&proxy);
         smoke_audio_prompt(&proxy);
+        // The input steps' verdict; route a failure into the run's exit code here.
+        if !smoke_input::smoke(&proxy) {
+            eprintln!("smoke test: input steps FAILED");
+        }
         // Last: it records. Its failures, for the run's failure report:
         if let Err(e) = meter_smoke::smoke(&engine, &proxy) { eprintln!("smoke test: level meter: FAIL: {e}") }
         std::thread::sleep(Duration::from_millis(1500));
         proxy.send(AppEvent::Quit);
     });
     t0
+}
+
+/// Set by [`smoke_fail`]; the run then exits 1.
+static SMOKE_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Report a `--smoke-test` step that failed outright (an unexpected error or
+/// a wrong result, not a capability this machine lacks): prints the
+/// `FAILED` line and makes the run exit 1 once it has finished.
+pub(crate) fn smoke_fail(step: &str, err: impl std::fmt::Display) {
+    eprintln!("smoke test: {step} FAILED ({err})");
+    SMOKE_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// `--smoke-test` step: pin a synthetic PNG (a temp file, not added to
+/// history, so the step does not depend on what the history holds) through
+/// `Engine::pin` and the UI host, check with the window server that one
+/// window of the image's size appeared, close it, and check it is gone. Any
+/// error fails the run.
+fn smoke_pin(engine: &Engine, proxy: &Proxy) {
+    const SIZE: (u32, u32) = (237, 151);
+    let pins = || -> Result<usize> {
+        Ok(bugle_platform::windows(true)?
+            .iter()
+            .filter(|w| w.pid == std::process::id() as i32 && w.frame.w == SIZE.0 as f64 && w.frame.h == SIZE.1 as f64)
+            .count())
+    };
+    // Poll until `want` such windows are on screen, for at most 2 s.
+    let wait_for = |want: usize| -> Result<usize> {
+        let t = Instant::now();
+        loop {
+            let n = pins()?;
+            if n == want || t.elapsed() > Duration::from_secs(2) {
+                return Ok(n);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let run = || -> Result<()> {
+        let png = tempfile::Builder::new().prefix("bugle-smoke-pin-").suffix(".png").tempfile()?;
+        image::RgbaImage::from_pixel(SIZE.0, SIZE.1, image::Rgba([230, 140, 30, 255])).save(png.path())?;
+        let before = pins()?;
+        engine.pin(&png.path().display().to_string(), None, 1.0, false)?;
+        let shown = wait_for(1)?;
+        let (tx, rx) = mpsc::channel();
+        proxy.send(AppEvent::Ui(UiRequest::ClosePins(tx)));
+        let closed = rx.recv_timeout(Duration::from_secs(2)).context("closing the pins timed out")?;
+        let after = wait_for(0)?;
+        eprintln!(
+            "smoke test: pin {}×{} windows before {before}, shown {shown} (want 1), closed {closed} (want 1), after {after} (want 0)",
+            SIZE.0, SIZE.1
+        );
+        if (before, shown, closed, after) != (0, 1, 1, 0) {
+            anyhow::bail!("unexpected pin windows");
+        }
+        Ok(())
+    };
+    if let Err(e) = run() {
+        smoke_fail("pin", format!("{e:#}"));
+    }
 }
 
 /// `--smoke-test` step: open the *Audio Levels* prompt from its menu item,

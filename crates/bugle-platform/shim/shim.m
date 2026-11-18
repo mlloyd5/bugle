@@ -1048,6 +1048,19 @@ int32_t bugle_pin_image_show(const uint8_t *png, size_t len, double x, double y,
     }
 }
 
+int32_t bugle_pin_close_all(void) {
+    @autoreleasepool {
+        int32_t closed = 0;
+        for (NSWindow *win in [g_pins copy]) {
+            if ([win.contentView isKindOfClass:[BuglePinView class]]) {
+                [(BuglePinView *)win.contentView closePin];
+                closed++;
+            }
+        }
+        return closed;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Toast: a small non-activating panel in the corner of the main screen that
 // shows a thumbnail and two lines of text, then fades out. Clicking it opens
@@ -1727,7 +1740,7 @@ bugle_image_t bugle_video_frame(const char *path, double seconds) {
         gen.requestedTimeToleranceAfter = CMTimeMake(1, 10);
         NSError *err = nil;
         CGImageRef img = [gen copyCGImageAtTime:CMTimeMakeWithSeconds(seconds, 600) actualTime:NULL error:&err];
-        if (!img) { set_error(@"frame extraction failed: %@", err.localizedDescription); return (bugle_image_t){0}; }
+        if (!img) { set_error(@"frame extraction failed for %@: %@", url.path, err.localizedDescription); return (bugle_image_t){0}; }
         bugle_image_t out = cg_to_rgba(img);
         CGImageRelease(img);
         return out;

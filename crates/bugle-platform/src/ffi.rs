@@ -155,6 +155,7 @@ extern "C" {
     pub fn bugle_run_loop_once(seconds: f64);
     pub fn bugle_is_main_thread() -> i32;
     pub fn bugle_pin_image_show(png: *const u8, len: size_t, x: f64, y: f64, w: f64, h: f64, opacity: f64) -> i32;
+    pub fn bugle_pin_close_all() -> i32;
     pub fn bugle_toast_show(
         png: *const u8,
         len: size_t,

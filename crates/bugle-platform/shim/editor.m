@@ -1135,7 +1135,9 @@ void bugle_editor_set_menu(int32_t ident, int32_t index, const char *title, cons
             if (flag == '-') {
                 it = [NSMenuItem separatorItem];
             } else if (flag == 'h') {
-                if (@available(macOS 14.0, *)) {
+                // A selector check rather than `@available`, which would not
+                // link (see sck_available in shim.m).
+                if ([NSMenuItem respondsToSelector:@selector(sectionHeaderWithTitle:)]) {
                     it = [NSMenuItem sectionHeaderWithTitle:t];
                 } else {
                     it = [[NSMenuItem alloc] initWithTitle:t action:nil keyEquivalent:@""];
@@ -1215,5 +1217,19 @@ void bugle_editor_inject(int32_t ident, int32_t kind, double x, double y, int32_
         // field goes, as it would have.
         if (kind == EV_TEXT) [e discardField];
         [e emit:kind x:x y:y arg:arg text:text];
+    }
+}
+
+/// Smoke test: where edited-image pixel (x, y) of the newest editor is, in
+/// window coordinates (points, origin at the bottom left), written to
+/// `out` (x, y). Returns 1; 0 with no editor open. Main thread only.
+int32_t bugle_editor_smoke_point(double x, double y, double *out) {
+    @autoreleasepool {
+        BugleEditor *e = g_editors.lastObject;
+        if (!e || !out) return 0;
+        NSPoint p = [e.canvas convertPoint:[e.canvas toView:x y:y] toView:nil];
+        out[0] = p.x;
+        out[1] = p.y;
+        return 1;
     }
 }

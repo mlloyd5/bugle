@@ -110,6 +110,8 @@ void bugle_draw_overlay_hint(NSRect bounds, NSString *text);
 // The newest open markup editor's window, and the video editor's, or nil.
 NSWindow *bugle_markup_editor_front_window(void);
 NSWindow *bugle_video_editor_window(void);
+// The open text prompt's panel, or nil.
+NSWindow *bugle_prompt_window(void);
 #endif
 // Called by an editor window (markup or video) once it is off screen: puts
 // the keyboard focus on another open Bugle editor, or, when none is left,
@@ -125,6 +127,8 @@ int32_t bugle_select_rect_active(void);
 void bugle_select_rect_cancel(void);
 void bugle_pin_image_blocking(const uint8_t *png, size_t len, double x, double y, double w, double h, double opacity);
 int32_t bugle_pin_image_show(const uint8_t *png, size_t len, double x, double y, double w, double h, double opacity);
+/// Close every pin window this process shows; returns how many. Main thread.
+int32_t bugle_pin_close_all(void);
 void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const char *subtitle, const char *open_path,
                       double seconds);
 
