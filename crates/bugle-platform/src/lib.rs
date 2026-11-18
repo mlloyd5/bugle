@@ -548,6 +548,12 @@ pub fn pin_image_show(png: &[u8], frame: Option<Rect>, opacity: f64) -> Result<(
     Ok(())
 }
 
+/// Close every pin window [`pin_image_show`] opened in this process, as Esc
+/// on each would; returns how many were open. Main thread only.
+pub fn pin_close_all() -> usize {
+    unsafe { ffi::bugle_pin_close_all() }.max(0) as usize
+}
+
 /// Show a transient corner notification with an optional PNG thumbnail.
 /// Clicking it opens `open_path`. Main thread only, needs a running AppKit loop.
 pub fn toast_show(png: Option<&[u8]>, title: &str, subtitle: &str, open_path: Option<&Path>, seconds: f64) {

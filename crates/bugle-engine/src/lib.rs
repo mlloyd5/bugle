@@ -122,11 +122,18 @@ impl Engine {
 
     pub fn load_image(&self, source: &str) -> Result<(MediaItem, RgbaImage)> {
         let m = self.resolve_media(source)?;
-        if m.is_video() {
+        // A history entry outlives its file when that is moved or deleted
+        // outside Bugle. Say so instead of handing the decoder a missing path
+        // (AVFoundation only answers "The operation could not be completed").
+        if !m.path.is_file() {
+            return Err(BugleError::MediaNotFound(format!("{} ({} no longer exists)", m.id, m.path.display())).into());
+        }
+        if m.kind == MediaKind::Video {
             // First frame of a video is a fine stand-in for image operations.
             let img = bugle_platform::video_frame(&m.path, 0.0)?;
             return Ok((m, img));
         }
+        // Images, and GIFs (their first frame): AVFoundation cannot open a GIF.
         let img = image::open(&m.path).with_context(|| format!("opening {}", m.path.display()))?.to_rgba8();
         Ok((m, img))
     }
@@ -869,6 +876,32 @@ mod tests {
 
     fn is_no_host(e: &anyhow::Error) -> bool {
         matches!(e.downcast_ref::<BugleError>(), Some(BugleError::NoUiHost(_)))
+    }
+
+    #[test]
+    fn load_image_names_a_missing_file_and_reads_gifs_and_videos() {
+        let (dir, engine) = temp_engine();
+        // The latest history entry is a recording whose file was deleted
+        // since (the menu-bar app's *Pin Latest* and the smoke test's old
+        // pin step met this as "frame extraction failed").
+        let gone = MediaItem::new(MediaKind::Video, dir.path().join("gone.mp4"));
+        engine.history.push(&gone).unwrap();
+        let e = engine.load_image("latest").unwrap_err();
+        assert!(matches!(e.downcast_ref::<BugleError>(), Some(BugleError::MediaNotFound(_))), "{e:#}");
+        let msg = format!("{e:#}");
+        assert!(msg.contains("gone.mp4") && msg.contains("no longer exists"), "{msg}");
+        // A GIF is read with the image decoder (its first frame), not as a video.
+        let gif = dir.path().join("clip.gif");
+        RgbaImage::from_pixel(30, 20, image::Rgba([200, 40, 40, 255])).save(&gif).unwrap();
+        engine.history.push(&MediaItem::new(MediaKind::Gif, &gif)).unwrap();
+        let (m, img) = engine.load_image("latest").unwrap();
+        assert_eq!((m.kind, img.dimensions()), (MediaKind::Gif, (30, 20)));
+        // A video still gives its first frame.
+        let mp4 = dir.path().join("clip.mp4");
+        let fixture = bugle_platform::ToneFixture { tracks: 1, seconds: 1.0, video: true, ..Default::default() };
+        bugle_platform::write_tone_fixture(&mp4, &fixture).unwrap();
+        let (_, img) = engine.load_image(&mp4.display().to_string()).unwrap();
+        assert_eq!(img.dimensions(), (64, 64));
     }
 
     #[test]

@@ -106,6 +106,8 @@ enum UiRequest {
     PickWindow(picker::Request),
     /// Space or Esc for the open overlay, without a keyboard (`--smoke-test`).
     PickControl(picker::Control),
+    /// Close every pin window; answers how many were open (`--smoke-test`).
+    ClosePins(Sender<usize>),
 }
 
 enum AppEvent {
@@ -652,6 +654,9 @@ impl App {
                 picker::begin(req);
             }
             UiRequest::PickControl(c) => picker::control(c),
+            UiRequest::ClosePins(reply) => {
+                let _ = reply.send(bugle_platform::pin_close_all());
+            }
         }
     }
 
@@ -984,6 +989,10 @@ fn main() -> Result<()> {
                 if let Some(api) = app.api.take() {
                     api.stop();
                 }
+                if SMOKE_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
+                    eprintln!("smoke test: FAILED");
+                    std::process::exit(1);
+                }
             }
             _ => {}
         }
@@ -1009,10 +1018,7 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
         std::thread::sleep(Duration::from_millis(400));
         let r = engine.select_area();
         eprintln!("smoke test: select_area → {r:?}");
-        match engine.pin("latest", None, 1.0, false) {
-            Ok(m) => eprintln!("smoke test: pinned {}", m.path.display()),
-            Err(e) => eprintln!("smoke test: pin skipped ({e:#})"),
-        }
+        smoke_pin(&engine, &proxy);
         // The picker must close itself: give it a short timeout and check
         // that the answer comes back. A click during the test only reports
         // the window, nothing is captured.
@@ -1032,6 +1038,51 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
         proxy.send(AppEvent::Quit);
     });
     t0
+}
+
+/// Set by a `--smoke-test` step that fails outright; the run then exits 1.
+static SMOKE_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `--smoke-test` step: pin a synthetic PNG (in the temp directory, not added
+/// to history, so the step does not depend on what the history's latest item
+/// is or whether its file still exists) through `Engine::pin` and the UI
+/// host, check with the window server that one window of the image's size
+/// appeared, close it, and check it is gone. Any error fails the run.
+fn smoke_pin(engine: &Engine, proxy: &Proxy) {
+    const SIZE: (u32, u32) = (237, 151);
+    let pins = || {
+        bugle_platform::windows(true).map(|ws| {
+            ws.iter()
+                .filter(|w| w.pid == std::process::id() as i32 && w.frame.w == SIZE.0 as f64 && w.frame.h == SIZE.1 as f64)
+                .count()
+        })
+    };
+    let path = std::env::temp_dir().join("bugle-smoke-pin.png");
+    let run = || -> Result<()> {
+        image::RgbaImage::from_pixel(SIZE.0, SIZE.1, image::Rgba([230, 140, 30, 255])).save(&path)?;
+        let before = pins()?;
+        engine.pin(&path.display().to_string(), None, 1.0, false)?;
+        std::thread::sleep(Duration::from_millis(400));
+        let shown = pins()?;
+        let (tx, rx) = mpsc::channel();
+        proxy.send(AppEvent::Ui(UiRequest::ClosePins(tx)));
+        let closed = rx.recv_timeout(Duration::from_secs(2)).context("closing the pins timed out")?;
+        std::thread::sleep(Duration::from_millis(300));
+        let after = pins()?;
+        eprintln!(
+            "smoke test: pin {}×{} windows before {before}, shown {shown} (want 1), closed {closed} (want 1), after {after} (want 0)",
+            SIZE.0, SIZE.1
+        );
+        if (before, shown, closed, after) != (0, 1, 1, 0) {
+            anyhow::bail!("unexpected pin windows");
+        }
+        Ok(())
+    };
+    if let Err(e) = run() {
+        eprintln!("smoke test: pin FAILED ({e:#})");
+        SMOKE_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    let _ = std::fs::remove_file(&path);
 }
 
 /// `--smoke-test` step: open the *Audio Levels* prompt from its menu item,
