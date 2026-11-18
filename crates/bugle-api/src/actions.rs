@@ -276,7 +276,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "permissions",
-            description: "Report Screen Recording and Accessibility permission state.",
+            description: "Report Screen Recording and Accessibility permission state, and microphone access (read without prompting).",
             input_schema: json!({"type":"object","properties":{}}),
         },
     ]

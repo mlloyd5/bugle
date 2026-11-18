@@ -44,6 +44,7 @@ char *bugle_last_error(void);
 int32_t bugle_screen_access_preflight(void);
 int32_t bugle_screen_access_request(void);
 int32_t bugle_accessibility_trusted(int32_t prompt);
+int32_t bugle_microphone_access(void);
 
 int32_t bugle_list_displays(bugle_display_t *out, int32_t max);
 // Writes up to `max` windows and returns the total count found (may exceed

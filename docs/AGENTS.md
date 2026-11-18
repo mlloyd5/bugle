@@ -112,7 +112,7 @@ curl -s -H "$H" -H 'content-type: application/json' \
 | `sync` | `source` | `media` (new `path`/`url`), `sync` (`action`, `destination`, `sidecars`) |
 | `select_area` | – | `rect` (user drags) |
 | `providers` | – | provider list with roles |
-| `permissions` | – | `screen_recording`, `accessibility` |
+| `permissions` | – | `screen_recording`, `accessibility`, `microphone` (`authorized`, `denied`, `restricted` or `not_determined`; read without prompting) |
 
 `edit_video` with `original` copies video samples only when the cut starts on a
 keyframe and re-encodes otherwise, so trimmed-off footage is not left in the

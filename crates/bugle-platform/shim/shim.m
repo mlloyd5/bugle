@@ -139,6 +139,12 @@ int32_t bugle_accessibility_trusted(int32_t prompt) {
     return AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts) ? 1 : 0;
 }
 
+// Microphone access as AVAuthorizationStatus (0 not determined, 1
+// restricted, 2 denied, 3 authorized). Only reads it: never prompts.
+int32_t bugle_microphone_access(void) {
+    return (int32_t)[AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
+}
+
 // ---------------------------------------------------------------------------
 // Displays & windows
 // ---------------------------------------------------------------------------
@@ -2915,8 +2921,13 @@ void *bugle_sck_record_start(double x, double y, double w, double h, uint32_t wi
             return NULL;
         }
         if (max_seconds > 0) {
+            // Weak: a recording stopped before the deadline must not stay
+            // alive until it. The writer removes its temporary file (next to
+            // the output) only when it is released, so a strong reference
+            // left that file behind whenever the process exited first.
+            __weak BugleSckRecorder *weakRec = rec;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(max_seconds * NSEC_PER_SEC)),
-                           dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ [rec stopCapture]; });
+                           dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ [weakRec stopCapture]; });
         }
         return (__bridge_retained void *)rec;
     }

@@ -29,6 +29,10 @@ mod prompt;
 #[cfg(target_os = "macos")]
 pub use prompt::{prompt_active, prompt_answer, prompt_text};
 #[cfg(target_os = "macos")]
+mod status_menu;
+#[cfg(target_os = "macos")]
+pub use status_menu::status_menu_probe;
+#[cfg(target_os = "macos")]
 mod editor;
 #[cfg(target_os = "macos")]
 pub use editor::{
@@ -147,6 +151,17 @@ pub fn screen_access_request() -> bool {
 /// Accessibility trust (needed to post scroll events for scrolling capture).
 pub fn accessibility_trusted(prompt: bool) -> bool {
     unsafe { ffi::bugle_accessibility_trusted(prompt as i32) != 0 }
+}
+
+/// Microphone access, read without prompting: `"authorized"`, `"denied"`,
+/// `"restricted"` or `"not_determined"` (asking would show a prompt).
+pub fn microphone_access() -> &'static str {
+    match unsafe { ffi::bugle_microphone_access() } {
+        3 => "authorized",
+        2 => "denied",
+        1 => "restricted",
+        _ => "not_determined",
+    }
 }
 
 // ---------------------------------------------------------------------------
