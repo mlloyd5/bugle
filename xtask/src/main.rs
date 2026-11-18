@@ -127,7 +127,7 @@ fn main() -> Result<()> {
             let out = out.map(std::path::absolute).transpose()?.unwrap_or_else(default_dist);
             std::fs::create_dir_all(&out)?;
             std::fs::write(out.join(format!("{ICON_NAME}.icns")), icns::icns()?)?;
-            std::fs::write(out.join(format!("{ICON_NAME}-1024.png")), icns::png(&icns::render(1024))?)?;
+            std::fs::write(out.join(format!("{ICON_NAME}-1024.png")), icns::png(&icns::render(1024)?)?)?;
             println!("wrote {}/{ICON_NAME}.icns and {ICON_NAME}-1024.png", out.display());
             Ok(())
         }

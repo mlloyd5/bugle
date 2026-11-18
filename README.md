@@ -74,8 +74,8 @@ cargo xtask verify --smoke-test    # re-check a bundle and launch it briefly
 `bundle` builds the release binaries (taking their paths from cargo, so a custom
 target directory works) and assembles the bundle in `dist/.staging`: an
 `Info.plist` with the workspace version, `LSUIElement` (menu-bar only, no Dock
-icon) and the microphone usage string; `Bugle.icns`, rendered from the menu-bar
-glyph; `Contents/MacOS/bugle-app` and the `bugle` CLI next to it. Both
+icon) and the microphone usage string; `Bugle.icns`, scaled from the artwork in
+[`packaging/Bugle-icon-1024.png`](packaging/Bugle-icon-1024.png); `Contents/MacOS/bugle-app` and the `bugle` CLI next to it. Both
 executables are signed with the hardened runtime and
 [`packaging/Bugle.entitlements`](packaging/Bugle.entitlements) (microphone only;
 the app is not sandboxed), then checked with `plutil -lint` (Info.plist and the

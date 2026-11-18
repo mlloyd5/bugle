@@ -457,8 +457,9 @@ Bugle.app/Contents/
   PkgInfo
   MacOS/bugle-app     CFBundleExecutable
   MacOS/bugle         the CLI, signed as <bundle id>.cli
-  Resources/Bugle.icns  icns.rs: glyph.rs (included by path) on a gradient square,
-                        rendered per size and written as PNG elements, reproducibly
+  Resources/Bugle.icns  icns.rs: packaging/Bugle-icon-1024.png (embedded) masked to a
+                        rounded square, scaled per size and written as PNG elements,
+                        reproducibly
 ```
 
 Signing is inside-out (CLI, then the bundle) with `--options runtime` and

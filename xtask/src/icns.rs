@@ -1,26 +1,28 @@
-//! The application icon: the menu-bar camera glyph (shared SDF in
-//! `crates/bugle-app/src/icon/glyph.rs`) in white on a brass-coloured rounded
-//! square, rendered directly at every size and packed into an `.icns` file.
+//! The application icon: the full-bleed artwork in
+//! `packaging/Bugle-icon-1024.png` (a horn inside capture corners on an amber
+//! gradient), masked to the macOS rounded square with a soft drop shadow, then
+//! scaled to every size and packed into an `.icns` file.
 //!
-//! Every size is rasterised from the distance fields rather than downscaled,
-//! so small sizes stay crisp, and the output is byte-for-byte reproducible.
+//! The artwork is embedded at compile time, so the build does not depend on
+//! the working directory, and every step is deterministic: the same artwork
+//! gives a byte-for-byte identical `.icns`.
 
+#[allow(dead_code)] // only the rounded-rect distance field is used here
 #[path = "../../crates/bugle-app/src/icon/glyph.rs"]
 mod glyph;
 
-use anyhow::Result;
-use image::{ImageEncoder, RgbaImage};
+use anyhow::{Context, Result};
+use image::imageops::{self, FilterType};
+use image::{ImageEncoder, Rgba, Rgba32FImage, RgbaImage};
+
+/// The master artwork: square, full bleed, no transparency.
+const ARTWORK: &[u8] = include_bytes!("../../packaging/Bugle-icon-1024.png");
 
 /// The design grid: a 1024-unit canvas with an 824-unit rounded square, the
 /// usual proportions for macOS app icons.
-const CANVAS: f32 = 1024.0;
+const CANVAS: u32 = 1024;
 const BODY_HALF: f32 = 412.0;
 const BODY_RADIUS: f32 = 185.0;
-/// Edge length of the glyph's square, in canvas units.
-const GLYPH: f32 = 620.0;
-/// Gradient top and bottom (sRGB, 0–1).
-const TOP: [f32; 3] = [1.0, 0.749, 0.329]; // #FFBF54
-const BOTTOM: [f32; 3] = [0.894, 0.408, 0.129]; // #E46821
 
 /// `.icns` element types and the pixel size each holds.
 pub const ICNS_ELEMENTS: &[(&[u8; 4], u32)] = &[
@@ -36,52 +38,64 @@ pub const ICNS_ELEMENTS: &[(&[u8; 4], u32)] = &[
     (b"ic10", 1024), // 512@2x
 ];
 
-/// Renders the icon at `px`×`px`.
-pub fn render(px: u32) -> RgbaImage {
-    let scale = CANVAS / px as f32; // canvas units per output pixel
-    let glyph_px = GLYPH / scale;
-    let glyph_x0 = (CANVAS * 0.5 - GLYPH * 0.5) / scale;
-    // The glyph's ink spans roughly y = 0.22..0.83 of its square; centre that.
-    let glyph_y0 = (CANVAS * 0.5 - GLYPH * 0.525) / scale;
-    let mut img = RgbaImage::new(px, px);
+/// The icon on the full 1024-unit canvas, premultiplied, linear in the
+/// sRGB-encoded values (as the artwork is).
+fn master() -> Result<Rgba32FImage> {
+    let art = image::load_from_memory_with_format(ARTWORK, image::ImageFormat::Png)
+        .context("decoding packaging/Bugle-icon-1024.png")?
+        .to_rgba32f();
+    let side = (2.0 * BODY_HALF) as u32;
+    let art = imageops::resize(&art, side, side, FilterType::Lanczos3);
+    let origin = CANVAS as f32 * 0.5 - BODY_HALF;
+
+    let mut img = Rgba32FImage::new(CANVAS, CANVAS);
     for (x, y, p) in img.enumerate_pixels_mut() {
-        let fx = x as f32 + 0.5;
-        let fy = y as f32 + 0.5;
-        let (cx, cy) = (fx * scale - CANVAS * 0.5, fy * scale - CANVAS * 0.5);
+        let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+        let (cx, cy) = (fx - CANVAS as f32 * 0.5, fy - CANVAS as f32 * 0.5);
 
         // Soft drop shadow under the body.
         let ds = glyph::sd_round_rect(cx, cy - 10.0, BODY_HALF, BODY_HALF, BODY_RADIUS);
         let shadow = 0.28 * (1.0 - ((ds + 6.0) / 30.0).clamp(0.0, 1.0)).powi(2);
-        let mut c = [0.0f32; 3];
-        let mut a = shadow;
 
-        // Body with a vertical gradient.
+        // The artwork, clipped to the body with one unit of anti-aliasing.
         let db = glyph::sd_round_rect(cx, cy, BODY_HALF, BODY_HALF, BODY_RADIUS);
-        let body_a = (0.5 - db / scale).clamp(0.0, 1.0);
-        let t = ((cy + BODY_HALF) / (2.0 * BODY_HALF)).clamp(0.0, 1.0);
-        let body: [f32; 3] = std::array::from_fn(|i| TOP[i] + (BOTTOM[i] - TOP[i]) * t);
-        over(&mut c, &mut a, body, body_a);
+        let body_a = (0.5 - db).clamp(0.0, 1.0);
+        let ax = ((fx - origin).floor() as i64).clamp(0, side as i64 - 1) as u32;
+        let ay = ((fy - origin).floor() as i64).clamp(0, side as i64 - 1) as u32;
+        let c = art.get_pixel(ax, ay).0;
 
-        // White glyph, clipped to the body.
-        let g = glyph::coverage(fx - glyph_x0, fy - glyph_y0, glyph_px) * body_a;
-        over(&mut c, &mut a, [1.0; 3], g);
-
-        let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-        *p = image::Rgba([to8(c[0]), to8(c[1]), to8(c[2]), to8(a)]);
+        // Premultiplied "source over": body onto shadow (black).
+        let a = body_a + shadow * (1.0 - body_a);
+        *p = Rgba([c[0] * body_a, c[1] * body_a, c[2] * body_a, a]);
     }
-    img
+    Ok(img)
 }
 
-/// Straight-alpha "source over" of `src` with alpha `sa` onto `dst`/`da`.
-fn over(dst: &mut [f32; 3], da: &mut f32, src: [f32; 3], sa: f32) {
-    let out_a = sa + *da * (1.0 - sa);
-    if out_a <= 0.0 {
-        return;
+/// Premultiplied float image → straight-alpha 8-bit.
+fn to_rgba8(img: &Rgba32FImage) -> RgbaImage {
+    let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    RgbaImage::from_fn(img.width(), img.height(), |x, y| {
+        let [r, g, b, a] = img.get_pixel(x, y).0;
+        let a = a.clamp(0.0, 1.0);
+        let un = |v: f32| if a > 0.0 { v / a } else { 0.0 };
+        Rgba([to8(un(r)), to8(un(g)), to8(un(b)), to8(a)])
+    })
+}
+
+/// Renders the icon at `px`×`px` from an already composed master.
+fn render_from(master: &Rgba32FImage, px: u32) -> RgbaImage {
+    if px == CANVAS {
+        to_rgba8(master)
+    } else {
+        // Resampling premultiplied values keeps the transparent corners from
+        // bleeding dark fringes into the edge.
+        to_rgba8(&imageops::resize(master, px, px, FilterType::Lanczos3))
     }
-    for i in 0..3 {
-        dst[i] = (src[i] * sa + dst[i] * *da * (1.0 - sa)) / out_a;
-    }
-    *da = out_a;
+}
+
+/// Renders the icon at `px`×`px`.
+pub fn render(px: u32) -> Result<RgbaImage> {
+    Ok(render_from(&master()?, px))
 }
 
 pub fn png(img: &RgbaImage) -> Result<Vec<u8>> {
@@ -98,9 +112,10 @@ pub fn png(img: &RgbaImage) -> Result<Vec<u8>> {
 /// The complete `.icns` file: `icns` + total length, then one PNG element per
 /// entry of [`ICNS_ELEMENTS`] (type + element length + data, big-endian).
 pub fn icns() -> Result<Vec<u8>> {
+    let master = master()?;
     let mut body = Vec::new();
     for (kind, size) in ICNS_ELEMENTS {
-        let data = png(&render(*size))?;
+        let data = png(&render_from(&master, *size))?;
         body.extend_from_slice(*kind);
         body.extend_from_slice(&(data.len() as u32 + 8).to_be_bytes());
         body.extend_from_slice(&data);
@@ -117,15 +132,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn corners_are_clear_and_centre_is_opaque() {
-        let img = render(128);
+    fn artwork_is_a_square_master() {
+        let art = image::load_from_memory(ARTWORK).unwrap();
+        assert_eq!((art.width(), art.height()), (CANVAS, CANVAS));
+    }
+
+    #[test]
+    fn corners_are_clear_and_body_is_artwork() {
+        let img = render(128).unwrap();
         assert_eq!(img.get_pixel(0, 0)[3], 0);
         assert_eq!(img.get_pixel(127, 0)[3], 0);
-        let mid = img.get_pixel(64, 64);
-        assert_eq!(mid[3], 255);
-        // The left edge of the camera body is white ink.
-        let ink = img.get_pixel((64.0 - 0.4 * GLYPH / 8.0) as u32, 64);
-        assert!(ink[0] > 240 && ink[1] > 240 && ink[2] > 240, "{ink:?}");
+        // The top of the body is the warm gradient, fully opaque.
+        let top = img.get_pixel(64, 20);
+        assert_eq!(top[3], 255);
+        assert!(top[0] > 200 && top[1] > 100 && top[2] < 120, "{top:?}");
+        // Somewhere in the middle there is white ink (the horn).
+        let ink = (32..96)
+            .flat_map(|y| (32..96).map(move |x| (x, y)))
+            .filter(|&(x, y)| img.get_pixel(x, y).0[..3].iter().all(|&v| v > 235))
+            .count();
+        assert!(ink > 100, "only {ink} white pixels");
+    }
+
+    #[test]
+    fn shadow_sits_below_the_body() {
+        let img = render(1024).unwrap();
+        let below = img.get_pixel(512, 512 + BODY_HALF as u32 + 8);
+        let above = img.get_pixel(512, 512 - BODY_HALF as u32 - 8);
+        assert!(below[3] > above[3], "{below:?} vs {above:?}");
     }
 
     #[test]
@@ -148,6 +182,6 @@ mod tests {
 
     #[test]
     fn rendering_is_deterministic() {
-        assert_eq!(png(&render(64)).unwrap(), png(&render(64)).unwrap());
+        assert_eq!(png(&render(64).unwrap()).unwrap(), png(&render(64).unwrap()).unwrap());
     }
 }

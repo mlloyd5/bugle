@@ -2,7 +2,7 @@
 //!
 //! Dependency-free on purpose: the menu-bar icon (`icon.rs`) rasterises it at
 //! status-item size, and the packaging task (`xtask`) includes this file by
-//! path to draw the application icon at every `.icns` size.
+//! path for its rounded-rect distance field, which masks the application icon.
 
 /// The size the glyph was designed at; stroke widths scale from it.
 pub const DESIGN_SIZE: f32 = 36.0;
