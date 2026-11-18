@@ -427,7 +427,7 @@ pub(crate) fn smoke(proxy: &Proxy) {
     proxy.send(AppEvent::VideoEditor(VideoEditorMsg::Open(path.display().to_string())));
     std::thread::sleep(Duration::from_millis(700));
     if !smoke_waveform(&path) {
-        eprintln!("smoke test: video editor waveform check failed");
+        crate::smoke_fail("video editor waveform", "a check in the line above did not hold");
     }
     snap("video-editor-waveform");
     send(VideoEditorEvent::Seek(0.5));

@@ -1053,12 +1053,13 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
         editor_window::smoke(&proxy);
         video_editor_window::smoke(&proxy);
         smoke_audio_prompt(&proxy);
-        // The input steps' verdict; route a failure into the run's exit code here.
         if !smoke_input::smoke(&proxy) {
-            eprintln!("smoke test: input steps FAILED");
+            smoke_fail("input", "one or more checks failed, see the lines above");
         }
-        // Last: it records. Its failures, for the run's failure report:
-        if let Err(e) = meter_smoke::smoke(&engine, &proxy) { eprintln!("smoke test: level meter: FAIL: {e}") }
+        // Last: it records.
+        if let Err(e) = meter_smoke::smoke(&engine, &proxy) {
+            smoke_fail("level meter", e);
+        }
         std::thread::sleep(Duration::from_millis(1500));
         proxy.send(AppEvent::Quit);
     });
