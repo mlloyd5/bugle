@@ -376,9 +376,10 @@ impl App {
 }
 
 /// `--smoke-test` step: write a synthetic 3-second recording (a moving
-/// gradient, 640x400 at 30 fps) with an event track (pointer hidden, two
-/// clicks) to the temp directory — not added to history — open it in the
-/// video editor, and drive it with injected events (nothing can click):
+/// gradient, 640x400 at 30 fps, two tone bursts as its audio) with an event
+/// track (pointer hidden, two clicks) to the temp directory — not added to
+/// history — open it in the video editor, check its waveform reached the
+/// timeline, and drive it with injected events (nothing can click):
 /// seek, set the in and out points, zoom, smoothing, a preset, playback.
 /// The window is captured along the way (kept only with
 /// `BUGLE_SMOKE_KEEP`) and closed without exporting; with
@@ -413,6 +414,10 @@ pub(crate) fn smoke(proxy: &Proxy) {
     };
     proxy.send(AppEvent::VideoEditor(VideoEditorMsg::Open(path.display().to_string())));
     std::thread::sleep(Duration::from_millis(700));
+    if !smoke_waveform(&path) {
+        eprintln!("smoke test: video editor waveform check failed");
+    }
+    snap("video-editor-waveform");
     send(VideoEditorEvent::Seek(0.5));
     command(VideoEditorCommand::MarkIn);
     send(VideoEditorEvent::SetOut(2.6));
@@ -468,11 +473,17 @@ pub(crate) fn smoke(proxy: &Proxy) {
 }
 
 /// The smoke test's recording and its event track: 320x200 pt recorded at
-/// 2 px/pt with the pointer hidden, moving across, clicking twice.
+/// 2 px/pt with the pointer hidden, moving across, clicking twice, with the
+/// audio of [`SMOKE_TONES`].
 fn write_smoke_recording(path: &std::path::Path, side: &std::path::Path) -> anyhow::Result<()> {
     use bugle_core::events::{CursorEvent, EventKind, MouseButton};
     let (w, h, fps) = (640u32, 400u32, 30u32);
-    let mut writer = bugle_platform::VideoFrameWriter::create(path, w, h, fps, true)?;
+    // The frames go to a video-only file first; the audio is added after.
+    let video = path.with_file_name("bugle-smoke-video-editor-frames.mp4");
+    let _frames = RemoveOnDrop(vec![video.clone()]);
+    // The recording and its track, unless both were written.
+    let mut written = RemoveOnDrop(vec![path.to_owned(), side.to_owned()]);
+    let mut writer = bugle_platform::VideoFrameWriter::create(&video, w, h, fps, true)?;
     for i in 0..3 * fps {
         let shift = i * 4;
         writer.append(&RgbaImage::from_fn(w, h, |x, y| {
@@ -480,6 +491,7 @@ fn write_smoke_recording(path: &std::path::Path, side: &std::path::Path) -> anyh
         }))?;
     }
     writer.finish()?;
+    add_smoke_audio(&video, path)?;
     let click = |t: f64, kind: EventKind, x: f64, y: f64| CursorEvent { t, kind, button: Some(MouseButton::Left), x, y };
     let mut events: Vec<CursorEvent> =
         (0..30).map(|i| CursorEvent::moved(i as f64 * 0.1, 20.0 + i as f64 * 9.0, 40.0 + i as f64 * 4.0)).collect();
@@ -490,5 +502,261 @@ fn write_smoke_recording(path: &std::path::Path, side: &std::path::Path) -> anyh
     events.sort_by(|a, b| a.t.total_cmp(&b.t));
     let mut track = bugle_core::EventTrack::new(bugle_core::Rect::new(0.0, 0.0, 320.0, 200.0), false, 3.0, events);
     track.fps = Some(fps as f64);
-    track.save(side)
+    track.save(side)?;
+    written.0.clear();
+    Ok(())
+}
+
+/// Files removed (those still there) when this is dropped, so the smoke
+/// recording's scratch files go on every path out.
+struct RemoveOnDrop(Vec<std::path::PathBuf>);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// The smoke recording's audio: a 440 Hz tone over each (start, end,
+/// amplitude) in seconds (full scale 1), silence elsewhere. The loud
+/// burst fills the timeline's waveform, the second is half as tall.
+const SMOKE_TONES: [(f64, f64, f64); 2] = [(0.2, 1.2, 0.8), (2.0, 2.8, 0.4)];
+
+/// The amplitude [`SMOKE_TONES`] gives `t` seconds in (0: silent).
+fn smoke_tone_at(t: f64) -> f64 {
+    SMOKE_TONES.iter().find(|(a, b, _)| (*a..*b).contains(&t)).map_or(0.0, |s| s.2)
+}
+
+/// Write `path`: the video of `video` with the 3 s of [`SMOKE_TONES`] as its
+/// audio track (16-bit mono PCM at 48 kHz, written as a WAV file next to it
+/// and copied in without re-encoding).
+fn add_smoke_audio(video: &std::path::Path, path: &std::path::Path) -> anyhow::Result<()> {
+    const RATE: u32 = 48_000;
+    let samples: Vec<i16> = (0..3 * RATE)
+        .map(|i| {
+            let t = i as f64 / RATE as f64;
+            (smoke_tone_at(t) * (std::f64::consts::TAU * 440.0 * t).sin() * i16::MAX as f64) as i16
+        })
+        .collect();
+    let bytes = (samples.len() * 2) as u32;
+    let mut wav = Vec::with_capacity(44 + bytes as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + bytes).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    // PCM, one channel, the rate, bytes a second, bytes a frame, bits.
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&RATE.to_le_bytes());
+    wav.extend_from_slice(&(RATE * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&bytes.to_le_bytes());
+    samples.iter().for_each(|s| wav.extend_from_slice(&s.to_le_bytes()));
+    let tone = path.with_file_name("bugle-smoke-video-editor-tone.wav");
+    let _tone = RemoveOnDrop(vec![tone.clone()]);
+    std::fs::write(&tone, wav)?;
+    let muxed = bugle_platform::mux_audio(video, &tone, 0.0, 3.0, path, true, Some(30.0))?;
+    anyhow::ensure!(muxed, "the tone was not added to the smoke recording");
+    Ok(())
+}
+
+/// What is wrong with `peaks` (equal slices of `duration` seconds, as
+/// [`EditSource::audio_peaks`] reads them, or scaled by
+/// [`waveform_levels`]) for [`SMOKE_TONES`]: empty, or a slice well inside
+/// a tone not near that tone's share of the loudest, or one well inside the
+/// silence not near zero. Time within 50 ms of a tone's edge is not judged.
+fn smoke_waveform_problems(peaks: &[f32], duration: f64) -> Vec<String> {
+    if peaks.is_empty() {
+        return vec!["no peaks".into()];
+    }
+    let loudest = SMOKE_TONES.iter().fold(0.0f64, |m, s| m.max(s.2));
+    let top = peaks.iter().copied().fold(0.0f32, f32::max) as f64;
+    // Judged over windows of at least 20 ms (the loudest slice in each), so
+    // each holds whole cycles of the tone however fine the slices are.
+    let slice = duration / peaks.len() as f64;
+    let per = ((0.02 / slice).ceil() as usize).max(1);
+    let mut problems = Vec::new();
+    for (i, window) in peaks.chunks(per).enumerate() {
+        let v = window.iter().copied().fold(0.0f32, f32::max);
+        let (from, to) = ((i * per) as f64 * slice, (i * per + window.len()) as f64 * slice);
+        let (a, b) = (from - 0.05, to + 0.05);
+        let (amp_a, amp_b) = (smoke_tone_at(a.max(0.0)), smoke_tone_at(b.min(duration - 1e-9)));
+        if amp_a != amp_b || SMOKE_TONES.iter().any(|(s, e, _)| (a < *s && *s < b) || (a < *e && *e < b)) {
+            continue;
+        }
+        let want = amp_a / loudest * top;
+        let ok = if amp_a == 0.0 { (v as f64) < 0.02 * top.max(0.1) } else { ((v as f64) - want).abs() < 0.15 * want };
+        if !ok && problems.len() < 5 {
+            problems.push(format!("{from:.2}–{to:.2}s at {v:.3}, want {want:.3}"));
+        }
+    }
+    problems
+}
+
+/// `--smoke-test` step, with the video editor open on the smoke recording
+/// at `path`: wait for the waveform to reach the timeline, then check the
+/// levels it holds (all [`WAVEFORM_BUCKETS`] of them, scaled so the loudest
+/// is 1, the shape of [`SMOKE_TONES`], what a second read of the file gives)
+/// and how a capture of the window draws them ([`smoke_drawn_problems`]).
+/// Prints what it found; returns whether every check passed.
+fn smoke_waveform(path: &std::path::Path) -> bool {
+    let t0 = Instant::now();
+    let shown = loop {
+        match bugle_platform::video_editor_waveform() {
+            Some(w) if !w.is_empty() => break Some(w),
+            _ if t0.elapsed() > Duration::from_secs(5) => break None,
+            _ => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    let Some(shown) = shown else {
+        let waited = t0.elapsed().as_secs_f64();
+        eprintln!("smoke test: video editor waveform not shown after {waited:.1}s (want {WAVEFORM_BUCKETS} levels: false)");
+        return false;
+    };
+    let waited = t0.elapsed().as_secs_f64();
+    let duration = bugle_platform::video_info(path).map(|i| i.start + i.duration).unwrap_or(f64::NAN);
+    let read = bugle_platform::audio_peaks(path, duration, WAVEFORM_BUCKETS, None);
+    // How far the window's levels are from those of a second read (reads
+    // of one file differ a little: the decoder's resampling).
+    let off = match &read {
+        Ok(Some(p)) if p.len() == shown.len() => {
+            Some(waveform_levels(p).iter().zip(&shown).fold(0.0f32, |m, (a, b)| m.max((a - b).abs())))
+        }
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("smoke test: video editor waveform could not be read again ({e:#})");
+            None
+        }
+    };
+    let top = shown.iter().copied().fold(0.0f32, f32::max);
+    let problems = smoke_waveform_problems(&shown, duration);
+    // The loudest level over the 20 ms from `t`.
+    let at = |t: f64| {
+        let i = |t: f64| ((t / duration * shown.len() as f64) as usize).min(shown.len());
+        shown[i(t)..i(t + 0.02).max(i(t) + 1).min(shown.len())].iter().copied().fold(f32::NAN, f32::max)
+    };
+    // Let the timeline redraw before capturing it.
+    std::thread::sleep(Duration::from_millis(500));
+    let drawn = smoke_drawn_problems(duration);
+    let ok = shown.len() == WAVEFORM_BUCKETS
+        && (top - 1.0).abs() < 0.01
+        && off.is_some_and(|d| d < 0.01)
+        && problems.is_empty()
+        && drawn.as_ref().is_ok_and(|d| d.1.is_empty());
+    eprintln!(
+        "smoke test: video editor waveform {} levels after {waited:.1}s, loudest {top:.2}, at 0.7s {:.2}, 1.6s {:.2}, 2.4s {:.2}; \
+         a second read differs by {off:?}; problems: {problems:?}; drawn (rows at 0.7s, 1.6s, 2.4s; problems): {drawn:?} \
+         (want {WAVEFORM_BUCKETS} levels, loudest 1.00, 1.00 / 0.00 / 0.50, under 0.01, no problems: {ok})",
+        shown.len(),
+        at(0.7),
+        at(1.6),
+        at(2.4),
+    );
+    ok
+}
+
+/// Capture the video editor's window and measure the waveform drawn in its
+/// timeline track: in each pixel column, the rows that differ clearly from
+/// the same rows of a column in the silence (so the colours of either
+/// appearance do not matter), averaged over a few columns around 0.7 s
+/// (the loud tone), 1.6 s (silence) and 2.4 s (the half-level tone). Returns
+/// those three heights in pixels and what is wrong with them: the loud
+/// tone should fill most of the track, the half-level one about half as
+/// much, the silence nothing.
+fn smoke_drawn_problems(duration: f64) -> Result<([f64; 3], Vec<String>), String> {
+    let (track, (win_w, _)) = bugle_platform::video_editor_track_frame().ok_or("no video editor")?;
+    let window = bugle_platform::app_windows()
+        .map_err(|e| format!("{e:#}"))?
+        .into_iter()
+        .find(|w| w.title.starts_with("Edit Video"))
+        .ok_or("window not found")?;
+    let shot = bugle_platform::capture_window(window.id, false, false).map_err(|e| format!("capture: {e:#}"))?;
+    let scale = shot.width() as f64 / win_w;
+    // Inside the track, clear of its outline.
+    let (top, bottom) = (((track.y + 2.0) * scale) as u32, ((track.y + track.h - 2.0) * scale) as u32);
+    if bottom as f64 > shot.height() as f64 || top >= bottom {
+        return Err(format!("track {track:?} is outside the {}x{} capture", shot.width(), shot.height()));
+    }
+    let col = |t: f64| ((track.x + track.w * t / duration) * scale) as u32;
+    let base = col(1.6);
+    let differs = |x: u32, y: u32| {
+        let (a, b) = (shot.get_pixel(x, y).0, shot.get_pixel(base, y).0);
+        (0..3).map(|c| (a[c] as i32 - b[c] as i32).abs()).sum::<i32>() > 40
+    };
+    // Rows differing from the silent column, averaged over five columns
+    // spaced 3 px apart either side of `t` (the silent one compares columns
+    // 60 ms either side of the base).
+    let height = |t: f64| {
+        let cols: Vec<u32> = if t == 1.6 {
+            vec![col(1.54), col(1.66)]
+        } else {
+            (-2..=2).map(|k| (col(t) as i32 + 3 * k).max(0) as u32).collect()
+        };
+        let rows: usize = cols.iter().map(|&x| (top..bottom).filter(|&y| differs(x, y)).count()).sum();
+        rows as f64 / cols.len() as f64
+    };
+    let h = [height(0.7), height(1.6), height(2.4)];
+    let full = (bottom - top) as f64;
+    let mut problems = Vec::new();
+    if h[0] < 0.6 * full {
+        problems.push(format!("the loud tone is {:.0} of {full:.0} rows tall", h[0]));
+    }
+    if h[1] > 0.1 * h[0].max(1.0) {
+        problems.push(format!("the silence is {:.0} rows tall", h[1]));
+    }
+    if !(0.35..=0.65).contains(&(h[2] / h[0].max(1.0))) {
+        problems.push(format!("the half-level tone is {:.0} rows to the loud one's {:.0}", h[2], h[0]));
+    }
+    Ok((h, problems))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoke_recording_has_the_tones_as_audio() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bugle-smoke-video-editor.mp4");
+        let side = bugle_core::EventTrack::sidecar_path(&path);
+        write_smoke_recording(&path, &side).unwrap();
+        assert_eq!(bugle_platform::audio_track_count(&path).unwrap(), 1);
+        let peaks = bugle_platform::audio_peaks(&path, 3.0, 30, None).unwrap().expect("audio");
+        let problems = smoke_waveform_problems(&peaks, 3.0);
+        assert!(problems.is_empty(), "{problems:?} in {peaks:?}");
+        assert!(smoke_waveform_problems(&waveform_levels(&peaks), 3.0).is_empty(), "scaled: {:?}", waveform_levels(&peaks));
+        assert!((peaks[7] - 0.8).abs() < 0.05 && peaks[16] < 0.01 && (peaks[24] - 0.4).abs() < 0.05, "{peaks:?}");
+        // As finely as the window reads them, too.
+        let fine = bugle_platform::audio_peaks(&path, 3.0, WAVEFORM_BUCKETS, None).unwrap().expect("audio");
+        let problems = smoke_waveform_problems(&waveform_levels(&fine), 3.0);
+        assert!(problems.is_empty(), "{problems:?}");
+        let again = bugle_platform::audio_peaks(&path, 3.0, WAVEFORM_BUCKETS, None).unwrap().expect("audio");
+        let off = fine.iter().zip(&again).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        // Reads of the same file differ a little (the decoder's resampling),
+        // never by much.
+        assert!(off < 0.01, "a second read is {off} off");
+        // The wrong shape is caught: backwards, flat, missing.
+        let backwards: Vec<f32> = peaks.iter().rev().copied().collect();
+        assert!(!smoke_waveform_problems(&backwards, 3.0).is_empty());
+        assert!(!smoke_waveform_problems(&[0.5; 30], 3.0).is_empty());
+        assert!(!smoke_waveform_problems(&[], 3.0).is_empty());
+        // Only the files asked for are left behind.
+        let mut left: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        left.sort();
+        assert_eq!(left.len(), 2, "{left:?}");
+    }
+
+    #[test]
+    fn a_failed_smoke_recording_leaves_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bugle-smoke-video-editor.mp4");
+        // The event track cannot be saved: the recording is removed too.
+        let side = tmp.path().join("missing").join("track.json");
+        assert!(write_smoke_recording(&path, &side).is_err());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
 }
