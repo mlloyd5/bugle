@@ -11,6 +11,7 @@
 //! * `dmg` is `bundle --dmg`.
 //! * `verify` re-runs the checks on an existing bundle.
 //! * `icon` writes the `.icns` and a 1024 px PNG preview.
+//! * `check` runs clippy (warnings are errors) and the workspace tests.
 
 mod icns;
 mod plist;
@@ -62,6 +63,9 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Run `cargo clippy --workspace --all-targets -- -D warnings` and
+    /// `cargo test --workspace`; fails if either does.
+    Check,
 }
 
 #[derive(Args)]
@@ -127,11 +131,33 @@ fn main() -> Result<()> {
             let out = out.map(std::path::absolute).transpose()?.unwrap_or_else(default_dist);
             std::fs::create_dir_all(&out)?;
             std::fs::write(out.join(format!("{ICON_NAME}.icns")), icns::icns()?)?;
-            std::fs::write(out.join(format!("{ICON_NAME}-1024.png")), icns::png(&icns::render(1024))?)?;
+            std::fs::write(out.join(format!("{ICON_NAME}-1024.png")), icns::png(&icns::render(1024)?)?)?;
             println!("wrote {}/{ICON_NAME}.icns and {ICON_NAME}-1024.png", out.display());
             Ok(())
         }
+        Cmd::Check => check(),
     }
+}
+
+/// Clippy, then the tests. The tests run even if clippy failed, including
+/// when clippy stopped on a compile error, so one pass shows both; each
+/// failure's error (a non-zero exit, or cargo not starting) is printed
+/// before the summary.
+fn check() -> Result<()> {
+    let clippy = run(cargo().args(["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]));
+    let test = run(cargo().args(["test", "--workspace"]));
+    let mut failed = Vec::new();
+    for (name, result) in [("clippy", clippy), ("tests", test)] {
+        if let Err(e) = result {
+            eprintln!("{name}: {e:#}");
+            failed.push(name);
+        }
+    }
+    if !failed.is_empty() {
+        bail!("check failed: {}", failed.join(" and "));
+    }
+    println!("check: clippy and tests passed");
+    Ok(())
 }
 
 fn workspace_root() -> PathBuf {
@@ -146,10 +172,33 @@ fn entitlements_file() -> PathBuf {
     workspace_root().join("packaging").join(format!("{APP_NAME}.entitlements"))
 }
 
+/// A cargo command run from the workspace root. `cargo run` gives xtask its
+/// own package variables (CARGO_MANIFEST_DIR, CARGO_PKG_*, ...); they are
+/// removed so build scripts that watch them (ring's) do not see a change and
+/// rebuild every time xtask and plain cargo alternate.
 fn cargo() -> Command {
     let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     cmd.current_dir(workspace_root());
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(is_package_env_var) {
+            cmd.env_remove(&key);
+        }
+    }
     cmd
+}
+
+/// The per-package variables cargo sets for a binary it runs.
+fn is_package_env_var(key: &str) -> bool {
+    key.starts_with("CARGO_PKG_")
+        || matches!(
+            key,
+            "CARGO_MANIFEST_DIR"
+                | "CARGO_MANIFEST_PATH"
+                | "CARGO_MANIFEST_LINKS"
+                | "CARGO_CRATE_NAME"
+                | "CARGO_BIN_NAME"
+                | "CARGO_PRIMARY_PACKAGE"
+        )
 }
 
 /// What `cargo metadata` says about the workspace: the real target directory

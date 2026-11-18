@@ -44,7 +44,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | Sync to your own storage | folder copy/move, or SigV4 uploads (multipart for large files) to any S3-compatible bucket; a destination per media kind; subtitles follow their video | ✅ |
 | Trim and export recordings (presets: trim, several cuts in one export, H.264/HEVC, 1080p/720p/540p, frame rate, GIF) | `AVAssetExportSession` + video composition, `AVAssetImageGenerator` → GIF, `AVAssetWriter` for GIF → MP4 | ✅ (CLI/API, and the video editor window) |
 | Auto-zoom on clicks (a level for all, or per click), smoothed pointer | pointer/click event track recorded next to the video (`clip.mp4.events.json`); frames re-rendered in Rust (`AVAssetReader` → `AVAssetWriter`, audio copied back in) | ✅ (CLI/API, and the video editor window); track timing measured on real recordings, zoom checked with hand-written clicks, live clicks not exercised |
-| Video editor | `bugle-app` window for videos and GIFs: preview, timeline with audio waveform, click markers, in/out handles and cuts, playback, zoom (per click too) and pointer options, preset, export through the same edit pipeline | ✅ driven by synthetic events in `--smoke-test`, also as in-process mouse and key events through AppKit (see Video editor); a person's hardware mouse and keyboard not exercised |
+| Video editor | `bugle-app` window for videos and GIFs: preview, timeline with audio waveform, click markers, in/out handles and cuts, playback, zoom (per click too) and pointer options, preset, export through the same edit pipeline | ✅ driven by synthetic events in `--smoke-test`, also as in-process mouse and key events through AppKit (see Video editor); timeline waveform checked on a synthetic tone (levels handed to it, and drawn in a window capture); a person's hardware mouse and keyboard not exercised |
 | `Bugle.app` bundle | `cargo xtask bundle` (hardened runtime, ad-hoc or Developer ID) | ✅ ad-hoc; Developer ID signing and notarization not yet exercised |
 | Disk image, universal binary | `cargo xtask dmg` (`hdiutil`, `/Applications` link), `--universal` (`lipo`) | ✅ DMG; universal needs both Rust targets installed |
 | System notifications | `UNUserNotificationCenter` from Bugle.app, alongside the toast (`[general] system_notifications`), with the capture's thumbnail attached | built; reading the authorization verified from the bundle, posting and the attached thumbnail unverified |
@@ -61,6 +61,9 @@ The binaries are `target/release/bugle` (CLI + servers) and `target/release/bugl
 Objective-C shim (`crates/bugle-platform/shim/shim.m`) with the Xcode command
 line tools; no Xcode project is needed.
 
+`cargo xtask check` runs `cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo test --workspace` and exits non-zero if either fails; run it before sending a change.
+
 ### App bundle
 
 ```bash
@@ -74,8 +77,8 @@ cargo xtask verify --smoke-test    # re-check a bundle and launch it briefly
 `bundle` builds the release binaries (taking their paths from cargo, so a custom
 target directory works) and assembles the bundle in `dist/.staging`: an
 `Info.plist` with the workspace version, `LSUIElement` (menu-bar only, no Dock
-icon) and the microphone usage string; `Bugle.icns`, rendered from the menu-bar
-glyph; `Contents/MacOS/bugle-app` and the `bugle` CLI next to it. Both
+icon) and the microphone usage string; `Bugle.icns`, scaled from the artwork in
+[`packaging/Bugle-icon-1024.png`](packaging/Bugle-icon-1024.png); `Contents/MacOS/bugle-app` and the `bugle` CLI next to it. Both
 executables are signed with the hardened runtime and
 [`packaging/Bugle.entitlements`](packaging/Bugle.entitlements) (microphone only;
 the app is not sandboxed), then checked with `plutil -lint` (Info.plist and the
@@ -314,7 +317,7 @@ peach, mint, any `#hex`, or `gradient:#a,#b[,angle]`.
 cargo run -p bugle-app            # or target/release/bugle-app [--serve] [--config FILE]
 ```
 
-`bugle-app` is an accessory process (no Dock icon) that puts a camera glyph in the
+`bugle-app` is an accessory process (no Dock icon) that puts a horn glyph in the
 menu bar and listens for global hotkeys. Everything it does goes through the same
 `Engine` as the CLI, so captures land in the configured `save_dir`, appear in
 history, and play the shutter sound when `general.shutter_sound` is on.
@@ -553,8 +556,11 @@ beyond that only every second (third, ...) frame is shown while scrubbing a
 very long GIF. The export always uses every frame. *Original* exports a GIF
 again.
 Quit waits for a running export: it is refused until the export finishes.
-`bugle-app --smoke-test` opens it on a synthetic recording and drives it with
-synthetic events (exporting with `BUGLE_SMOKE_SAVE`).
+`bugle-app --smoke-test` opens it on a synthetic recording (two tone bursts
+as its audio), checks the levels handed to the timeline against the tones
+and against a second read of the file, checks a capture of the window shows
+the waveform at those heights, and drives it with synthetic events
+(exporting with `BUGLE_SMOKE_SAVE`).
 
 A second pass sends the window mouse and key events built inside the app,
 so its own hit-testing and key handling take part, and checks the playhead,
@@ -691,7 +697,7 @@ look at what it took.
 
 ## Architecture
 
-Eight crates plus an `xtask` for packaging; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the details.
+Eight crates plus an `xtask` for packaging and checks; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the details.
 
 ```
 bugle-core      types, config, naming, history (no OS calls)
@@ -703,7 +709,7 @@ bugle-engine    Engine: capture, scroll stitch, record, annotate, OCR, AI action
 bugle-api       action catalog → HTTP (axum) and MCP (stdio)
 bugle-cli       the `bugle` binary
 bugle-app       the `bugle-app` menu-bar binary: status item, hotkeys, toasts
-xtask           `cargo xtask bundle`: assemble, sign and verify Bugle.app
+xtask           `cargo xtask bundle`: assemble, sign and verify Bugle.app; `cargo xtask check`: clippy + tests
 ```
 
 ## Why "Bugle"?

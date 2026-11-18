@@ -57,10 +57,10 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `select_rect_blocking`, `select_rect_begin`/`_cancel` | borderless `NSWindow` per screen, dim fill, crosshair, size label; blocking (`[NSApp run]`) or callback-based for a host with its own run loop |
 | `window_pick_begin`/`_highlight`/`_cancel`/`_switch` (`shim/picker.m`) | see-through `NSWindow` per screen with an always-active `NSTrackingArea`; reports pointer moves and the final click/Esc/Space/timeout through a C callback and draws whatever rect the host hands back |
 | `select_rect_begin_ex`, `select_rect_switch` | the selection overlay with an optional timeout and a Space "switch" result (not while dragging); a switch from either overlay leaves Bugle active so the other can open at once |
-| `pin_image_blocking`, `pin_image_show` | floating borderless window, drag/resize/close; blocking or fire-and-forget |
+| `pin_image_blocking`, `pin_image_show`, `pin_close_all` | floating borderless window, drag/resize/close; blocking or fire-and-forget; close every open pin |
 | `toast_show` | non-activating `NSPanel` with `NSVisualEffectView`, thumbnail + two lines, fades out |
 | `editor_open` (`shim/editor.m`) | markup editor windows, several at once, each named by the `EditorId` `editor_open` returns: toolbar with pull-down menus, canvas in an `NSScrollView` (fit, zoom stops, pinch, ⌘+/⌘−/⌘1/⌘0), multi-line label text field, unsaved-changes sheet; reports input in edited-image pixels through a callback and draws the image (told where the edited image's origin lies in it), overlay primitives and menus it is handed |
-| `video_editor_open` (`shim/video_editor.m`) | video editor window: `NSImageView` preview, a timeline view (audio waveform, kept range, in/out handles, struck-out cuts and the cut being marked, playhead, click markers; drags move locally until Rust answers, a click (not a drag) snaps the playhead onto a marker), control bar (play, Set In/Out, Cut/Restore, zoom, click-zoom and preset pop-ups, smoothing check box, Export); reports input as times in seconds through a callback and shows the frame, control state, markers and waveform it is handed |
+| `video_editor_open` (`shim/video_editor.m`) | video editor window: `NSImageView` preview, a timeline view (audio waveform, kept range, in/out handles, struck-out cuts and the cut being marked, playhead, click markers; drags move locally until Rust answers, a click (not a drag) snaps the playhead onto a marker), control bar (play, Set In/Out, Cut/Restore, zoom, click-zoom and preset pop-ups, smoothing check box, Export); reports input as times in seconds through a callback and shows the frame, control state, markers and waveform it is handed (the waveform and the track's place can be read back, for the smoke test) |
 | `panel_show` (`shim/panel.m`) | quick-access panels: non-activating, never-key `NSPanel`s, thumbnail, buttons, close, each named by an id the caller picks; several stack in the corner (newest nearest it) and close up when one goes; `panel_hide_all` / `panel_show_all` take them off screen during a capture; reports clicks through a callback |
 | `clipboard_*` | `NSPasteboard` |
 | `SckRecorder` (`bugle_sck_record_*`) | `SCStream` (`capturesAudio`, `excludesCurrentProcessAudio`, `showMouseClicks`) → `AVAssetWriter` H.264 + AAC .mp4; `AVCaptureSession` microphone as a second AAC track |
@@ -463,8 +463,9 @@ Bugle.app/Contents/
   PkgInfo
   MacOS/bugle-app     CFBundleExecutable
   MacOS/bugle         the CLI, signed as <bundle id>.cli
-  Resources/Bugle.icns  icns.rs: glyph.rs (included by path) on a gradient square,
-                        rendered per size and written as PNG elements, reproducibly
+  Resources/Bugle.icns  icns.rs: packaging/Bugle-icon-1024.png (embedded) masked to a
+                        rounded square, scaled per size and written as PNG elements,
+                        reproducibly
 ```
 
 Signing is inside-out (CLI, then the bundle) with `--options runtime` and
@@ -587,7 +588,11 @@ Export checks the request with `EditSource::check`, then runs
 closes the window and shows the quick-access panel for the new file, and a
 failure re-enables it. The panel's **Edit** button (videos and GIFs) and
 *Edit Latest Recording* (`edit_latest`) open it; `--smoke-test` writes a synthetic
-recording with an event track and drives it through `video_editor_inject`.
+recording with an event track and two tone bursts as its audio, reads the
+timeline's levels back (`video_editor_waveform`) to check their shape, scale
+and match with a second read of the file, measures the drawn waveform in a
+capture of the window (`video_editor_track_frame` locates the track), and
+drives it through `video_editor_inject`.
 
 `--smoke-test` then drives the windows through AppKit as well
 (`smoke_input.rs` in the app, `bugle_platform::smoke_input` over

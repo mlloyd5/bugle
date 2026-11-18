@@ -122,11 +122,25 @@ impl Engine {
 
     pub fn load_image(&self, source: &str) -> Result<(MediaItem, RgbaImage)> {
         let m = self.resolve_media(source)?;
-        if m.is_video() {
+        // A history entry outlives its file when that is moved or deleted
+        // outside Bugle. Say so instead of handing the decoder a missing path
+        // (AVFoundation only answers "The operation could not be completed").
+        match std::fs::metadata(&m.path) {
+            Ok(md) if md.is_dir() => {
+                return Err(BugleError::Invalid(format!("{} is a directory, not an image or video", m.path.display())).into())
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(BugleError::MediaNotFound(format!("{}: file not found at {}", m.id, m.path.display())).into())
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("reading {}", m.path.display()))),
+        }
+        if m.kind == MediaKind::Video {
             // First frame of a video is a fine stand-in for image operations.
             let img = bugle_platform::video_frame(&m.path, 0.0)?;
             return Ok((m, img));
         }
+        // Images, and GIFs (their first frame): AVFoundation cannot open a GIF.
         let img = image::open(&m.path).with_context(|| format!("opening {}", m.path.display()))?.to_rgba8();
         Ok((m, img))
     }
@@ -156,6 +170,8 @@ impl Engine {
     /// Without one, a recognised image extension on `output` decides, then
     /// the configured default. An explicit format that disagrees with the
     /// extension wins and the extension is corrected.
+    // Three internal callers, each passing different values; a struct would only rename these positions.
+    #[allow(clippy::too_many_arguments)]
     pub fn save_image(
         &self,
         img: &RgbaImage,
@@ -370,10 +386,12 @@ impl Engine {
                 ocr = Some(r);
             }
         }
-        let images = if media.is_video() {
-            sample_video_frames(&media.path, 4)?
-        } else {
-            vec![ImageInput::png(encode_png_bounded(&img, 1600)?)]
+        let images = match media.kind {
+            MediaKind::Video => sample_video_frames(&media.path, 4)?,
+            MediaKind::Gif => {
+                edit::sample_gif_frames(&media.path, 4)?.iter().map(|f| Ok(ImageInput::png(encode_png_bounded(f, 1280)?))).collect::<Result<_>>()?
+            }
+            _ => vec![ImageInput::png(encode_png_bounded(&img, 1600)?)],
         };
         let description = provider.describe(&images, &prompt, None).await?;
         Ok(DescribeResult { description, provider: provider.name().to_string(), model: provider.model(), ocr })
@@ -869,6 +887,77 @@ mod tests {
 
     fn is_no_host(e: &anyhow::Error) -> bool {
         matches!(e.downcast_ref::<BugleError>(), Some(BugleError::NoUiHost(_)))
+    }
+
+    /// The menu-bar app's *Pin Latest* and the smoke test's old pin step met
+    /// a history entry whose file had been deleted as "frame extraction
+    /// failed: The operation could not be completed".
+    #[test]
+    fn load_image_reports_a_missing_file() {
+        let (dir, engine) = temp_engine();
+        engine.history.push(&MediaItem::new(MediaKind::Video, dir.path().join("gone.mp4"))).unwrap();
+        let e = engine.load_image("latest").unwrap_err();
+        assert!(matches!(e.downcast_ref::<BugleError>(), Some(BugleError::MediaNotFound(_))), "{e:#}");
+        let msg = format!("{e:#}");
+        assert!(msg.contains("file not found at") && msg.contains("gone.mp4"), "{msg}");
+    }
+
+    #[test]
+    fn load_image_refuses_a_directory() {
+        let (dir, engine) = temp_engine();
+        let e = engine.load_image(&dir.path().display().to_string()).unwrap_err();
+        assert!(matches!(e.downcast_ref::<BugleError>(), Some(BugleError::Invalid(_))), "{e:#}");
+        assert!(format!("{e:#}").contains("is a directory"), "{e:#}");
+        // A directory in history (a path that was a file once) is no different.
+        engine.history.push(&MediaItem::new(MediaKind::Screenshot, dir.path())).unwrap();
+        let e = engine.load_image("latest").unwrap_err();
+        assert!(matches!(e.downcast_ref::<BugleError>(), Some(BugleError::Invalid(_))), "{e:#}");
+    }
+
+    #[test]
+    fn load_image_reads_a_gif_with_the_image_decoder() {
+        // AVFoundation cannot open a GIF ("Cannot Open").
+        let (dir, engine) = temp_engine();
+        let gif = dir.path().join("clip.gif");
+        RgbaImage::from_pixel(30, 20, image::Rgba([200, 40, 40, 255])).save(&gif).unwrap();
+        engine.history.push(&MediaItem::new(MediaKind::Gif, &gif)).unwrap();
+        let (m, img) = engine.load_image("latest").unwrap();
+        assert_eq!((m.kind, img.dimensions()), (MediaKind::Gif, (30, 20)));
+    }
+
+    #[test]
+    fn load_image_reads_the_first_frame_of_a_video() {
+        let (dir, engine) = temp_engine();
+        let mp4 = dir.path().join("clip.mp4");
+        let fixture = bugle_platform::ToneFixture { tracks: 1, seconds: 1.0, video: true, ..Default::default() };
+        bugle_platform::write_tone_fixture(&mp4, &fixture).unwrap();
+        let (m, img) = engine.load_image(&mp4.display().to_string()).unwrap();
+        assert_eq!((m.kind, img.dimensions()), (MediaKind::Video, (64, 64)));
+    }
+
+    #[tokio::test]
+    async fn describe_samples_a_gif_with_the_image_decoder() {
+        // Describing a GIF went through AVFoundation and failed with "could
+        // not extract any frames" before any provider was asked.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.general.save_dir = dir.path().join("out").display().to_string();
+        config.general.history_path = Some(dir.path().join("history.jsonl").display().to_string());
+        // A `command` provider is handed the first sampled frame as a PNG.
+        let provider = bugle_core::config::ProviderConfig {
+            kind: "command".into(),
+            command: vec!["/usr/bin/file".into(), "-b".into(), "{input}".into()],
+            ..Default::default()
+        };
+        config.ai.providers.insert("file".into(), provider);
+        config.ai.default_vision = Some("file".into());
+        let engine = Engine::new(config, false).unwrap();
+        let gif = dir.path().join("clip.gif");
+        RgbaImage::from_pixel(30, 20, image::Rgba([200, 40, 40, 255])).save(&gif).unwrap();
+        let req = DescribeRequest { source: gif.display().to_string(), prompt: None, provider: None, with_ocr: true };
+        let r = engine.describe(&req).await.unwrap();
+        assert!(r.description.starts_with("PNG image data, 30 x 20"), "{}", r.description);
+        assert!(r.ocr.is_none(), "OCR grounding is for images only");
     }
 
     #[test]

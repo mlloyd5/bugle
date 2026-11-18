@@ -43,6 +43,8 @@ pub use video_editor::{
     video_editor_active, video_editor_close, video_editor_focus, video_editor_inject, video_editor_open, video_editor_set_frame,
     video_editor_set_state, video_editor_set_waveform, ClickMarker, VideoEditorCommand, VideoEditorEvent, VideoEditorState,
 };
+#[cfg(target_os = "macos")]
+pub use video_editor::{video_editor_track_frame, video_editor_waveform};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bugle_core::audio_level::{AudioLevels, TrackLevel};
@@ -548,6 +550,12 @@ pub fn pin_image_show(png: &[u8], frame: Option<Rect>, opacity: f64) -> Result<(
         bail!("could not decode image for pin window");
     }
     Ok(())
+}
+
+/// Close every pin window [`pin_image_show`] opened in this process, as Esc
+/// on each would; returns how many were open. Main thread only.
+pub fn pin_close_all() -> usize {
+    unsafe { ffi::bugle_pin_close_all() }.max(0) as usize
 }
 
 /// Show a transient corner notification with an optional PNG thumbnail.
