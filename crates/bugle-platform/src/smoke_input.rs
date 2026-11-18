@@ -6,8 +6,9 @@
 //! hit-testing, the view that took the mouse-down getting the drags, key
 //! equivalents, the responder chain, a text field's field editor, a
 //! button's highlight and action. Nothing reaches the window server: the real
-//! pointer does not move, other apps see nothing, and no Accessibility
-//! permission is needed. It is not the same as a person's hardware input:
+//! pointer does not move, no Accessibility permission is needed, and other
+//! apps see none of these events ([`paste`] does write the general
+//! pasteboard, which they can read). It is not the same as a person's hardware input:
 //! the window server's part (which window is under the pointer, activation
 //! by a click, the keyboard layout) is left out.
 //!
@@ -25,8 +26,7 @@ extern "C" {
     fn bugle_smoke_click(target: i32, x: f64, y: f64) -> i32;
     fn bugle_smoke_key(target: i32, key_code: u16, chars: *const c_char, chars_ignoring: *const c_char, mods: u64) -> i32;
     fn bugle_smoke_pick_popup(target: i32, x: f64, y: f64, index: i32) -> i32;
-    fn bugle_smoke_pasteboard_swap(text: *const c_char);
-    fn bugle_smoke_pasteboard_restore();
+    fn bugle_smoke_paste(target: i32, text: *const c_char) -> i32;
     fn bugle_video_editor_smoke_rect(which: i32, out: *mut f64) -> i32;
     fn bugle_editor_smoke_point(x: f64, y: f64, out: *mut f64) -> i32;
     fn bugle_prompt_smoke_text(buf: *mut c_char, cap: usize) -> i32;
@@ -85,6 +85,8 @@ pub enum Key {
     Escape,
     /// The Delete (backspace) key.
     Delete,
+    /// The forward-delete key (fn-Delete).
+    ForwardDelete,
     Left,
     Right,
     Up,
@@ -102,6 +104,7 @@ impl Key {
             Key::Return => (36, '\r', 0),
             Key::Escape => (53, '\u{1b}', 0),
             Key::Delete => (51, '\u{7f}', 0),
+            Key::ForwardDelete => (117, '\u{f728}', fn_key),
             Key::Left => (123, '\u{f702}', fn_key | Mods::NUMERIC_PAD),
             Key::Right => (124, '\u{f703}', fn_key | Mods::NUMERIC_PAD),
             Key::Down => (125, '\u{f701}', fn_key | Mods::NUMERIC_PAD),
@@ -145,8 +148,9 @@ pub enum KeyRoute {
 /// How a click's mouse-up reached the view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClickRoute {
-    /// A tracking loop of the view's own took it from the queue (NSButton
-    /// on macOS 26 runs none).
+    /// Something took it off the queue during the mouse-down: a tracking
+    /// loop of the view's own (NSButton on macOS 26 runs none, so this has
+    /// not been seen).
     Tracked,
     /// Sent to the window after the mouse-down (a view without one).
     Sent,
@@ -273,15 +277,34 @@ pub fn pick_popup(target: Target, at: (f64, f64), index: usize) -> Option<PopupP
     }
 }
 
-/// Run `f` with `text` on the general pasteboard, and put back what was
-/// there afterwards (data an app only promised and never handed over is
-/// lost; clipboard history tools see `text` go by).
-pub fn with_pasteboard_text<R>(text: &str, f: impl FnOnce() -> R) -> R {
+/// What [`paste`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Paste {
+    /// ⌘V was pressed with the text on the pasteboard, and the previous
+    /// contents were put back.
+    Restored,
+    /// ⌘V was pressed, but something else wrote the pasteboard meanwhile, so
+    /// the previous contents were left out rather than overwrite it.
+    NotRestored,
+    /// The pasteboard held more than plain text (possibly data an app has
+    /// only promised): nothing was touched.
+    Declined,
+}
+
+/// Press ⌘V in the target window with `text` on the general pasteboard and
+/// put back what was there, in one main-thread turn. Only when the
+/// pasteboard is empty or holds plain text alone; see [`Paste`]. It goes
+/// through the user's real pasteboard (its change count goes up twice and
+/// clipboard tools see `text` go by), so callers make it opt-in. `None`
+/// when the target window is not on screen.
+pub fn paste(target: Target, text: &str) -> Option<Paste> {
     let c = CString::new(text.replace('\0', "")).unwrap_or_default();
-    unsafe { bugle_smoke_pasteboard_swap(c.as_ptr()) };
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    unsafe { bugle_smoke_pasteboard_restore() };
-    r.unwrap_or_else(|p| std::panic::resume_unwind(p))
+    match unsafe { bugle_smoke_paste(target as i32, c.as_ptr()) } {
+        1 => Some(Paste::Restored),
+        2 => Some(Paste::NotRestored),
+        -1 => Some(Paste::Declined),
+        _ => None,
+    }
 }
 
 /// A part of the video editor, for [`video_editor_rect`].
@@ -344,5 +367,6 @@ mod tests {
         assert_eq!(Key::Char(' ').raw().map(|r| r.0), Some(49));
         assert_eq!(Key::Char('é').raw(), None);
         assert_eq!(Key::Left.raw().map(|r| r.1), Some('\u{f702}'));
+        assert_eq!(Key::ForwardDelete.raw().map(|r| r.0), Some(117));
     }
 }

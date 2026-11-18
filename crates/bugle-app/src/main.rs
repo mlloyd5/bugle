@@ -1029,7 +1029,10 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
         editor_window::smoke(&proxy);
         video_editor_window::smoke(&proxy);
         smoke_audio_prompt(&proxy);
-        smoke_input::smoke(&proxy);
+        // The input steps' verdict; route a failure into the run's exit code here.
+        if !smoke_input::smoke(&proxy) {
+            eprintln!("smoke test: input steps FAILED");
+        }
         std::thread::sleep(Duration::from_millis(1500));
         proxy.send(AppEvent::Quit);
     });

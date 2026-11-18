@@ -7,11 +7,12 @@
 // hit-testing, the view that took the mouse-down getting the drags and the
 // mouse-up, key equivalents before the first responder, the responder chain,
 // the field editor of a text field, a button's highlight and action. Nothing is
-// posted to the window server: the real pointer does not move, no other app
-// sees anything, and no Accessibility permission is involved. It is still
-// not a person's input: the window server's own steps (which window is under
-// the pointer, activation by a click, the input method's keyboard layout)
-// are left out.
+// posted to the window server: the real pointer does not move, no
+// Accessibility permission is involved, and other apps see none of these
+// events (the opt-in paste step, bugle_smoke_paste, does write the general
+// pasteboard, which other apps can read). It is still not a person's input:
+// the window server's own steps (which window is under the pointer,
+// activation by a click, the input method's keyboard layout) are left out.
 //
 // Every function may be called from any thread except the main one (it runs
 // its work there with dispatch_sync, so the main thread must be running its
@@ -27,8 +28,6 @@ enum { TARGET_VIDEO_EDITOR = 0, TARGET_MARKUP_EDITOR = 1, TARGET_PROMPT = 2 };
 enum { PHASE_DOWN = 0, PHASE_DRAG = 1, PHASE_UP = 2 };
 
 static NSInteger g_smoke_event_number = 0;
-static NSArray<NSPasteboardItem *> *g_saved_pasteboard = nil;
-static BOOL g_pasteboard_swapped = NO;
 
 static void on_main(dispatch_block_t block) {
     if ([NSThread isMainThread]) block();
@@ -88,14 +87,17 @@ int32_t bugle_smoke_mouse(int32_t target, int32_t phase, double x, double y, int
     return rc;
 }
 
-/// A click at window point (x, y): the mouse-up is queued first, then the
-/// mouse-down is sent to the window. A control that tracks the mouse in a
-/// loop of its own pulls the queued mouse-up from the queue, as it would a
-/// real one; otherwise the mouse-up is taken back off the queue and sent
-/// after the mouse-down. (On macOS 26 NSButton runs no such loop: it
-/// highlights on the mouse-down and acts on the mouse-up the window sends
-/// it.) Returns 1 when a tracking loop took the mouse-up, 2 when it was sent
-/// afterwards, 0 when the target window is not on screen.
+/// A click at window point (x, y): the mouse-up is queued at the head of
+/// the app's event queue, then the mouse-down is sent to the window. A
+/// control that tracks the mouse in a loop of its own would pull the queued
+/// mouse-up from the queue, as it would a real one, instead of blocking the
+/// main thread; otherwise the mouse-up, still at the head of the queue, is
+/// taken off it and sent after the mouse-down. (On macOS 26 NSButton runs no
+/// such loop: it highlights on the mouse-down and acts on the mouse-up the
+/// window sends it, so the tracking-loop path has not been run on a macOS
+/// where a button tracks.) Returns 1 when something took the mouse-up off the
+/// queue during the mouse-down, 2 when it was sent afterwards, 0 when the
+/// target window is not on screen.
 int32_t bugle_smoke_click(int32_t target, double x, double y) {
     __block int32_t rc = 0;
     on_main(^{
@@ -105,25 +107,13 @@ int32_t bugle_smoke_click(int32_t target, double x, double y) {
             NSPoint p = NSMakePoint(x, y);
             NSEvent *down = mouse_event(NSEventTypeLeftMouseDown, w, p, 1, 0);
             NSEvent *up = mouse_event(NSEventTypeLeftMouseUp, w, p, 1, 0);
-            [NSApp postEvent:up atStart:NO];
+            [NSApp postEvent:up atStart:YES];
             [w sendEvent:down];
-            // Ours still waiting? Take it (and only it) back off the queue.
-            NSMutableArray<NSEvent *> *others = [NSMutableArray array];
-            BOOL pending = NO;
-            for (;;) {
-                NSEvent *e = [NSApp nextEventMatchingMask:NSEventMaskLeftMouseUp
-                                                untilDate:nil
-                                                   inMode:NSDefaultRunLoopMode
-                                                  dequeue:YES];
-                if (!e) break;
-                if (e.eventNumber == up.eventNumber && e.windowNumber == up.windowNumber) {
-                    pending = YES;
-                    break;
-                }
-                [others addObject:e];
-            }
-            for (NSEvent *e in others.reverseObjectEnumerator) [NSApp postEvent:e atStart:YES];
-            if (pending) {
+            // Ours is at the head unless a tracking loop took it: only then is
+            // anything dequeued, so no other event changes place.
+            NSEvent *head = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:nil inMode:NSDefaultRunLoopMode dequeue:NO];
+            if (head.type == NSEventTypeLeftMouseUp && head.eventNumber == up.eventNumber && head.windowNumber == up.windowNumber) {
+                [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:nil inMode:NSDefaultRunLoopMode dequeue:YES];
                 [w sendEvent:up];
                 rc = 2;
             } else {
@@ -134,15 +124,55 @@ int32_t bugle_smoke_click(int32_t target, double x, double y) {
     return rc;
 }
 
+/// Deliver key event `ev` to `w` the way a real one is delivered: posted at
+/// the head of the queue and taken off it again, so it becomes
+/// NSApp.currentEvent (code that looks at the current event's modifiers sees
+/// this one, not the last real event), then sent through NSApplication when
+/// `w` is Bugle's key window and Bugle is active (returns 1), else through
+/// -performKeyEquivalent: and -sendEvent: on the window (returns 2).
+static int32_t deliver_key(NSWindow *w, NSEvent *ev) {
+    NSEventMask mask = NSEventMaskFromType(ev.type);
+    [NSApp postEvent:ev atStart:YES];
+    NSEvent *got = [NSApp nextEventMatchingMask:mask untilDate:nil inMode:NSDefaultRunLoopMode dequeue:YES];
+    // The queue hands back a copy (its timestamp rounded to the nanosecond).
+    BOOL ours = got && fabs(got.timestamp - ev.timestamp) < 1e-6 && got.keyCode == ev.keyCode && got.windowNumber == ev.windowNumber &&
+                got.type == ev.type && [got.characters isEqualToString:ev.characters];
+    if (got && !ours) {
+        // Not ours (should not happen: ours was at the head); put it back.
+        [NSApp postEvent:got atStart:YES];
+        got = nil;
+    }
+    NSEvent *send = got ?: ev;
+    if (NSApp.isActive && NSApp.keyWindow == w) {
+        [NSApp sendEvent:send];
+        return 1;
+    }
+    if (send.type != NSEventTypeKeyDown || ![w performKeyEquivalent:send]) [w sendEvent:send];
+    return 2;
+}
+
+static NSEvent *key_event(NSWindow *w, NSEventType type, uint16_t key_code, NSString *c, NSString *ci, uint64_t mods) {
+    return [NSEvent keyEventWithType:type
+                            location:NSZeroPoint
+                       modifierFlags:(NSEventModifierFlags)mods
+                           timestamp:NSProcessInfo.processInfo.systemUptime
+                        windowNumber:w.windowNumber
+                             context:nil
+                          characters:c
+         charactersIgnoringModifiers:ci
+                           isARepeat:NO
+                             keyCode:key_code];
+}
+
 /// A key press (key-down, then key-up) with `key_code` (a virtual key code
 /// of the ANSI layout), `chars` and `chars_ignoring` (UTF-8, the event's
 /// `characters` and `charactersIgnoringModifiers`) and `mods`
-/// (NSEventModifierFlags). When the target is Bugle's key window and Bugle
-/// is active, the key-down goes through -[NSApplication sendEvent:], as a
-/// real one does (key equivalents first, then the first responder): returns
-/// 1. Otherwise the same steps are taken by hand on the target window
-/// (-performKeyEquivalent:, then -sendEvent:): returns 2. 0 when the target
-/// window is not on screen.
+/// (NSEventModifierFlags), delivered as deliver_key describes: through
+/// -[NSApplication sendEvent:] when the target is Bugle's key window and
+/// Bugle is active (returns 1), else by hand on the target window
+/// (-performKeyEquivalent:, then -sendEvent:; returns 2). Either way the
+/// event is NSApp.currentEvent while it is handled. 0 when the target window
+/// is not on screen.
 int32_t bugle_smoke_key(int32_t target, uint16_t key_code, const char *chars, const char *chars_ignoring, uint64_t mods) {
     NSString *c = [NSString stringWithUTF8String:chars ? chars : ""] ?: @"";
     NSString *ci = [NSString stringWithUTF8String:chars_ignoring ? chars_ignoring : ""] ?: @"";
@@ -151,30 +181,11 @@ int32_t bugle_smoke_key(int32_t target, uint16_t key_code, const char *chars, co
         @autoreleasepool {
             NSWindow *w = target_window(target);
             if (!w) return;
-            NSEvent *(^key)(NSEventType) = ^NSEvent *(NSEventType type) {
-                return [NSEvent keyEventWithType:type
-                                        location:NSZeroPoint
-                                   modifierFlags:(NSEventModifierFlags)mods
-                                       timestamp:NSProcessInfo.processInfo.systemUptime
-                                    windowNumber:w.windowNumber
-                                         context:nil
-                                      characters:c
-                     charactersIgnoringModifiers:ci
-                                       isARepeat:NO
-                                         keyCode:key_code];
-            };
-            NSEvent *down = key(NSEventTypeKeyDown), *up = key(NSEventTypeKeyUp);
-            if (NSApp.isActive && NSApp.keyWindow == w) {
-                [NSApp sendEvent:down];
-                rc = 1;
-            } else {
-                if (![w performKeyEquivalent:down]) [w sendEvent:down];
-                rc = 2;
-            }
-            // The key-up goes to whichever window is key now (a ⌘W has
-            // closed the target).
-            NSWindow *now = target_window(target);
-            if (now) [now sendEvent:up];
+            rc = deliver_key(w, key_event(w, NSEventTypeKeyDown, key_code, c, ci, mods));
+            // The key-up goes the same way to the target window, if it is
+            // still on screen (⌘W closes it).
+            NSWindow *still = target_window(target);
+            if (still) deliver_key(still, key_event(still, NSEventTypeKeyUp, key_code, c, ci, mods));
         }
     });
     return rc;
@@ -245,43 +256,67 @@ int32_t bugle_smoke_pick_popup(int32_t target, double x, double y, int32_t index
     return rc;
 }
 
-/// Put `text` on the general pasteboard for a paste, keeping a copy of what
-/// was there for bugle_smoke_pasteboard_restore. Data a pasteboard item only
-/// promises and never hands over is not kept.
-void bugle_smoke_pasteboard_swap(const char *text) {
+/// Plain-text types whose data the pasteboard can hand over at once. AppKit
+/// has no public way to tell data an app has only promised from data it has
+/// written, so anything else on the pasteboard makes the paste step stand
+/// down rather than force it to be provided (or lose it).
+static BOOL plain_type(NSPasteboardType t) {
+    static NSSet<NSString *> *plain;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        plain = [NSSet setWithArray:@[ NSPasteboardTypeString, @"public.utf16-plain-text", @"public.utf16-external-plain-text",
+                                       @"NSStringPboardType", NSPasteboardTypeRTF, NSPasteboardTypeHTML ]];
+    });
+    return [plain containsObject:t];
+}
+
+/// Press ⌘V in the target window with `text` on the general pasteboard, and
+/// put the previous contents back, all in one main-thread turn. Only when
+/// the pasteboard is empty or holds nothing but plain text (copied first):
+/// otherwise nothing is touched and -1 is returned. The previous contents go
+/// back only if nothing else wrote the pasteboard in between (its change
+/// count is what this wrote); else they are left and 2 is returned. 1:
+/// pasted and put back; 0: the target window is not on screen. The change
+/// count goes up twice either way.
+int32_t bugle_smoke_paste(int32_t target, const char *text) {
     NSString *t = [NSString stringWithUTF8String:text ? text : ""] ?: @"";
+    __block int32_t rc = 0;
     on_main(^{
         @autoreleasepool {
+            NSWindow *w = target_window(target);
+            if (!w) return;
             NSPasteboard *pb = NSPasteboard.generalPasteboard;
-            if (!g_pasteboard_swapped) {
-                NSMutableArray<NSPasteboardItem *> *saved = [NSMutableArray array];
-                for (NSPasteboardItem *item in pb.pasteboardItems) {
-                    NSPasteboardItem *copy = [[NSPasteboardItem alloc] init];
-                    for (NSPasteboardType type in item.types) {
-                        NSData *d = [item dataForType:type];
-                        if (d) [copy setData:d forType:type];
+            NSMutableArray<NSPasteboardItem *> *saved = [NSMutableArray array];
+            for (NSPasteboardItem *item in pb.pasteboardItems) {
+                for (NSPasteboardType type in item.types) {
+                    if (!plain_type(type)) {
+                        rc = -1;
+                        return;
                     }
-                    [saved addObject:copy];
                 }
-                g_saved_pasteboard = saved;
-                g_pasteboard_swapped = YES;
+            }
+            for (NSPasteboardItem *item in pb.pasteboardItems) {
+                NSPasteboardItem *copy = [[NSPasteboardItem alloc] init];
+                for (NSPasteboardType type in item.types) {
+                    NSData *d = [item dataForType:type];
+                    if (d) [copy setData:d forType:type];
+                }
+                [saved addObject:copy];
             }
             [pb clearContents];
             [pb setString:t forType:NSPasteboardTypeString];
-        }
-    });
-}
-
-/// Put back what bugle_smoke_pasteboard_swap found on the pasteboard.
-void bugle_smoke_pasteboard_restore(void) {
-    on_main(^{
-        @autoreleasepool {
-            if (!g_pasteboard_swapped) return;
-            NSPasteboard *pb = NSPasteboard.generalPasteboard;
+            NSInteger written = pb.changeCount;
+            deliver_key(w, key_event(w, NSEventTypeKeyDown, 9, @"v", @"v", NSEventModifierFlagCommand));
+            NSWindow *still = target_window(target);
+            if (still) deliver_key(still, key_event(still, NSEventTypeKeyUp, 9, @"v", @"v", NSEventModifierFlagCommand));
+            if (pb.changeCount != written) {
+                rc = 2;
+                return;
+            }
             [pb clearContents];
-            if (g_saved_pasteboard.count) [pb writeObjects:g_saved_pasteboard];
-            g_saved_pasteboard = nil;
-            g_pasteboard_swapped = NO;
+            if (saved.count) [pb writeObjects:saved];
+            rc = 1;
         }
     });
+    return rc;
 }

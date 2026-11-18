@@ -249,6 +249,12 @@ pub(crate) fn smoke_state() -> Option<bugle_platform::VideoEditorState> {
     CURRENT.with(|c| c.borrow().upgrade()).and_then(|s| s.try_borrow().ok().map(|s| s.editor.state()))
 }
 
+/// Smoke test: write the synthetic recording and its event track (see
+/// `write_smoke_recording`) for the input steps in `smoke_input.rs`.
+pub(crate) fn write_input_smoke_recording(path: &std::path::Path, side: &std::path::Path) -> anyhow::Result<()> {
+    write_smoke_recording(path, side)
+}
+
 /// Whether the open video editor (if any) is exporting.
 pub(crate) fn export_running() -> bool {
     CURRENT.with(|c| c.borrow().upgrade()).is_some_and(|s| s.try_borrow().map_or(true, |s| s.editor.busy()))
@@ -475,7 +481,7 @@ pub(crate) fn smoke(proxy: &Proxy) {
 
 /// The smoke test's recording and its event track: 320x200 pt recorded at
 /// 2 px/pt with the pointer hidden, moving across, clicking twice.
-pub(crate) fn write_smoke_recording(path: &std::path::Path, side: &std::path::Path) -> anyhow::Result<()> {
+fn write_smoke_recording(path: &std::path::Path, side: &std::path::Path) -> anyhow::Result<()> {
     use bugle_core::events::{CursorEvent, EventKind, MouseButton};
     let (w, h, fps) = (640u32, 400u32, 30u32);
     let mut writer = bugle_platform::VideoFrameWriter::create(path, w, h, fps, true)?;

@@ -4,37 +4,52 @@
 //! (`bugle_platform::smoke_input`), so the views' own hit-testing, key
 //! handling and focus are what is tested. Each step checks the state the
 //! window reported back to Rust (playhead, in and out points, cuts, shapes,
-//! the prompt's answer) and prints `ok` or `FAILED` with what it saw.
+//! the prompt's answer) and prints `ok` or `FAILED` with what it saw; a step
+//! that cannot run counts as failed.
 //!
 //! These events reach the window without the window server: the real
-//! pointer never moves, other apps see nothing, and no Accessibility
-//! permission is needed. A person's input also goes through the window
-//! server first (which window is under the pointer, activation, the
-//! keyboard layout); that part is not covered.
+//! pointer never moves, no Accessibility permission is needed, and other
+//! apps see none of them. The one exception is the opt-in paste step
+//! (`BUGLE_SMOKE_CLIPBOARD=1`), which goes through the general pasteboard.
+//! A person's input also goes through the window server first (which window
+//! is under the pointer, activation, the keyboard layout); that part is not
+//! covered.
 
 use crate::editor_window::{self, EditorMsg};
-use crate::video_editor::PRESETS;
+use crate::video_editor::{CLICK_ZOOMS, PRESETS};
 use crate::video_editor_window::{self, VideoEditorMsg};
 use crate::{AppEvent, Proxy};
 use bugle_markup::Shape;
-use bugle_platform::smoke_input::{self as input, Key, Mods, Target, VideoEditorPart};
+use bugle_platform::smoke_input::{self as input, Key, Mods, Paste, PopupPick, Target, VideoEditorPart};
 use image::RgbaImage;
 use std::fmt::Display;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// Run every input step and print a tally.
-pub(crate) fn smoke(proxy: &Proxy) {
+/// Run every input step and print a tally. `true` when every check passed
+/// (a step that could not run, or panicked, is a failed check).
+pub(crate) fn smoke(proxy: &Proxy) -> bool {
     let mut checks = Checks::default();
-    video_editor(proxy, &mut checks);
-    markup_editor(proxy, &mut checks);
-    prompt(&mut checks);
+    type Step = fn(&Proxy, &mut Checks);
+    let steps: [(&str, Step); 3] = [("video editor", video_editor), ("markup editor", markup_editor), ("prompt", prompt)];
+    for (name, step) in steps {
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| step(proxy, &mut checks)));
+        if let Err(panic) = run {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            checks.check(&format!("{name} step"), false, format!("panicked: {msg}"));
+        }
+    }
     eprintln!(
         "smoke test: input: {} of {} checks passed{}",
         checks.passed,
         checks.passed + checks.failed,
         if checks.failed > 0 { " (FAILED)" } else { "" }
     );
+    checks.failed == 0
 }
 
 #[derive(Default)]
@@ -52,24 +67,45 @@ impl Checks {
         }
         eprintln!("smoke test: input: {what}: {} ({saw})", if ok { "ok" } else { "FAILED" });
     }
+
+    /// A step that could not run: a failed check.
+    fn skipped(&mut self, what: &str, why: impl Display) {
+        self.check(what, false, format!("skipped: {why}"));
+    }
+}
+
+/// Ask `f` every 50 ms until it gives something or `within` is over.
+fn poll<T>(within: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
+    let t0 = Instant::now();
+    loop {
+        if let Some(v) = f() {
+            return Some(v);
+        }
+        if t0.elapsed() >= within {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// The video editor on a synthetic recording (3 s, clicks at 1 s and 2 s):
 /// the timeline (click to seek, a click next to a click marker snaps onto
-/// it and a drag does not, the in and out handles), every keyboard
-/// shortcut, the Set In and play buttons, the Smooth pointer check box, the
-/// preset and zoom menus, and ⌘W (⌘E with `BUGLE_SMOKE_SAVE`, which exports).
+/// it and a drag does not, the in and out handles); the keys Space, I, O, C,
+/// Delete, forward delete, the arrows, Home, End and Esc; the Set In, Set
+/// Out, Cut, Restore and play buttons and the Smooth pointer check box; the
+/// preset, zoom and click-zoom menus; and ⌘W, or ⌘E with
+/// `BUGLE_SMOKE_SAVE` (which exports). The Export button is not clicked.
 fn video_editor(proxy: &Proxy, c: &mut Checks) {
     const T: Target = Target::VideoEditor;
     let path = std::env::temp_dir().join("bugle-smoke-input.mp4");
     let side = bugle_core::EventTrack::sidecar_path(&path);
-    if let Err(e) = video_editor_window::write_smoke_recording(&path, &side) {
-        eprintln!("smoke test: input: video editor skipped ({e:#})");
-        return;
+    if let Err(e) = video_editor_window::write_input_smoke_recording(&path, &side) {
+        return c.skipped("video editor", format!("{e:#}"));
     }
+    let active = || input::on_main(bugle_platform::video_editor_active);
     let cleanup = || {
         proxy.send(AppEvent::VideoEditor(VideoEditorMsg::Close));
-        std::thread::sleep(Duration::from_millis(300));
+        poll(Duration::from_secs(2), || (!active()).then_some(()));
         for p in [&path, &side] {
             if let Err(e) = std::fs::remove_file(p) {
                 eprintln!("smoke test: could not remove {} ({e})", p.display());
@@ -77,11 +113,11 @@ fn video_editor(proxy: &Proxy, c: &mut Checks) {
         }
     };
     proxy.send(AppEvent::VideoEditor(VideoEditorMsg::Open(path.display().to_string())));
-    std::thread::sleep(Duration::from_millis(900));
     let state = || input::on_main(video_editor_window::smoke_state);
     let rect = input::video_editor_rect;
-    let (Some(track), Some(s0)) = (rect(VideoEditorPart::Track), state()) else {
-        c.check("video editor open", false, "no video editor window");
+    // Open, with its click markers (the state's first answer has them).
+    let Some((track, s0)) = poll(Duration::from_secs(5), || Some((rect(VideoEditorPart::Track)?, state()?))) else {
+        c.skipped("video editor", "no video editor window after 5s");
         return cleanup();
     };
     let d = s0.out_point;
@@ -163,7 +199,8 @@ fn video_editor(proxy: &Proxy, c: &mut Checks) {
     c.check("Space plays", s.playing, fmt(&s));
     key(Key::Char(' '));
     let s = state().unwrap_or_default();
-    c.check("Space again pauses", !s.playing, fmt(&s));
+    // Paused, not played out (the clip is 0.7s; the out point would mean it ended).
+    c.check("Space again pauses", !s.playing && s.playhead < s.out_point, fmt(&s));
     key(Key::Char(' '));
     let playing = state().is_some_and(|s| s.playing);
     key(Key::Escape);
@@ -184,6 +221,11 @@ fn video_editor(proxy: &Proxy, c: &mut Checks) {
     c.check("Delete restores the cut under the playhead", s.cuts.is_empty(), fmt(&s));
     key(Key::Char('c'));
     let marked = state().is_some_and(|s| s.cut_mark.is_some());
+    key(Key::ForwardDelete);
+    let s = state().unwrap_or_default();
+    c.check("forward delete drops the cut being marked", marked && s.cut_mark.is_none() && s.cuts.is_empty(), fmt(&s));
+    key(Key::Char('c'));
+    let marked = state().is_some_and(|s| s.cut_mark.is_some());
     key(Key::Escape);
     let s = state().unwrap_or_default();
     c.check("Esc drops the cut being marked", marked && s.cut_mark.is_none() && s.cuts.is_empty(), fmt(&s));
@@ -193,10 +235,32 @@ fn video_editor(proxy: &Proxy, c: &mut Checks) {
     let route = rect(VideoEditorPart::SetIn).and_then(|r| input::click(T, r.mid()));
     let s = state().unwrap_or_default();
     c.check(&format!("the Set In button (mouse-up {route:?})"), route.is_some() && near(s.in_point, 1.2), fmt(&s));
+    let button = |part: VideoEditorPart| rect(part).and_then(|r| input::click(T, r.mid()));
+    click_at(2.1);
+    let route = button(VideoEditorPart::SetOut);
+    let s = state().unwrap_or_default();
+    c.check(&format!("the Set Out button (mouse-up {route:?})"), route.is_some() && near(s.out_point, 2.1), fmt(&s));
+    click_at(1.4);
+    button(VideoEditorPart::Cut);
+    let marked = state().and_then(|s| s.cut_mark);
+    click_at(1.6);
+    let route = button(VideoEditorPart::Cut);
+    let s = state().unwrap_or_default();
+    let one_cut = matches!(s.cuts.as_slice(), [(a, b)] if near(*a, 1.4) && near(*b, 1.6));
+    c.check(
+        &format!("the Cut button, twice: one cut 1.4–1.6s (mouse-up {route:?})"),
+        marked.is_some_and(|m| near(m, 1.4)) && one_cut,
+        format!("mark after the first {marked:?}; {}", fmt(&s)),
+    );
+    click_at(1.5);
+    let route = button(VideoEditorPart::Restore);
+    let s = state().unwrap_or_default();
+    c.check(&format!("the Restore button restores it (mouse-up {route:?})"), one_cut && s.cuts.is_empty(), fmt(&s));
     let route = rect(VideoEditorPart::Play).and_then(|r| input::click(T, r.mid()));
     let s = state().unwrap_or_default();
     c.check(&format!("the play button plays (mouse-up {route:?})"), s.playing, fmt(&s));
-    key(Key::Char(' '));
+    // Esc only ever pauses (Space would start it again had it played out).
+    key(Key::Escape);
     let smooth = state().is_some_and(|s| s.smooth);
     let route = rect(VideoEditorPart::Smooth).and_then(|r| input::click(T, r.mid()));
     let s = state().unwrap_or_default();
@@ -204,10 +268,24 @@ fn video_editor(proxy: &Proxy, c: &mut Checks) {
     let p720 = PRESETS.iter().position(|p| *p == bugle_engine::ExportPreset::P720).unwrap_or(0);
     let pick = rect(VideoEditorPart::PresetMenu).and_then(|r| input::pick_popup(T, r.mid(), p720));
     let s = state().unwrap_or_default();
-    c.check(&format!("the preset menu: 720p ({pick:?})"), s.preset == p720, format!("preset {} (want {p720})", s.preset));
+    c.check(&format!("the preset menu opens and 720p is chosen ({pick:?})"), pick == Some(PopupPick::Opened) && s.preset == p720, format!("preset {} (want {p720})", s.preset));
     let pick = rect(VideoEditorPart::ZoomMenu).and_then(|r| input::pick_popup(T, r.mid(), 2));
     let s = state().unwrap_or_default();
-    c.check(&format!("the zoom menu: 2× ({pick:?})"), s.zoom == 2, format!("zoom {} (want 2)", s.zoom));
+    c.check(&format!("the zoom menu opens and 2× is chosen ({pick:?})"), pick == Some(PopupPick::Opened) && s.zoom == 2, format!("zoom {} (want 2)", s.zoom));
+    // The click menu is about the click at the playhead: snap onto the
+    // second marker, then give that click 3×.
+    let second = s0.clicks.get(1).map_or(2.0, |m| m.t);
+    input::mouse_down(T, (x(second) + 2.0, y));
+    input::mouse_up(T, (x(second) + 2.0, y));
+    let three = CLICK_ZOOMS.iter().position(|z| z.1 == Some(3.0)).unwrap_or(0);
+    let pick = rect(VideoEditorPart::ClickMenu).and_then(|r| input::pick_popup(T, r.mid(), three));
+    let s = state().unwrap_or_default();
+    let level = s.clicks.get(1).map(|m| m.level);
+    c.check(
+        &format!("the click menu opens and 3× is chosen for the click at {second:.2}s ({pick:?})"),
+        pick == Some(PopupPick::Opened) && s.click_zoom == Some(three) && level == Some(3.0),
+        format!("playhead {:.3}, click choice {:?} (want Some({three})), level {level:?}", s.playhead, s.click_zoom),
+    );
     // The buttons and menus never take the keyboard: keys still reach the
     // timeline.
     let before = s.playhead;
@@ -216,35 +294,45 @@ fn video_editor(proxy: &Proxy, c: &mut Checks) {
     c.check("after the buttons and menus → still steps a frame", (s.playhead - before - step).abs() < 1e-6, fmt(&s));
 
     // ---- closing ----
-    let active = || input::on_main(bugle_platform::video_editor_active);
+    let t0 = Instant::now();
     if std::env::var_os("BUGLE_SMOKE_SAVE").is_some() {
         let route = input::key(T, Key::Char('e'), Mods::COMMAND);
-        let t0 = Instant::now();
-        while active() && t0.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        c.check(&format!("⌘E exports, and the window closes when written (key route {route:?})"), !active(), format!("after {:.1}s", t0.elapsed().as_secs_f64()));
+        let closed = poll(Duration::from_secs(15), || (!active()).then_some(())).is_some();
+        c.check(&format!("⌘E exports, and the window closes when written (key route {route:?})"), closed, format!("after {:.1}s", t0.elapsed().as_secs_f64()));
     } else {
         let route = input::key(T, Key::Char('w'), Mods::COMMAND);
-        std::thread::sleep(Duration::from_millis(200));
-        c.check(&format!("⌘W closes the window (key route {route:?})"), !active(), format!("open: {}", active()));
+        let closed = poll(Duration::from_secs(2), || (!active()).then_some(())).is_some();
+        c.check(&format!("⌘W closes the window (key route {route:?})"), closed, format!("after {:.1}s", t0.elapsed().as_secs_f64()));
     }
     cleanup();
 }
 
 /// The markup editor on a synthetic image: pick the rectangle tool with its
-/// key, drag one out on the canvas, undo it with ⌘Z and redo it with ⇧⌘Z.
+/// key, drag one out on the canvas, undo it with ⌘Z and redo it with ⇧⌘Z,
+/// then type a two-line label (⇧Return for the new line, Return to finish).
 fn markup_editor(proxy: &Proxy, c: &mut Checks) {
     const T: Target = Target::MarkupEditor;
     let img = RgbaImage::from_fn(600, 400, |x, y| image::Rgba([30 + (x / 5) as u8, 90 + (y / 4) as u8, 150, 255]));
     let path = std::env::temp_dir().join("bugle-smoke-input.png");
     if let Err(e) = img.save(&path) {
-        eprintln!("smoke test: input: markup editor skipped ({e})");
-        return;
+        return c.skipped("markup editor", e);
     }
-    proxy.send(AppEvent::Editor(EditorMsg::Open(path.display().to_string())));
-    std::thread::sleep(Duration::from_millis(900));
     let shapes = || input::on_main(editor_window::smoke_shapes);
+    let cleanup = || {
+        proxy.send(AppEvent::Editor(EditorMsg::Close));
+        poll(Duration::from_secs(2), || shapes().is_none().then_some(()));
+        if let Err(e) = std::fs::remove_file(&path) {
+            eprintln!("smoke test: could not remove {} ({e})", path.display());
+        }
+    };
+    proxy.send(AppEvent::Editor(EditorMsg::Open(path.display().to_string())));
+    let Some(before) = poll(Duration::from_secs(5), || {
+        input::markup_editor_point(0.0, 0.0)?;
+        shapes()
+    }) else {
+        c.skipped("markup editor", "no markup editor window after 5s");
+        return cleanup();
+    };
     let rects = |v: &Option<Vec<Shape>>| match v {
         Some(v) => format!(
             "{} shape(s): {:?}",
@@ -252,20 +340,19 @@ fn markup_editor(proxy: &Proxy, c: &mut Checks) {
             v.iter()
                 .map(|s| match s {
                     Shape::Rectangle { rect, .. } => format!("rectangle {:.0},{:.0} {:.0}×{:.0}", rect.x, rect.y, rect.w, rect.h),
+                    Shape::Text { text, .. } => format!("text {text:?}"),
                     _ => "other".to_string(),
                 })
                 .collect::<Vec<_>>()
         ),
         None => "no editor".into(),
     };
-    let before = shapes();
-    c.check("markup editor opens empty", before.as_ref().is_some_and(|v| v.is_empty()), rects(&before));
+    c.check("markup editor opens empty", before.is_empty(), rects(&Some(before.clone())));
     let route = input::key(T, Key::Char('r'), Mods::NONE);
     let (from, to) = (input::markup_editor_point(100.0, 80.0), input::markup_editor_point(320.0, 260.0));
     if let (Some(from), Some(to)) = (from, to) {
         input::drag(T, from, to, 6);
     }
-    std::thread::sleep(Duration::from_millis(200));
     let drawn = shapes();
     // Within a pixel or two of where it was aimed: the drag is in points.
     let close = |a: f64, b: f64| (a - b).abs() <= 2.5;
@@ -278,15 +365,17 @@ fn markup_editor(proxy: &Proxy, c: &mut Checks) {
     input::key(T, Key::Char('z'), Mods::COMMAND.with(Mods::SHIFT));
     let redone = shapes();
     c.check("⇧⌘Z redoes it", redone.as_ref().is_some_and(|v| v.len() == 1), rects(&redone));
-    // A label: T, a click opens the text field, typing and Return finish it.
+    // A label: T, a click opens the text field, ⇧Return starts a second
+    // line (the window reads the modifiers from NSApp.currentEvent), Return
+    // finishes it.
     input::key(T, Key::Char('t'), Mods::NONE);
     if let Some(at) = input::markup_editor_point(120.0, 330.0) {
         input::click(T, at);
     }
-    std::thread::sleep(Duration::from_millis(200));
-    input::type_text(T, "Hi there");
+    input::type_text(T, "Hi");
+    input::key(T, Key::Return, Mods::SHIFT);
+    input::type_text(T, "there");
     input::key(T, Key::Return, Mods::NONE);
-    std::thread::sleep(Duration::from_millis(200));
     let labelled = shapes();
     let label = labelled.as_ref().and_then(|v| {
         v.iter().find_map(|s| match s {
@@ -295,46 +384,68 @@ fn markup_editor(proxy: &Proxy, c: &mut Checks) {
         })
     });
     c.check(
-        "T, a click, typing and Return add the label \"Hi there\"",
-        label.as_deref() == Some("Hi there") && labelled.as_ref().is_some_and(|v| v.len() == 2),
+        "T, a click, typing, ⇧Return, typing and Return add the two-line label \"Hi\\nthere\"",
+        label.as_deref() == Some("Hi\nthere") && labelled.as_ref().is_some_and(|v| v.len() == 2),
         format!("label {label:?}, {}", rects(&labelled)),
     );
-    proxy.send(AppEvent::Editor(EditorMsg::Close));
-    std::thread::sleep(Duration::from_millis(300));
-    if let Err(e) = std::fs::remove_file(&path) {
-        eprintln!("smoke test: could not remove {} ({e})", path.display());
-    }
+    cleanup();
 }
 
 /// The text prompt (the one *Audio Levels → Custom…* opens), opened here
 /// with an answer that goes nowhere, so nothing is written to the config:
-/// ⌘A over the value, typing, ⌘V and Return give the typed text; typing and
-/// Esc cancel. The paste borrows the clipboard, which is put back after.
-fn prompt(c: &mut Checks) {
+/// typing over the selected value, ⌘A then typing, (with
+/// `BUGLE_SMOKE_CLIPBOARD=1`) ⌘A then ⌘V, and Return give the typed text;
+/// typing and Esc cancel.
+fn prompt(_proxy: &Proxy, c: &mut Checks) {
     const T: Target = Target::Prompt;
+    let field = input::prompt_field_text;
     let open = |initial: &'static str| {
+        // The previous prompt is gone first.
+        poll(Duration::from_secs(2), || (!input::on_main(bugle_platform::prompt_active)).then_some(()))?;
         let (tx, rx) = mpsc::channel::<Option<String>>();
         let opened = input::on_main(move || {
             bugle_platform::prompt_text("Smoke Test Level", "Type a level.", initial, move |answer| {
                 let _ = tx.send(answer);
             })
         });
-        std::thread::sleep(Duration::from_millis(500));
-        opened.then_some(rx)
+        // Up, with its field being edited (the value selected).
+        (opened && poll(Duration::from_secs(2), || field().filter(|t| t == initial)).is_some()).then_some(rx)
     };
     let Some(rx) = open("100") else {
-        return c.check("prompt opens", false, "another prompt is open");
+        return c.skipped("prompt", "it did not open (another prompt is open?)");
     };
     eprintln!("smoke test: input: prompt key window {:?}", bugle_platform::key_window_title());
-    let field = input::prompt_field_text;
+    // The value starts selected, so the first key replaces it; ⌘A must then
+    // select what was typed for the next key to replace it in turn.
+    input::type_text(T, "8");
+    let first = field();
     let route = input::key(T, Key::Char('a'), Mods::COMMAND);
     input::type_text(T, "1");
     let typed = field();
-    c.check(&format!("prompt: ⌘A then typing replaces the value (key route {route:?})"), typed.as_deref() == Some("1"), format!("{typed:?}"));
+    c.check(
+        &format!("prompt: typing replaces the selected value, then ⌘A and typing replace that (key route {route:?})"),
+        first.as_deref() == Some("8") && typed.as_deref() == Some("1"),
+        format!("{first:?} then {typed:?}"),
+    );
     input::key(T, Key::Char('a'), Mods::COMMAND);
-    input::with_pasteboard_text("37", || input::key(T, Key::Char('v'), Mods::COMMAND));
-    let pasted = field();
-    c.check("prompt: ⌘A then ⌘V replaces it with the clipboard", pasted.as_deref() == Some("37"), format!("{pasted:?}"));
+    if std::env::var_os("BUGLE_SMOKE_CLIPBOARD").is_some() {
+        let paste = input::paste(T, "37");
+        let pasted = field();
+        match paste {
+            Some(Paste::Declined) => {
+                eprintln!("smoke test: input: prompt: ⌘V skipped (the clipboard holds more than plain text; left untouched)");
+                input::type_text(T, "37");
+            }
+            _ => c.check(
+                &format!("prompt: ⌘A then ⌘V replaces it with the clipboard ({paste:?})"),
+                pasted.as_deref() == Some("37") && paste == Some(Paste::Restored),
+                format!("{pasted:?}"),
+            ),
+        }
+    } else {
+        eprintln!("smoke test: input: prompt: ⌘V skipped (set BUGLE_SMOKE_CLIPBOARD=1 to paste through the real clipboard)");
+        input::type_text(T, "37");
+    }
     input::type_text(T, "5");
     let before_return = field();
     input::key(T, Key::Return, Mods::NONE);
@@ -347,18 +458,16 @@ fn prompt(c: &mut Checks) {
     if answer.is_err() {
         bugle_platform::prompt_answer(None);
     }
-    std::thread::sleep(Duration::from_millis(300));
     let Some(rx) = open("100") else {
-        return c.check("prompt opens again", false, "another prompt is open");
+        return c.skipped("prompt (second)", "it did not open");
     };
     input::type_text(T, "9");
     input::key(T, Key::Escape, Mods::NONE);
     let answer = rx.recv_timeout(Duration::from_secs(2));
     c.check("prompt: typing then Esc cancels", matches!(answer, Ok(None)), format!("{answer:?}"));
-    std::thread::sleep(Duration::from_millis(300));
-    let left = input::on_main(bugle_platform::prompt_active);
-    c.check("no prompt left open", !left, format!("open: {left}"));
-    if left {
+    let gone = poll(Duration::from_secs(2), || (!input::on_main(bugle_platform::prompt_active)).then_some(())).is_some();
+    c.check("no prompt left open", gone, format!("closed: {gone}"));
+    if !gone {
         bugle_platform::prompt_answer(None);
     }
 }

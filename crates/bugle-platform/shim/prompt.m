@@ -69,12 +69,15 @@ static NSTextField *label(NSString *text, NSFont *font) {
 - (void)ok:(id)sender { [self finish:YES]; }
 - (void)cancel:(id)sender { [self finish:NO]; }
 
-// Return (or Enter) in the field answers OK. The default button alone did
-// not do it for the key-downs the smoke test sends through NSApplication:
-// Return is not offered to key equivalents, the field editor takes it and
-// only ends editing (whether a hardware Return behaves the same was not
-// checked). Taken here, as the markup editor's label field does, Return
-// answers either way.
+// Return (or Enter) in the field answers OK: a hardening, not a confirmed
+// bug fix. With the default button alone, a synthetic Return key-down sent
+// to the panel while the field is editing (through -[NSApp sendEvent:],
+// -postEvent:, or posted, dequeued and sent) never pressed OK: the field
+// editor took it and only ended editing. The same happens on a bare
+// NSPanel with an NSTextField and a default button, so it is AppKit's
+// behaviour for such events; whether a hardware Return behaves the same was
+// not checked. Taking insertNewline: here, as the markup editor's label
+// field does, makes Return answer OK either way.
 - (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)sel {
     if (sel == @selector(insertNewline:)) {
         [self finish:YES];
