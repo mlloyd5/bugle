@@ -1135,7 +1135,9 @@ void bugle_editor_set_menu(int32_t ident, int32_t index, const char *title, cons
             if (flag == '-') {
                 it = [NSMenuItem separatorItem];
             } else if (flag == 'h') {
-                if (@available(macOS 14.0, *)) {
+                // A selector check rather than `@available`, which would not
+                // link (see sck_available in shim.m).
+                if ([NSMenuItem respondsToSelector:@selector(sectionHeaderWithTitle:)]) {
                     it = [NSMenuItem sectionHeaderWithTitle:t];
                 } else {
                     it = [[NSMenuItem alloc] initWithTitle:t action:nil keyEquivalent:@""];
