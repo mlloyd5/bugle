@@ -314,7 +314,7 @@ peach, mint, any `#hex`, or `gradient:#a,#b[,angle]`.
 cargo run -p bugle-app            # or target/release/bugle-app [--serve] [--config FILE]
 ```
 
-`bugle-app` is an accessory process (no Dock icon) that puts a camera glyph in the
+`bugle-app` is an accessory process (no Dock icon) that puts a horn glyph in the
 menu bar and listens for global hotkeys. Everything it does goes through the same
 `Engine` as the CLI, so captures land in the configured `save_dir`, appear in
 history, and play the shutter sound when `general.shutter_sound` is on.
