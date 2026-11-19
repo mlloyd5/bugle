@@ -52,18 +52,19 @@ pub unsafe fn status_menu_probe(
 }
 
 extern "C" {
-    fn bugle_menu_title_mono_tail(head: *const c_char, tail: *const c_char, disabled: i32) -> *mut c_void;
+    fn bugle_menu_title_mono_tail(head: *const c_char, tail: *const c_char) -> *mut c_void;
     fn bugle_attributed_width(s: *mut c_void) -> f64;
 }
 
-/// A menu-item title of `head` in the menu font followed by `tail` in the
-/// monospaced system font of the same size, for `muda`'s
+/// A menu-item title of `head` in the menu font followed by `tail` in Menlo
+/// at the same size (the monospaced system font lacks the meter's `▮`/`▯`;
+/// it is used only without Menlo), for `muda`'s
 /// `MenuItem::set_attributed_title`: a tail of a constant character count
-/// draws at a constant width. Greyed when `disabled`, as AppKit does not
-/// grey an attributed title. `None` if either part holds a NUL.
-pub fn menu_title_mono_tail(head: &str, tail: &str, disabled: bool) -> Option<Retained<NSAttributedString>> {
+/// draws at a constant width. No colour is set, so AppKit colours it for
+/// the item's state. `None` if either part holds a NUL.
+pub fn menu_title_mono_tail(head: &str, tail: &str) -> Option<Retained<NSAttributedString>> {
     let (head, tail) = (CString::new(head).ok()?, CString::new(tail).ok()?);
-    let raw = unsafe { bugle_menu_title_mono_tail(head.as_ptr(), tail.as_ptr(), disabled as i32) };
+    let raw = unsafe { bugle_menu_title_mono_tail(head.as_ptr(), tail.as_ptr()) };
     // SAFETY: the shim returns a +1 NSAttributedString, or null.
     unsafe { Retained::from_raw(raw as *mut NSAttributedString) }
 }
@@ -88,7 +89,7 @@ mod tests {
                 .iter()
                 .map(|&db| {
                     let (head, gauge) = meter_label_parts(name, &TrackLevel { peak_db: db, rms_db: db });
-                    attributed_width(&menu_title_mono_tail(&head, &gauge, true).unwrap())
+                    attributed_width(&menu_title_mono_tail(&head, &gauge).unwrap())
                 })
                 .collect();
             let (lo, hi) = widths.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &w| (lo.min(w), hi.max(w)));
@@ -96,8 +97,8 @@ mod tests {
             assert!(hi - lo < 0.01, "{name}: drawn widths {lo:.2}..{hi:.2} pt");
         }
         // In the menu font the same parts would not hold still.
-        let plain = |t: &str| attributed_width(&menu_title_mono_tail(t, "", false).unwrap());
-        assert!((plain("▯▯▯▯▯▯▯▯▯▯▯▯  silent") - plain("▮▮▮▮▮▮▮▮▮▮▯▯  -11 dB")).abs() > 0.5);
-        assert!(menu_title_mono_tail("a\0b", "", false).is_none());
+        let plain = |t: &str| attributed_width(&menu_title_mono_tail(t, "").unwrap());
+        assert!((plain("▯▯▯▯▯▯▯▯▯▯▯▯  silent") - plain("▮▮▮▮▮▮▮▮▮▮▯▯  -11 dB")).abs() > 0.0);
+        assert!(menu_title_mono_tail("a\0b", "").is_none());
     }
 }

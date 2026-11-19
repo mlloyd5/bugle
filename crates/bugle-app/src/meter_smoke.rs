@@ -457,7 +457,7 @@ fn glyph_matches(g: char, line: &str) -> bool {
     let db = if line.trim_end().ends_with("silent") {
         METER_RANGE_DB
     } else {
-        match line.trim_end().strip_suffix(" dB").and_then(|s| s.rsplit(|c: char| c.is_whitespace() || c == '\u{2007}').next()) {
+        match line.trim_end().strip_suffix(" dB").and_then(|s| s.rsplit(' ').next()) {
             Some(n) => match n.parse::<f64>() {
                 Ok(d) => d,
                 Err(_) => return false,
