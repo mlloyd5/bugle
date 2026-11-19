@@ -29,7 +29,12 @@ Pure data: `Rect`/`Point`, `CaptureTarget`, `CaptureOptions`, `OcrResult`,
 `destinations`), filename
 templates (`naming`) and the JSON-lines `History`. A history line whose id is
 already present replaces the earlier record, which is how a moved file or a new
-sync URL is stored without rewriting the file. `audio_mix` holds the sample
+sync URL is stored without rewriting the file. Opening the history and
+`History::recent` (every listing: CLI, menu, quick-access panel, editor, the
+`history` action) tombstone entries whose file was deleted outside Bugle, only
+when the parent directory still exists (an unmounted volume keeps its entries),
+never for an entry with a synced `url` or one recorded in the last minute, and
+never touching a file. `audio_mix` holds the sample
 math for the mixed recording track (per-source gain, ducking, peak limiter),
 so it is tested on synthetic buffers without AVFoundation. `events` defines a recording's
 pointer/click event track, the `<file>.events.json` sidecar named after the

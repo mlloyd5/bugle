@@ -104,7 +104,7 @@ curl -s -H "$H" -H 'content-type: application/json' \
 | `subtitles` | `source`, `format` (srt/vtt), `provider`, `language`, `output` | `path`, `segments`, `text` |
 | `edit_video` | `source`, `start`, `end` (seconds, negative = from the end), `cuts` (`[{start, end}]` ranges to remove; the rest is joined), `preset` (original/lossless/high/hevc/1080p/720p/540p/gif/gif-small), `fps` (re-encodes video; resamples GIF), `max_size` (GIF long edge), `zoom` (factor above 1, at most 4: zoom in on clicks), `click_zooms` (`[{"t": 4.2, "zoom": 3}]`: one click's level, by its time; overrides `zoom`, 1 leaves the click out), `smooth_cursor` (draw a smoothed pointer; `hide_cursor` recordings), `output`, `label` | `media` (parent = source when it is a history item) |
 | `complete` | `prompt`, `provider`, `system` | `text` |
-| `history` | `limit` | media list |
+| `history` | `limit` | media list, newest first (entries whose file was deleted are dropped from history) |
 | `get_media` | `source`, `inline_image`, `max_edge` | media (+ image) |
 | `delete_media` | `id`, `delete_file` | `deleted` |
 | `pin` | `source`, `frame`, `opacity` | `pinned` |
