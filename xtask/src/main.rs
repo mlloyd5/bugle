@@ -53,8 +53,7 @@ enum Cmd {
         /// The bundle to check (default dist/Bugle.app).
         app: Option<PathBuf>,
         /// Also launch the bundled app with `--smoke-test` and a throwaway
-        /// config (about 35 s for a debug build; limit 180 s or
-        /// BUGLE_SMOKE_TIMEOUT seconds).
+        /// config (killed after 180 s, or BUGLE_SMOKE_TIMEOUT seconds).
         #[arg(long)]
         smoke_test: bool,
     },
@@ -123,9 +122,10 @@ fn main() -> Result<()> {
         Cmd::Verify { app, smoke_test } => {
             let ws = Workspace::load()?;
             let app = app.unwrap_or_else(|| default_dist().join(format!("{APP_NAME}.app")));
+            let smoke_limit = smoke_test.then(smoke_timeout_from_env).transpose()?;
             verify(&app, &ws, None)?;
-            if smoke_test {
-                smoke(&app)?;
+            if let Some(limit) = smoke_limit {
+                smoke(&app, limit)?;
             }
             Ok(())
         }
@@ -254,6 +254,8 @@ fn bundle(args: &BundleArgs) -> Result<()> {
     let ws = Workspace::load()?;
     let bundle_id = args.bundle_id.clone().unwrap_or_else(|| ws.bundle_id.clone());
     validate_bundle_id(&bundle_id)?;
+    // Before anything is built, so a bad BUGLE_SMOKE_TIMEOUT fails early.
+    let smoke_limit = args.smoke_test.then(smoke_timeout_from_env).transpose()?;
     let adhoc = args.sign == "-";
     // An explicit --notarize that cannot run is an error, not a silent skip.
     let notary = if args.notarize {
@@ -360,7 +362,7 @@ fn bundle(args: &BundleArgs) -> Result<()> {
                 let _ = std::fs::remove_file(&zip);
             }
             Step::Zip => make_zip(&final_app, &zip)?,
-            Step::Smoke => smoke(&final_app)?,
+            Step::Smoke => smoke(&final_app, smoke_limit.expect("planned only with --smoke-test"))?,
         }
     }
     std::fs::remove_dir_all(&staging)?;
@@ -842,19 +844,34 @@ fn rosetta_available() -> bool {
 }
 
 /// How long [`smoke`] waits for the app before killing it, unless
-/// `BUGLE_SMOKE_TIMEOUT` (whole seconds) says otherwise. A debug build takes
-/// about 35 s, most of it the editors and the 2 s recording.
+/// `BUGLE_SMOKE_TIMEOUT` (whole seconds) says otherwise. A run from a
+/// release bundle took about 32 s, most of it the editors and the 2 s
+/// recording.
 const SMOKE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(180);
 
-/// The smoke-test time limit from the value of `BUGLE_SMOKE_TIMEOUT`.
-fn smoke_timeout(var: Option<&str>) -> Result<Duration> {
-    let Some(v) = var.map(str::trim).filter(|v| !v.is_empty()) else {
-        return Ok(SMOKE_TIMEOUT_DEFAULT);
+/// The smoke-test time limit from `BUGLE_SMOKE_TIMEOUT` as
+/// `std::env::var` reads it: unset or empty is the default, anything else
+/// must be a whole number of seconds above 0.
+fn smoke_timeout(var: Result<String, std::env::VarError>) -> Result<Duration> {
+    let v = match var {
+        Ok(v) => v,
+        Err(std::env::VarError::NotPresent) => return Ok(SMOKE_TIMEOUT_DEFAULT),
+        Err(std::env::VarError::NotUnicode(v)) => bail!("BUGLE_SMOKE_TIMEOUT={v:?}: not valid Unicode"),
     };
+    let v = v.trim();
+    if v.is_empty() {
+        return Ok(SMOKE_TIMEOUT_DEFAULT);
+    }
     match v.parse::<u64>() {
         Ok(s) if s > 0 => Ok(Duration::from_secs(s)),
         _ => bail!("BUGLE_SMOKE_TIMEOUT={v:?}: expected a whole number of seconds greater than 0"),
     }
+}
+
+/// [`smoke_timeout`] for this process, read before any build step so a bad
+/// value fails early.
+fn smoke_timeout_from_env() -> Result<Duration> {
+    smoke_timeout(std::env::var("BUGLE_SMOKE_TIMEOUT"))
 }
 
 /// A TOML basic string holding `s`.
@@ -881,21 +898,26 @@ const SMOKE_HOTKEYS: [&str; 8] =
     ["capture_area", "capture_screen", "capture_window", "scroll_capture", "record", "record_gif", "ocr_latest", "pin_latest"];
 
 /// The throwaway config the smoke test runs with: saves and history go to
-/// `dir`, sync (folder or S3) is off, and no global hotkey is registered, so
-/// the run neither reads nor touches the user's own config, captures,
-/// history, sync destination or clipboard, and leaves a running Bugle its
-/// hotkeys. Everything else is the default.
-fn smoke_config(dir: &Path) -> String {
-    let path = |name: &str| toml_string(&dir.join(name).display().to_string());
+/// `dir`, sync (folder or S3) is off, clipboard copy is off, and no global
+/// hotkey is registered, so the run neither reads nor touches the user's
+/// own config, captures, history or sync destination, and leaves a running
+/// Bugle its hotkeys. Everything else is the default. Fails on a path that
+/// is not UTF-8 (TOML strings must be).
+fn smoke_config(dir: &Path) -> Result<String> {
+    let path = |name: &str| -> Result<String> {
+        let p = dir.join(name);
+        let s = p.to_str().ok_or_else(|| anyhow!("smoke-test path is not UTF-8: {}", p.display()))?;
+        Ok(toml_string(s))
+    };
     let mut s = String::from("# Written by `cargo xtask` for one `bugle-app --smoke-test` run.\n\n[general]\n");
-    s += &format!("save_dir = {}\n", path("captures"));
-    s += &format!("history_path = {}\n", path("history.jsonl"));
+    s += &format!("save_dir = {}\n", path("captures")?);
+    s += &format!("history_path = {}\n", path("history.jsonl")?);
     s += "copy_to_clipboard = false\nshutter_sound = false\nsystem_notifications = false\n\n";
     s += "[sync]\nenabled = false\n\n[hotkeys]\n";
     for h in SMOKE_HOTKEYS {
         s += &format!("{h} = \"\"\n");
     }
-    s
+    Ok(s)
 }
 
 /// A fresh directory for one smoke run, removed on drop unless
@@ -906,10 +928,14 @@ impl SmokeDir {
     fn create() -> Result<Self> {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
         let dir = std::env::temp_dir().join(format!("bugle-xtask-smoke-{}-{nanos}", std::process::id()));
+        // Exclusive: fails if the directory already exists.
+        std::fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let me = Self(dir);
         for sub in ["captures", "tmp"] {
-            std::fs::create_dir_all(dir.join(sub)).with_context(|| format!("creating {}", dir.display()))?;
+            let d = me.0.join(sub);
+            std::fs::create_dir(&d).with_context(|| format!("creating {}", d.display()))?;
         }
-        Ok(Self(dir))
+        Ok(me)
     }
 }
 
@@ -925,15 +951,19 @@ impl Drop for SmokeDir {
 
 /// Launches the bundled app with `--smoke-test` (overlay, toast, pin, the
 /// panels and editors, a 2 s recording; then it quits by itself) and fails
-/// if it errors or does not finish in time. The app gets a throwaway config
-/// ([`smoke_config`]) and its own `TMPDIR`, both in a temp directory removed
-/// afterwards, so the run never touches the user's config or data.
-fn smoke(app: &Path) -> Result<()> {
-    let limit = smoke_timeout(std::env::var("BUGLE_SMOKE_TIMEOUT").ok().as_deref())?;
+/// if it errors or does not finish within `limit`. The app gets a throwaway
+/// config ([`smoke_config`]) and its own `TMPDIR`, both in a temp directory
+/// removed afterwards, so the run never touches the user's config or data.
+/// The app's own opt-ins pass through from the environment on purpose:
+/// `BUGLE_SMOKE_CLIPBOARD=1` pastes through the real clipboard,
+/// `BUGLE_SMOKE_MICROPHONE=1` records the microphone, `BUGLE_SMOKE_SAVE`
+/// saves and exports (into the throwaway `save_dir`), `BUGLE_SMOKE_KEEP`
+/// keeps the files.
+fn smoke(app: &Path, limit: Duration) -> Result<()> {
     let exe = app.join("Contents").join("MacOS").join(APP_EXECUTABLE);
     let dir = SmokeDir::create()?;
     let config = dir.0.join("config.toml");
-    std::fs::write(&config, smoke_config(&dir.0)).with_context(|| format!("writing {}", config.display()))?;
+    std::fs::write(&config, smoke_config(&dir.0)?).with_context(|| format!("writing {}", config.display()))?;
     println!("$ {} --smoke-test --config {}  (limit {}s)", exe.display(), config.display(), limit.as_secs());
     let mut child = Command::new(&exe)
         .arg("--smoke-test")
@@ -945,7 +975,15 @@ fn smoke(app: &Path) -> Result<()> {
         .context("launching the bundled app")?;
     let t0 = Instant::now();
     loop {
-        if let Some(status) = child.try_wait()? {
+        let status = match child.try_wait() {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e).context("waiting for the smoke test");
+            }
+        };
+        if let Some(status) = status {
             if !status.success() {
                 bail!("smoke test exited with {status}");
             }
@@ -1202,13 +1240,20 @@ mod tests {
 
     #[test]
     fn smoke_timeouts() {
-        assert_eq!(smoke_timeout(None).unwrap(), SMOKE_TIMEOUT_DEFAULT);
-        assert_eq!(smoke_timeout(Some("")).unwrap(), SMOKE_TIMEOUT_DEFAULT);
-        assert_eq!(smoke_timeout(Some(" 300 ")).unwrap(), Duration::from_secs(300));
+        use std::env::VarError;
+        use std::os::unix::ffi::OsStringExt;
+        let ok = |s: &str| smoke_timeout(Ok(s.to_string()));
+        assert_eq!(smoke_timeout(Err(VarError::NotPresent)).unwrap(), SMOKE_TIMEOUT_DEFAULT);
+        assert_eq!(ok("").unwrap(), SMOKE_TIMEOUT_DEFAULT);
+        assert_eq!(ok(" 300 ").unwrap(), Duration::from_secs(300));
         for bad in ["0", "-5", "1.5", "2m", "abc"] {
-            let e = smoke_timeout(Some(bad)).unwrap_err().to_string();
+            let e = ok(bad).unwrap_err().to_string();
             assert!(e.contains("BUGLE_SMOKE_TIMEOUT"), "{bad}: {e}");
         }
+        let e = smoke_timeout(Err(VarError::NotUnicode(std::ffi::OsString::from_vec(vec![b'6', 0xff]))))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not valid Unicode"), "{e}");
     }
 
     #[test]
@@ -1224,7 +1269,7 @@ mod tests {
         use bugle_core::config::Config;
         use bugle_core::MediaKind;
         let dir = Path::new("/private/tmp/bugle smoke \"dir\"");
-        let cfg: Config = toml::from_str(&smoke_config(dir)).unwrap();
+        let cfg: Config = toml::from_str(&smoke_config(dir).unwrap()).unwrap();
         assert_eq!(cfg.save_dir(), dir.join("captures"));
         assert_eq!(cfg.history_path(), dir.join("history.jsonl"));
         assert!(!cfg.sync.enabled);
@@ -1237,5 +1282,9 @@ mod tests {
         // Every hotkey with a default is cleared.
         let defaults: Vec<_> = Config::default().hotkeys.bindings().into_iter().map(|(n, _)| n).collect();
         assert!(defaults.iter().all(|n| SMOKE_HOTKEYS.contains(n)), "{defaults:?}");
+        // A path TOML cannot hold is an error, not a lossy rewrite.
+        use std::os::unix::ffi::OsStrExt;
+        let bad = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/bugle-\xff"));
+        assert!(smoke_config(bad).unwrap_err().to_string().contains("not UTF-8"));
     }
 }
