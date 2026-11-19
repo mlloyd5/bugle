@@ -29,7 +29,18 @@ Pure data: `Rect`/`Point`, `CaptureTarget`, `CaptureOptions`, `OcrResult`,
 `destinations`), filename
 templates (`naming`) and the JSON-lines `History`. A history line whose id is
 already present replaces the earlier record, which is how a moved file or a new
-sync URL is stored without rewriting the file. `audio_mix` holds the sample
+sync URL is stored without rewriting the file. `History::recent`
+(the CLI's `bugle history`, the menu, the quick-access panel, the editor's
+recent list and the `history` action) hides entries whose file was deleted
+outside Bugle, without writing anything, so a file put back from the Trash
+reappears with its metadata; `History::all`/`get`/`latest` (the video editor,
+`latest` resolution) still return them, and a missing file is then reported as
+such. Hidden means an absolute path whose parent directory exists (an unmounted
+volume keeps its entries), no synced `url`, and older than a minute. Only
+`bugle history prune` (the `history_prune` action) tombstones them, also keeping
+entries under an empty directory (an offline mount point) and videos whose
+subtitle entry stays; it never touches a file, and it re-checks its candidates
+under the writer lock. `audio_mix` holds the sample
 math for the mixed recording track (per-source gain, ducking, peak limiter),
 so it is tested on synthetic buffers without AVFoundation. `events` defines a recording's
 pointer/click event track, the `<file>.events.json` sidecar named after the

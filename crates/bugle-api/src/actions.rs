@@ -236,8 +236,13 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "history",
-            description: "List recent captures (newest first).",
+            description: "List recent captures (newest first). Entries whose file was deleted are hidden.",
             input_schema: json!({"type":"object","properties":{"limit":{"type":"integer","default":20}}}),
+        },
+        ToolSpec {
+            name: "history_prune",
+            description: "Remove history entries whose file was deleted (files are never touched). Entries on an unmounted volume or empty mount point, with a synced URL, or recorded in the last minute are kept. dry_run lists them without changing anything.",
+            input_schema: json!({"type":"object","properties":{"dry_run":{"type":"boolean","default":false}}}),
         },
         ToolSpec {
             name: "get_media",
@@ -396,6 +401,11 @@ pub async fn run(engine: &Arc<Engine>, name: &str, args: Value) -> Result<Action
         "history" => {
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
             Ok(ActionOutput::json(json!(tokio::task::spawn_blocking(move || e.history.recent(limit)).await??)))
+        }
+        "history_prune" => {
+            let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+            let pruned = tokio::task::spawn_blocking(move || e.history.prune_missing(dry_run)).await??;
+            Ok(ActionOutput::json(json!({"pruned": pruned, "dry_run": dry_run})))
         }
         "get_media" => {
             let source = source_of(&args);
