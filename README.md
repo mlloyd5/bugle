@@ -85,6 +85,13 @@ the app is not sandboxed), then checked with `plutil -lint` (Info.plist and the
 entitlements embedded in each signature), `codesign --verify --deep --strict`,
 `iconutil` and `--version`. Only a bundle that passes replaces `dist/Bugle.app`.
 
+`--smoke-test` (on `verify` and `bundle`) then runs `bugle-app --smoke-test`
+from the bundle with a throwaway config in a temp directory: saves, history and
+`TMPDIR` go there, sync is off and no global hotkey is registered, so your own
+config, captures and sync destination are never read or touched; the directory
+is removed afterwards (kept with `BUGLE_SMOKE_KEEP=1`). The run takes about
+35 s and is killed after 180 s (`BUGLE_SMOKE_TIMEOUT=<seconds>` changes that).
+
 By default the binaries are built for the host architecture only (arm64 on
 Apple silicon, x86_64 on Intel), and the bundle does not launch on the other
 kind of Mac. `--universal` builds both (`--target aarch64-apple-darwin` and

@@ -4495,9 +4495,11 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bugle-core",
  "clap",
  "image",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

@@ -52,7 +52,9 @@ enum Cmd {
     Verify {
         /// The bundle to check (default dist/Bugle.app).
         app: Option<PathBuf>,
-        /// Also launch the bundled app with `--smoke-test` (shows UI for a few seconds).
+        /// Also launch the bundled app with `--smoke-test` and a throwaway
+        /// config (about 35 s for a debug build; limit 180 s or
+        /// BUGLE_SMOKE_TIMEOUT seconds).
         #[arg(long)]
         smoke_test: bool,
     },
@@ -839,12 +841,108 @@ fn rosetta_available() -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Launches the bundled app with `--smoke-test` (overlay, toast and pin for a
-/// few seconds, then it quits by itself) and fails if it errors or hangs.
+/// How long [`smoke`] waits for the app before killing it, unless
+/// `BUGLE_SMOKE_TIMEOUT` (whole seconds) says otherwise. A debug build takes
+/// about 35 s, most of it the editors and the 2 s recording.
+const SMOKE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(180);
+
+/// The smoke-test time limit from the value of `BUGLE_SMOKE_TIMEOUT`.
+fn smoke_timeout(var: Option<&str>) -> Result<Duration> {
+    let Some(v) = var.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(SMOKE_TIMEOUT_DEFAULT);
+    };
+    match v.parse::<u64>() {
+        Ok(s) if s > 0 => Ok(Duration::from_secs(s)),
+        _ => bail!("BUGLE_SMOKE_TIMEOUT={v:?}: expected a whole number of seconds greater than 0"),
+    }
+}
+
+/// A TOML basic string holding `s`.
+fn toml_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The named `[hotkeys]` keys; [`smoke_config`] clears every one.
+const SMOKE_HOTKEYS: [&str; 8] =
+    ["capture_area", "capture_screen", "capture_window", "scroll_capture", "record", "record_gif", "ocr_latest", "pin_latest"];
+
+/// The throwaway config the smoke test runs with: saves and history go to
+/// `dir`, sync (folder or S3) is off, and no global hotkey is registered, so
+/// the run neither reads nor touches the user's own config, captures,
+/// history, sync destination or clipboard, and leaves a running Bugle its
+/// hotkeys. Everything else is the default.
+fn smoke_config(dir: &Path) -> String {
+    let path = |name: &str| toml_string(&dir.join(name).display().to_string());
+    let mut s = String::from("# Written by `cargo xtask` for one `bugle-app --smoke-test` run.\n\n[general]\n");
+    s += &format!("save_dir = {}\n", path("captures"));
+    s += &format!("history_path = {}\n", path("history.jsonl"));
+    s += "copy_to_clipboard = false\nshutter_sound = false\nsystem_notifications = false\n\n";
+    s += "[sync]\nenabled = false\n\n[hotkeys]\n";
+    for h in SMOKE_HOTKEYS {
+        s += &format!("{h} = \"\"\n");
+    }
+    s
+}
+
+/// A fresh directory for one smoke run, removed on drop unless
+/// `BUGLE_SMOKE_KEEP` is set (the app then keeps its recording too).
+struct SmokeDir(PathBuf);
+
+impl SmokeDir {
+    fn create() -> Result<Self> {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+        let dir = std::env::temp_dir().join(format!("bugle-xtask-smoke-{}-{nanos}", std::process::id()));
+        for sub in ["captures", "tmp"] {
+            std::fs::create_dir_all(dir.join(sub)).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for SmokeDir {
+    fn drop(&mut self) {
+        if std::env::var_os("BUGLE_SMOKE_KEEP").is_some() {
+            println!("smoke test files kept in {}", self.0.display());
+        } else {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+/// Launches the bundled app with `--smoke-test` (overlay, toast, pin, the
+/// panels and editors, a 2 s recording; then it quits by itself) and fails
+/// if it errors or does not finish in time. The app gets a throwaway config
+/// ([`smoke_config`]) and its own `TMPDIR`, both in a temp directory removed
+/// afterwards, so the run never touches the user's config or data.
 fn smoke(app: &Path) -> Result<()> {
+    let limit = smoke_timeout(std::env::var("BUGLE_SMOKE_TIMEOUT").ok().as_deref())?;
     let exe = app.join("Contents").join("MacOS").join(APP_EXECUTABLE);
-    println!("$ {} --smoke-test", exe.display());
-    let mut child = Command::new(&exe).arg("--smoke-test").spawn().context("launching the bundled app")?;
+    let dir = SmokeDir::create()?;
+    let config = dir.0.join("config.toml");
+    std::fs::write(&config, smoke_config(&dir.0)).with_context(|| format!("writing {}", config.display()))?;
+    println!("$ {} --smoke-test --config {}  (limit {}s)", exe.display(), config.display(), limit.as_secs());
+    let mut child = Command::new(&exe)
+        .arg("--smoke-test")
+        .arg("--config")
+        .arg(&config)
+        .env_remove("BUGLE_CONFIG")
+        .env("TMPDIR", dir.0.join("tmp"))
+        .spawn()
+        .context("launching the bundled app")?;
     let t0 = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -854,10 +952,10 @@ fn smoke(app: &Path) -> Result<()> {
             println!("smoke test passed in {:.1}s", t0.elapsed().as_secs_f32());
             return Ok(());
         }
-        if t0.elapsed() > Duration::from_secs(60) {
+        if t0.elapsed() > limit {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("smoke test did not finish within 60s");
+            bail!("smoke test did not finish within {}s (BUGLE_SMOKE_TIMEOUT sets the limit)", limit.as_secs());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -1100,5 +1198,44 @@ mod tests {
         ));
         assert!(notary_credentials_from(env(&[])).is_err());
         assert!(notary_credentials_from(env(&[("BUGLE_NOTARY_KEY_ID", "id")])).is_err());
+    }
+
+    #[test]
+    fn smoke_timeouts() {
+        assert_eq!(smoke_timeout(None).unwrap(), SMOKE_TIMEOUT_DEFAULT);
+        assert_eq!(smoke_timeout(Some("")).unwrap(), SMOKE_TIMEOUT_DEFAULT);
+        assert_eq!(smoke_timeout(Some(" 300 ")).unwrap(), Duration::from_secs(300));
+        for bad in ["0", "-5", "1.5", "2m", "abc"] {
+            let e = smoke_timeout(Some(bad)).unwrap_err().to_string();
+            assert!(e.contains("BUGLE_SMOKE_TIMEOUT"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn toml_strings() {
+        let parse = |s: &str| toml::from_str::<toml::Table>(&format!("v = {}", toml_string(s))).unwrap()["v"].clone();
+        for s in ["/tmp/a b", "C:\\x\\y", "quote \" here", "tab\tnew\nline", "\u{1}ctl", "ünï/çødé"] {
+            assert_eq!(parse(s).as_str(), Some(s), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn smoke_config_stays_in_its_directory() {
+        use bugle_core::config::Config;
+        use bugle_core::MediaKind;
+        let dir = Path::new("/private/tmp/bugle smoke \"dir\"");
+        let cfg: Config = toml::from_str(&smoke_config(dir)).unwrap();
+        assert_eq!(cfg.save_dir(), dir.join("captures"));
+        assert_eq!(cfg.history_path(), dir.join("history.jsonl"));
+        assert!(!cfg.sync.enabled);
+        for kind in [MediaKind::Screenshot, MediaKind::Video, MediaKind::Gif] {
+            assert!(!cfg.sync.applies_to(kind), "{kind:?} would sync");
+        }
+        assert!(!cfg.general.copy_to_clipboard && !cfg.general.shutter_sound && !cfg.general.system_notifications);
+        assert!(cfg.hotkeys.bindings().is_empty(), "{:?}", cfg.hotkeys.bindings());
+        assert!(cfg.hotkeys.extra.is_empty(), "every key is a named one: {:?}", cfg.hotkeys.extra);
+        // Every hotkey with a default is cleared.
+        let defaults: Vec<_> = Config::default().hotkeys.bindings().into_iter().map(|(n, _)| n).collect();
+        assert!(defaults.iter().all(|n| SMOKE_HOTKEYS.contains(n)), "{defaults:?}");
     }
 }
