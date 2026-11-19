@@ -87,17 +87,34 @@ pub fn meter_bar(db: f64, width: usize) -> String {
     (0..width).map(|i| if i < lit { '▮' } else { '▯' }).collect()
 }
 
-/// A menu line for one source: name, bar, a clip mark (`!` in a slot kept
-/// when not clipping) and the peak in dB (or "silent" at the bottom of the
-/// meter), right-aligned in a fixed number of characters. The padding is
-/// figure spaces (digit width), which keeps the character count; the menu
-/// font's digits are proportional and "silent" is narrower than a value, so
-/// the drawn line still varies by a few points (`--smoke-test` measures the
-/// open menu's width).
+/// Characters in every [`meter_gauge`]: 12 bar cells, the clip mark, a
+/// space and the 6-character value.
+pub const METER_GAUGE_CHARS: usize = 20;
+
+/// The level part of a source's menu line: bar, a clip mark (`!`, or a
+/// space when not clipping) and the peak in dB (or "silent" at the bottom
+/// of the meter, also for -inf or NaN), right-aligned with plain spaces to
+/// [`METER_GAUGE_CHARS`] characters whatever the level. The app draws it in
+/// a monospaced font, where a constant character count is a constant width,
+/// so the open menu does not resize as the level moves (the menu font's
+/// digits, minus sign and "silent" all differ in width).
+pub fn meter_gauge(level: &TrackLevel) -> String {
+    let value = if level.peak_db > METER_RANGE_DB { format!("{:.0} dB", level.peak_db.min(20.0).round() + 0.0) } else { "silent".to_string() };
+    let clip = if level.clipping() { '!' } else { ' ' };
+    format!("{}{clip} {value:>6}", meter_bar(level.peak_db, 12))
+}
+
+/// A source's menu line in two parts: the name (drawn in the menu font,
+/// with the two spaces after it) and its [`meter_gauge`] (drawn
+/// monospaced). The name is constant per line, so the line's width is too.
+pub fn meter_label_parts(name: &str, level: &TrackLevel) -> (String, String) {
+    (format!("{name}  "), meter_gauge(level))
+}
+
+/// A source's whole menu line as plain text: [`meter_label_parts`] joined.
 pub fn meter_label(name: &str, level: &TrackLevel) -> String {
-    let value = if level.peak_db <= METER_RANGE_DB { "silent".to_string() } else { format!("{:.0} dB", level.peak_db.round() + 0.0) };
-    let clip = if level.clipping() { '!' } else { '\u{2007}' };
-    format!("{name}  {}{clip} {value:\u{2007}>6}", meter_bar(level.peak_db, 12))
+    let (head, gauge) = meter_label_parts(name, level);
+    head + &gauge
 }
 
 /// The status-item suffix: one glyph per captured source (microphone first,
@@ -157,15 +174,50 @@ mod tests {
         assert_eq!(meter_bar(-30.0, 4), "▮▮▯▯");
         assert_eq!(meter_bar(FLOOR_DB, 4), "▯▯▯▯");
         let quiet = TrackLevel { peak_db: FLOOR_DB, rms_db: FLOOR_DB };
-        assert_eq!(meter_label("Microphone", &quiet), "Microphone  ▯▯▯▯▯▯▯▯▯▯▯▯\u{2007} silent");
+        assert_eq!(meter_label("Microphone", &quiet), "Microphone  ▯▯▯▯▯▯▯▯▯▯▯▯  silent");
         let loud = TrackLevel { peak_db: -0.2, rms_db: -6.0 };
         assert!(loud.clipping());
-        assert_eq!(meter_label("System Audio", &loud), "System Audio  ▮▮▮▮▮▮▮▮▮▮▮▮! \u{2007}\u{2007}0 dB");
+        assert_eq!(meter_label("System Audio", &loud), "System Audio  ▮▮▮▮▮▮▮▮▮▮▮▮!   0 dB");
         let mid = TrackLevel::from_linear(0.1, 0.05);
-        assert_eq!(meter_label("Microphone", &mid), "Microphone  ▮▮▮▮▮▮▮▮▯▯▯▯\u{2007} -20 dB");
-        // Every value takes the same number of characters.
-        let width = |db: f64| meter_label("M", &TrackLevel { peak_db: db, rms_db: db }).chars().count();
-        assert!([-100.0, -45.0, -6.0, -0.2, 0.0].iter().all(|&db| width(db) == width(-18.0)));
+        assert_eq!(meter_label("Microphone", &mid), "Microphone  ▮▮▮▮▮▮▮▮▯▯▯▯  -20 dB");
+        assert_eq!(meter_label_parts("Microphone", &mid), ("Microphone  ".to_string(), "▮▮▮▮▮▮▮▮▯▯▯▯  -20 dB".to_string()));
+    }
+
+    /// Levels across the whole range: silence, the floor, -inf and NaN
+    /// (never reported, but harmless), the rounding boundaries, clipping and
+    /// overshoot above full scale.
+    fn every_level() -> Vec<TrackLevel> {
+        let mut dbs = vec![f64::NEG_INFINITY, f64::NAN, FLOOR_DB, METER_RANGE_DB, -59.6, -59.4, -9.6, -9.4, -0.6, -0.5, -0.4, -0.04, 0.0];
+        dbs.extend((0..=1200).map(|i| -100.0 + i as f64 * 0.1));
+        dbs.extend([0.4, 9.6, 20.0, f64::INFINITY]);
+        dbs.into_iter().map(|db| TrackLevel { peak_db: db, rms_db: db }).collect()
+    }
+
+    #[test]
+    fn gauge_width_is_constant() {
+        // Only characters that are one cell wide in a monospaced font: the
+        // bar cells, digits, minus, plain spaces and the letters of "dB" and
+        // "silent" (no figure spaces: a monospaced font may not have them).
+        let allowed = |c: char| matches!(c, '▮' | '▯' | '!' | ' ' | '-' | '0'..='9' | 'd' | 'B' | 's' | 'i' | 'l' | 'e' | 'n' | 't');
+        for l in every_level() {
+            let g = meter_gauge(&l);
+            assert_eq!(g.chars().count(), METER_GAUGE_CHARS, "{}: {g:?}", l.peak_db);
+            assert!(g.chars().all(allowed), "{}: {g:?}", l.peak_db);
+            assert!(g.ends_with(" dB") || g.ends_with(" silent"), "{g:?}");
+        }
+        // Both sources' lines keep one length at every level.
+        for name in ["Microphone", "System Audio"] {
+            let lens: std::collections::BTreeSet<_> = every_level().iter().map(|l| meter_label(name, l).chars().count()).collect();
+            assert_eq!(lens.len(), 1, "{name}: {lens:?}");
+        }
+        let at = |db: f64| meter_gauge(&TrackLevel { peak_db: db, rms_db: db });
+        assert_eq!(at(f64::NEG_INFINITY), "▯▯▯▯▯▯▯▯▯▯▯▯  silent");
+        assert_eq!(at(f64::NAN), "▯▯▯▯▯▯▯▯▯▯▯▯  silent");
+        assert_eq!(at(-59.6), "▯▯▯▯▯▯▯▯▯▯▯▯  -60 dB");
+        assert_eq!(at(-0.04), "▮▮▮▮▮▮▮▮▮▮▮▮!   0 dB");
+        assert_eq!(at(20.0), "▮▮▮▮▮▮▮▮▮▮▮▮!  20 dB");
+        // Never reported (levels are clamped to +20), but kept in width.
+        assert!(at(f64::INFINITY).ends_with("!  20 dB"));
     }
 
     #[test]

@@ -401,10 +401,18 @@ callers get the in-app overlay too. Feedback is a transient toast (`toast_show`)
 plus the shutter sound; the status item title shows `● m:ss` while recording.
 With audio levels in the record status, `level_meter.rs` appends one block
 glyph per source to that title and inserts a disabled line per source under
-*Stop Recording* (bar, `!` near full scale, peak dB padded with figure spaces
-to a fixed number of characters; the menu font's digits are proportional and
-`silent` is narrower than a dB value, so the line's width still shifts by a
-few points as the value moves); while a recording reports levels, the event
+*Stop Recording*: the source's name in the menu font, then a gauge
+(`audio_level::meter_gauge`: bar, `!` near full scale, peak dB or `silent`)
+of a fixed number of characters in Menlo at the same size, set as an
+attributed title with no colour of its own, so AppKit colours it for the
+disabled item (`menu_title_mono_tail`, `shim/status_menu.m`). Menlo rather
+than the monospaced system font, which has no `▮`/`▯`: with it CoreText
+would draw the bar cells from a fallback font of its own choosing (the
+monospaced system font is used only if Menlo is missing). The menu font's
+digits are proportional and `silent` is narrower than a dB value, so plain
+text would resize the open menu as the level moves; the monospaced gauge
+draws at one width at every level (a `bugle-platform` unit test measures
+it). While a recording reports levels, the event
 loop wakes every 100 ms instead of every second to redraw them, and the title
 and recording entries are set only when they change. The redraw goes on while
 the status menu is open. That rests on tao 0.37's source: its wake-up timer,

@@ -4,7 +4,7 @@
 //! whatever recording is running, however it was started.
 
 use anyhow::Result;
-use bugle_core::audio_level::{meter_label, meter_title, AudioLevels};
+use bugle_core::audio_level::{meter_label_parts, meter_title, AudioLevels};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -44,6 +44,9 @@ pub struct LevelMeter {
     at: usize,
     /// Which lines are in the menu now: (microphone, system audio).
     shown: (bool, bool),
+    /// The text each line was last set to (muda keeps a title across a
+    /// remove and insert), so an unchanged line is not set again.
+    set: (Option<String>, Option<String>),
 }
 
 impl LevelMeter {
@@ -53,6 +56,7 @@ impl LevelMeter {
             system: MenuItem::with_id("level:system_audio", "System Audio", false, None),
             at,
             shown: (false, false),
+            set: (None, None),
         }
     }
 
@@ -80,10 +84,21 @@ impl LevelMeter {
             self.shown = want;
         }
         let mut lines = Vec::new();
-        for (item, name, level) in [(&self.mic, "Microphone", mic), (&self.system, "System Audio", system)] {
+        for ((item, set), name, level) in
+            [((&self.mic, &mut self.set.0), "Microphone", mic), ((&self.system, &mut self.set.1), "System Audio", system)]
+        {
             if let Some(l) = level {
-                let text = meter_label(name, &l);
-                item.set_text(&text);
+                // The gauge in a monospaced font: its width never changes,
+                // so the open menu does not resize as the level moves.
+                let (head, gauge) = meter_label_parts(name, &l);
+                let text = format!("{head}{gauge}");
+                if set.as_deref() != Some(text.as_str()) {
+                    match bugle_platform::menu_title_mono_tail(&head, &gauge) {
+                        Some(title) => item.set_attributed_title(Some(&title)),
+                        None => item.set_text(&text),
+                    }
+                    *set = Some(text.clone());
+                }
                 lines.push(text);
             }
         }

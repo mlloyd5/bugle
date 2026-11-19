@@ -86,3 +86,34 @@ int32_t bugle_status_menu_probe(void *status_item, void *menu, double seconds, d
     });
     return 1;
 }
+
+// A menu-item title for the level meter: `head` in the menu font, `tail` in
+// Menlo at the same size, so a tail of a constant character count always
+// draws at a constant width. Menlo rather than the monospaced system font
+// (SF Mono): SF Mono has no ▮/▯, so CoreText would draw the bar cells from
+// a fallback font of its choosing; Menlo has every character a gauge uses,
+// at one advance. The monospaced system font is used only if Menlo is
+// missing. No color is set, so AppKit draws the title in the colour of the
+// item's state (grey, as the meter lines are disabled). Returns a +1
+// NSAttributedString, or NULL for a null argument.
+void *bugle_menu_title_mono_tail(const char *head, const char *tail) {
+    if (!head || !tail) return NULL;
+    @autoreleasepool {
+        NSFont *menuFont = [NSFont menuFontOfSize:0];
+        CGFloat size = menuFont.pointSize;
+        NSFont *mono = [NSFont fontWithName:@"Menlo-Regular" size:size]
+                           ?: [NSFont monospacedSystemFontOfSize:size weight:NSFontWeightRegular];
+        NSDictionary *headAttrs = @{NSFontAttributeName : menuFont};
+        NSDictionary *tailAttrs = @{NSFontAttributeName : mono};
+        NSMutableAttributedString *s = [[NSMutableAttributedString alloc] initWithString:@(head) ?: @"" attributes:headAttrs];
+        [s appendAttributedString:[[NSAttributedString alloc] initWithString:@(tail) ?: @"" attributes:tailAttrs]];
+        NSAttributedString *out = [s copy];
+        return (__bridge_retained void *)out;
+    }
+}
+
+// The drawn width (points) of an NSAttributedString.
+double bugle_attributed_width(void *s) {
+    if (!s) return 0;
+    return ((__bridge NSAttributedString *)s).size.width;
+}

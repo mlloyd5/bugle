@@ -488,6 +488,8 @@ dependencies = [
  "cc",
  "image",
  "libc",
+ "objc2",
+ "objc2-foundation",
  "tempfile",
  "tracing",
 ]
