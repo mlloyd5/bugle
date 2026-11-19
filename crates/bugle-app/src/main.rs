@@ -118,6 +118,9 @@ enum AppEvent {
     Ui(UiRequest),
     Done(Action, Result<Option<Notice>, String>),
     ApiStopped(Option<String>),
+    /// The engine started or stopped a recording, from whichever thread
+    /// (the app's own Agent API included): redraw the recording state now.
+    RecordingChanged,
     QuickAccess(quick_access::QuickEvent),
     Editor(editor_window::EditorMsg),
     VideoEditor(video_editor_window::VideoEditorMsg),
@@ -169,6 +172,10 @@ impl UiHost for AppUiHost {
         // Refused (BugleError::Busy), not queued, while another pick or
         // selection is open or just after the user dismissed one.
         picker::pick_window(&self.proxy, picker::PICK_TIMEOUT)
+    }
+
+    fn recording_changed(&self) {
+        self.proxy.send(AppEvent::RecordingChanged);
     }
 }
 
@@ -540,6 +547,9 @@ struct App {
     /// What the status item and recording entries show now, so a redraw
     /// changes only what moved: (title, recording).
     recording_shown: Option<(Option<String>, bool)>,
+    /// A thread is finalising a recording that stopped by itself
+    /// ([`App::reap_auto_stopped`]).
+    reaping: Arc<std::sync::atomic::AtomicBool>,
     quick: quick_access::QuickAccess,
     /// Numbers editor windows, so a late save or preview reaches only its own.
     editor_generation: u64,
@@ -712,6 +722,7 @@ impl App {
         let shown = (title, recording);
         if self.recording_shown.as_ref() != Some(&shown) {
             if self.recording_shown.as_ref().map(|s| s.1) != Some(recording) {
+                level_meter::note_shown(recording);
                 self.items.stop.set_enabled(recording);
                 self.items.record.set_enabled(!recording);
                 self.items.record_gif.set_enabled(!recording);
@@ -725,6 +736,43 @@ impl App {
         }
         self.metering = st.audio_levels.is_some();
         self.last_meter = Instant::now();
+    }
+
+    /// A recording started or stopped, possibly behind the app's back (the
+    /// app's own Agent API): show it now instead of on the next tick, which
+    /// remains a fallback.
+    fn on_recording_changed(&mut self) {
+        self.update_recording_ui();
+        level_meter::note_event(self.recording_shown.as_ref().is_some_and(|s| s.1));
+        // A stop the app did not ask for: its panels come back and the
+        // recording joins the recent list (a no-op while busy or recording).
+        self.quick_after_action();
+        self.refresh_recent();
+    }
+
+    /// A recording that stopped by itself (an Agent API request's
+    /// `max_seconds`) stays in the engine, shown as running, until something
+    /// finalises it: do that off the main thread (an MP4 export can take a
+    /// while). The engine then sends `RecordingChanged`, and a later
+    /// `record_stop` from the API still gets the media record.
+    fn reap_auto_stopped(&self) {
+        use std::sync::atomic::Ordering;
+        if self.engine.record_status().state != RecordingState::Finishing || self.reaping.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (engine, reaping) = (self.engine.clone(), self.reaping.clone());
+        let spawned = std::thread::Builder::new().name("bugle-reap".into()).spawn(move || {
+            match engine.record_reap() {
+                Some(Ok(m)) => tracing::info!("recording stopped by itself, saved to {}", m.path.display()),
+                Some(Err(e)) => tracing::warn!("finalising a recording that stopped by itself: {e:#}"),
+                None => {}
+            }
+            reaping.store(false, Ordering::SeqCst);
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("could not start the thread finalising a recording: {e}");
+            self.reaping.store(false, Ordering::SeqCst);
+        }
     }
 
     /// How long the event loop may sleep before the next [`App::tick`].
@@ -814,7 +862,10 @@ impl App {
             bugle_platform::video_editor_focus();
             return self.toast_error("Edit Video: an export is running; quit once it has finished");
         }
-        if self.is_recording() {
+        // A reap in progress has already freed the slot (the status reads
+        // idle) but is still writing the file: `record_stop` waits for it
+        // rather than exiting mid-export.
+        if self.is_recording() || self.reaping.load(std::sync::atomic::Ordering::SeqCst) {
             match self.engine.record_stop() {
                 Ok(m) => tracing::info!("recording saved to {}", m.path.display()),
                 Err(e) => tracing::warn!("stopping recording on quit: {e:#}"),
@@ -838,6 +889,7 @@ impl App {
             return;
         }
         self.last_tick = Instant::now();
+        self.reap_auto_stopped();
         if !self.busy {
             // Panels hidden for a recording that ended without a Done
             // (stopped through the HTTP API, say) come back too.
@@ -965,6 +1017,7 @@ fn main() -> Result<()> {
         metering: false,
         last_meter: Instant::now(),
         recording_shown: None,
+        reaping: Default::default(),
         quick: quick_access::QuickAccess::new(engine.config.quick_access.clone()),
         editor_generation: 0,
         video_editor_generation: 0,
@@ -1015,6 +1068,7 @@ fn main() -> Result<()> {
                 AppEvent::Ui(req) => app.on_ui(req),
                 AppEvent::Done(action, result) => app.on_done(action, result),
                 AppEvent::ApiStopped(err) => app.on_api_stopped(err),
+                AppEvent::RecordingChanged => app.on_recording_changed(),
                 AppEvent::QuickAccess(e) => app.on_quick(e),
                 AppEvent::Editor(m) => app.on_editor(m),
                 AppEvent::VideoEditor(m) => app.on_video_editor(m),

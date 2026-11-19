@@ -37,9 +37,51 @@ const RECORD_FOR: Duration = Duration::from_millis(2200);
 /// reads it.
 const MENU_OPEN_S: f64 = 1.5;
 const SAMPLE_AT_S: f64 = 1.2;
-/// How long the app may take to show a recording started behind its back
-/// (it notices on its next housekeeping tick, about once a second).
+/// How long the app may take to show the meter of a recording started
+/// behind its back: the levels come with the first audio buffers.
 const SHOW_TIMEOUT: Duration = Duration::from_secs(3);
+/// How soon after the call that starts (or stops) a recording behind the
+/// app's back returns, as its Agent API does, the engine's `RecordingChanged`
+/// must have reached the app and the status item switched: well inside the
+/// one-second tick that used to be the only way the app found out. Timed from
+/// the return, so the recorder's own startup (ScreenCaptureKit can take a
+/// while) does not count.
+const SHOW_PROMPTLY: Duration = Duration::from_millis(500);
+
+/// Check that by [`SHOW_PROMPTLY`] after `until` (when the call made at
+/// `since` returned) the app handled the engine's event for `recording`
+/// (`what`) and the status item showed it; either may already have happened
+/// during the call (0 ms). The event is required, not just the switch: the
+/// 100 ms meter tick, or the one-second one, could flip the item without it.
+fn check_prompt(what: &str, recording: bool, since: Instant, until: Instant, failures: &mut Vec<String>) {
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let (event, shown) = loop {
+        let (event, shown) = (level_meter::event_at(recording), level_meter::shown_at(recording));
+        if (event.is_some() && shown.is_some()) || until.elapsed() > SHOW_PROMPTLY {
+            break (event.map(|at| at.saturating_duration_since(until)), shown.map(|at| at.saturating_duration_since(until)));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let call = ms(until.saturating_duration_since(since));
+    match (event, shown) {
+        (Some(e), Some(s)) if e <= SHOW_PROMPTLY && s <= SHOW_PROMPTLY => say(format!(
+            "the status item showed the {what} {:.0} ms and the engine's event was handled {:.0} ms after the call returned (the call took {call:.0} ms)",
+            ms(s),
+            ms(e)
+        )),
+        (None, _) => failures.push(format!(
+            "the app handled no RecordingChanged event for the {what} within {} ms of the call returning (it took {call:.0} ms)",
+            SHOW_PROMPTLY.as_millis()
+        )),
+        (_, None) => failures.push(format!("the status item did not show the {what} within {} ms of the call returning", SHOW_PROMPTLY.as_millis())),
+        (Some(e), Some(s)) => failures.push(format!(
+            "the status item showed the {what} {:.0} ms and the event came {:.0} ms after the call returned, not within {} ms (the call took {call:.0} ms)",
+            ms(s),
+            ms(e),
+            SHOW_PROMPTLY.as_millis()
+        )),
+    }
+}
 
 /// Ask the main thread to open the status menu and read it
 /// ([`bugle_platform::status_menu_probe`]); the report (JSON) or why it
@@ -174,11 +216,12 @@ fn run(engine: &Engine, proxy: &Proxy, out: &Path) -> Result<(), Vec<String>> {
         label: None,
     };
     level_meter::watch(true);
+    let t0 = Instant::now();
     if let Err(e) = engine.record_start(&req) {
         return Err(vec![format!("could not start the recording: {e:#}")]);
     }
     let mut failures = Vec::new();
-    let t0 = Instant::now();
+    check_prompt("recording", true, t0, Instant::now(), &mut failures);
     let mut sounds: Vec<Option<Child>> = vec![chirp()];
     let mut polled: Vec<Option<bugle_core::audio_level::AudioLevels>> = Vec::new();
     let mut inactive = 0;
@@ -190,8 +233,8 @@ fn run(engine: &Engine, proxy: &Proxy, out: &Path) -> Result<(), Vec<String>> {
             *inactive += 1;
         }
     };
-    // The step started the recording behind the app's back (no `Done`), so
-    // the app shows it on its next tick: wait for the meter, not a fixed time.
+    // The step started the recording behind the app's back (no `Done`); the
+    // meter follows once the levels come in: wait for it, not a fixed time.
     while level_meter::updates().is_empty() && t0.elapsed() < SHOW_TIMEOUT {
         poll(&mut polled, &mut inactive);
         std::thread::sleep(Duration::from_millis(50));
@@ -281,7 +324,10 @@ fn run(engine: &Engine, proxy: &Proxy, out: &Path) -> Result<(), Vec<String>> {
 
     // Stop and check the file.
     let mut mic_skipped = false;
-    match engine.record_stop() {
+    let stop_at = Instant::now();
+    let stopped = engine.record_stop();
+    check_prompt("stop", false, stop_at, Instant::now(), &mut failures);
+    match stopped {
         Ok(media) => {
             let info = bugle_platform::video_info(&media.path);
             let tracks = bugle_platform::audio_track_count(&media.path).unwrap_or(0);
