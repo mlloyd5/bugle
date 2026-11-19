@@ -47,6 +47,13 @@ pub trait UiHost: Send + Sync {
     fn pick_window(&self) -> Result<Option<WindowInfo>> {
         Err(BugleError::NoUiHost("this UI host has no window picker".into()).into())
     }
+    /// A recording started or stopped, whoever asked (the host's own menu,
+    /// the agent API, MCP), so the host can redraw its recording state now
+    /// rather than on its next poll. Called from the thread that changed it,
+    /// without the recorder locked; it must not block. A stop calls it twice:
+    /// once the slot is free (the status reads idle) and again once the file
+    /// is finalised (and in the history, unless that failed).
+    fn recording_changed(&self) {}
 }
 
 /// Why a `pick_window` target fails outside the menu-bar app.

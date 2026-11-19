@@ -118,6 +118,9 @@ enum AppEvent {
     Ui(UiRequest),
     Done(Action, Result<Option<Notice>, String>),
     ApiStopped(Option<String>),
+    /// The engine started or stopped a recording, from whichever thread
+    /// (the agent API's included): redraw the recording state now.
+    RecordingChanged,
     QuickAccess(quick_access::QuickEvent),
     Editor(editor_window::EditorMsg),
     VideoEditor(video_editor_window::VideoEditorMsg),
@@ -169,6 +172,10 @@ impl UiHost for AppUiHost {
         // Refused (BugleError::Busy), not queued, while another pick or
         // selection is open or just after the user dismissed one.
         picker::pick_window(&self.proxy, picker::PICK_TIMEOUT)
+    }
+
+    fn recording_changed(&self) {
+        self.proxy.send(AppEvent::RecordingChanged);
     }
 }
 
@@ -691,6 +698,7 @@ impl App {
         let shown = (title, recording);
         if self.recording_shown.as_ref() != Some(&shown) {
             if self.recording_shown.as_ref().map(|s| s.1) != Some(recording) {
+                level_meter::note_shown(recording);
                 self.items.stop.set_enabled(recording);
                 self.items.record.set_enabled(!recording);
                 self.items.record_gif.set_enabled(!recording);
@@ -704,6 +712,18 @@ impl App {
         }
         self.metering = st.audio_levels.is_some();
         self.last_meter = Instant::now();
+    }
+
+    /// A recording started or stopped, possibly behind the app's back (the
+    /// agent API, MCP): show it now instead of on the next tick. The tick
+    /// still covers what the engine does not announce (a recording that
+    /// reached its `max_seconds`).
+    fn on_recording_changed(&mut self) {
+        self.update_recording_ui();
+        // A stop the app did not ask for: its panels come back and the
+        // recording joins the recent list (a no-op while busy or recording).
+        self.quick_after_action();
+        self.refresh_recent();
     }
 
     /// How long the event loop may sleep before the next [`App::tick`].
@@ -991,6 +1011,7 @@ fn main() -> Result<()> {
                 AppEvent::Ui(req) => app.on_ui(req),
                 AppEvent::Done(action, result) => app.on_done(action, result),
                 AppEvent::ApiStopped(err) => app.on_api_stopped(err),
+                AppEvent::RecordingChanged => app.on_recording_changed(),
                 AppEvent::QuickAccess(e) => app.on_quick(e),
                 AppEvent::Editor(m) => app.on_editor(m),
                 AppEvent::VideoEditor(m) => app.on_video_editor(m),

@@ -415,9 +415,13 @@ the sound, and an open menu that shows what the app last set. It then checks
 that the stopped file has video and audio and that no temporary file is left
 beside it. The step is skipped when `[sync]` would copy or upload a video,
 records the microphone only with `BUGLE_SMOKE_MICROPHONE=1`, and removes the
-recording even after a failure. A recording started behind the app's back
-(the agent API, MCP) shows in the menu bar on the app's next housekeeping
-tick, up to about a second late.
+recording even after a failure. A recording started or stopped behind the
+app's back (the agent API, MCP) shows in the menu bar straight away: the
+engine calls `UiHost::recording_changed` on every start and stop, which
+`bugle-app` turns into an event on its loop; the step requires the status
+item to switch within 250 ms of the start and of the stop. The housekeeping
+tick (about once a second) still catches what the engine does not announce,
+such as a recording reaching its `max_seconds`.
 When the process runs from `Bugle.app`, an *Open at Login* check item
 (`login.rs`) registers the bundle with `SMAppService`. Its check mark is
 re-read on the periodic tick (every 5 s) and set only for an enabled item; a

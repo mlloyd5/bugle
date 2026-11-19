@@ -504,6 +504,7 @@ impl Engine {
                 Ok(m) => tracing::info!("finalised the previous recording: {}", m.path.display()),
                 Err(e) => tracing::warn!("finalising the previous recording failed: {e:#}"),
             }
+            self.recording_changed();
         }
     }
 
@@ -546,7 +547,7 @@ impl Engine {
             }
         };
         validate_record_rect(&rect)?;
-        let mut g = self.idle_recorder()?;
+        let g = self.idle_recorder()?;
         let mut vars = HashMap::new();
         vars.insert("kind", "recording".to_string());
         if let Some(w) = &window {
@@ -712,7 +713,7 @@ impl Engine {
             };
             l.attach(clock, !cursor_hidden, fps);
         }
-        *g = Some(Active {
+        Ok(self.install(g, Active {
             format: req.format,
             started: Instant::now(),
             started_at: Utc::now(),
@@ -724,15 +725,33 @@ impl Engine {
             max_seconds: req.max_seconds,
             finished_at: None,
             events: log,
-        });
+        }))
+    }
+
+    /// Put a started recording in the (idle, locked) slot `g` and tell the
+    /// UI host, so a front end shows it straight away.
+    fn install(&self, mut g: MutexGuard<'_, Option<Active>>, active: Active) -> RecordingStatus {
+        *g = Some(active);
         drop(g);
-        Ok(self.record_status())
+        self.recording_changed();
+        self.record_status()
     }
 
     /// Stop the active recording and finalise the file.
     pub fn record_stop(&self) -> Result<MediaItem> {
         let active = self.recorder_state.inner.lock().unwrap().take().ok_or_else(|| anyhow!("no recording in progress"))?;
-        self.finalize(active)
+        // Idle from here on: the host can show that while the file is
+        // finalised (an MP4 export can take a while).
+        self.recording_changed();
+        let r = self.finalize(active);
+        self.recording_changed();
+        r
+    }
+
+    fn recording_changed(&self) {
+        if let Some(host) = &self.ui_host {
+            host.recording_changed();
+        }
     }
 
     /// Stop `active`'s backend (if still running), finish the file and add
@@ -1149,6 +1168,92 @@ mod tests {
         assert!(engine.record_stop().is_err());
         assert!(!out.exists());
         assert!(engine.record_stop().is_err(), "slot is free after a failed stop");
+    }
+
+    /// Records what the engine reports to its UI host: the recording state
+    /// at each `recording_changed`.
+    #[derive(Default)]
+    struct Watcher {
+        engine: std::sync::OnceLock<std::sync::Weak<Engine>>,
+        seen: Mutex<Vec<RecordingState>>,
+    }
+
+    impl crate::UiHost for Watcher {
+        fn select_area(&self) -> Result<Option<Rect>> {
+            Ok(None)
+        }
+        fn pin(&self, _: Vec<u8>, _: Option<Rect>, _: f64) -> Result<()> {
+            Ok(())
+        }
+        fn recording_changed(&self) {
+            // Called without the recorder locked: reading the status here
+            // (as the app does, on its main thread) must not deadlock.
+            let state = self.engine.get().and_then(std::sync::Weak::upgrade).map(|e| e.record_status().state);
+            self.seen.lock().unwrap().push(state.expect("engine alive"));
+        }
+    }
+
+    fn watched_engine(tmp: &Path) -> (Arc<Engine>, Arc<Watcher>) {
+        let watcher = Arc::new(Watcher::default());
+        let mut engine = engine_in(tmp);
+        engine.ui_host = Some(watcher.clone());
+        let engine = Arc::new(engine);
+        watcher.engine.set(Arc::downgrade(&engine)).unwrap();
+        (engine, watcher)
+    }
+
+    /// A GIF backend that writes one 4×4 frame to `out` once stopped.
+    fn one_frame_gif(out: &Path, release: Arc<AtomicBool>) -> Backend {
+        let out = out.to_path_buf();
+        gif(release, move || {
+            let img = RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]));
+            let mut enc = GifEncoder::new(std::fs::File::create(&out)?);
+            enc.encode_frames(std::iter::once(Frame::new(img)))?;
+            Ok(1)
+        })
+        .0
+    }
+
+    #[test]
+    fn start_and_stop_notify_the_ui_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, watcher) = watched_engine(tmp.path());
+        let seen = || watcher.seen.lock().unwrap().clone();
+
+        // Started (by the API, MCP, anyone): the host hears it with the
+        // recording already showing as active.
+        let out = tmp.path().join("a.gif");
+        let st = engine.install(engine.idle_recorder().unwrap(), active(one_frame_gif(&out, Default::default()), out.clone(), None));
+        assert_eq!(st.state, RecordingState::Active);
+        assert_eq!(seen(), vec![RecordingState::Active]);
+
+        // Stopped: once when the slot is free, again once finalised.
+        let m = engine.record_stop().unwrap();
+        assert_eq!(m.path, out);
+        assert_eq!(seen(), vec![RecordingState::Active, RecordingState::Idle, RecordingState::Idle]);
+
+        // Nothing to stop: nothing changed, no call.
+        assert!(engine.record_stop().is_err());
+        assert_eq!(seen().len(), 3);
+
+        // A failed stop still frees the slot, and says so.
+        let (backend, _) = gif(Default::default(), || bail!("encoder failed"));
+        engine.install(engine.idle_recorder().unwrap(), active(backend, tmp.path().join("b.gif"), None));
+        assert!(engine.record_stop().is_err());
+        assert_eq!(seen()[3..], [RecordingState::Active, RecordingState::Idle, RecordingState::Idle]);
+    }
+
+    #[test]
+    fn reaping_a_finished_recording_notifies_the_ui_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, watcher) = watched_engine(tmp.path());
+        let release = Arc::new(AtomicBool::new(false));
+        let out = tmp.path().join("c.gif");
+        *engine.recorder_state.inner.lock().unwrap() = Some(active(one_frame_gif(&out, release.clone()), out, None));
+        release.store(true, Ordering::Relaxed);
+        wait_until(|| engine.record_status().state == RecordingState::Finishing);
+        drop(engine.idle_recorder().unwrap());
+        assert_eq!(*watcher.seen.lock().unwrap(), vec![RecordingState::Idle]);
     }
 
     #[test]

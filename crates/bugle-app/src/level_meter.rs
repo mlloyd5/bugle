@@ -7,7 +7,7 @@ use anyhow::Result;
 use bugle_core::audio_level::{meter_label, meter_title, AudioLevels};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tray_icon::menu::{Menu, MenuItem};
 
 /// How often the meter is redrawn while recording.
@@ -24,17 +24,32 @@ pub struct Update {
 
 static WATCHING: AtomicBool = AtomicBool::new(false);
 static UPDATES: Mutex<Vec<Update>> = Mutex::new(Vec::new());
+static SHOWN: Mutex<Vec<(bool, Instant)>> = Mutex::new(Vec::new());
 
-/// Start (clearing the log) or stop logging meter redraws. Off unless a
-/// smoke test turns it on.
+/// Start (clearing the logs) or stop logging meter redraws and recording
+/// state changes. Off unless a smoke test turns it on.
 pub fn watch(on: bool) {
     UPDATES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    SHOWN.lock().unwrap_or_else(|e| e.into_inner()).clear();
     WATCHING.store(on, Ordering::Relaxed);
 }
 
 /// The redraws logged since [`watch`] turned logging on.
 pub fn updates() -> Vec<Update> {
     UPDATES.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Main thread: the status item (and menu) just switched to showing a
+/// recording (`true`) or no recording; logged while [`watch`]ing.
+pub fn note_shown(recording: bool) {
+    if WATCHING.load(Ordering::Relaxed) {
+        SHOWN.lock().unwrap_or_else(|e| e.into_inner()).push((recording, Instant::now()));
+    }
+}
+
+/// When the app last switched to showing `recording`, since [`watch`].
+pub fn shown_at(recording: bool) -> Option<Instant> {
+    SHOWN.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().find(|s| s.0 == recording).map(|s| s.1)
 }
 
 pub struct LevelMeter {
