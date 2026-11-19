@@ -70,22 +70,30 @@ impl Engine {
         match self.sync_item(item) {
             Ok(Some(r)) => {
                 tracing::info!("{} {} → {}", r.action, original.display(), r.destination);
-                self.record_sync(item, true);
+                self.record_sync(item, Some(&original));
             }
             Ok(None) => {}
             Err(e) => tracing::warn!("sync of {} failed: {e:#}", original.display()),
         }
     }
 
-    /// Store `item`'s new path / URL / synced name in history. `in_history`
-    /// says the item was recorded before the sync started: if its entry has
-    /// gone meanwhile (a `bugle history prune` in another process saw the
-    /// old path missing during a move), it is recorded again rather than
-    /// leaving the synced file without an entry.
-    fn record_sync(&self, item: &MediaItem, in_history: bool) {
+    /// Store `item`'s new path / URL / synced name in history.
+    /// `recorded_path` is the path its history entry had before the sync
+    /// (`None` when it was not in history).
+    ///
+    /// If the entry has gone meanwhile and the sync moved the file, it is
+    /// recorded again: a `bugle history prune` in another process can have
+    /// seen the old path missing mid-move, and the synced file would
+    /// otherwise have no entry. A copy or upload leaves the old path in
+    /// place, so prune cannot have removed the entry and a vanished entry
+    /// was deleted on purpose; it stays deleted. The trade-off: a `bugle
+    /// delete` that lands during a move is undone (the two cannot be told
+    /// apart, both write the same tombstone), which keeps the moved file
+    /// findable rather than orphaned in the sync folder.
+    fn record_sync(&self, item: &MediaItem, recorded_path: Option<&Path>) {
         let stored = match self.history.get(&item.id) {
             Ok(Some(s)) => s,
-            Ok(None) if in_history => {
+            Ok(None) if recorded_path.is_some_and(|p| p != item.path) => {
                 tracing::warn!("history entry {} vanished during its sync; recording it again", item.id);
                 if let Err(e) = self.history.push(item) {
                     tracing::warn!("could not record the sync of {}: {e:#}", item.path.display());
@@ -149,7 +157,7 @@ impl Engine {
     /// `enabled` and `kinds` say, and record the new path / URL in history.
     pub fn sync_media(&self, source: &str) -> Result<(MediaItem, SyncReport)> {
         let mut item = self.resolve_media(source)?;
-        let in_history = matches!(self.history.get(&item.id), Ok(Some(_)));
+        let recorded = matches!(self.history.get(&item.id), Ok(Some(_))).then(|| item.path.clone());
         let report = self.sync_item(&mut item)?.ok_or_else(|| {
             anyhow!(
                 "no sync destination configured for {}: set [sync] folder or [sync.s3] in {}",
@@ -157,7 +165,7 @@ impl Engine {
                 Config::default_path().display()
             )
         })?;
-        self.record_sync(&item, in_history);
+        self.record_sync(&item, recorded.as_deref());
         Ok((item, report))
     }
 
@@ -196,7 +204,7 @@ impl Engine {
         match result {
             Ok(Some(r)) => {
                 tracing::info!("{} {} → {}", r.action, path.display(), r.destination);
-                self.record_sync(&m, true);
+                self.record_sync(&m, Some(path));
             }
             Ok(None) => {}
             Err(e) => tracing::warn!("sync of {} failed: {e:#}", path.display()),
@@ -286,7 +294,7 @@ impl Engine {
             match self.sync_sidecar(video, &mut sub, None) {
                 Ok(Some(r)) => {
                     if known.is_some() {
-                        self.record_sync(&sub, true);
+                        self.record_sync(&sub, Some(&path));
                     } else if let Err(e) = self.history.push(&sub) {
                         // Recorded so a later re-sync knows the file is ours.
                         tracing::warn!("could not record the synced sidecar {}: {e:#}", sub.path.display());
@@ -1275,15 +1283,23 @@ mod tests {
         // The window between the move and record_sync.
         assert_eq!(engine.history.prune_missing(false).unwrap().len(), 1);
         assert!(engine.history.get(&item.id).unwrap().is_none());
-        engine.record_sync(&moving, true);
+        engine.record_sync(&moving, Some(&src));
         let stored = engine.history.get(&item.id).unwrap().unwrap();
         assert_eq!(stored.path, moving.path);
         assert!(stored.path.is_file());
 
         // An item that was never in history is not added by a sync.
         let loose = MediaItem::new(MediaKind::Screenshot, tmp.path().join("loose.png"));
-        engine.record_sync(&loose, false);
+        engine.record_sync(&loose, None);
         assert!(engine.history.get(&loose.id).unwrap().is_none());
+
+        // A copy (or upload) keeps the old path, so prune cannot have removed
+        // the entry: one deleted during the sync stays deleted.
+        let mut copied = item.clone();
+        copied.id = "copy00000001".into();
+        copied.synced_as = Some("shot.png".into());
+        engine.record_sync(&copied, Some(&copied.path.clone()));
+        assert!(engine.history.get(&copied.id).unwrap().is_none());
     }
 
     #[test]
