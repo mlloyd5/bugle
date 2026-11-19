@@ -15,9 +15,23 @@ static char *fixture_error(NSString *fmt, ...) {
     return strdup(u ? u : "fixture error");
 }
 
-static BOOL wait_ready(AVAssetWriterInput *in) {
-    for (int w = 0; w < 5000 && !in.readyForMoreMediaData; w++) usleep(1000);
-    return in.readyForMoreMediaData;
+// Wait for `in` to take more data, then make sure the writer is still
+// writing: appending to a writer that has failed or stopped raises an
+// Objective-C exception, which must not cross into Rust.
+static BOOL ready_to_append(AVAssetWriter *writer, AVAssetWriterInput *in, NSString **failure) {
+    for (int w = 0; w < 5000 && !in.readyForMoreMediaData && writer.status == AVAssetWriterStatusWriting; w++) {
+        usleep(1000);
+    }
+    if (writer.status != AVAssetWriterStatusWriting) {
+        *failure = writer.error.localizedDescription
+                       ?: [NSString stringWithFormat:@"the writer stopped (status %ld)", (long)writer.status];
+        return NO;
+    }
+    if (!in.readyForMoreMediaData) {
+        *failure = @"timed out waiting for the writer input";
+        return NO;
+    }
+    return YES;
 }
 
 char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double seconds, double amplitude, int32_t overlap,
@@ -52,6 +66,18 @@ char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double sec
         const int32_t vfps = 10, vsize = 64;
         AVAssetWriterInput *vin = nil;
         AVAssetWriterInputPixelBufferAdaptor *adaptor = nil;
+        // Frames are allocated one by one rather than from the adaptor's
+        // pixelBufferPool. That pool is owned by the VideoToolbox compression
+        // session, which may replace it at any time: a pointer read from the
+        // adaptor can dangle by the time CoreVideo uses it, and it then traps
+        // or faults and takes the test binary down. A pool buys nothing for a
+        // few 64x64 frames.
+        NSDictionary *pxattrs = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+            (id)kCVPixelBufferWidthKey: @(vsize),
+            (id)kCVPixelBufferHeightKey: @(vsize),
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        };
         if (video) {
             vin = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:@{
                 AVVideoCodecKey: AVVideoCodecTypeH264,
@@ -60,11 +86,7 @@ char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double sec
             }];
             vin.expectsMediaDataInRealTime = YES;
             adaptor = [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:vin
-                sourcePixelBufferAttributes:@{
-                    (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-                    (id)kCVPixelBufferWidthKey: @(vsize),
-                    (id)kCVPixelBufferHeightKey: @(vsize),
-                }];
+                sourcePixelBufferAttributes:pxattrs];
             if (![writer canAddInput:vin]) return fixture_error(@"writer refused the video track");
             [writer addInput:vin];
         }
@@ -95,20 +117,31 @@ char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double sec
         int64_t vnext = 0;
         float buf[chunk * 2];
         BOOL ok = YES;
+        NSString *failure = nil;
         // Advance every track chunk by chunk in time order so the writer
         // can interleave them.
         for (int64_t start = 0; start < total && ok; start += chunk) {
             while (ok && vin && vnext < vframes && vnext * 48000 / vfps <= start) {
                 CVPixelBufferRef px = NULL;
-                ok = CVPixelBufferPoolCreatePixelBuffer(NULL, adaptor.pixelBufferPool, &px) == kCVReturnSuccess;
-                if (ok) {
-                    CVPixelBufferLockBaseAddress(px, 0);
+                CVReturn cr = CVPixelBufferCreate(kCFAllocatorDefault, vsize, vsize, kCVPixelFormatType_32BGRA,
+                                                  (__bridge CFDictionaryRef)pxattrs, &px);
+                if (cr != kCVReturnSuccess || !px) {
+                    ok = NO;
+                    failure = [NSString stringWithFormat:@"could not allocate a pixel buffer for a video frame (CVReturn %d)", cr];
+                    break;
+                }
+                cr = CVPixelBufferLockBaseAddress(px, 0);
+                if (cr == kCVReturnSuccess) {
                     memset(CVPixelBufferGetBaseAddress(px), (int)(vnext * 23 % 256),
                            CVPixelBufferGetBytesPerRow(px) * CVPixelBufferGetHeight(px));
                     CVPixelBufferUnlockBaseAddress(px, 0);
-                    ok = wait_ready(vin) && [adaptor appendPixelBuffer:px withPresentationTime:CMTimeMake(vnext, vfps)];
-                    CVPixelBufferRelease(px);
+                    ok = ready_to_append(writer, vin, &failure) &&
+                         [adaptor appendPixelBuffer:px withPresentationTime:CMTimeMake(vnext, vfps)];
+                } else {
+                    ok = NO;
+                    failure = [NSString stringWithFormat:@"could not lock a video frame (CVReturn %d)", cr];
                 }
+                CVPixelBufferRelease(px);
                 vnext++;
             }
             for (int32_t t = 0; t < tracks && ok; t++) {
@@ -131,14 +164,14 @@ char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double sec
                      CMAudioSampleBufferCreateReadyWithPacketDescriptions(kCFAllocatorDefault, bb, fmt, n,
                                                                           CMTimeMake(pos[t], 48000), NULL, &sb) == noErr;
                 if (bb) CFRelease(bb);
-                ok = ok && wait_ready(inputs[t]) && [inputs[t] appendSampleBuffer:sb];
+                ok = ok && ready_to_append(writer, inputs[t], &failure) && [inputs[t] appendSampleBuffer:sb];
                 if (sb) CFRelease(sb);
                 pos[t] += n;
             }
         }
         CFRelease(fmt);
         if (!ok) {
-            NSString *why = writer.error.localizedDescription ?: @"append failed";
+            NSString *why = failure ?: writer.error.localizedDescription ?: @"append failed";
             [writer cancelWriting];
             return fixture_error(@"writing the tone fixture failed: %@", why);
         }
@@ -146,7 +179,9 @@ char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double sec
         [vin markAsFinished];
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         [writer finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
-        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) != 0) {
+            return fixture_error(@"finalising the tone fixture timed out after 30 s");
+        }
         if (writer.status != AVAssetWriterStatusCompleted) {
             return fixture_error(@"finalising the tone fixture failed: %@", writer.error.localizedDescription);
         }
