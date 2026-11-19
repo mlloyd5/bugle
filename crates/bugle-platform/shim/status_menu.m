@@ -86,3 +86,32 @@ int32_t bugle_status_menu_probe(void *status_item, void *menu, double seconds, d
     });
     return 1;
 }
+
+// A menu-item title for the level meter: `head` in the menu font, `tail` in
+// the monospaced system font of the same size, so a tail of a constant
+// character count always draws at a constant width. In the disabled control
+// text color when `disabled`: AppKit does not grey an attributed title by
+// itself. Returns a +1 NSAttributedString, or NULL for a null argument.
+void *bugle_menu_title_mono_tail(const char *head, const char *tail, int32_t disabled) {
+    if (!head || !tail) return NULL;
+    @autoreleasepool {
+        NSFont *menuFont = [NSFont menuFontOfSize:0];
+        NSFont *mono = [NSFont monospacedSystemFontOfSize:menuFont.pointSize weight:NSFontWeightRegular];
+        NSMutableDictionary *headAttrs = [NSMutableDictionary dictionaryWithObject:menuFont forKey:NSFontAttributeName];
+        NSMutableDictionary *tailAttrs = [NSMutableDictionary dictionaryWithObject:mono forKey:NSFontAttributeName];
+        if (disabled) {
+            headAttrs[NSForegroundColorAttributeName] = [NSColor disabledControlTextColor];
+            tailAttrs[NSForegroundColorAttributeName] = [NSColor disabledControlTextColor];
+        }
+        NSMutableAttributedString *s = [[NSMutableAttributedString alloc] initWithString:@(head) ?: @"" attributes:headAttrs];
+        [s appendAttributedString:[[NSAttributedString alloc] initWithString:@(tail) ?: @"" attributes:tailAttrs]];
+        NSAttributedString *out = [s copy];
+        return (__bridge_retained void *)out;
+    }
+}
+
+// The drawn width (points) of an NSAttributedString.
+double bugle_attributed_width(void *s) {
+    if (!s) return 0;
+    return ((__bridge NSAttributedString *)s).size.width;
+}

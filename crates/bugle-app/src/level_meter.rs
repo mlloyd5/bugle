@@ -4,7 +4,7 @@
 //! whatever recording is running, however it was started.
 
 use anyhow::Result;
-use bugle_core::audio_level::{meter_label, meter_title, AudioLevels};
+use bugle_core::audio_level::{meter_label_parts, meter_title, AudioLevels};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -82,9 +82,14 @@ impl LevelMeter {
         let mut lines = Vec::new();
         for (item, name, level) in [(&self.mic, "Microphone", mic), (&self.system, "System Audio", system)] {
             if let Some(l) = level {
-                let text = meter_label(name, &l);
-                item.set_text(&text);
-                lines.push(text);
+                // The gauge in a monospaced font: its width never changes,
+                // so the open menu does not resize as the level moves.
+                let (head, gauge) = meter_label_parts(name, &l);
+                match bugle_platform::menu_title_mono_tail(&head, &gauge, true) {
+                    Some(title) => item.set_attributed_title(Some(&title)),
+                    None => item.set_text(head.clone() + &gauge),
+                }
+                lines.push(head + &gauge);
             }
         }
         if WATCHING.load(Ordering::Relaxed) && !lines.is_empty() {
