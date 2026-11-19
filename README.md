@@ -71,7 +71,7 @@ cargo xtask bundle                 # → dist/Bugle.app, ad-hoc signed
 cargo xtask bundle --zip           # also dist/Bugle-<version>.zip
 cargo xtask dmg                    # also dist/Bugle-<version>.dmg (= bundle --dmg)
 cargo xtask bundle --universal     # arm64 + x86_64 in one bundle
-cargo xtask verify --smoke-test    # re-check a bundle and launch it briefly
+cargo xtask verify --smoke-test    # re-check a bundle, then run its smoke test (~30 s)
 ```
 
 `bundle` builds the release binaries (taking their paths from cargo, so a custom
@@ -84,6 +84,18 @@ executables are signed with the hardened runtime and
 the app is not sandboxed), then checked with `plutil -lint` (Info.plist and the
 entitlements embedded in each signature), `codesign --verify --deep --strict`,
 `iconutil` and `--version`. Only a bundle that passes replaces `dist/Bugle.app`.
+
+`--smoke-test` (on `verify` and `bundle`) then runs `bugle-app --smoke-test`
+from the bundle with a throwaway config in a temp directory: saves, history and
+`TMPDIR` go there, sync is off and no global hotkey is registered, so your own
+config, captures and sync destination are never read or touched; the directory
+is removed afterwards (kept with `BUGLE_SMOKE_KEEP=1`). The app's opt-ins
+pass through from your environment: `BUGLE_SMOKE_CLIPBOARD=1` pastes through
+the real clipboard, `BUGLE_SMOKE_MICROPHONE=1` records the microphone and
+`BUGLE_SMOKE_SAVE=1` saves and exports (into the throwaway folder). From the
+release bundle the run took about 32 s; it is killed after 180 s
+(`BUGLE_SMOKE_TIMEOUT=<seconds>` changes that, and a bad value fails before
+anything is built).
 
 By default the binaries are built for the host architecture only (arm64 on
 Apple silicon, x86_64 on Intel), and the bundle does not launch on the other
