@@ -12,12 +12,12 @@
 //! tombstones and the items they removed) than live items, `open` compacts it
 //! under the same lock.
 //!
-//! Entries whose file was deleted outside Bugle are pruned (tombstoned, the
-//! file itself is never touched) when the history is opened and when
-//! [`History::recent`] lists it. Only an entry whose parent directory still
-//! exists but whose file does not is pruned: a file on an unmounted volume
-//! or an unreachable share, an entry with a synced copy (`url`), a relative
-//! path and an entry recorded in the last [`PRUNE_GRACE`] are kept.
+//! Entries whose file was deleted outside Bugle are hidden by
+//! [`History::recent`] (every listing) but stay in the file, so a file put
+//! back from the Trash or renamed back shows up again with its metadata.
+//! Only [`History::prune_missing`] (`bugle history prune`, the
+//! `history_prune` action) writes tombstones for them, and it never touches a
+//! file. See [`looks_deleted`] and [`History::prune_missing`] for what counts.
 
 use crate::media_item::MediaItem;
 use crate::BugleError;
@@ -31,23 +31,31 @@ use std::sync::Mutex;
 /// Shortest id prefix `get`/`delete` accept when the id is not an exact match.
 pub const MIN_PREFIX_LEN: usize = 4;
 
-/// Entries younger than this are never pruned: a save or a sync move may be
-/// between writing the file and recording its new path.
+/// Entries younger than this are never hidden or pruned: a save or a sync
+/// move may be between writing the file and recording its new path.
 pub const PRUNE_GRACE: chrono::Duration = chrono::Duration::seconds(60);
 
-/// Whether `m` points at a local file that is gone for good: its path is
-/// absolute, its parent directory exists, the file does not (`NotFound`, not
-/// a permission or I/O error), it has no synced copy, and it is older than
-/// [`PRUNE_GRACE`].
-pub fn is_prunable(m: &MediaItem, now: chrono::DateTime<chrono::Utc>) -> bool {
+/// Whether `m` points at a local file that looks deleted: its path is
+/// absolute, the file is `NotFound` (not a permission or I/O error; a broken
+/// symlink still exists), its parent directory exists (so an unmounted
+/// volume does not count), it has no synced copy (`url`), and it is older
+/// than [`PRUNE_GRACE`]. [`History::recent`] hides such entries.
+pub fn looks_deleted(m: &MediaItem, now: chrono::DateTime<chrono::Utc>) -> bool {
     if m.url.is_some() || !m.path.is_absolute() || now - m.created_at < PRUNE_GRACE {
         return false;
     }
-    match std::fs::symlink_metadata(&m.path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        _ => return false,
-    }
-    m.path.parent().is_some_and(|d| d.is_dir())
+    file_not_found(&m.path) && m.path.parent().is_some_and(|d| d.is_dir())
+}
+
+fn file_not_found(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Whether `dir` is known to hold at least one entry. An empty directory
+/// (or one that cannot be read) may be the mount point of a share that is
+/// offline, so nothing under it is pruned.
+fn has_entries(dir: &Path) -> bool {
+    std::fs::read_dir(dir).map(|mut d| d.next().is_some()).unwrap_or(false)
 }
 
 pub struct History {
@@ -79,11 +87,6 @@ impl History {
             std::fs::create_dir_all(parent)?;
         }
         let h = Self { path, lock: Mutex::new(()) };
-        match h.prune_missing() {
-            Ok(gone) if !gone.is_empty() => tracing::info!("pruned {} history entries whose file is gone", gone.len()),
-            Ok(_) => {}
-            Err(e) => tracing::warn!("history pruning skipped: {e:#}"),
-        }
         if let Err(e) = h.compact_if_needed() {
             tracing::warn!("history compaction skipped: {e:#}");
         }
@@ -237,68 +240,77 @@ impl History {
         res.map(|_| true)
     }
 
-    /// The `n` newest items, newest first. Prunable entries met on the way
-    /// (see [`is_prunable`]) are left out and tombstoned, so only as many
-    /// files are checked as it takes to find `n` live ones.
+    /// The `n` newest items, newest first, leaving out entries whose file
+    /// [`looks_deleted`]. Nothing is written: hidden entries come back when
+    /// their file does. Only as many files are checked as it takes to find
+    /// `n` shown ones.
     pub fn recent(&self, n: usize) -> Result<Vec<MediaItem>> {
         let now = chrono::Utc::now();
-        let mut out = Vec::new();
-        let mut gone = Vec::new();
-        for m in self.all()?.into_iter().rev() {
-            if out.len() >= n {
-                break;
-            }
-            if is_prunable(&m, now) {
-                gone.push(m.id);
-            } else {
-                out.push(m);
-            }
-        }
-        if !gone.is_empty() {
-            if let Err(e) = self.tombstone_if_still_missing(&gone, now) {
-                tracing::warn!("history pruning skipped: {e:#}");
-            }
-        }
-        Ok(out)
+        Ok(self.all()?.into_iter().rev().filter(|m| !looks_deleted(m, now)).take(n).collect())
     }
 
-    /// Tombstone every prunable entry (see [`is_prunable`]); files are never
-    /// deleted. Returns the entries removed.
-    pub fn prune_missing(&self) -> Result<Vec<MediaItem>> {
+    /// Tombstone the entries whose file was deleted, for `bugle history
+    /// prune`; files are never touched. On top of [`looks_deleted`], an entry
+    /// is kept when its parent directory is empty (possibly the mount point
+    /// of an offline share) and when it is the `parent` of a subtitle entry
+    /// that stays (a sidecar sync finds its video that way). With `dry_run`
+    /// nothing is written. Returns the entries removed (or that would be).
+    ///
+    /// The files are checked without the writer lock; under it only the
+    /// candidates are re-checked: each must still have the record that was
+    /// checked (another process may have recorded a new path meanwhile) and
+    /// still be missing.
+    pub fn prune_missing(&self, dry_run: bool) -> Result<Vec<MediaItem>> {
+        let candidates = self.prune_candidates()?;
+        if candidates.is_empty() || dry_run {
+            return Ok(candidates);
+        }
+        self.tombstone_unchanged(candidates)
+    }
+
+    /// The unlocked half of [`History::prune_missing`].
+    fn prune_candidates(&self) -> Result<Vec<MediaItem>> {
         let now = chrono::Utc::now();
-        let ids: Vec<String> = {
+        let items = {
             let _g = self.lock.lock().unwrap();
-            self.read_unlocked()?.items.into_iter().filter(|m| is_prunable(m, now)).map(|m| m.id).collect()
+            self.read_unlocked()?.items
         };
-        if ids.is_empty() {
-            return Ok(vec![]);
-        }
-        self.tombstone_if_still_missing(&ids, now)
+        let mut dir_ok: HashMap<PathBuf, bool> = HashMap::new();
+        let mut candidates: Vec<MediaItem> = items
+            .iter()
+            .filter(|m| {
+                looks_deleted(m, now)
+                    && m.path.parent().is_some_and(|d| *dir_ok.entry(d.to_path_buf()).or_insert_with(|| has_entries(d)))
+            })
+            .cloned()
+            .collect();
+        let candidate_ids: std::collections::HashSet<&str> = candidates.iter().map(|m| m.id.as_str()).collect();
+        let needed: std::collections::HashSet<String> = items
+            .iter()
+            .filter(|m| m.kind == crate::media_item::MediaKind::Subtitle && !candidate_ids.contains(m.id.as_str()))
+            .filter_map(|m| m.parent.clone())
+            .collect();
+        candidates.retain(|m| !needed.contains(&m.id));
+        Ok(candidates)
     }
 
-    /// Re-read under the writer lock and tombstone those of `ids` that are
-    /// still prunable, in one write: another process may have recorded a
-    /// new path for one of them since the unlocked read.
-    fn tombstone_if_still_missing(&self, ids: &[String], now: chrono::DateTime<chrono::Utc>) -> Result<Vec<MediaItem>> {
-        let ids: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+    /// The locked half of [`History::prune_missing`]: tombstone those of
+    /// `candidates` whose record is unchanged and whose file is still gone.
+    fn tombstone_unchanged(&self, mut candidates: Vec<MediaItem>) -> Result<Vec<MediaItem>> {
         let _g = self.lock.lock().unwrap();
         let _fl = self.lock_exclusive()?;
-        let gone: Vec<MediaItem> = self
-            .read_unlocked()?
-            .items
-            .into_iter()
-            .filter(|m| ids.contains(m.id.as_str()) && is_prunable(m, now))
-            .collect();
-        if gone.is_empty() {
-            return Ok(gone);
+        let current: HashMap<String, MediaItem> = self.read_unlocked()?.items.into_iter().map(|m| (m.id.clone(), m)).collect();
+        candidates.retain(|m| {
+            current.get(&m.id).is_some_and(|c| c.path == m.path && c.url == m.url && c.created_at == m.created_at)
+                && file_not_found(&m.path)
+        });
+        if candidates.is_empty() {
+            return Ok(candidates);
         }
-        let mut buf = String::new();
-        for m in &gone {
-            buf.push_str(&format!("DELETE {}\n", m.id));
-        }
+        let buf: String = candidates.iter().map(|m| format!("DELETE {}\n", m.id)).collect();
         let mut f = OpenOptions::new().append(true).open(&self.path)?;
         f.write_all(buf.as_bytes())?;
-        Ok(gone)
+        Ok(candidates)
     }
 
     /// Look up an item. An exact id wins; otherwise `id` must be a prefix of
@@ -366,6 +378,24 @@ mod tests {
         let mut m = MediaItem::new(MediaKind::Screenshot, format!("/nonexistent/{id}.png"));
         m.id = id.to_string();
         m
+    }
+
+    /// An item recorded at `path` just now (inside the prune grace period).
+    fn item_at(id: &str, path: &Path) -> MediaItem {
+        let mut m = MediaItem::new(MediaKind::Screenshot, path);
+        m.id = id.to_string();
+        m
+    }
+
+    /// An item recorded at `path` well before the prune grace period.
+    fn old_item(id: &str, path: &Path) -> MediaItem {
+        let mut m = item_at(id, path);
+        m.created_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        m
+    }
+
+    fn ids(items: &[MediaItem]) -> Vec<&str> {
+        items.iter().map(|m| m.id.as_str()).collect()
     }
 
     fn is_invalid(e: &anyhow::Error) -> bool {
@@ -566,16 +596,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// An item recorded at `path` well before the prune grace period.
-    fn old_item(id: &str, path: &Path) -> MediaItem {
-        let mut m = MediaItem::new(MediaKind::Screenshot, path);
-        m.id = id.to_string();
-        m.created_at = chrono::Utc::now() - chrono::Duration::hours(1);
-        m
+    #[test]
+    fn recent_hides_missing_files_without_writing() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        let h = History::open(&path).unwrap();
+        for i in 0..3 {
+            let p = dir.join(format!("live{i}.png"));
+            std::fs::write(&p, b"x").unwrap();
+            h.push(&old_item(&format!("live0000000{i}"), &p)).unwrap();
+            h.push(&old_item(&format!("gone0000000{i}"), &dir.join(format!("gone{i}.png")))).unwrap();
+        }
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(ids(&h.recent(2).unwrap()), ["live00000002", "live00000001"]);
+        assert_eq!(h.recent(10).unwrap().len(), 3);
+        // Opening does not prune either.
+        History::open(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "listing and opening never write");
+        assert_eq!(h.all().unwrap().len(), 6);
+        // Put back from the Trash: the entry shows again, metadata intact.
+        std::fs::write(dir.join("gone2.png"), b"x").unwrap();
+        assert_eq!(ids(&h.recent(1).unwrap()), ["gone00000002"]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn prunes_entries_whose_file_is_gone_and_keeps_the_rest() {
+    fn prune_removes_deleted_files_and_keeps_the_rest() {
         let dir = temp_dir();
         let media = dir.join("media");
         std::fs::create_dir_all(&media).unwrap();
@@ -587,6 +634,9 @@ mod tests {
         h.push(&old_item("gone00000001", &media.join("gone.png"))).unwrap();
         // Parent directory missing: an unmounted volume looks like this.
         h.push(&old_item("vol000000001", &dir.join("Volumes/Backup/shot.png"))).unwrap();
+        // Parent directory empty: the mount point of an offline share.
+        std::fs::create_dir_all(dir.join("nas")).unwrap();
+        h.push(&old_item("nas000000001", &dir.join("nas/shot.png"))).unwrap();
         // Synced copy: the entry still leads somewhere.
         let mut synced = old_item("sync00000001", &media.join("uploaded.png"));
         synced.url = Some("https://example.invalid/uploaded.png".into());
@@ -598,93 +648,115 @@ mod tests {
         // A directory where the file was is not "gone".
         std::fs::create_dir_all(media.join("dir.png")).unwrap();
         h.push(&old_item("dir000000001", &media.join("dir.png"))).unwrap();
+        // A broken symlink still exists.
+        std::os::unix::fs::symlink(media.join("nowhere.png"), media.join("link.png")).unwrap();
+        h.push(&old_item("link00000001", &media.join("link.png"))).unwrap();
+        // A video whose subtitle stays is kept; one whose subtitle goes too is not.
+        h.push(&old_item("vid000000001", &media.join("clip.mp4"))).unwrap();
+        let vtt = media.join("clip.vtt");
+        std::fs::write(&vtt, b"WEBVTT").unwrap();
+        let mut sub = old_item("sub000000001", &vtt);
+        sub.kind = MediaKind::Subtitle;
+        sub.parent = Some("vid000000001".into());
+        h.push(&sub).unwrap();
+        h.push(&old_item("vid000000002", &media.join("other.mp4"))).unwrap();
+        let mut sub = old_item("sub000000002", &media.join("other.vtt"));
+        sub.kind = MediaKind::Subtitle;
+        sub.parent = Some("vid000000002".into());
+        h.push(&sub).unwrap();
 
-        let gone = h.prune_missing().unwrap();
-        assert_eq!(gone.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["gone00000001"]);
-        let ids: Vec<String> = h.all().unwrap().into_iter().map(|m| m.id).collect();
-        assert_eq!(ids, ["live00000001", "vol000000001", "sync00000001", "rel000000001", "new000000001", "dir000000001"]);
-        assert!(std::fs::read_to_string(&path).unwrap().contains("DELETE gone00000001"));
-        // Idempotent: nothing more to write.
         let before = std::fs::read_to_string(&path).unwrap();
-        assert!(h.prune_missing().unwrap().is_empty());
+        let expected = ["gone00000001", "vid000000002", "sub000000002"];
+        assert_eq!(ids(&h.prune_missing(true).unwrap()), expected);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "dry run writes nothing");
+        assert_eq!(ids(&h.prune_missing(false).unwrap()), expected);
+        let kept: Vec<String> = h.all().unwrap().into_iter().map(|m| m.id).collect();
+        assert_eq!(
+            kept,
+            [
+                "live00000001", "vol000000001", "nas000000001", "sync00000001", "rel000000001", "new000000001",
+                "dir000000001", "link00000001", "vid000000001", "sub000000001"
+            ]
+        );
+        // Idempotent, and no file was touched.
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(h.prune_missing(false).unwrap().is_empty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
-        // No file was touched.
-        assert!(live.is_file() && media.join("dir.png").is_dir());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    fn item_at(id: &str, path: &Path) -> MediaItem {
-        let mut m = MediaItem::new(MediaKind::Screenshot, path);
-        m.id = id.to_string();
-        m
-    }
-
-    #[test]
-    fn open_prunes_and_the_pruning_persists() {
-        let dir = temp_dir();
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("history.jsonl");
-        let keep = dir.join("keep.png");
-        std::fs::write(&keep, b"x").unwrap();
-        let h = History::open(&path).unwrap();
-        h.push(&old_item("keep00000001", &keep)).unwrap();
-        h.push(&old_item("gone00000001", &dir.join("gone.png"))).unwrap();
-        assert_eq!(h.all().unwrap().len(), 2, "all() itself does not prune");
-
-        let h = History::open(&path).unwrap();
-        assert_eq!(h.all().unwrap().into_iter().map(|m| m.id).collect::<Vec<_>>(), ["keep00000001"]);
-        // A plain reader (no pruning) sees the same: it was written down.
-        let raw = History { path: path.clone(), lock: Mutex::new(()) };
-        assert_eq!(raw.all().unwrap().len(), 1);
-        // A pruned id can be recorded again, like any tombstoned one.
-        std::fs::write(dir.join("gone.png"), b"x").unwrap();
-        h.push(&old_item("gone00000001", &dir.join("gone.png"))).unwrap();
-        assert_eq!(h.all().unwrap().len(), 2);
+        assert!(live.is_file() && vtt.is_file() && media.join("dir.png").is_dir());
+        assert!(media.join("link.png").symlink_metadata().is_ok());
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn recent_skips_and_prunes_missing_files() {
+    fn prune_keeps_entries_it_cannot_check() {
+        let dir = temp_dir();
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("other.png"), b"x").unwrap();
+        let h = History::open(dir.join("history.jsonl")).unwrap();
+        h.push(&old_item("perm00000001", &locked.join("shot.png"))).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = std::fs::symlink_metadata(locked.join("shot.png")).is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+        let pruned = h.prune_missing(false).unwrap();
+        let shown = h.recent(5).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if denied {
+            assert!(pruned.is_empty(), "PermissionDenied is not NotFound");
+            assert_eq!(ids(&shown), ["perm00000001"]);
+        } // else running as root: the directory is still readable.
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prune_rechecks_candidates_under_the_lock() {
+        // Between the unlocked check and the tombstone write another process
+        // recorded a new path (a sync move), and a file was put back.
         let dir = temp_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("history.jsonl");
         let h = History::open(&path).unwrap();
-        for i in 0..4 {
-            let p = dir.join(format!("live{i}.png"));
-            std::fs::write(&p, b"x").unwrap();
-            h.push(&old_item(&format!("live0000000{i}"), &p)).unwrap();
-            h.push(&old_item(&format!("gone0000000{i}"), &dir.join(format!("gone{i}.png")))).unwrap();
-        }
-        // Newest first; the two newest live items, with the missing ones met on the way pruned.
-        let ids: Vec<String> = h.recent(2).unwrap().into_iter().map(|m| m.id).collect();
-        assert_eq!(ids, ["live00000003", "live00000002"]);
+        let moved = old_item("move00000001", &dir.join("before.png"));
+        h.push(&moved).unwrap();
+        h.push(&old_item("back00000001", &dir.join("back.png"))).unwrap();
+        h.push(&old_item("gone00000001", &dir.join("gone.png"))).unwrap();
+        std::fs::write(dir.join("unrelated.png"), b"x").unwrap();
+        let candidates = h.prune_candidates().unwrap();
+        assert_eq!(ids(&candidates), ["move00000001", "back00000001", "gone00000001"]);
+        let mut after = moved.clone();
+        after.path = dir.join("synced/after.png");
+        History::open(&path).unwrap().update(&after).unwrap();
+        std::fs::write(dir.join("back.png"), b"x").unwrap();
+        assert_eq!(ids(&h.tombstone_unchanged(candidates).unwrap()), ["gone00000001"]);
+        assert_eq!(ids(&h.all().unwrap()), ["move00000001", "back00000001"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_prunes_write_one_tombstone() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("keep.png"), b"x").unwrap();
+        let path = dir.join("history.jsonl");
+        let h = History::open(&path).unwrap();
+        h.push(&old_item("gone00000001", &dir.join("gone.png"))).unwrap();
+        // Opened up front, like separate running processes: an `open` after
+        // the tombstone would compact it away.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| History::open(&path).unwrap())
+            .map(|other| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    other.prune_missing(false).unwrap().len()
+                })
+            })
+            .collect();
+        let total: usize = threads.into_iter().map(|t| t.join().unwrap()).sum();
+        assert_eq!(total, 1);
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("DELETE gone00000003") && text.contains("DELETE gone00000002"), "{text}");
-        assert!(!text.contains("DELETE gone00000001"), "older entries are only checked when listed: {text}");
-        assert_eq!(h.all().unwrap().len(), 6);
-        assert_eq!(h.recent(10).unwrap().len(), 4);
-        assert_eq!(h.all().unwrap().len(), 4);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn pruning_rechecks_under_the_lock() {
-        // Another process recorded a new path for the entry (a sync move)
-        // between the unlocked read and the tombstone write.
-        let dir = temp_dir();
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("history.jsonl");
-        let h = History::open(&path).unwrap();
-        let m = old_item("move00000001", &dir.join("before.png"));
-        h.push(&m).unwrap();
-        let moved = dir.join("after.png");
-        std::fs::write(&moved, b"x").unwrap();
-        let mut after = m.clone();
-        after.path = moved;
-        h.update(&after).unwrap();
-        let ids = vec![m.id.clone()];
-        assert!(h.tombstone_if_still_missing(&ids, chrono::Utc::now()).unwrap().is_empty());
-        assert_eq!(h.all().unwrap().len(), 1);
+        assert_eq!(text.matches("DELETE gone00000001").count(), 1, "{text}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

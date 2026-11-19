@@ -37,7 +37,7 @@ Verified on macOS 26.5 (arm64), Rust 1.99:
 | System audio in recordings | ScreenCaptureKit `SCStream` audio tap + `AVAssetWriter` (H.264 + AAC .mp4), microphone as a second track or mixed into one (`--mix-audio`) with per-source levels (on either output), optional ducking of system audio under the microphone and a peak limiter, live level meter while recording | ✅ (macOS 14+) |
 | Describe image / video frames with a vision model | OpenAI-compatible, Ollama, Anthropic, command | ✅ |
 | Transcribe / subtitles (SRT, VTT) | whisper.cpp server, OpenAI-compatible, command | ✅ |
-| History | JSON-lines file, ids, delete, entries of deleted files pruned | ✅ |
+| History | JSON-lines file, ids, delete, `history prune` for deleted files | ✅ |
 | HTTP API + OpenAPI | axum, bearer token | ✅ |
 | MCP server (stdio) | JSON-RPC 2.0, image content | ✅ |
 | Menu-bar app, global hotkeys | `bugle-app`: `NSStatusItem` via `tray-icon`, Carbon hotkeys via `global-hotkey`, in-app overlays | ✅ |
@@ -235,6 +235,7 @@ bugle annotate --schema                            # example of every shape
 
 bugle pin latest --at 1900,120,600,300 --opacity 0.95
 bugle windows | bugle displays | bugle history -n 10 | bugle delete <id> --file
+bugle history prune [--dry-run]    # drop entries whose file was deleted (files untouched)
 bugle sync latest                  # copy/move/upload to the [sync] destination
 bugle providers | bugle ask "summarise this OCR output: ..."
 bugle config init | bugle config show

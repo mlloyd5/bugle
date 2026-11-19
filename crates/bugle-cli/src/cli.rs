@@ -64,10 +64,12 @@ pub enum Cmd {
         #[arg(long)]
         all: bool,
     },
-    /// Show recent captures.
+    /// Show recent captures (entries whose file was deleted are hidden).
     History {
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
+        #[command(subcommand)]
+        cmd: Option<HistoryCmd>,
     },
     /// Remove an item from history.
     Delete {
@@ -498,6 +500,18 @@ pub struct PinArgs {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum HistoryCmd {
+    /// Remove history entries whose file was deleted (files are never
+    /// touched). Entries on an unmounted volume or an empty mount point,
+    /// with a synced URL, or recorded in the last minute are kept.
+    Prune {
+        /// List what would be removed without changing the history.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum ConfigCmd {
     /// Write a default config file (does not overwrite).
     Init,
@@ -918,7 +932,19 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Cmd::History { limit } => {
+        Cmd::History { cmd: Some(HistoryCmd::Prune { dry_run }), .. } => {
+            let gone = engine.history.prune_missing(dry_run)?;
+            if json {
+                println!("{}", json!({"pruned": gone, "dry_run": dry_run}));
+            } else {
+                for m in &gone {
+                    println!("{}  {}", m.id, m.path.display());
+                }
+                let verb = if dry_run { "would remove" } else { "removed" };
+                println!("{verb} {} history entr{}", gone.len(), if gone.len() == 1 { "y" } else { "ies" });
+            }
+        }
+        Cmd::History { limit, cmd: None } => {
             let items = engine.history.recent(limit)?;
             if json {
                 println!("{}", json!(items));
@@ -1143,6 +1169,14 @@ mod tests {
         assert!(matches!(cli.cmd, Cmd::Config { cmd: ConfigCmd::Show { reveal: true } }));
         let cli = Cli::try_parse_from(["bugle", "config", "show"]).unwrap();
         assert!(matches!(cli.cmd, Cmd::Config { cmd: ConfigCmd::Show { reveal: false } }));
+    }
+
+    #[test]
+    fn history_prune_subcommand() {
+        let cli = Cli::try_parse_from(["bugle", "history", "prune", "--dry-run"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::History { cmd: Some(HistoryCmd::Prune { dry_run: true }), .. }));
+        let cli = Cli::try_parse_from(["bugle", "history", "-n", "5"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::History { limit: 5, cmd: None }));
     }
 
     #[test]
