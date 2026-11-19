@@ -20,6 +20,20 @@ static BOOL wait_ready(AVAssetWriterInput *in) {
     return in.readyForMoreMediaData;
 }
 
+// Frames come from a standalone buffer, not the adaptor's pixelBufferPool.
+// That pool is nil until the session runs, and under load the writer can tear
+// it down while we hold its unretained pointer: CoreVideo then traps or
+// faults inside CVPixelBufferPoolCreatePixelBuffer and takes the test binary
+// with it. A pool buys nothing for a few 64x64 frames.
+static CVPixelBufferRef fixture_pixel_buffer(AVAssetWriterInputPixelBufferAdaptor *adaptor, int32_t size) {
+    CVPixelBufferRef px = NULL;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, size, size, kCVPixelFormatType_32BGRA,
+                            (__bridge CFDictionaryRef)adaptor.sourcePixelBufferAttributes, &px) != kCVReturnSuccess) {
+        return NULL;
+    }
+    return px;
+}
+
 char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double seconds, double amplitude, int32_t overlap,
                                 double delay, int32_t video) {
     @autoreleasepool {
@@ -95,12 +109,16 @@ char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double sec
         int64_t vnext = 0;
         float buf[chunk * 2];
         BOOL ok = YES;
+        NSString *failure = nil;
         // Advance every track chunk by chunk in time order so the writer
         // can interleave them.
         for (int64_t start = 0; start < total && ok; start += chunk) {
             while (ok && vin && vnext < vframes && vnext * 48000 / vfps <= start) {
-                CVPixelBufferRef px = NULL;
-                ok = CVPixelBufferPoolCreatePixelBuffer(NULL, adaptor.pixelBufferPool, &px) == kCVReturnSuccess;
+                CVPixelBufferRef px = fixture_pixel_buffer(adaptor, vsize);
+                if (!px) {
+                    ok = NO;
+                    failure = @"could not allocate a pixel buffer for a video frame";
+                }
                 if (ok) {
                     CVPixelBufferLockBaseAddress(px, 0);
                     memset(CVPixelBufferGetBaseAddress(px), (int)(vnext * 23 % 256),
@@ -138,7 +156,7 @@ char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double sec
         }
         CFRelease(fmt);
         if (!ok) {
-            NSString *why = writer.error.localizedDescription ?: @"append failed";
+            NSString *why = failure ?: writer.error.localizedDescription ?: @"append failed";
             [writer cancelWriting];
             return fixture_error(@"writing the tone fixture failed: %@", why);
         }
