@@ -41,10 +41,15 @@ pub struct RecorderState {
     /// place of the `[recordings]` ones.
     levels: Mutex<Option<AudioMixConfig>>,
     /// A recording [`Engine::record_reap`] finalised after it stopped by
-    /// itself, for the `record_stop` that comes for it; cleared by the next
-    /// start.
-    reaped: Mutex<Option<std::result::Result<MediaItem, String>>>,
+    /// itself (and when), for the `record_stop` that comes for it; cleared
+    /// by the next start, ignored after [`REAPED_KEPT`].
+    reaped: Mutex<Option<(Instant, std::result::Result<MediaItem, String>)>>,
 }
+
+/// How long a `record_stop` may still collect a recording that
+/// [`Engine::record_reap`] finalised; later it is "no recording in
+/// progress" again rather than a stale record.
+const REAPED_KEPT: Duration = Duration::from_secs(10 * 60);
 
 struct Active {
     format: RecordingFormat,
@@ -514,7 +519,8 @@ impl Engine {
     /// Finalise a recording whose backend stopped by itself (it reached its
     /// `max_seconds`), so a front end need not wait for a `record_stop` to
     /// show it ended. `None` when there is none (idle, or still capturing).
-    /// The next `record_stop`, until another recording starts, returns the
+    /// The next `record_stop`, until another recording starts and within
+    /// [`REAPED_KEPT`], returns the
     /// same result, so a caller that asked for the auto-stop still gets its
     /// media record.
     pub fn record_reap(&self) -> Option<Result<MediaItem>> {
@@ -528,7 +534,7 @@ impl Engine {
         let mut reaped = self.recorder_state.reaped.lock().unwrap_or_else(|e| e.into_inner());
         drop(g);
         let r = self.finish(finished);
-        *reaped = Some(r.as_ref().map(Clone::clone).map_err(|e| format!("{e:#}")));
+        *reaped = Some((Instant::now(), r.as_ref().map(Clone::clone).map_err(|e| format!("{e:#}"))));
         drop(reaped);
         Some(r)
     }
@@ -773,8 +779,8 @@ impl Engine {
             drop(g);
             let reaped = self.recorder_state.reaped.lock().unwrap_or_else(|e| e.into_inner()).take();
             return match reaped {
-                Some(r) => r.map_err(|e| anyhow!(e)),
-                None => Err(anyhow!("no recording in progress")),
+                Some((at, r)) if at.elapsed() < REAPED_KEPT => r.map_err(|e| anyhow!(e)),
+                _ => Err(anyhow!("no recording in progress")),
             };
         };
         drop(g);
@@ -1336,6 +1342,48 @@ mod tests {
         engine.install(engine.idle_recorder().unwrap(), active(one_frame_gif(&out2, Default::default()), out2.clone(), None));
         assert_eq!(engine.record_stop().unwrap().path, out2, "the running one, not the reaped one");
         assert!(engine.record_stop().is_err());
+    }
+
+    #[test]
+    fn record_stop_waits_for_a_reap_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _) = watched_engine(tmp.path());
+        let out = tmp.path().join("slow.gif");
+        let out2 = out.clone();
+        // Capturing has ended; writing the file takes a while (an export).
+        let (backend, _) = gif(Arc::new(AtomicBool::new(true)), move || {
+            std::thread::sleep(Duration::from_millis(400));
+            let img = RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]));
+            GifEncoder::new(std::fs::File::create(&out2)?).encode_frames(std::iter::once(Frame::new(img)))?;
+            Ok(1)
+        });
+        engine.install(engine.idle_recorder().unwrap(), active(backend, out.clone(), Some(1.0)));
+        wait_until(|| engine.record_status().state == RecordingState::Finishing);
+        let reaper = {
+            let engine = engine.clone();
+            std::thread::spawn(move || engine.record_reap())
+        };
+        // The slot is free (idle) while the reap is still writing...
+        wait_until(|| engine.record_status().state == RecordingState::Idle);
+        // ...and a stop then (quitting, say) waits for the file.
+        let m = engine.record_stop().unwrap();
+        assert_eq!(m.path, out);
+        assert!(out.exists(), "finalised by the time record_stop returns");
+        assert!(reaper.join().unwrap().unwrap().is_ok());
+    }
+
+    #[test]
+    fn a_reaped_result_expires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _) = watched_engine(tmp.path());
+        let out = tmp.path().join("old.gif");
+        engine.install(engine.idle_recorder().unwrap(), active(one_frame_gif(&out, Arc::new(AtomicBool::new(true))), out, Some(1.0)));
+        wait_until(|| engine.record_status().state == RecordingState::Finishing);
+        assert!(engine.record_reap().unwrap().is_ok());
+        let Some(long_ago) = Instant::now().checked_sub(REAPED_KEPT + Duration::from_secs(1)) else { return };
+        engine.recorder_state.reaped.lock().unwrap().as_mut().unwrap().0 = long_ago;
+        let e = engine.record_stop().unwrap_err();
+        assert!(e.to_string().contains("no recording in progress"), "{e}");
     }
 
     /// `record_start` must hand its recording to the UI host via `install`

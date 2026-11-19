@@ -839,7 +839,10 @@ impl App {
             bugle_platform::video_editor_focus();
             return self.toast_error("Edit Video: an export is running; quit once it has finished");
         }
-        if self.is_recording() {
+        // A reap in progress has already freed the slot (the status reads
+        // idle) but is still writing the file: `record_stop` waits for it
+        // rather than exiting mid-export.
+        if self.is_recording() || self.reaping.load(std::sync::atomic::Ordering::SeqCst) {
             match self.engine.record_stop() {
                 Ok(m) => tracing::info!("recording saved to {}", m.path.display()),
                 Err(e) => tracing::warn!("stopping recording on quit: {e:#}"),
