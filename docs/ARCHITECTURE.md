@@ -421,8 +421,8 @@ away: the engine calls `UiHost::recording_changed` on every start and stop
 (twice for a stop: once the slot is free, again once the file is
 finalised), which `bugle-app` turns into a `RecordingChanged` event on its
 loop. The step requires that event to be handled and the status item to
-switch within 500 ms of the call that starts the recording and of the one
-that stops it. (`bugle mcp` and `bugle serve` are separate processes with
+switch by 500 ms after the call that starts the recording returns, and
+likewise for the stop (both usually happen during the call). (`bugle mcp` and `bugle serve` are separate processes with
 their own engine and no UI host, so the app does not see their
 recordings.) A recording that stops by itself at an Agent API request's
 `max_seconds` is noticed on the housekeeping tick (about once a second):

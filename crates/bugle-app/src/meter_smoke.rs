@@ -41,29 +41,31 @@ const SAMPLE_AT_S: f64 = 1.2;
 /// behind its back: the levels come with the first audio buffers.
 const SHOW_TIMEOUT: Duration = Duration::from_secs(3);
 /// How soon after the call that starts (or stops) a recording behind the
-/// app's back, as its Agent API does, the engine's `RecordingChanged` must
-/// reach the app and the status item switch: well inside the one-second tick
-/// that used to be the only way the app found out.
+/// app's back returns, as its Agent API does, the engine's `RecordingChanged`
+/// must have reached the app and the status item switched: well inside the
+/// one-second tick that used to be the only way the app found out. Timed from
+/// the return, so the recorder's own startup (ScreenCaptureKit can take a
+/// while) does not count.
 const SHOW_PROMPTLY: Duration = Duration::from_millis(500);
 
-/// Check that within [`SHOW_PROMPTLY`] of `since` the app handled the
-/// engine's event for `recording` (`what`) and the status item showed it,
-/// waiting until [`SHOW_PROMPTLY`] after `until` (the call returned). The
-/// event is required, not just the switch: the 100 ms meter tick, or the
-/// one-second one, could flip the item without it.
+/// Check that by [`SHOW_PROMPTLY`] after `until` (when the call made at
+/// `since` returned) the app handled the engine's event for `recording`
+/// (`what`) and the status item showed it; either may already have happened
+/// during the call (0 ms). The event is required, not just the switch: the
+/// 100 ms meter tick, or the one-second one, could flip the item without it.
 fn check_prompt(what: &str, recording: bool, since: Instant, until: Instant, failures: &mut Vec<String>) {
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
     let (event, shown) = loop {
         let (event, shown) = (level_meter::event_at(recording), level_meter::shown_at(recording));
         if (event.is_some() && shown.is_some()) || until.elapsed() > SHOW_PROMPTLY {
-            break (event.map(|at| at.saturating_duration_since(since)), shown.map(|at| at.saturating_duration_since(since)));
+            break (event.map(|at| at.saturating_duration_since(until)), shown.map(|at| at.saturating_duration_since(until)));
         }
         std::thread::sleep(Duration::from_millis(5));
     };
     let call = ms(until.saturating_duration_since(since));
     match (event, shown) {
         (Some(e), Some(s)) if e <= SHOW_PROMPTLY && s <= SHOW_PROMPTLY => say(format!(
-            "the status item showed the {what} after {:.0} ms, the engine's event handled after {:.0} ms (the call took {call:.0} ms)",
+            "the status item showed the {what} {:.0} ms and the engine's event was handled {:.0} ms after the call returned (the call took {call:.0} ms)",
             ms(s),
             ms(e)
         )),
@@ -73,7 +75,7 @@ fn check_prompt(what: &str, recording: bool, since: Instant, until: Instant, fai
         )),
         (_, None) => failures.push(format!("the status item did not show the {what} within {} ms of the call returning", SHOW_PROMPTLY.as_millis())),
         (Some(e), Some(s)) => failures.push(format!(
-            "the status item showed the {what} after {:.0} ms and the event came after {:.0} ms, not within {} ms (the call took {call:.0} ms)",
+            "the status item showed the {what} {:.0} ms and the event came {:.0} ms after the call returned, not within {} ms (the call took {call:.0} ms)",
             ms(s),
             ms(e),
             SHOW_PROMPTLY.as_millis()
