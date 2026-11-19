@@ -526,6 +526,36 @@ the bundle's signature and architectures, and detaches. `release_steps`
 fixes the order: all of that happens before `dist/Bugle.app` is replaced, and
 the new image is renamed over the old one (never deleted first).
 
+`cargo xtask smoke-vm` (`smoke_vm.rs`) runs the smoke test in a throwaway
+Tart VM. `--prepare` `tart clone`s an already pulled Cirrus Labs image to the
+golden image `bugle-smoke-base`, boots it, and through `tart exec` (gRPC to
+the Tart guest agent, a LaunchAgent in the auto-logged-in `admin` session, so
+commands run in the GUI session with the window server) checks
+`csrutil status` and `INSERT OR REPLACE`s `kTCCServiceScreenCapture`,
+`Microphone`, `Accessibility` and `PostEvent` rows for the bundle id
+(`client_type` 0) and the fixed guest executable path (`client_type` 1), with
+no code requirement so ad-hoc rebuilds still match, into the system and the
+user `TCC.db` (macOS 27: the user database is found through `tccd`'s open
+files), the same way the image build grants its guest agent. Writing TCC.db
+needs SIP off, which those images already are in the guest (their build runs
+`csrutil disable` from guest recovery); the host is never asked to change SIP.
+A run checks
+for `tart` (and `tart exec`) and the golden image, assembles a bundle with
+`bundle` into its own `target/xtask/smoke-vm/<run>/dist`, writes
+`smoke_config` for the guest path `/Users/admin/bugle-smoke/run` and the guest
+script, clones the golden image, and `tart run --no-graphics --no-audio
+--no-clipboard --dir=app:<dist>:ro --dir=run:<share>`. `--no-graphics` only
+skips the host window: Tart always configures a `VZMacGraphicsDeviceConfiguration`,
+so the guest has a display for the windows and ScreenCaptureKit (VNC is not
+needed). `--no-audio` leaves the guest a null speaker, so system audio is
+still a device to record while nothing plays on the host and the host
+microphone is not attached. Readiness is `tart exec <vm> test -e
+"/Volumes/My Shared Files/run/run.sh"` (agent up, user logged in, shares
+mounted). The script copies the bundle off the share, runs it, tees the log
+into the share and `ditto`s the run directory back; the host enforces the time
+limit and a `Vm` guard stops and deletes the clone on every exit path but a
+signal.
+
 After a capture the app shows the quick-access panel instead of the toast
 (`[quick_access]`, on by default). `quick_access.rs` is the platform-free part:
 which buttons a media kind gets, the panels up (captures in a row stack up to
