@@ -72,6 +72,7 @@ cargo xtask bundle --zip           # also dist/Bugle-<version>.zip
 cargo xtask dmg                    # also dist/Bugle-<version>.dmg (= bundle --dmg)
 cargo xtask bundle --universal     # arm64 + x86_64 in one bundle
 cargo xtask verify --smoke-test    # re-check a bundle, then run its smoke test (~30 s)
+cargo xtask smoke-vm               # the smoke test in a throwaway macOS VM (see Testing in a VM)
 ```
 
 `bundle` builds the release binaries (taking their paths from cargo, so a custom
@@ -190,6 +191,58 @@ keychain profile it accepts an App Store Connect API key: `BUGLE_NOTARY_KEY`
 secret is passed on the command line, and identifiers are masked in the log.
 `--notarize` fails before building when the identity is ad-hoc or the
 credentials are missing or incomplete; any failing step fails the run.
+
+### Testing in a VM
+
+The smoke test takes over the Mac it runs on for about 30 s: overlays, editor
+windows, in-process mouse and key events, a 2 s recording with system audio and
+a sound. `cargo xtask smoke-vm` runs it in a macOS virtual machine instead,
+with [Tart](https://tart.run) (Apple's Virtualization.framework; Apple silicon
+only), so nothing appears on your screen, clipboard or speakers.
+
+Once (the base image is tens of GB):
+
+```bash
+brew install cirruslabs/cli/tart
+tart pull ghcr.io/cirruslabs/macos-tahoe-base:latest   # match your macOS: sonoma, sequoia, tahoe, golden-gate
+cargo xtask smoke-vm --prepare                          # → local image bugle-smoke-base
+```
+
+Then for each run:
+
+```bash
+cargo xtask smoke-vm                     # build, run in a fresh clone, delete it
+cargo xtask smoke-vm --app dist/Bugle.app  # an existing bundle instead
+```
+
+`--prepare` clones the pulled image (`--from`, default the Cirrus Labs
+`macos-<your macOS>-base` image) to `bugle-smoke-base` (`--image`, or
+`BUGLE_SMOKE_VM_IMAGE`), boots it and grants Bugle Screen Recording,
+Microphone, Accessibility and Post Event in the guest's TCC databases. That
+works because the Cirrus Labs `-base` and `-xcode` images have SIP disabled
+*inside the guest*; your Mac's SIP is never touched. With an image whose SIP is
+on, `--prepare` stops and says how to turn it off in that guest's recovery
+(`tart run --recovery <vm>`, then Options → Utilities → Terminal,
+`csrutil disable`). `--force` rebuilds an existing golden image, for instance
+after a month, when macOS may ask to re-confirm screen recording.
+
+A run builds the bundle into `target/xtask/smoke-vm/<run>/dist`, clones the
+golden image to `bugle-smoke-run-<millis>-<pid>` (copy-on-write, so it is
+quick and runs do not share state; macOS allows two VMs at a time), boots it
+without a window, host audio or a shared clipboard, and shares the bundle
+read-only and a run directory read-write. Through the Tart guest agent
+(`tart exec`) the guest copies the bundle to `/Users/admin/bugle-smoke` and
+runs `--smoke-test` with the same throwaway config as `verify --smoke-test`,
+plus `BUGLE_SMOKE_KEEP`, `BUGLE_SMOKE_CLIPBOARD=1` and `BUGLE_SMOKE_SAVE`
+(nothing leaves the VM, so the clipboard and export steps run too). The output
+streams to your terminal and to `share/smoke.log`; the guest's run directory
+(captures, history, kept temp files) comes back as `share/artifacts`. The VM is
+stopped and deleted afterwards, also on failure (after Ctrl-C, `tart list` and
+`tart delete bugle-smoke-run-…`). The run fails if the app fails, if it takes
+longer than `BUGLE_SMOKE_TIMEOUT` plus a minute for the copies, if the VM is not
+ready within `BUGLE_SMOKE_VM_BOOT_TIMEOUT` (300 s), or if the recording step
+was skipped for lack of Screen Recording access. Nothing is downloaded on its
+own: a missing `tart` or image is an error naming the command to run.
 
 ## Permissions
 

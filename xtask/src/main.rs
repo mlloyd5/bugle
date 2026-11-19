@@ -12,9 +12,13 @@
 //! * `verify` re-runs the checks on an existing bundle.
 //! * `icon` writes the `.icns` and a 1024 px PNG preview.
 //! * `check` runs clippy (warnings are errors) and the workspace tests.
+//! * `smoke-vm` runs the bundle's `--smoke-test` in a throwaway Tart macOS
+//!   VM instead of on the host; `smoke-vm --prepare` makes its golden image
+//!   (see `smoke_vm.rs`).
 
 mod icns;
 mod plist;
+mod smoke_vm;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -67,6 +71,10 @@ enum Cmd {
     /// Run `cargo clippy --workspace --all-targets -- -D warnings` and
     /// `cargo test --workspace`; fails if either does.
     Check,
+    /// Build the bundle and run its `--smoke-test` in a throwaway Tart macOS
+    /// VM (cloned from a golden image, deleted afterwards), so nothing shows
+    /// on this Mac. `--prepare` makes the golden image once.
+    SmokeVm(smoke_vm::SmokeVmArgs),
 }
 
 #[derive(Args)]
@@ -138,6 +146,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Check => check(),
+        Cmd::SmokeVm(args) => smoke_vm::smoke_vm(&args),
     }
 }
 
