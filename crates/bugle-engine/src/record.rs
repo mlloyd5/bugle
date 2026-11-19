@@ -40,6 +40,10 @@ pub struct RecorderState {
     /// Levels set with [`Engine::set_recording_levels`] since launch, in
     /// place of the `[recordings]` ones.
     levels: Mutex<Option<AudioMixConfig>>,
+    /// A recording [`Engine::record_reap`] finalised after it stopped by
+    /// itself, for the `record_stop` that comes for it; cleared by the next
+    /// start.
+    reaped: Mutex<Option<std::result::Result<MediaItem, String>>>,
 }
 
 struct Active {
@@ -500,12 +504,33 @@ impl Engine {
             }
             let finished = g.take().expect("checked above");
             drop(g);
-            match self.finalize(finished) {
+            match self.finish(finished) {
                 Ok(m) => tracing::info!("finalised the previous recording: {}", m.path.display()),
                 Err(e) => tracing::warn!("finalising the previous recording failed: {e:#}"),
             }
-            self.recording_changed();
         }
+    }
+
+    /// Finalise a recording whose backend stopped by itself (it reached its
+    /// `max_seconds`), so a front end need not wait for a `record_stop` to
+    /// show it ended. `None` when there is none (idle, or still capturing).
+    /// The next `record_stop`, until another recording starts, returns the
+    /// same result, so a caller that asked for the auto-stop still gets its
+    /// media record.
+    pub fn record_reap(&self) -> Option<Result<MediaItem>> {
+        let mut g = self.recorder_state.inner.lock().unwrap();
+        if g.as_mut()?.poll() != RecordingState::Finishing {
+            return None;
+        }
+        let finished = g.take().expect("checked above");
+        // Stored before the slot is seen to be free, so a `record_stop`
+        // racing the finalisation finds the result once it is there.
+        let mut reaped = self.recorder_state.reaped.lock().unwrap_or_else(|e| e.into_inner());
+        drop(g);
+        let r = self.finish(finished);
+        *reaped = Some(r.as_ref().map(Clone::clone).map_err(|e| format!("{e:#}")));
+        drop(reaped);
+        Some(r)
     }
 
     pub fn record_start(&self, req: &RecordRequest) -> Result<RecordingStatus> {
@@ -733,15 +758,33 @@ impl Engine {
     fn install(&self, mut g: MutexGuard<'_, Option<Active>>, active: Active) -> RecordingStatus {
         *g = Some(active);
         drop(g);
+        // Not under the recorder lock: a reap may hold this one while it
+        // finalises, and the status must stay readable meanwhile.
+        self.recorder_state.reaped.lock().unwrap_or_else(|e| e.into_inner()).take();
         self.recording_changed();
         self.record_status()
     }
 
-    /// Stop the active recording and finalise the file.
+    /// Stop the active recording and finalise the file. With none running,
+    /// the result of a recording [`Engine::record_reap`] finalised (once).
     pub fn record_stop(&self) -> Result<MediaItem> {
-        let active = self.recorder_state.inner.lock().unwrap().take().ok_or_else(|| anyhow!("no recording in progress"))?;
-        // Idle from here on: the host can show that while the file is
-        // finalised (an MP4 export can take a while).
+        let mut g = self.recorder_state.inner.lock().unwrap();
+        let Some(active) = g.take() else {
+            drop(g);
+            let reaped = self.recorder_state.reaped.lock().unwrap_or_else(|e| e.into_inner()).take();
+            return match reaped {
+                Some(r) => r.map_err(|e| anyhow!(e)),
+                None => Err(anyhow!("no recording in progress")),
+            };
+        };
+        drop(g);
+        self.finish(active)
+    }
+
+    /// Finalise `active`, just taken out of the slot, telling the UI host
+    /// once it is idle (it can show that while an MP4 export runs) and again
+    /// once the file is done.
+    fn finish(&self, active: Active) -> Result<MediaItem> {
         self.recording_changed();
         let r = self.finalize(active);
         self.recording_changed();
@@ -1220,8 +1263,8 @@ mod tests {
         let (engine, watcher) = watched_engine(tmp.path());
         let seen = || watcher.seen.lock().unwrap().clone();
 
-        // Started (by the API, MCP, anyone): the host hears it with the
-        // recording already showing as active.
+        // Started (by the menu, the in-process Agent API, anyone): the host
+        // hears it with the recording already showing as active.
         let out = tmp.path().join("a.gif");
         let st = engine.install(engine.idle_recorder().unwrap(), active(one_frame_gif(&out, Default::default()), out.clone(), None));
         assert_eq!(st.state, RecordingState::Active);
@@ -1253,7 +1296,58 @@ mod tests {
         release.store(true, Ordering::Relaxed);
         wait_until(|| engine.record_status().state == RecordingState::Finishing);
         drop(engine.idle_recorder().unwrap());
-        assert_eq!(*watcher.seen.lock().unwrap(), vec![RecordingState::Idle]);
+        assert_eq!(*watcher.seen.lock().unwrap(), vec![RecordingState::Idle, RecordingState::Idle]);
+    }
+
+    #[test]
+    fn record_reap_finalises_an_auto_stopped_recording_for_the_next_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, watcher) = watched_engine(tmp.path());
+        assert!(engine.record_reap().is_none(), "idle: nothing to reap");
+
+        // Still capturing: left alone.
+        let release = Arc::new(AtomicBool::new(false));
+        let out = tmp.path().join("d.gif");
+        engine.install(engine.idle_recorder().unwrap(), active(one_frame_gif(&out, release.clone()), out.clone(), Some(1.0)));
+        assert!(engine.record_reap().is_none());
+        assert_eq!(engine.record_status().state, RecordingState::Active);
+
+        // Stopped by itself (as at max_seconds): finalised, the host told
+        // when idle and when done, and the item in the history.
+        release.store(true, Ordering::Relaxed);
+        wait_until(|| engine.record_status().state == RecordingState::Finishing);
+        let m = engine.record_reap().unwrap().unwrap();
+        assert_eq!(m.path, out);
+        assert_eq!(engine.record_status().state, RecordingState::Idle);
+        assert_eq!(*watcher.seen.lock().unwrap(), vec![RecordingState::Active, RecordingState::Idle, RecordingState::Idle]);
+        assert_eq!(engine.history.all().unwrap().len(), 1);
+        assert!(engine.record_reap().is_none());
+
+        // The caller that asked for the auto-stop still gets its record, once.
+        assert_eq!(engine.record_stop().unwrap().id, m.id);
+        assert!(engine.record_stop().is_err());
+
+        // A new start drops an uncollected one.
+        let out = tmp.path().join("e.gif");
+        engine.install(engine.idle_recorder().unwrap(), active(one_frame_gif(&out, Arc::new(AtomicBool::new(true))), out.clone(), Some(1.0)));
+        wait_until(|| engine.record_status().state == RecordingState::Finishing);
+        assert!(engine.record_reap().unwrap().is_ok());
+        let out2 = tmp.path().join("f.gif");
+        engine.install(engine.idle_recorder().unwrap(), active(one_frame_gif(&out2, Default::default()), out2.clone(), None));
+        assert_eq!(engine.record_stop().unwrap().path, out2, "the running one, not the reaped one");
+        assert!(engine.record_stop().is_err());
+    }
+
+    /// `record_start` must hand its recording to the UI host via `install`
+    /// (tested above), not set the slot itself.
+    #[test]
+    fn record_start_goes_through_install() {
+        let src = include_str!("record.rs");
+        let start = src.find("pub fn record_start(").unwrap();
+        let end = start + src[start..].find("\n    }\n").unwrap();
+        let body = &src[start..end];
+        assert!(body.contains("self.install(g, Active {"), "record_start no longer calls install");
+        assert!(!body.contains("*g = Some("), "record_start sets the slot directly");
     }
 
     #[test]

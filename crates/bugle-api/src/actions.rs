@@ -167,7 +167,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "record_stop",
-            description: "Stop the active recording and return its media record.",
+            description: "Stop the active recording and return its media record. After a max_seconds auto-stop that the menu-bar app already finalised, returns that recording's media record (once, until another recording starts).",
             input_schema: json!({"type":"object","properties":{}}),
         },
         ToolSpec {

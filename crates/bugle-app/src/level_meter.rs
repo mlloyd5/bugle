@@ -25,12 +25,14 @@ pub struct Update {
 static WATCHING: AtomicBool = AtomicBool::new(false);
 static UPDATES: Mutex<Vec<Update>> = Mutex::new(Vec::new());
 static SHOWN: Mutex<Vec<(bool, Instant)>> = Mutex::new(Vec::new());
+static EVENTS: Mutex<Vec<(bool, Instant)>> = Mutex::new(Vec::new());
 
 /// Start (clearing the logs) or stop logging meter redraws and recording
 /// state changes. Off unless a smoke test turns it on.
 pub fn watch(on: bool) {
     UPDATES.lock().unwrap_or_else(|e| e.into_inner()).clear();
     SHOWN.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    EVENTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     WATCHING.store(on, Ordering::Relaxed);
 }
 
@@ -47,9 +49,29 @@ pub fn note_shown(recording: bool) {
     }
 }
 
-/// When the app last switched to showing `recording`, since [`watch`].
+/// When the app last switched to showing `recording`, since [`watch`]
+/// (whatever made it redraw: the engine's event or the tick).
 pub fn shown_at(recording: bool) -> Option<Instant> {
-    SHOWN.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().find(|s| s.0 == recording).map(|s| s.1)
+    last(&SHOWN, recording)
+}
+
+/// Main thread: the app handled the engine's `RecordingChanged` and now
+/// shows `recording`; logged while [`watch`]ing.
+pub fn note_event(recording: bool) {
+    if WATCHING.load(Ordering::Relaxed) {
+        EVENTS.lock().unwrap_or_else(|e| e.into_inner()).push((recording, Instant::now()));
+    }
+}
+
+/// When the app first handled a `RecordingChanged` leaving it showing
+/// `recording`, since [`watch`]: proof the engine's hook, not the tick,
+/// brought the change.
+pub fn event_at(recording: bool) -> Option<Instant> {
+    EVENTS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|s| s.0 == recording).map(|s| s.1)
+}
+
+fn last(log: &Mutex<Vec<(bool, Instant)>>, recording: bool) -> Option<Instant> {
+    log.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().find(|s| s.0 == recording).map(|s| s.1)
 }
 
 pub struct LevelMeter {

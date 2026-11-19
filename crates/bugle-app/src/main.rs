@@ -119,7 +119,7 @@ enum AppEvent {
     Done(Action, Result<Option<Notice>, String>),
     ApiStopped(Option<String>),
     /// The engine started or stopped a recording, from whichever thread
-    /// (the agent API's included): redraw the recording state now.
+    /// (the app's own Agent API included): redraw the recording state now.
     RecordingChanged,
     QuickAccess(quick_access::QuickEvent),
     Editor(editor_window::EditorMsg),
@@ -526,6 +526,9 @@ struct App {
     /// What the status item and recording entries show now, so a redraw
     /// changes only what moved: (title, recording).
     recording_shown: Option<(Option<String>, bool)>,
+    /// A thread is finalising a recording that stopped by itself
+    /// ([`App::reap_auto_stopped`]).
+    reaping: Arc<std::sync::atomic::AtomicBool>,
     quick: quick_access::QuickAccess,
     /// Numbers editor windows, so a late save or preview reaches only its own.
     editor_generation: u64,
@@ -715,15 +718,40 @@ impl App {
     }
 
     /// A recording started or stopped, possibly behind the app's back (the
-    /// agent API, MCP): show it now instead of on the next tick. The tick
-    /// still covers what the engine does not announce (a recording that
-    /// reached its `max_seconds`).
+    /// app's own Agent API): show it now instead of on the next tick, which
+    /// remains a fallback.
     fn on_recording_changed(&mut self) {
         self.update_recording_ui();
+        level_meter::note_event(self.recording_shown.as_ref().is_some_and(|s| s.1));
         // A stop the app did not ask for: its panels come back and the
         // recording joins the recent list (a no-op while busy or recording).
         self.quick_after_action();
         self.refresh_recent();
+    }
+
+    /// A recording that stopped by itself (an Agent API request's
+    /// `max_seconds`) stays in the engine, shown as running, until something
+    /// finalises it: do that off the main thread (an MP4 export can take a
+    /// while). The engine then sends `RecordingChanged`, and a later
+    /// `record_stop` from the API still gets the media record.
+    fn reap_auto_stopped(&self) {
+        use std::sync::atomic::Ordering;
+        if self.engine.record_status().state != RecordingState::Finishing || self.reaping.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (engine, reaping) = (self.engine.clone(), self.reaping.clone());
+        let spawned = std::thread::Builder::new().name("bugle-reap".into()).spawn(move || {
+            match engine.record_reap() {
+                Some(Ok(m)) => tracing::info!("recording stopped by itself, saved to {}", m.path.display()),
+                Some(Err(e)) => tracing::warn!("finalising a recording that stopped by itself: {e:#}"),
+                None => {}
+            }
+            reaping.store(false, Ordering::SeqCst);
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("could not start the thread finalising a recording: {e}");
+            self.reaping.store(false, Ordering::SeqCst);
+        }
     }
 
     /// How long the event loop may sleep before the next [`App::tick`].
@@ -835,6 +863,7 @@ impl App {
             return;
         }
         self.last_tick = Instant::now();
+        self.reap_auto_stopped();
         if !self.busy {
             // Panels hidden for a recording that ended without a Done
             // (stopped through the HTTP API, say) come back too.
@@ -961,6 +990,7 @@ fn main() -> Result<()> {
         metering: false,
         last_meter: Instant::now(),
         recording_shown: None,
+        reaping: Default::default(),
         quick: quick_access::QuickAccess::new(engine.config.quick_access.clone()),
         editor_generation: 0,
         video_editor_generation: 0,

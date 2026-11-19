@@ -40,35 +40,44 @@ const SAMPLE_AT_S: f64 = 1.2;
 /// How long the app may take to show the meter of a recording started
 /// behind its back: the levels come with the first audio buffers.
 const SHOW_TIMEOUT: Duration = Duration::from_secs(3);
-/// How soon the status item must switch to (and back from) a recording
-/// started and stopped behind the app's back, as the agent API does: the
-/// engine tells the app straight away, well inside its one-second tick.
-const SHOW_PROMPTLY: Duration = Duration::from_millis(250);
+/// How soon after the call that starts (or stops) a recording behind the
+/// app's back, as its Agent API does, the engine's `RecordingChanged` must
+/// reach the app and the status item switch: well inside the one-second tick
+/// that used to be the only way the app found out.
+const SHOW_PROMPTLY: Duration = Duration::from_millis(500);
 
-/// How long after `since` the app switched to showing `recording`, waiting
-/// until [`SHOW_PROMPTLY`] after `until` for it; `None` when it did not.
-fn switched_after(recording: bool, since: Instant, until: Instant) -> Option<Duration> {
-    loop {
-        if let Some(at) = level_meter::shown_at(recording) {
-            return Some(at.saturating_duration_since(since));
-        }
-        if until.elapsed() > SHOW_PROMPTLY {
-            return None;
+/// Check that within [`SHOW_PROMPTLY`] of `since` the app handled the
+/// engine's event for `recording` (`what`) and the status item showed it,
+/// waiting until [`SHOW_PROMPTLY`] after `until` (the call returned). The
+/// event is required, not just the switch: the 100 ms meter tick, or the
+/// one-second one, could flip the item without it.
+fn check_prompt(what: &str, recording: bool, since: Instant, until: Instant, failures: &mut Vec<String>) {
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let (event, shown) = loop {
+        let (event, shown) = (level_meter::event_at(recording), level_meter::shown_at(recording));
+        if (event.is_some() && shown.is_some()) || until.elapsed() > SHOW_PROMPTLY {
+            break (event.map(|at| at.saturating_duration_since(since)), shown.map(|at| at.saturating_duration_since(since)));
         }
         std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-/// Check that the app showed `what` within [`SHOW_PROMPTLY`] of `since`.
-fn check_prompt(what: &str, after: Option<Duration>, failures: &mut Vec<String>) {
-    match after {
-        Some(d) if d <= SHOW_PROMPTLY => say(format!("the status item showed the {what} after {:.0} ms", d.as_secs_f64() * 1000.0)),
-        Some(d) => failures.push(format!(
-            "the status item showed the {what} after {:.0} ms, not within {} ms",
-            d.as_secs_f64() * 1000.0,
+    };
+    let call = ms(until.saturating_duration_since(since));
+    match (event, shown) {
+        (Some(e), Some(s)) if e <= SHOW_PROMPTLY && s <= SHOW_PROMPTLY => say(format!(
+            "the status item showed the {what} after {:.0} ms, the engine's event handled after {:.0} ms (the call took {call:.0} ms)",
+            ms(s),
+            ms(e)
+        )),
+        (None, _) => failures.push(format!(
+            "the app handled no RecordingChanged event for the {what} within {} ms of the call returning (it took {call:.0} ms)",
             SHOW_PROMPTLY.as_millis()
         )),
-        None => failures.push(format!("the status item did not show the {what} within {} ms", SHOW_PROMPTLY.as_millis())),
+        (_, None) => failures.push(format!("the status item did not show the {what} within {} ms of the call returning", SHOW_PROMPTLY.as_millis())),
+        (Some(e), Some(s)) => failures.push(format!(
+            "the status item showed the {what} after {:.0} ms and the event came after {:.0} ms, not within {} ms (the call took {call:.0} ms)",
+            ms(s),
+            ms(e),
+            SHOW_PROMPTLY.as_millis()
+        )),
     }
 }
 
@@ -205,12 +214,12 @@ fn run(engine: &Engine, proxy: &Proxy, out: &Path) -> Result<(), Vec<String>> {
         label: None,
     };
     level_meter::watch(true);
+    let t0 = Instant::now();
     if let Err(e) = engine.record_start(&req) {
         return Err(vec![format!("could not start the recording: {e:#}")]);
     }
     let mut failures = Vec::new();
-    let t0 = Instant::now();
-    check_prompt("recording", switched_after(true, t0, t0), &mut failures);
+    check_prompt("recording", true, t0, Instant::now(), &mut failures);
     let mut sounds: Vec<Option<Child>> = vec![chirp()];
     let mut polled: Vec<Option<bugle_core::audio_level::AudioLevels>> = Vec::new();
     let mut inactive = 0;
@@ -315,7 +324,7 @@ fn run(engine: &Engine, proxy: &Proxy, out: &Path) -> Result<(), Vec<String>> {
     let mut mic_skipped = false;
     let stop_at = Instant::now();
     let stopped = engine.record_stop();
-    check_prompt("stop", switched_after(false, stop_at, Instant::now()), &mut failures);
+    check_prompt("stop", false, stop_at, Instant::now(), &mut failures);
     match stopped {
         Ok(media) => {
             let info = bugle_platform::video_info(&media.path);
