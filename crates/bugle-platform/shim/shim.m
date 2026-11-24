@@ -2107,8 +2107,16 @@ static NSDictionary *bt709_properties(void) {
 @property(strong) NSURL *url;
 @property int32_t width, height, fps;
 @property int64_t frames;
+// Our own pool for the frames, not the adaptor's pixelBufferPool: that one
+// belongs to the VideoToolbox compression session, which may replace it at
+// any time, so a pointer read from the adaptor can dangle by the time
+// CoreVideo uses it (it then traps or faults, taking the process down).
+@property CVPixelBufferPoolRef pool;
 @end
 @implementation BugleFrameWriter
+- (void)dealloc {
+    CVPixelBufferPoolRelease(_pool);
+}
 @end
 
 void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int32_t mp4, int32_t hevc) {
@@ -2152,10 +2160,18 @@ void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int
             (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
             (id)kCVPixelBufferWidthKey: @(w),
             (id)kCVPixelBufferHeightKey: @(h),
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
         };
+        CVPixelBufferPoolRef pool = NULL;
+        if (CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)attrs, &pool) != kCVReturnSuccess) {
+            set_error(@"writer: could not create a pixel buffer pool for %dx%d frames", w, h);
+            return NULL;
+        }
         AVAssetWriterInputPixelBufferAdaptor *adaptor =
             [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:input
                                                                              sourcePixelBufferAttributes:attrs];
+        BugleFrameWriter *fw = [[BugleFrameWriter alloc] init];
+        fw.pool = pool;  // released with fw, on every path from here
         if (![writer canAddInput:input]) { set_error(@"writer refused the %@ video track", hevc ? @"HEVC" : @"H.264"); return NULL; }
         [writer addInput:input];
         if (![writer startWriting]) {
@@ -2164,7 +2180,6 @@ void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int
             return NULL;
         }
         [writer startSessionAtSourceTime:kCMTimeZero];
-        BugleFrameWriter *fw = [[BugleFrameWriter alloc] init];
         fw.writer = writer;
         fw.input = input;
         fw.adaptor = adaptor;
@@ -2194,9 +2209,7 @@ int32_t bugle_writer_append(void *handle, const uint8_t *rgba, size_t len, int32
             usleep(5000);
         }
         CVPixelBufferRef pb = NULL;
-        CVReturn rc = fw.adaptor.pixelBufferPool
-                          ? CVPixelBufferPoolCreatePixelBuffer(NULL, fw.adaptor.pixelBufferPool, &pb)
-                          : CVPixelBufferCreate(NULL, w, h, kCVPixelFormatType_32BGRA, NULL, &pb);
+        CVReturn rc = CVPixelBufferPoolCreatePixelBuffer(NULL, fw.pool, &pb);
         if (rc != kCVReturnSuccess || !pb) { set_error(@"writer: could not allocate a pixel buffer (%d)", rc); return -1; }
         CVPixelBufferLockBaseAddress(pb, 0);
         uint8_t *base = CVPixelBufferGetBaseAddress(pb);
