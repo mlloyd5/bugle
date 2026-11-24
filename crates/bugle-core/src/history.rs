@@ -22,7 +22,12 @@
 //! [`History::record_synced`]) from a prune that saw the file mid-move (which
 //! the sync undoes). A plain tombstone, including one written by an older
 //! build, counts as the latter, as it always did. Readers take the first
-//! word after `DELETE ` as the id and ignore words they do not know.
+//! word after `DELETE ` as the id and ignore words they do not know. An
+//! older build ignores markers (its compaction drops them, and its sync
+//! records a moved entry again as it always did), so with mixed versions a
+//! delete during a move can still be undone, as before; nothing is lost. A
+//! delete only reaches files on disk: an upload to S3 that races a `delete
+//! --file` leaves the uploaded object.
 //!
 //! Several processes (CLI, menu-bar app, API server) may append to the same
 //! file. Every writer takes an exclusive advisory lock on a sidecar
@@ -454,11 +459,17 @@ impl History {
             None => return Ok(false),
         };
         let item = self.tombstone_by_user(item, remove_file)?;
-        if remove_file && item.path.exists() {
-            std::fs::remove_file(&item.path).with_context(|| format!("removing {}", item.path.display()))?;
-            // The cursor event track belongs to the file.
-            if let Some(events) = item.events.as_ref().filter(|p| p.is_file()) {
-                std::fs::remove_file(events).with_context(|| format!("removing {}", events.display()))?;
+        if remove_file {
+            // The cursor event track belongs to the file. A file already
+            // gone is fine: removed by hand, or moved by a sync that will see
+            // the marker and remove it there.
+            for p in std::iter::once(&item.path).chain(item.events.as_ref()) {
+                match std::fs::remove_file(p) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(e).with_context(|| format!("removing {}", p.display()))
+                    }
+                    _ => {}
+                }
             }
         }
         Ok(true)
@@ -929,6 +940,24 @@ mod tests {
     }
 
     #[test]
+    fn delete_of_a_file_already_gone_succeeds() {
+        // Removed by hand, or moved away by a sync after the delete read the
+        // entry: the delete still succeeds, and the event track goes.
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = History::open(dir.join("history.jsonl")).unwrap();
+        let mut m = item_at("gone00000001", &dir.join("clip.mp4"));
+        let events = dir.join("clip.mp4.events.json");
+        std::fs::write(&events, b"{}").unwrap();
+        m.events = Some(events.clone());
+        h.push(&m).unwrap();
+        assert!(h.delete("gone00000001", true).unwrap());
+        assert!(!events.exists());
+        assert!(h.all().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn delete_markers_are_compatible_both_ways() {
         let dir = temp_dir();
         std::fs::create_dir_all(&dir).unwrap();
@@ -1005,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_removes_the_file_the_entry_names_under_the_lock() {
+    fn delete_takes_the_path_recorded_before_it_took_the_lock() {
         // The id was resolved, then a sync recorded the moved path before
         // the delete took the lock: the moved file goes, not the old path.
         let dir = temp_dir();

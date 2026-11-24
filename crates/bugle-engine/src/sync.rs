@@ -86,7 +86,9 @@ impl Engine {
     /// prune that saw the old path missing mid-move is undone, so the moved
     /// file keeps its entry; a user's delete (`bugle delete`, `DELETE
     /// /v1/media/{id}`) stays, and when it asked for the file to go, the
-    /// moved file and event track it could not see are removed here.
+    /// moved file and event track it could not see are removed here (a
+    /// move across volumes included, see [`move_file`]). An uploaded object
+    /// is left alone: an upload racing a `delete --file` leaves it.
     ///
     /// [`History::record_synced`]: bugle_core::History::record_synced
     fn record_sync(&self, item: &MediaItem, recorded_path: Option<&Path>) {
@@ -478,13 +480,56 @@ fn unique_in_dir(dir: &Path, name: &str) -> PathBuf {
 }
 
 /// Rename, falling back to copy + delete across volumes.
+///
+/// A source that is gone once the copy finished counts as moved: the copy
+/// read it through an open file, so `to` is whole, and something removed the
+/// source meanwhile, typically a `bugle delete --file`. The file then lives
+/// only at `to`, which the caller records; [`Engine::record_sync`] sees that
+/// delete and removes `to`. Any other failure to remove the source is an
+/// error (the file would then exist twice).
 fn move_file(from: &Path, to: &Path) -> Result<()> {
-    if std::fs::rename(from, to).is_ok() {
+    if !move_hooks::force_copy() && std::fs::rename(from, to).is_ok() {
         return Ok(());
     }
     std::fs::copy(from, to).with_context(|| format!("copying to {}", to.display()))?;
-    std::fs::remove_file(from).with_context(|| format!("removing {} after copy", from.display()))?;
-    Ok(())
+    move_hooks::after_copy();
+    match std::fs::remove_file(from) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("removing {} after copy", from.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Test hooks for [`move_file`]: take the copy path as across volumes, and
+/// run code between the copy and the removal of the source.
+#[cfg(test)]
+mod move_hooks {
+    use std::cell::{Cell, RefCell};
+
+    thread_local! {
+        pub static FORCE_COPY: Cell<bool> = const { Cell::new(false) };
+        pub static AFTER_COPY: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    pub fn force_copy() -> bool {
+        FORCE_COPY.with(|f| f.get())
+    }
+
+    pub fn after_copy() {
+        if let Some(f) = AFTER_COPY.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+}
+
+#[cfg(not(test))]
+mod move_hooks {
+    pub fn force_copy() -> bool {
+        false
+    }
+
+    pub fn after_copy() {}
 }
 
 /// `~/Library/Mobile Documents/com~apple~CloudDocs/X` → `iCloud Drive/X`,
@@ -1333,6 +1378,30 @@ mod tests {
             assert_eq!(moving.path.is_file(), !remove_file, "the moved file follows the delete");
             assert_eq!(moved_events.is_file(), !remove_file, "so does its event track");
         }
+    }
+
+    /// Across volumes a move is a copy, then removing the source. A `delete
+    /// --file` that lands during the copy removes the source (the copy goes
+    /// on from the open file): the copy must not stay behind unrecorded.
+    #[test]
+    fn a_delete_with_the_file_during_a_cross_volume_copy_leaves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_in(tmp.path(), SyncMode::Move);
+        let src = engine.config.save_dir().join("clip.gif");
+        std::fs::write(&src, b"not really a gif").unwrap();
+        let mut item = MediaItem::new(MediaKind::Gif, &src);
+        engine.history.push(&item).unwrap();
+        let (history, id) = (engine.history.path().to_path_buf(), item.id.clone());
+        move_hooks::FORCE_COPY.with(|f| f.set(true));
+        move_hooks::AFTER_COPY.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || assert!(History::open(&history).unwrap().delete(&id, true).unwrap())))
+        });
+        engine.sync_after_save(&mut item);
+        move_hooks::FORCE_COPY.with(|f| f.set(false));
+        assert!(engine.history.get(&item.id).unwrap().is_none());
+        assert!(!src.exists());
+        let left: Vec<_> = std::fs::read_dir(tmp.path().join("cloud")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     /// The delete reads the entry after the sync recorded the new path: it
