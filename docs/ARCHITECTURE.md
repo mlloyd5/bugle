@@ -363,6 +363,11 @@ built by walking it and `[hotkeys]` keys are resolved against its names, so ever
 item is bindable and the two cannot drift. Unknown keys, unparsable or duplicate
 combinations and bindings the OS refuses are logged, summarised in one toast and
 skipped. Menu and hotkey events are forwarded to the loop as user events.
+*Recent Captures* is rebuilt when the history file changes or when
+`recent_probe.rs` (a background thread checking the files on show every 2 s
+with `looks_deleted`) finds one deleted, on any volume; a hung external or
+network volume blocks only that thread, and an unplugged drive's files (their
+folder is gone too) stay listed.
 *Capture Window* and *Record Window* open the window picker (`picker.rs`): the main thread snapshots
 the on-screen window list, shows the shim's overlay and, on every pointer move,
 asks `window_at` — a pure function over the z-ordered list that skips Bugle's

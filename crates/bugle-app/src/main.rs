@@ -18,6 +18,7 @@ mod notifications;
 mod picker;
 mod quick_access;
 mod quick_panel;
+mod recent_probe;
 mod smoke_input;
 mod video_editor;
 mod video_editor_window;
@@ -397,21 +398,6 @@ fn saved_subtitle(engine: &Engine, item: &bugle_core::MediaItem) -> String {
 }
 
 
-/// The paths of `items` that exist on the volume of the home folder or `/`
-/// (see `App::recent_watch`). Building the menu stats these files anyway
-/// (`exists` for the enabled state), so this meets no new volume.
-fn local_files(items: &[bugle_core::MediaItem]) -> Vec<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-    let dev = |p: &std::path::Path| std::fs::metadata(p).ok().map(|m| m.dev());
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let local: Vec<u64> = [home.as_deref().and_then(dev), dev(std::path::Path::new("/"))].into_iter().flatten().collect();
-    items
-        .iter()
-        .filter(|m| dev(&m.path).is_some_and(|d| local.contains(&d)))
-        .map(|m| m.path.clone())
-        .collect()
-}
-
 fn file_name(p: &std::path::Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string())
 }
@@ -533,11 +519,11 @@ struct App {
     hotkeys: HashMap<u32, Command>,
     _hotkey_manager: GlobalHotKeyManager,
     history_mtime: Option<SystemTime>,
-    /// Files of the Recent items on show that the tick re-checks, so one
-    /// deleted in Finder drops out without a history change: only those on
-    /// the volume of the home folder or `/`, never an external or network
-    /// volume that may hang a `stat`.
-    recent_watch: Vec<PathBuf>,
+    /// Checks the files of the Recent items on show off the main thread, so
+    /// one deleted in Finder drops out without a history change, on an
+    /// external or network volume too, without a `stat` there blocking the
+    /// tick.
+    recent_probe: recent_probe::RecentProbe,
     proxy: Proxy,
     last_tick: Instant,
     /// Whether the recording on show has a level meter (it then redraws every
@@ -786,14 +772,13 @@ impl App {
 
     fn refresh_recent(&mut self) {
         let mtime = std::fs::metadata(self.engine.history.path()).and_then(|m| m.modified()).ok();
-        let file_gone = |p: &PathBuf| matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
-        if mtime == self.history_mtime && !self.items.recent.items().is_empty() && !self.recent_watch.iter().any(file_gone) {
+        if mtime == self.history_mtime && !self.items.recent.items().is_empty() && !self.recent_probe.file_gone() {
             return;
         }
         self.history_mtime = mtime;
         while self.items.recent.remove_at(0).is_some() {}
         let recent = self.engine.history.recent(5).unwrap_or_default();
-        self.recent_watch = local_files(&recent);
+        self.recent_probe.watch(recent.clone());
         if recent.is_empty() {
             let _ = self.items.recent.append(&MenuItem::with_id("recent:none", "No captures yet", false, None));
             return;
@@ -1011,7 +996,7 @@ fn main() -> Result<()> {
         hotkeys,
         _hotkey_manager: hotkey_manager,
         history_mtime: None,
-        recent_watch: Vec::new(),
+        recent_probe: recent_probe::RecentProbe::start(recent_probe::INTERVAL),
         proxy: proxy.clone(),
         last_tick: Instant::now() - Duration::from_secs(5),
         metering: false,
