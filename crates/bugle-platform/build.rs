@@ -11,6 +11,15 @@ fn main() {
     println!("cargo:rerun-if-changed=shim/prompt.m");
     println!("cargo:rerun-if-changed=shim/smoke_input.m");
     println!("cargo:rerun-if-changed=shim/status_menu.m");
+    // BUGLE_TEST_NO_SCREEN=1 (set by CI on hosted runners) compiles the tests
+    // that need a display from the window server as `#[ignore]`d, so libtest
+    // lists each one as "ignored" with its reason instead of failing or
+    // passing silently. Unset (a developer Mac), every test runs.
+    println!("cargo::rustc-check-cfg=cfg(bugle_no_screen)");
+    println!("cargo:rerun-if-env-changed=BUGLE_TEST_NO_SCREEN");
+    if std::env::var("BUGLE_TEST_NO_SCREEN").is_ok_and(|v| !v.is_empty() && v != "0") {
+        println!("cargo:rustc-cfg=bugle_no_screen");
+    }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }

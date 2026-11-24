@@ -1,5 +1,7 @@
 # Bugle
 
+[![CI](https://github.com/mlloyd5/bugle/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mlloyd5/bugle/actions/workflows/ci.yml)
+
 > *"Pictures! I need pictures of Spider-Man!"* — J. Jonah Jameson, editor, the Daily Bugle
 
 Bugle is a macOS screenshot and screen-recording tool written in Rust. It covers the
@@ -63,6 +65,19 @@ line tools; no Xcode project is needed.
 
 `cargo xtask check` runs `cargo clippy --workspace --all-targets -- -D warnings` and
 `cargo test --workspace` and exits non-zero if either fails; run it before sending a change.
+
+### CI
+
+GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs
+`cargo xtask check` on a GitHub-hosted macOS 26 arm64 runner for every pull request
+and every push to `main`. Hosted runners have no Screen Recording, Accessibility or
+microphone access, so the workflow sets `BUGLE_TEST_NO_SCREEN=1`: tests that need a
+display from the window server are then compiled as ignored and listed as `ignored`
+in the test output (mark one with
+`#[cfg_attr(bugle_no_screen, ignore = "BUGLE_TEST_NO_SCREEN: ...")]` in
+`bugle-platform`), and tests that capture the screen check Screen Recording access
+at run time. Unset, as on a developer Mac, every test runs. The smoke test
+(`--smoke-test`, `cargo xtask smoke-vm`) is not run in CI.
 
 ### App bundle
 

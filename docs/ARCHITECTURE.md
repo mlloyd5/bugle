@@ -557,6 +557,18 @@ the bundle's signature and architectures, and detaches. `release_steps`
 fixes the order: all of that happens before `dist/Bugle.app` is replaced, and
 the new image is renamed over the old one (never deleted first).
 
+`cargo xtask check` runs `cargo clippy --workspace --all-targets -- -D
+warnings` and `cargo test --workspace`. CI (`.github/workflows/ci.yml`) runs
+it on a GitHub-hosted `macos-26` arm64 runner for pull requests and pushes to
+`main`, with the stable toolchain and `BUGLE_TEST_NO_SCREEN=1`. That variable
+makes `bugle-platform`'s build script set `cfg(bugle_no_screen)`, and tests
+that need a display from the window server carry
+`#[cfg_attr(bugle_no_screen, ignore = "...")]`, so on the runner libtest
+reports them as ignored with the reason; capture tests already skip their
+capture part when `screen_access_preflight()` is false. Nothing else is
+gated: the AVFoundation, VideoToolbox, Vision and CoreText tests run on the
+runner as they do locally.
+
 `cargo xtask smoke-vm` (`smoke_vm.rs`) runs the smoke test in a throwaway
 Tart VM. `--prepare` `tart clone`s an already pulled Cirrus Labs image to the
 golden image `bugle-smoke-base`, boots it, and through `tart exec` (gRPC to
