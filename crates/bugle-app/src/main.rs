@@ -727,6 +727,13 @@ impl App {
                 self.items.record.set_enabled(!recording);
                 self.items.record_gif.set_enabled(!recording);
                 self.items.record_window.set_enabled(!recording);
+                // Monospaced digits while the title counts, so the item (and
+                // its neighbours) do not shift every second; the button's own
+                // font is back before the idle title is set.
+                if let Some(item) = self.tray.ns_status_item() {
+                    // SAFETY: the status item is alive; this is the main thread.
+                    unsafe { bugle_platform::status_item_mono_digits(&*item as *const _ as *mut std::ffi::c_void, recording) };
+                }
             }
             self.tray.set_title(shown.0.as_deref());
             self.recording_shown = Some(shown);

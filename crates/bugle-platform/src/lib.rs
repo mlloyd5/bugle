@@ -31,7 +31,7 @@ pub use prompt::{prompt_active, prompt_answer, prompt_text};
 #[cfg(target_os = "macos")]
 mod status_menu;
 #[cfg(target_os = "macos")]
-pub use status_menu::{attributed_width, menu_title_mono_tail, status_menu_probe};
+pub use status_menu::{attributed_width, menu_title_mono_tail, status_item_mono_digits, status_menu_probe, status_title_width};
 #[cfg(target_os = "macos")]
 mod editor;
 #[cfg(target_os = "macos")]

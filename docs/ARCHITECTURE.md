@@ -398,7 +398,11 @@ here) sends a request to the main thread and blocks the worker on a channel unti
 the overlay calls back. The agent API can be started from the menu on a tokio
 runtime thread (`http::serve_with_shutdown`) and shares the same `Engine`, so API
 callers get the in-app overlay too. Feedback is a transient toast (`toast_show`)
-plus the shutter sound; the status item title shows `● m:ss` while recording.
+plus the shutter sound; the status item title shows `● m:ss` while recording,
+in the system font with monospaced digits (`status_item_mono_digits`, which
+changes only the button's font, so its colouring is the system's and the
+item keeps one width as the seconds count; the button's own font is back
+when the recording ends).
 With audio levels in the record status, `level_meter.rs` appends one block
 glyph per source to that title and inserts a disabled line per source under
 *Stop Recording*: the source's name in the menu font, then a gauge

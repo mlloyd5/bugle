@@ -488,6 +488,9 @@ fn check_probe(json: &str, updates: &[Update], failures: &mut Vec<String>) -> Op
     if !title.starts_with("● ") || glyphs != last.glyphs {
         failures.push(format!("the status item title is {title:?}; want `● m:ss {}`", last.glyphs));
     }
+    if s["digits_monospaced"].as_bool() != Some(true) {
+        failures.push("the status item title's font does not draw its digits at one width".into());
+    }
     for (g, line) in glyphs.chars().zip(&meter) {
         if !glyph_matches(g, line) {
             failures.push(format!("title glyph {g} does not match {line:?}"));
@@ -542,7 +545,7 @@ mod tests {
     fn report(sample_title: &str, sample_line: &str) -> String {
         serde_json::json!({
             "opened": true, "opened_at": 100.0, "closed_at": 101.5, "firings": 2,
-            "sample": {"t": 1.2, "mode": "NSEventTrackingRunLoopMode", "title": sample_title,
+            "sample": {"t": 1.2, "mode": "NSEventTrackingRunLoopMode", "title": sample_title, "digits_monospaced": true,
                        "items": ["Record", "Stop Recording", sample_line, "", "Audio Levels"], "width": 320.0}
         })
         .to_string()
@@ -570,5 +573,13 @@ mod tests {
         let mut failures = Vec::new();
         check_probe(&report(&format!("● 0:01 {ga}"), &b), &ups[..3], &mut failures);
         assert_eq!(failures.len(), 3, "{failures:?}");
+
+        // A title in proportional digits is caught.
+        let mut v: serde_json::Value = serde_json::from_str(&report(&format!("● 0:01 {gb}"), &b)).unwrap();
+        v["sample"]["digits_monospaced"] = false.into();
+        let mut failures = Vec::new();
+        check_probe(&v.to_string(), &ups, &mut failures);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("digits"), "{failures:?}");
     }
 }

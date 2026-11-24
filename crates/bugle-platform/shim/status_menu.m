@@ -12,8 +12,27 @@
 // the menu from the same kind of place.
 
 #import <AppKit/AppKit.h>
+#import <objc/runtime.h>
 #include <stdint.h>
 #include "shim.h"
+
+// Whether every digit 0-9 has one advance in `font`.
+static BOOL font_digits_monospaced(NSFont *font) {
+    if (!font) return NO;
+    NSDictionary *attrs = @{NSFontAttributeName : font};
+    CGFloat zero = [@"0" sizeWithAttributes:attrs].width;
+    for (char c = '1'; c <= '9'; c++) {
+        NSString *d = [NSString stringWithFormat:@"%c", c];
+        if (fabs([d sizeWithAttributes:attrs].width - zero) > 0.01) return NO;
+    }
+    return YES;
+}
+
+// The system font at `size` with monospaced digits: it draws letters and
+// symbols as the system font does, but every digit at one advance.
+static NSFont *mono_digit_font(CGFloat size) {
+    return [NSFont monospacedDigitSystemFontOfSize:size weight:NSFontWeightRegular];
+}
 
 typedef void (*bugle_menu_probe_callback_t)(void *ctx, const char *json);
 
@@ -22,8 +41,9 @@ static BOOL g_probe_running = NO;
 // Report (JSON, to `cb` on the main thread once the menu has closed):
 // {"opened": bool, "opened_at": s, "closed_at": s (Unix time), "firings": the
 //  probe's own timer firings while open, "sample": {"t": s after opening,
-//  "mode": run-loop mode, "title": status item title, "items": [menu item
-//  titles], "width": menu width in points} or null}.
+//  "mode": run-loop mode, "title": status item title, "digits_monospaced":
+//  whether the status item's font draws every digit at one advance, "items":
+//  [menu item titles], "width": menu width in points} or null}.
 // The sample is taken `sample_at` seconds after the menu opens; it closes
 // after `seconds`. Returns 0 without calling `cb` when a probe is running,
 // an argument is missing, or not on the main thread. Main thread only.
@@ -53,6 +73,7 @@ int32_t bugle_status_menu_probe(void *status_item, void *menu, double seconds, d
                 @"t" : @(opened ? CFAbsoluteTimeGetCurrent() - openedAt : -1),
                 @"mode" : [NSRunLoop currentRunLoop].currentMode ?: @"",
                 @"title" : item.button.title ?: @"",
+                @"digits_monospaced" : @(font_digits_monospaced(item.button.font)),
                 @"items" : titles,
                 @"width" : @(m.size.width),
             };
@@ -116,4 +137,42 @@ void *bugle_menu_title_mono_tail(const char *head, const char *tail) {
 double bugle_attributed_width(void *s) {
     if (!s) return 0;
     return ((__bridge NSAttributedString *)s).size.width;
+}
+
+static char kPlainFontKey;
+
+// While `on`, the status item's button draws its title in the system font
+// with monospaced digits at the size of its own font, so a `● m:ss` title
+// keeps one width while the seconds count (and grows by one digit at
+// 10:00). Only the font changes: the title stays a plain string, so the
+// button colours it as before for a light or dark menu bar and when
+// highlighted. The button's own font is kept on it and put back when `on`
+// is 0. Returns 0 without a change off the main thread or for a null or
+// buttonless item. Main thread only.
+int32_t bugle_status_item_mono_digits(void *status_item, int32_t on) {
+    if (![NSThread isMainThread] || !status_item) return 0;
+    NSStatusBarButton *button = ((__bridge NSStatusItem *)status_item).button;
+    if (!button) return 0;
+    NSFont *plain = objc_getAssociatedObject(button, &kPlainFontKey);
+    if (on && !plain) {
+        plain = button.font ?: [NSFont menuBarFontOfSize:0];
+        objc_setAssociatedObject(button, &kPlainFontKey, plain, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        button.font = mono_digit_font(plain.pointSize) ?: plain;
+    } else if (!on && plain) {
+        button.font = plain;
+        objc_setAssociatedObject(button, &kPlainFontKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return 1;
+}
+
+// The width (points) `text` draws at in the menu-bar font: with monospaced
+// digits when `mono` (the font `bugle_status_item_mono_digits` gives a
+// button of the menu-bar font's size), else the plain menu-bar font.
+double bugle_status_title_width(const char *text, int32_t mono) {
+    if (!text) return 0;
+    @autoreleasepool {
+        NSFont *plain = [NSFont menuBarFontOfSize:0];
+        NSFont *font = mono ? mono_digit_font(plain.pointSize) : plain;
+        return [@(text) ?: @"" sizeWithAttributes:@{NSFontAttributeName : font}].width;
+    }
 }
