@@ -583,7 +583,9 @@ failure exits 6 and is reported with its error. Writing TCC.db
 needs SIP off, which those images already are in the guest (their build runs
 `csrutil disable` from guest recovery); the host is never asked to change SIP.
 A run (`VmSmoke`; `bundle --smoke-vm` and `verify --smoke-vm` make one before
-building or verifying and pass it the finished bundle as `--app` would) checks
+building or verifying; `bundle` runs it on the staged, signed bundle as the
+first release step, before notarization, the disk image, the zip and
+replacing `dist/`, and `verify` on the bundle it checked) checks
 for `tart` (and `tart exec`), the time limits and the golden image, removes
 stale clones, assembles a bundle with
 `bundle` into its own `target/xtask/smoke-vm/<run>/dist`, writes
@@ -600,26 +602,41 @@ mounted). The script copies the bundle off the share, runs it, tees the log
 into the share and `ditto`s the run directory back; the host enforces the time
 limit and a `Vm` guard stops and deletes the clone on every exit path.
 
-Signals (`interrupt.rs`): commands that own a VM install SIGINT, SIGTERM and
-SIGHUP handlers that only record the signal, and start every child (`cargo
-build`, `tart clone/run/exec/stop/delete`, codesign…) in its own process group,
-so a terminal's Ctrl-C reaches xtask alone. Every wait polls: the build, the
-boot probes, the `tart exec` of the test and the sleeps between probes notice
-the signal, SIGTERM (then SIGKILL after 5 s) the child's whole group and
-return `Interrupted`; unwinding drops the `Vm` guard, which runs `tart stop`
-and `tart delete` without that check, so a second Ctrl-C cannot cut the
-teardown short. `tart clone` is also always waited for and the signal checked
-after it, so no half-made clone is left; the guard exists before the clone and
-deletes it only if `tart list` shows it. `main` exits with 128 + the signal.
-Without the handlers (plain `bundle`, `verify`), the helpers are the plain
-`std::process` calls. A SIGKILLed run leaves its clone (still running, with an
-orphaned `tart run`); `cleanup_stale`, run first by every run and by
-`--cleanup`, parses `bugle-smoke-run-<millis>-<pid>` names strictly (local VMs
-only) and removes a clone only when its owner is certainly gone: the pid does
-not exist, or `proc_pidinfo` says it started after `<millis>` (a reused pid)
-or is not named `xtask`; if the process cannot be inspected it is assumed
-alive. A running stale clone is stopped first, which ends its orphaned
-`tart run` and `tart exec`.
+Signals (`interrupt.rs`): commands that own a VM install SIGINT, SIGTERM,
+SIGHUP and SIGQUIT handlers that only record the signal (a signal inherited as
+ignored stays ignored, so `nohup` works). Every child process `bundle`,
+`verify` and `smoke-vm` start goes through `interrupt::{status, output}` or
+`isolate`, which then put it in its own process group with a null stdin (a
+background group reading the terminal would stop on SIGTTIN), so a terminal's
+Ctrl-C reaches xtask alone; the one exception is the host `--smoke-test`
+launch, which never runs with the handlers installed. Every wait polls
+(`Wait`): interruptible waits (the build, codesign, notarytool, the boot
+probes, the test's `tart exec`, the sleeps between probes) notice the signal,
+SIGTERM (then SIGKILL after 5 s) the child's whole group and return
+`Interrupted`; unwinding drops the `Vm` guard, which runs `tart stop` and
+`tart delete` with `Wait::teardown`, not cut short by a second Ctrl-C. Every
+Tart wait also has a limit (`TimedOut`): queries 60 s, a boot probe 30 s and
+never past the boot limit, `tart clone` 120 s, `tart stop` its timeout plus
+60 s, `tart delete` 60 s, the grant script 300 s; a teardown step that times
+out says what may be left and how to remove it. `tart clone` is always
+waited for (bounded) and the signal checked after it, so no half-made clone is
+left; the guard exists before the clone and deletes it only if `tart list`
+shows it. A VM about to be deleted is stopped with a 5 s timeout; the
+prepared image is shut down with 120 s, and a failed `tart stop` there deletes
+it instead of keeping a possibly unflushed image. `main` exits with 128 + the
+signal. Without the handlers (plain `bundle`, `verify`), the helpers are the
+plain `std::process` calls. A SIGKILLed run leaves its clone (still running,
+with an orphaned `tart run`); `cleanup_stale`, run first by every run and by
+`--cleanup`, parses run names strictly (local VMs only). New names are
+`bugle-smoke-run-<millis>-p<pid>-s<start µs>`, the start time being the
+owner's own `proc_pidinfo` start time: the clone is stale only when that pid
+does not exist or now has another start time (equality, so clock steps cannot
+make a live run look stale). Older `<millis>-<pid>` names are stale only when
+the pid does not exist or belongs to a process not named `xtask`. A process
+that cannot be inspected counts as alive. A running stale clone is stopped
+first, which ends its orphaned `tart run` and `tart exec`. In a run's
+preflight a leftover that cannot be deleted is a warning (two runs may race
+to remove it, so the list is read again); with `--cleanup` it is an error.
 
 After a capture the app shows the quick-access panel instead of the toast
 (`[quick_access]`, on by default). `quick_access.rs` is the platform-free part:

@@ -25,12 +25,15 @@
 //! * SIGINT, SIGTERM and SIGHUP in any phase stop the child processes, stop
 //!   and delete the clone and exit with 128 + the signal ([`crate::interrupt`]).
 //!   A run killed outright (SIGKILL) cannot clean up; the next run, or
-//!   `--cleanup`, removes clones whose owning process is gone ([`stale_runs`]).
+//!   `--cleanup`, removes clones whose owning process is gone ([`stale_runs`]):
+//!   a clone's name carries its owner's pid and that process's start time,
+//!   so a live owner is recognised exactly.
 //!
 //! Nothing is downloaded implicitly: a missing `tart`, source image or golden
 //! image is an error naming the command that fixes it.
 
-use crate::{bundle, interrupt, smoke_config, smoke_timeout_from_env, BundleArgs, Workspace, APP_EXECUTABLE, APP_NAME};
+use crate::interrupt::{self, TimedOut, Wait};
+use crate::{bundle, smoke_config, smoke_timeout_from_env, BundleArgs, Workspace, APP_EXECUTABLE, APP_NAME};
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use std::ffi::OsString;
@@ -63,6 +66,16 @@ const MACOS_NAMES: [(u32, &str); 4] = [(14, "sonoma"), (15, "sequoia"), (26, "ta
 const KNOWN_GUESTS: std::ops::RangeInclusive<u32> = 14..=27;
 /// Set to try the newest known layout on a newer guest anyway.
 const UNTESTED_GUEST_VAR: &str = "BUGLE_SMOKE_VM_UNTESTED_GUEST";
+/// Limits on Tart commands, so a hung `tart` (a held lock, a wedged VM)
+/// cannot block a run forever, not even its teardown.
+const TART_QUERY_LIMIT: Duration = Duration::from_secs(60);
+const CLONE_LIMIT: Duration = Duration::from_secs(120);
+/// Added to `tart stop`'s own timeout; also the limit for `tart delete`.
+const TEARDOWN_MARGIN: Duration = Duration::from_secs(60);
+/// The longest single readiness probe (`tart exec … test -e`).
+const PROBE_LIMIT: Duration = Duration::from_secs(30);
+/// The `--prepare` grant script.
+const GRANT_LIMIT: Duration = Duration::from_secs(300);
 /// Exit codes of the `--prepare` script.
 const EXIT_NO_USER_DB: i32 = 4;
 const EXIT_MISSING_DB: i32 = 5;
@@ -101,7 +114,7 @@ pub fn smoke_vm(args: &SmokeVmArgs) -> Result<()> {
     let ws = Workspace::load()?;
     if args.cleanup {
         host_checks()?;
-        return cleanup_stale(&ws);
+        return cleanup_stale(&ws, true);
     }
     if args.prepare {
         host_checks()?;
@@ -149,7 +162,9 @@ impl VmSmoke {
                  (see README, Testing in a VM)"
             );
         }
-        cleanup_stale(ws)?;
+        // Another run may be cleaning up the same leftovers; that must not
+        // stop this one.
+        cleanup_stale(ws, false)?;
         Ok(Self { image: image.into(), limit, boot })
     }
 
@@ -158,7 +173,11 @@ impl VmSmoke {
     /// its bundle copy and keeps its logs.
     pub fn run(&self, ws: &Workspace, app: Option<&Path>) -> Result<()> {
         let since_epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-        let name = run_vm_name(std::process::id(), since_epoch);
+        let pid = std::process::id();
+        let start_us = process_info(pid as libc::pid_t)
+            .map(|(start, _)| start)
+            .context("reading this process's start time (it names the VM clone)")?;
+        let name = run_vm_name(since_epoch, pid, start_us);
         let dir = run_dir(ws, &name);
         let share = dir.join("share");
         std::fs::create_dir_all(&share).with_context(|| format!("creating {}", share.display()))?;
@@ -216,8 +235,7 @@ impl VmSmoke {
             share.join("run.sh").display(),
             self.limit.as_secs()
         );
-        let mut exec = interrupt::isolate(Command::new("tart").args(["exec", name, "/bin/bash", "-c", &script]))
-            .stdin(Stdio::null())
+        let mut exec = interrupt::isolate(Command::new("tart").args(["exec", name, "/bin/bash", "-c", &script]).stdin(Stdio::null()))
             .spawn()
             .context("running tart exec")?;
         let t0 = Instant::now();
@@ -320,30 +338,59 @@ exit "$status"
 
 // --- leftovers of killed runs ----------------------------------------------
 
-/// The start time (milliseconds since the epoch) and owning pid in a run
-/// clone's name, for exactly the names [`run_vm_name`] makes; `None` for
-/// every other VM, which this tool never touches.
-fn parse_run_name(name: &str) -> Option<(u64, u32)> {
-    let (ms, pid) = name.strip_prefix(RUN_PREFIX)?.split_once('-')?;
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    if !digits(ms) || !digits(pid) {
-        return None;
+/// The process that made a run clone, as its name records it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Owner {
+    /// `<millis>-p<pid>-s<start µs>`: the pid and that process's start time
+    /// (from `proc_pidinfo`), which identify it exactly.
+    Exact { pid: u32, start_us: u64 },
+    /// `<millis>-<pid>`, from runs before the start time was recorded.
+    Legacy { pid: u32 },
+}
+
+impl Owner {
+    fn pid(&self) -> u32 {
+        match *self {
+            Owner::Exact { pid, .. } | Owner::Legacy { pid } => pid,
+        }
     }
-    Some((ms.parse().ok()?, pid.parse().ok()?))
+}
+
+/// The owner recorded in a run clone's name, for exactly the names
+/// [`run_vm_name`] makes (and the older `<millis>-<pid>` ones); `None` for
+/// every other VM, which this tool never touches.
+fn parse_run_name(name: &str) -> Option<Owner> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let parts: Vec<&str> = name.strip_prefix(RUN_PREFIX)?.split('-').collect();
+    match parts[..] {
+        [ms, pid] if digits(ms) && digits(pid) => {
+            ms.parse::<u64>().ok()?;
+            Some(Owner::Legacy { pid: pid.parse().ok()? })
+        }
+        [ms, pid, start] if digits(ms) => {
+            let (pid, start) = (pid.strip_prefix('p')?, start.strip_prefix('s')?);
+            if !digits(pid) || !digits(start) {
+                return None;
+            }
+            ms.parse::<u64>().ok()?;
+            Some(Owner::Exact { pid: pid.parse().ok()?, start_us: start.parse().ok()? })
+        }
+        _ => None,
+    }
 }
 
 /// A run clone found by [`stale_runs`].
 #[derive(Debug, PartialEq)]
 struct RunVm {
     name: String,
-    pid: u32,
+    owner: Owner,
     running: bool,
 }
 
 /// The run clones in `tart list --format json` output, split into those
 /// whose owning run is gone (stale) and those still owned by a live run.
-/// `owner_alive(pid, started_ms)` decides; nothing else is listed.
-fn stale_runs(list_json: &str, owner_alive: impl Fn(u32, u64) -> bool) -> Result<(Vec<RunVm>, Vec<RunVm>)> {
+/// `owner_alive` decides; nothing else is listed.
+fn stale_runs(list_json: &str, owner_alive: impl Fn(&Owner) -> bool) -> Result<(Vec<RunVm>, Vec<RunVm>)> {
     let v: serde_json::Value = serde_json::from_str(list_json).context("parsing tart list --format json")?;
     let entries = v.as_array().context("tart list --format json: expected an array")?;
     let (mut stale, mut live) = (Vec::new(), Vec::new());
@@ -353,9 +400,9 @@ fn stale_runs(list_json: &str, owner_alive: impl Fn(u32, u64) -> bool) -> Result
             continue;
         }
         let Some(name) = e["Name"].as_str() else { continue };
-        let Some((started_ms, pid)) = parse_run_name(name) else { continue };
-        let vm = RunVm { name: name.into(), pid, running: e["Running"].as_bool().unwrap_or(true) };
-        if owner_alive(pid, started_ms) {
+        let Some(owner) = parse_run_name(name) else { continue };
+        let vm = RunVm { name: name.into(), owner, running: e["Running"].as_bool().unwrap_or(true) };
+        if owner_alive(&owner) {
             live.push(vm);
         } else {
             stale.push(vm);
@@ -364,12 +411,12 @@ fn stale_runs(list_json: &str, owner_alive: impl Fn(u32, u64) -> bool) -> Result
     Ok((stale, live))
 }
 
-/// Whether the run that named its clone with `pid` and `started_ms` may
-/// still be going: the pid exists, its process started no later than the
-/// run (else the pid was reused) and it is an `xtask`. When the process
-/// cannot be inspected, it is assumed alive, so a clone is removed only
-/// when its owner is certainly gone.
-fn owner_alive(pid: u32, started_ms: u64) -> bool {
+/// Whether the run that made a clone may still be going. Gone only when
+/// the pid does not exist, or the process now holding it is provably
+/// another one ([`owner_matches`]). When it cannot be inspected it counts
+/// as alive, so a clone is removed only when its owner is certainly gone.
+fn owner_alive(owner: &Owner) -> bool {
+    let pid = owner.pid();
     if pid == std::process::id() {
         return true;
     }
@@ -382,17 +429,23 @@ fn owner_alive(pid: u32, started_ms: u64) -> bool {
         return false;
     }
     match process_info(p) {
-        Some((start_ms, comm)) => owner_matches(start_ms, &comm, started_ms),
+        Some((start_us, comm)) => owner_matches(owner, start_us, &comm),
         None => true,
     }
 }
 
-/// [`owner_alive`] for a process that exists, from its start time and name.
-fn owner_matches(process_start_ms: u64, comm: &str, run_started_ms: u64) -> bool {
-    process_start_ms <= run_started_ms && comm == "xtask"
+/// [`owner_alive`] for a process that holds the owner's pid: an exact
+/// owner must have the recorded start time (equality, so no clock step
+/// matters); for a legacy name, any `xtask` might be the owner, so only a
+/// process with another name proves the pid was reused.
+fn owner_matches(owner: &Owner, process_start_us: u64, comm: &str) -> bool {
+    match *owner {
+        Owner::Exact { start_us, .. } => start_us == process_start_us,
+        Owner::Legacy { .. } => comm == "xtask",
+    }
 }
 
-/// A process's start time (milliseconds since the epoch) and short name.
+/// A process's start time (microseconds since the epoch) and short name.
 fn process_info(pid: libc::pid_t) -> Option<(u64, String)> {
     // SAFETY: proc_pidinfo fills at most `size` bytes of the zeroed struct.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -401,29 +454,41 @@ fn process_info(pid: libc::pid_t) -> Option<(u64, String)> {
     if n != size {
         return None;
     }
-    let start_ms = info.pbi_start_tvsec * 1000 + info.pbi_start_tvusec / 1000;
+    let start_us = info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec;
     let comm: Vec<u8> = info.pbi_comm.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
-    Some((start_ms, String::from_utf8_lossy(&comm).into_owned()))
+    Some((start_us, String::from_utf8_lossy(&comm).into_owned()))
 }
 
 /// Stops and deletes the run clones of runs that are gone (killed before
 /// they could clean up), and removes their bundle copies. Clones of live
-/// runs, and every VM not named by [`run_vm_name`], are left alone.
-fn cleanup_stale(ws: &Workspace) -> Result<()> {
+/// runs, and every VM not named by [`run_vm_name`], are left alone. With
+/// `strict` (`--cleanup`) a clone that cannot be deleted is an error;
+/// otherwise (a run's preflight) it is a warning, so two runs cleaning the
+/// same leftover do not stop each other.
+fn cleanup_stale(ws: &Workspace, strict: bool) -> Result<()> {
     let (stale, live) = stale_runs(&tart_list()?, owner_alive)?;
     for vm in &live {
-        if vm.pid != std::process::id() {
-            println!("VM {} belongs to a run still going (pid {}); left alone", vm.name, vm.pid);
+        if vm.owner.pid() != std::process::id() {
+            println!("VM {} belongs to a run still going (pid {}); left alone", vm.name, vm.owner.pid());
         }
     }
     for vm in &stale {
-        println!("removing VM {}, left by a run that is gone (pid {})", vm.name, vm.pid);
+        println!("removing VM {}, left by a run that is gone (pid {})", vm.name, vm.owner.pid());
         if vm.running {
             // Its `tart run` (and any `tart exec`) exit once the VM stops.
-            let _ = run_quiet(Command::new("tart").args(["stop", "--timeout", "5", &vm.name]), false);
+            let _ = run_quiet(Command::new("tart").args(["stop", "--timeout", "5", &vm.name]), stop_wait(5));
         }
-        run_quiet(Command::new("tart").args(["delete", &vm.name]), false)
-            .with_context(|| format!("removing the stale VM {}", vm.name))?;
+        if let Err(e) = run_quiet(Command::new("tart").args(["delete", &vm.name]), Wait::teardown(TEARDOWN_MARGIN)) {
+            let gone = tart_list().and_then(|l| image_listed(&l, &vm.name)).is_ok_and(|listed| !listed);
+            if gone {
+                println!("VM {} is already gone (another run removed it)", vm.name);
+            } else if strict {
+                return Err(e.context(format!("removing the stale VM {}", vm.name)));
+            } else {
+                eprintln!("warning: could not remove the stale VM {}: {e:#}; carrying on", vm.name);
+                continue;
+            }
+        }
         let _ = std::fs::remove_dir_all(run_dir(ws, &vm.name).join("dist"));
     }
     if stale.is_empty() {
@@ -458,7 +523,7 @@ fn prepare(args: &SmokeVmArgs, ws: &Workspace) -> Result<()> {
         if !args.force {
             bail!("{:?} already exists; pass --force to replace it", args.image);
         }
-        run_quiet(Command::new("tart").args(["delete", &args.image]), false)?;
+        run_quiet(Command::new("tart").args(["delete", &args.image]), Wait::teardown(TEARDOWN_MARGIN))?;
     }
     // Deleted again unless every step below succeeds.
     let mut vm = Vm::clone_from(&from, &args.image, 120)?;
@@ -478,12 +543,17 @@ fn prepare(args: &SmokeVmArgs, ws: &Workspace) -> Result<()> {
     let exe = Path::new(GUEST_DIR).join(format!("{APP_NAME}.app")).join("Contents").join("MacOS").join(APP_EXECUTABLE);
     let script = guest_prepare_script(&ws.bundle_id, &exe.display().to_string(), user_db);
     println!("$ tart exec {} /bin/bash -c <grant script>", args.image);
-    let status = interrupt::status(Command::new("tart").args(["exec", &args.image, "/bin/bash", "-c", &script]).stdin(Stdio::null()))
-        .context("running tart exec")?;
+    let status = interrupt::status(
+        Command::new("tart").args(["exec", &args.image, "/bin/bash", "-c", &script]).stdin(Stdio::null()),
+        Some(GRANT_LIMIT),
+    )
+    .context("running the grant script in the guest")?;
     if !status.success() {
         bail!("{}", prepare_failure(status.code(), &from, major));
     }
-    // A clean shutdown, so the TCC writes reach the disk image.
+    // A clean shutdown, so the TCC writes reach the disk image; if it
+    // fails, the image is deleted rather than kept half-written.
+    vm.shut_down().with_context(|| format!("shutting {} down cleanly; it is deleted again", args.image))?;
     vm.keep = true;
     drop(vm);
     interrupt::check()?;
@@ -508,16 +578,18 @@ fn parse_sip(out: &str) -> Sip {
         out.lines().find_map(|l| l.trim().strip_prefix(key)).map(|v| v.trim().trim_end_matches('.').to_ascii_lowercase())
     };
     let Some(status) = value("System Integrity Protection status:") else { return Sip::Unknown };
-    if status.starts_with("disabled") {
-        Sip::Disabled
-    } else if status.starts_with("enabled") {
-        Sip::Enabled
-    } else if status.contains("custom configuration") {
+    // A custom configuration first: its status may read "enabled (Custom
+    // Configuration)" with Filesystem Protections off.
+    if status.contains("custom configuration") {
         match value("Filesystem Protections:").as_deref() {
             Some("disabled") => Sip::Custom { filesystem_protected: false },
             Some("enabled") => Sip::Custom { filesystem_protected: true },
             _ => Sip::Unknown,
         }
+    } else if status.starts_with("disabled") {
+        Sip::Disabled
+    } else if status.starts_with("enabled") {
+        Sip::Enabled
     } else {
         Sip::Unknown
     }
@@ -594,14 +666,7 @@ fn prepare_failure(code: Option<i32>, from: &str, major: u32) -> String {
 /// (best effort). [`grant_plan`] has checked SIP and the macOS version.
 fn guest_prepare_script(bundle_id: &str, exe: &str, user_db: UserDb) -> String {
     let sql = tcc_sql(bundle_id, exe);
-    let find_user_db = match user_db {
-        UserDb::Home => r#"user_db="$HOME/Library/Application Support/com.apple.TCC/TCC.db""#.to_string(),
-        UserDb::Tccd => format!(
-            r#"# macOS 27 keeps the user database in a ProtectedSystem container; ask tccd.
-user_db=$(sudo lsof -a -u "$(id -u)" -c tccd -Fn | sed -n 's|^n\(/private/var/containers/Data/ProtectedSystem/.*/com\.apple\.TCC/TCC\.db\)$|\1|p' | sort -u)
-if [ "$(printf '%s\n' "$user_db" | grep -c .)" != 1 ]; then echo "cannot find the user TCC database" >&2; exit {EXIT_NO_USER_DB}; fi"#
-        ),
-    };
+    let find_user_db = find_user_db(user_db);
     format!(
         r#"#!/bin/bash
 # Written by `cargo xtask smoke-vm --prepare`; runs inside the VM.
@@ -618,6 +683,20 @@ defaults write "$approvals" {exe} -date "2100-01-01 00:00:00 +0000" 2>/dev/null 
         sql = sh_quote(&sql),
         exe = sh_quote(exe),
     )
+}
+
+/// The script lines that set `user_db`. With [`UserDb::Tccd`], none or
+/// several candidates exit [`EXIT_NO_USER_DB`]; lsof exits 1 when nothing
+/// matches, which must not abort the script under `set -e` first.
+fn find_user_db(user_db: UserDb) -> String {
+    match user_db {
+        UserDb::Home => r#"user_db="$HOME/Library/Application Support/com.apple.TCC/TCC.db""#.to_string(),
+        UserDb::Tccd => format!(
+            r#"# macOS 27 keeps the user database in a ProtectedSystem container; ask tccd.
+user_db=$({{ sudo lsof -a -u "$(id -u)" -c tccd -Fn || true; }} | sed -n 's|^n\(/private/var/containers/Data/ProtectedSystem/.*/com\.apple\.TCC/TCC\.db\)$|\1|p' | sort -u)
+if [ "$(printf '%s\n' "$user_db" | grep -c . || true)" != 1 ]; then echo "cannot find the user TCC database" >&2; exit {EXIT_NO_USER_DB}; fi"#
+        ),
+    }
 }
 
 /// `INSERT OR REPLACE` rows granting (`auth_value` 2) each of
@@ -687,16 +766,16 @@ fn guest_fits_host(from: &str, guest: u32, host: u32) -> Result<()> {
 
 /// `tart` is on PATH and has `exec` (Tart 2.22 and later).
 fn check_tart() -> Result<()> {
-    let out = match Command::new("tart").arg("--version").output() {
+    let out = match interrupt::output(Command::new("tart").arg("--version"), true, Wait::within(TART_QUERY_LIMIT)) {
         Ok(out) => out,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
+        Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => bail!(
             "`tart` is not installed. Install it with `brew install cirruslabs/cli/tart` (https://tart.run), \
              then pull a base image and run `cargo xtask smoke-vm --prepare` (see README, Testing in a VM)"
         ),
         Err(e) => return Err(e).context("running tart --version"),
     };
-    let ok = Command::new("tart").args(["exec", "--help"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
-    if !ok.is_ok_and(|s| s.success()) {
+    let ok = interrupt::output(Command::new("tart").args(["exec", "--help"]), true, Wait::within(TART_QUERY_LIMIT))?;
+    if !ok.status.success() {
         bail!(
             "tart {} has no `exec` command; update it with `brew upgrade cirruslabs/cli/tart`",
             String::from_utf8_lossy(&out.stdout).trim()
@@ -711,7 +790,11 @@ fn tart_list() -> Result<String> {
 
 /// [`tart_list`] that is not cut short by a signal, for the teardown.
 fn tart_list_teardown() -> Result<String> {
-    let out = interrupt::output(Command::new("tart").args(["list", "--format", "json"]).stdin(Stdio::null()), true, false)?;
+    let out = interrupt::output(
+        Command::new("tart").args(["list", "--format", "json"]).stdin(Stdio::null()),
+        true,
+        Wait::teardown(TART_QUERY_LIMIT),
+    )?;
     if !out.status.success() {
         bail!("tart list failed ({})", out.status);
     }
@@ -728,10 +811,27 @@ fn image_listed(list_json: &str, name: &str) -> Result<bool> {
     Ok(entries.iter().filter_map(|e| e["Name"].as_str()).any(|n| n == name || (untagged_oci && n == tagged)))
 }
 
-/// A per-run VM name: unique per process and millisecond, and only letters,
-/// digits and hyphens. [`parse_run_name`] reads it back.
-fn run_vm_name(pid: u32, since_epoch: Duration) -> String {
-    format!("{RUN_PREFIX}{}-{pid}", since_epoch.as_millis())
+/// A per-run VM name: the time, then this process's pid and start time
+/// (µs since the epoch, from `proc_pidinfo`), so [`owner_alive`] can tell
+/// exactly whether its owner still runs. Only letters, digits and hyphens;
+/// [`parse_run_name`] reads it back.
+fn run_vm_name(since_epoch: Duration, pid: u32, start_us: u64) -> String {
+    format!("{RUN_PREFIX}{}-p{pid}-s{start_us}", since_epoch.as_millis())
+}
+
+/// How to wait for `tart stop --timeout <secs>`: never cut short by a
+/// signal, never longer than its timeout plus [`TEARDOWN_MARGIN`].
+fn stop_wait(secs: u32) -> Wait {
+    Wait::teardown(Duration::from_secs(secs.into()) + TEARDOWN_MARGIN)
+}
+
+/// What to do about a VM whose teardown failed.
+fn leftover_hint(name: &str) -> String {
+    if parse_run_name(name).is_some() {
+        format!("`cargo xtask smoke-vm --cleanup` removes {name} once this command has exited")
+    } else {
+        format!("remove it with `tart stop {name}; tart delete {name}`")
+    }
 }
 
 /// A `tart run --dir` share: `/Volumes/My Shared Files/<name>` in the guest.
@@ -778,7 +878,7 @@ impl Vm {
     /// meanwhile is reported after it.
     fn clone_from(source: &str, name: &str, stop_timeout: u32) -> Result<Self> {
         let vm = Self { name: name.into(), run: None, log: None, keep: false, stop_timeout };
-        run_quiet(Command::new("tart").args(["clone", source, name]), false)
+        run_quiet(Command::new("tart").args(["clone", source, name]), Wait::teardown(CLONE_LIMIT))
             .with_context(|| format!("cloning {source} to {name}"))?;
         interrupt::check()?;
         Ok(vm)
@@ -791,8 +891,7 @@ impl Vm {
             args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "),
             log.display()
         );
-        let child = interrupt::isolate(Command::new("tart").args(args))
-            .stdin(Stdio::null())
+        let child = interrupt::isolate(Command::new("tart").args(args).stdin(Stdio::null()))
             .stdout(out.try_clone()?)
             .stderr(out)
             .spawn()
@@ -815,12 +914,19 @@ impl Vm {
                      this Mac's, Virtualization.framework cannot run it. Its log ends:\n{tail}"
                 );
             }
-            let probe = interrupt::output(
+            // A probe never outlasts the boot limit, so a hung `tart exec`
+            // cannot hold the loop past it.
+            let left = limit.saturating_sub(t0.elapsed()).clamp(Duration::from_secs(1), PROBE_LIMIT);
+            let ready = match interrupt::output(
                 Command::new("tart").args(["exec", &self.name, "/bin/test", "-e", path]).stdin(Stdio::null()),
                 true,
-                true,
-            )?;
-            if probe.status.success() {
+                Wait::within(left),
+            ) {
+                Ok(probe) => probe.status.success(),
+                Err(e) if e.downcast_ref::<TimedOut>().is_some() => false,
+                Err(e) => return Err(e),
+            };
+            if ready {
                 println!("VM {} ready after {:.0}s", self.name, t0.elapsed().as_secs_f32());
                 return Ok(());
             }
@@ -838,11 +944,37 @@ impl Vm {
 
     /// The trimmed standard output of a command run in the guest.
     fn exec_stdout(&self, argv: &[&str]) -> Result<String> {
-        let out = interrupt::output(Command::new("tart").arg("exec").arg(&self.name).args(argv).stdin(Stdio::null()), true, true)?;
+        let out = interrupt::output(
+            Command::new("tart").arg("exec").arg(&self.name).args(argv).stdin(Stdio::null()),
+            true,
+            Wait::within(TART_QUERY_LIMIT),
+        )
+        .with_context(|| format!("running `{}` in the guest", argv.join(" ")))?;
         if !out.status.success() {
             bail!("`{}` in the guest failed ({}): {}", argv.join(" "), out.status, String::from_utf8_lossy(&out.stderr).trim());
         }
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+}
+
+impl Vm {
+    /// Stops the VM this process booted (`tart stop` with `secs` to shut
+    /// down cleanly), then ends its `tart run`. Fails if `tart stop` did.
+    fn stop(&mut self, secs: u32) -> Result<()> {
+        let Some(mut child) = self.run.take() else { return Ok(()) };
+        let mut result = Ok(());
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            result =
+                run_quiet(Command::new("tart").args(["stop", "--timeout", &secs.to_string(), &self.name]), stop_wait(secs));
+        }
+        // Stopping `tart run` also ends the VM if `tart stop` could not.
+        interrupt::stop(&mut child);
+        result
+    }
+
+    /// A clean shutdown for an image that is kept.
+    fn shut_down(&mut self) -> Result<()> {
+        self.stop(self.stop_timeout)
     }
 }
 
@@ -851,14 +983,10 @@ impl Drop for Vm {
         if let Some(sig) = interrupt::pending() {
             eprintln!("{}: stopping and deleting VM {}", interrupt::Interrupted(sig), self.name);
         }
-        if let Some(mut child) = self.run.take() {
-            if !matches!(child.try_wait(), Ok(Some(_))) {
-                let _ = run_quiet(
-                    Command::new("tart").args(["stop", "--timeout", &self.stop_timeout.to_string(), &self.name]),
-                    false,
-                );
-            }
-            interrupt::stop(&mut child);
+        // A VM about to be deleted needs no clean shutdown.
+        let secs = if self.keep { self.stop_timeout } else { self.stop_timeout.min(5) };
+        if let Err(e) = self.stop(secs) {
+            eprintln!("could not stop VM {} cleanly: {e:#}; its `tart run` was stopped instead", self.name);
         }
         if self.keep {
             return;
@@ -866,8 +994,8 @@ impl Drop for Vm {
         // Not when the clone never appeared (it failed before creating it).
         let exists = tart_list_teardown().and_then(|l| image_listed(&l, &self.name)).unwrap_or(true);
         if exists {
-            if let Err(e) = run_quiet(Command::new("tart").args(["delete", &self.name]), false) {
-                eprintln!("could not delete VM {}: {e:#}; remove it with `tart delete {}`", self.name, self.name);
+            if let Err(e) = run_quiet(Command::new("tart").args(["delete", &self.name]), Wait::teardown(TEARDOWN_MARGIN)) {
+                eprintln!("could not delete VM {}: {e:#}; {}", self.name, leftover_hint(&self.name));
             }
         }
     }
@@ -907,14 +1035,13 @@ fn sh_quote(s: &str) -> String {
 }
 
 /// Runs a command, echoing it, with its output captured and shown only if
-/// it fails. Only an `interruptible` one is cut short by a signal; changes
-/// to Tart's VMs (clone, stop, delete) always run to the end.
-fn run_quiet(cmd: &mut Command, interruptible: bool) -> Result<()> {
+/// it fails, ended early as `how` says. Changes to Tart's VMs (clone, stop,
+/// delete) use [`Wait::teardown`]: not cut short by a signal, but bounded.
+fn run_quiet(cmd: &mut Command, how: Wait) -> Result<()> {
     let shown: Vec<String> =
         std::iter::once(cmd.get_program()).chain(cmd.get_args()).map(|s| s.to_string_lossy().into_owned()).collect();
     println!("$ {}", shown.join(" "));
-    let out = interrupt::output(cmd.stdin(Stdio::null()), true, interruptible)
-        .with_context(|| format!("running {}", shown[0]))?;
+    let out = interrupt::output(cmd.stdin(Stdio::null()), true, how).with_context(|| format!("running {}", shown.join(" ")))?;
     if !out.status.success() {
         bail!("{} failed ({}): {}", shown.join(" "), out.status, String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -923,7 +1050,7 @@ fn run_quiet(cmd: &mut Command, interruptible: bool) -> Result<()> {
 
 fn command_stdout(cmd: &mut Command) -> Result<String> {
     let program = cmd.get_program().to_string_lossy().into_owned();
-    let out = interrupt::output(cmd.stdin(Stdio::null()).stderr(Stdio::inherit()), false, true)
+    let out = interrupt::output(cmd.stdin(Stdio::null()).stderr(Stdio::inherit()), false, Wait::within(TART_QUERY_LIMIT))
         .with_context(|| format!("running {program}"))?;
     if !out.status.success() {
         bail!("{program} failed ({})", out.status);
@@ -937,13 +1064,16 @@ mod tests {
 
     #[test]
     fn run_names_are_unique_and_valid() {
-        let a = run_vm_name(42, Duration::from_millis(1_700_000_000_123));
-        assert_eq!(a, "bugle-smoke-run-1700000000123-42");
-        assert_ne!(a, run_vm_name(43, Duration::from_millis(1_700_000_000_123)));
-        assert_ne!(a, run_vm_name(42, Duration::from_millis(1_700_000_000_124)));
+        let t = Duration::from_millis(1_700_000_000_123);
+        let a = run_vm_name(t, 42, 1_699_999_990_000_001);
+        assert_eq!(a, "bugle-smoke-run-1700000000123-p42-s1699999990000001");
+        assert_ne!(a, run_vm_name(t, 43, 1_699_999_990_000_001));
+        assert_ne!(a, run_vm_name(Duration::from_millis(1_700_000_000_124), 42, 1_699_999_990_000_001));
         assert!(a.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
         assert!(!a.starts_with(GOLDEN_IMAGE), "a run clone must never look like the golden image");
-        assert_eq!(parse_run_name(&a), Some((1_700_000_000_123, 42)));
+        assert_eq!(parse_run_name(&a), Some(Owner::Exact { pid: 42, start_us: 1_699_999_990_000_001 }));
+        // Names from earlier runs are still recognised.
+        assert_eq!(parse_run_name("bugle-smoke-run-1700000000123-42"), Some(Owner::Legacy { pid: 42 }));
     }
 
     #[test]
@@ -959,6 +1089,13 @@ mod tests {
             "bugle-smoke-run-123-+42",
             "my-bugle-smoke-run-123-42",
             "bugle-smoke-run-99999999999999999999999-1",
+            "bugle-smoke-run-123-p42",
+            "bugle-smoke-run-123-42-s5",
+            "bugle-smoke-run-123-p-s5",
+            "bugle-smoke-run-123-p42-s",
+            "bugle-smoke-run-123-p42-s5-x",
+            "bugle-smoke-run-123-q42-s5",
+            "bugle-smoke-run-12x-p42-s5",
             "ghcr.io/cirruslabs/macos-tahoe-base:latest",
         ] {
             assert_eq!(parse_run_name(other), None, "{other}");
@@ -966,13 +1103,13 @@ mod tests {
     }
 
     /// `tart list --format json` as Tart 2.42 prints it (captured), plus run
-    /// clones: one of a live run, one of a killed run still running, one
-    /// stopped, and look-alikes that must never be touched.
+    /// clones: of a live run, of a killed run still running, stopped ones in
+    /// both name formats, and look-alikes that must never be touched.
     const LIST: &str = r#"[
   {"Source" : "local", "Disk" : 50, "Size" : 32, "State" : "stopped", "Accessed" : "2026-11-19T03:25:10Z", "Running" : false, "Name" : "bugle-smoke-base"},
   {"Source" : "OCI", "Disk" : 50, "Size" : 32, "State" : "stopped", "Accessed" : "2026-11-19T03:23:43Z", "Running" : false, "Name" : "ghcr.io\/cirruslabs\/macos-tahoe-base:latest"},
-  {"Source" : "local", "Disk" : 50, "Size" : 32, "State" : "running", "Running" : true, "Name" : "bugle-smoke-run-1000-11"},
-  {"Source" : "local", "Disk" : 50, "Size" : 32, "State" : "running", "Running" : true, "Name" : "bugle-smoke-run-2000-22"},
+  {"Source" : "local", "Disk" : 50, "Size" : 32, "State" : "running", "Running" : true, "Name" : "bugle-smoke-run-1000-p11-s900"},
+  {"Source" : "local", "Disk" : 50, "Size" : 32, "State" : "running", "Running" : true, "Name" : "bugle-smoke-run-2000-p22-s1900"},
   {"Source" : "local", "Disk" : 50, "Size" : 32, "State" : "stopped", "Running" : false, "Name" : "bugle-smoke-run-3000-33"},
   {"Source" : "local", "Disk" : 50, "Size" : 32, "State" : "stopped", "Running" : false, "Name" : "bugle-smoke-run-3000-33-mine"},
   {"Source" : "local", "Disk" : 50, "Size" : 32, "State" : "stopped", "Running" : false, "Name" : "someone-elses-vm"},
@@ -983,42 +1120,105 @@ mod tests {
     fn stale_runs_are_the_dead_owners_only() {
         let mut asked = Vec::new();
         let asked_cell = std::cell::RefCell::new(&mut asked);
-        let (stale, live) = stale_runs(LIST, |pid, ms| {
-            asked_cell.borrow_mut().push((pid, ms));
-            pid == 11
+        let (stale, live) = stale_runs(LIST, |owner| {
+            asked_cell.borrow_mut().push(*owner);
+            owner.pid() == 11
         })
         .unwrap();
-        let names = |v: &[RunVm]| v.iter().map(|r| (r.name.clone(), r.pid, r.running)).collect::<Vec<_>>();
-        assert_eq!(names(&live), [("bugle-smoke-run-1000-11".to_string(), 11, true)]);
+        let names = |v: &[RunVm]| v.iter().map(|r| (r.name.clone(), r.owner.pid(), r.running)).collect::<Vec<_>>();
+        assert_eq!(names(&live), [("bugle-smoke-run-1000-p11-s900".to_string(), 11, true)]);
         assert_eq!(
             names(&stale),
-            [("bugle-smoke-run-2000-22".to_string(), 22, true), ("bugle-smoke-run-3000-33".to_string(), 33, false)]
+            [("bugle-smoke-run-2000-p22-s1900".to_string(), 22, true), ("bugle-smoke-run-3000-33".to_string(), 33, false)]
         );
-        assert_eq!(asked, [(11, 1000), (22, 2000), (33, 3000)], "only run clones are looked at");
-        assert!(stale_runs("{}", |_, _| false).is_err());
+        assert_eq!(
+            asked,
+            [
+                Owner::Exact { pid: 11, start_us: 900 },
+                Owner::Exact { pid: 22, start_us: 1900 },
+                Owner::Legacy { pid: 33 }
+            ],
+            "only run clones are looked at"
+        );
+        assert!(stale_runs("{}", |_| false).is_err());
     }
 
     #[test]
-    fn owners_are_checked_by_pid_start_time_and_name() {
+    fn owners_are_identified_exactly() {
         // This test process: started before now, named after the test binary.
-        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-        let (start, comm) = process_info(std::process::id() as libc::pid_t).unwrap();
-        assert!(start <= now_ms && start > now_ms - 3_600_000, "{start} vs {now_ms}");
+        let now_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64;
+        let me = std::process::id();
+        let (start, comm) = process_info(me as libc::pid_t).unwrap();
+        assert!(start <= now_us && start > now_us - 3_600_000_000, "{start} vs {now_us}");
         assert!(comm.starts_with("xtask"), "{comm}");
-        assert!(owner_alive(std::process::id(), 0), "this process is always alive");
-        // A process that has exited is not.
+        assert!(owner_alive(&Owner::Exact { pid: me, start_us: 0 }), "this process is always alive");
+        // A live process is the owner only with its exact start time.
+        let mut sleeper = Command::new("/bin/sleep").arg("5").spawn().unwrap();
+        let (sleeper_start, _) = process_info(sleeper.id() as libc::pid_t).unwrap();
+        assert!(owner_alive(&Owner::Exact { pid: sleeper.id(), start_us: sleeper_start }));
+        assert!(!owner_alive(&Owner::Exact { pid: sleeper.id(), start_us: sleeper_start - 1 }), "a reused pid");
+        assert!(!owner_alive(&Owner::Exact { pid: sleeper.id(), start_us: sleeper_start + 1 }), "a reused pid");
+        // An old-format name: any live process other than an xtask proves reuse.
+        assert!(!owner_alive(&Owner::Legacy { pid: sleeper.id() }));
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        // A process that has exited is gone in both formats.
         let mut child = Command::new("/usr/bin/true").spawn().unwrap();
         let pid = child.id();
         child.wait().unwrap();
-        assert!(!owner_alive(pid, now_ms + 60_000));
-        // A live process that is not an xtask (a reused pid) is not either.
-        let mut sleeper = Command::new("/bin/sleep").arg("5").spawn().unwrap();
-        assert!(!owner_alive(sleeper.id(), now_ms + 60_000));
-        let _ = sleeper.kill();
-        let _ = sleeper.wait();
-        assert!(owner_matches(1_000, "xtask", 1_000));
-        assert!(!owner_matches(1_001, "xtask", 1_000), "started after the run: the pid was reused");
-        assert!(!owner_matches(1_000, "zsh", 2_000));
+        assert!(!owner_alive(&Owner::Exact { pid, start_us: 1 }));
+        assert!(!owner_alive(&Owner::Legacy { pid }));
+        // A legacy owner that is an xtask counts as alive whatever its start
+        // time, so no clock step can make it look stale.
+        assert!(owner_matches(&Owner::Legacy { pid: 1 }, u64::MAX, "xtask"));
+        assert!(!owner_matches(&Owner::Legacy { pid: 1 }, 0, "zsh"));
+        assert!(owner_matches(&Owner::Exact { pid: 1, start_us: 7 }, 7, "anything"));
+        assert!(!owner_matches(&Owner::Exact { pid: 1, start_us: 7 }, 8, "xtask"));
+    }
+
+    #[test]
+    fn leftover_hints() {
+        assert!(leftover_hint("bugle-smoke-run-1-p2-s3").contains("smoke-vm --cleanup"));
+        assert!(leftover_hint("bugle-smoke-base").contains("tart delete bugle-smoke-base"));
+    }
+
+    /// The `UserDb::Tccd` fragment run by bash under `set -euo pipefail`
+    /// with `sudo`, `lsof` and `id` stubbed: no match (lsof exits 1), one
+    /// match, and two candidates.
+    #[test]
+    fn user_db_lookup_runs_under_bash() {
+        let dir = std::env::temp_dir().join(format!("bugle-xtask-tccd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = |name: &str, body: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/bash\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        stub("sudo", r#"exec "$@""#);
+        stub("id", "echo 501");
+        stub("lsof", r#"printf '%b' "${LSOF_OUT:-}"; exit "${LSOF_EXIT:-0}""#);
+        let db = "/private/var/containers/Data/ProtectedSystem/ABC/Library/Application Support/com.apple.TCC/TCC.db";
+        let script = format!("set -euo pipefail\n{}\necho \"found:$user_db\"", find_user_db(UserDb::Tccd));
+        let run = |out: &str, code: &str| {
+            let o = Command::new("/bin/bash")
+                .args(["-c", &script])
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+                .env("LSOF_OUT", out)
+                .env("LSOF_EXIT", code)
+                .output()
+                .unwrap();
+            (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
+        };
+        let (code, _, err) = run("p123\\nftxt\\n", "1");
+        assert_eq!(code, Some(EXIT_NO_USER_DB), "no match: {err}");
+        assert!(err.contains("cannot find the user TCC database"), "{err}");
+        let (code, out, err) = run(&format!("p123\\nn{db}\\nn/usr/lib/x.dylib\\nn{db}\\n"), "0");
+        assert_eq!((code, out.trim()), (Some(0), format!("found:{db}").as_str()), "{err}");
+        let (code, _, _) = run(&format!("n{db}\\nn{}\\n", db.replace("ABC", "DEF")), "0");
+        assert_eq!(code, Some(EXIT_NO_USER_DB), "two candidates");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1131,6 +1331,9 @@ mod tests {
         assert_eq!(parse_sip(&fs_on), Sip::Custom { filesystem_protected: true });
         // The old in-guest check (`grep -q disabled`) took this for "off".
         assert!(fs_on.contains("disabled"));
+        // Some releases print "enabled (Custom Configuration)".
+        let enabled_custom = SIP_CUSTOM_FS_OFF.replace("unknown (Custom Configuration)", "enabled (Custom Configuration)");
+        assert_eq!(parse_sip(&enabled_custom), Sip::Custom { filesystem_protected: false });
         let no_fs = SIP_CUSTOM_FS_OFF.replace("\tFilesystem Protections: disabled\n", "");
         assert_eq!(parse_sip(&no_fs), Sip::Unknown);
         for odd in ["", "csrutil: command not found", "System Integrity Protection status: maybe."] {

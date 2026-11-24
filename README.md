@@ -91,7 +91,12 @@ entitlements embedded in each signature), `codesign --verify --deep --strict`,
 `--smoke-vm` (on `verify` and `bundle`) runs the smoke test of that exact
 bundle in a throwaway macOS VM, as `cargo xtask smoke-vm --app` does (see
 Testing in a VM); it is the recommended way, including for release builds, and
-a missing `tart` or golden image fails before anything is built.
+a missing `tart` or golden image fails before anything is built. On `bundle`
+it is the first step after signing and verification: the staged bundle is
+tested before it is notarized, made into a disk image or zip, or replaces
+`dist/Bugle.app`, so a bundle that fails it is never sent to Apple and nothing
+in `dist/` changes (the staging directory is left, as after any failed step,
+and removed by the next run).
 `--smoke-test` instead runs `bugle-app --smoke-test` on this Mac,
 from the bundle with a throwaway config in a temp directory: saves, history and
 `TMPDIR` go there, sync is off and no global hotkey is registered, so your own
@@ -245,7 +250,7 @@ covered by unit tests on `csrutil`/`sw_vers` output, not by real images.
 after a month, when macOS may ask to re-confirm screen recording.
 
 A run builds the bundle into `target/xtask/smoke-vm/<run>/dist`, clones the
-golden image to `bugle-smoke-run-<millis>-<pid>` (copy-on-write, so it is
+golden image to `bugle-smoke-run-<millis>-p<pid>-s<start>` (copy-on-write, so it is
 quick and runs do not share state; macOS allows two VMs at a time), boots it
 without a window, host audio or a shared clipboard, and shares the bundle
 read-only and a run directory read-write. Through the Tart guest agent
@@ -256,19 +261,31 @@ plus `BUGLE_SMOKE_KEEP`, `BUGLE_SMOKE_CLIPBOARD=1` and `BUGLE_SMOKE_SAVE`
 streams to your terminal and to `share/smoke.log`; the guest's run directory
 (captures, history, kept temp files) comes back as `share/artifacts`. The VM is
 stopped and deleted afterwards, also on failure and on Ctrl-C (SIGINT,
-SIGTERM or SIGHUP in any phase: the build, clone, boot or test is stopped, the
-clone deleted, the run's bundle copy removed with its logs kept, and the exit
-status is 128 + the signal). A run killed outright (SIGKILL, a crash) cannot
-clean up: every later run, and `--cleanup`, stops and deletes the
-`bugle-smoke-run-<millis>-<pid>` clones whose owning process is gone (the pid
-no longer exists, started after the run, or is not `xtask`); clones of runs
-still going and every other VM are left alone. These were tried for real:
+SIGTERM, SIGHUP or SIGQUIT in any phase: the build, boot or test is stopped, a
+clone in progress is allowed to finish (about a second) and then deleted, the
+run's bundle copy is removed with its logs kept, and the exit status is 128 +
+the signal; a signal inherited as ignored, as `nohup` does with SIGHUP, stays
+ignored). Every Tart command has a hard limit, the teardown's too (`tart
+stop` its own timeout plus 60 s, `tart delete` 60 s, `tart clone` 120 s, each
+boot probe 30 s and never past the boot limit), so a hung `tart` ends with an
+error naming what may be left rather than a wait that only SIGKILL ends. A
+run killed outright (SIGKILL, a crash) cannot clean up: every later run, and
+`--cleanup`, stops and deletes the clones whose owning process is gone. The
+name records the owner's pid and that process's start time, so the owner is
+recognised exactly (no clock is compared); for clones named
+`bugle-smoke-run-<millis>-<pid>` by older runs, any live `xtask` with that pid
+counts as the owner. Clones of runs still going and every other VM are left
+alone; a run that fails to delete a leftover warns and carries on (another
+run may be removing it), `--cleanup` fails. These were tried for real:
 SIGINT during the build, boot and test and a second one during the teardown,
-SIGTERM during the boot, and SIGKILL during the boot and the test followed by
-`--cleanup` or a new run; each left no clone and no `tart`, `cargo` or `rustc`
-process behind. `bundle --smoke-vm` and `verify --smoke-vm` have run end to
-end with an ad-hoc host-architecture bundle; with `--universal`, `--dmg` or
-`--notarize` they have not. The run fails if the app fails, if it takes
+SIGTERM and SIGQUIT during the boot, SIGKILL during the boot and the test
+followed by `--cleanup` or a new run, and `--cleanup` beside a live run (left
+alone); each left no clone and no `tart`, `cargo` or `rustc` process behind.
+The hard limits on hung Tart commands are covered by unit tests only.
+`bundle --smoke-vm` (also with the VM step failing, which left `dist/`
+untouched) and `verify --smoke-vm` have run end to end with an ad-hoc
+host-architecture bundle; with `--universal`, `--dmg` or `--notarize` they
+have not. The run fails if the app fails, if it takes
 longer than `BUGLE_SMOKE_TIMEOUT` plus a minute for the copies, if the VM is not
 ready within `BUGLE_SMOKE_VM_BOOT_TIMEOUT` (300 s), or if the recording step
 was skipped for lack of Screen Recording access. Nothing is downloaded on its
