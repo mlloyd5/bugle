@@ -16,14 +16,17 @@
 //!   fix when SIP still protects TCC.db or the guest's macOS is one whose
 //!   TCC layout this tool does not know ([`grant_plan`]).
 //! * A run builds the bundle into its own directory, clones the golden image
-//!   to `bugle-smoke-run-<millis>-<pid>` (an APFS copy-on-write clone, so
+//!   to `bugle-smoke-run-<millis>-p<pid>-s<start>` (an APFS copy-on-write clone, so
 //!   runs are cheap, clean and can overlap), boots it headless with two
 //!   shares (the bundle read-only, a run directory read-write), runs the
 //!   smoke test through the Tart guest agent (`tart exec`) with the
 //!   throwaway config from [`crate::smoke_config`], streams its output,
 //!   copies the guest's run directory back and deletes the VM.
-//! * SIGINT, SIGTERM and SIGHUP in any phase stop the child processes, stop
-//!   and delete the clone and exit with 128 + the signal ([`crate::interrupt`]).
+//! * SIGINT, SIGTERM, SIGHUP and SIGQUIT in any phase stop the child
+//!   processes, stop and delete the clone and exit with 128 + the signal
+//!   ([`crate::interrupt`]); every Tart wait, the teardown's included, has a
+//!   hard limit, and nothing printed on the way out can panic (`outln!`), so
+//!   a closed terminal or pipe does not skip the teardown.
 //!   A run killed outright (SIGKILL) cannot clean up; the next run, or
 //!   `--cleanup`, removes clones whose owning process is gone ([`stale_runs`]):
 //!   a clone's name carries its owner's pid and that process's start time,
@@ -184,7 +187,7 @@ impl VmSmoke {
         let result = self.build_and_run(&name, &dir, app);
         if interrupt::pending().is_some() {
             let _ = std::fs::remove_dir_all(dir.join("dist"));
-            eprintln!("logs of the interrupted run are in {}", dir.display());
+            errln!("logs of the interrupted run are in {}", dir.display());
         }
         result
     }
@@ -224,13 +227,13 @@ impl VmSmoke {
         std::fs::write(share.join("run.sh"), &script)?;
 
         let mut vm = Vm::clone_from(&self.image, name, 5)?;
-        println!("VM {name} (cloned from {}); stopped and deleted when the run ends or is interrupted", self.image);
+        outln!("VM {name} (cloned from {}); stopped and deleted when the run ends or is interrupted", self.image);
         let shares =
             [Share { name: "app", path: app_dir, read_only: true }, Share { name: "run", path: &share, read_only: false }];
         vm.boot(&tart_run_args(name, &shares)?, &dir.join("tart-run.log"))?;
         vm.wait_ready(&format!("{GUEST_SHARES}/run/run.sh"), self.boot)?;
 
-        println!(
+        outln!(
             "$ tart exec {name} /bin/bash -c <{}>  (limit {}s)",
             share.join("run.sh").display(),
             self.limit.as_secs()
@@ -274,7 +277,7 @@ impl VmSmoke {
                 self.image
             );
         }
-        println!(
+        outln!(
             "smoke test passed in the VM in {:.1}s; artefacts in {}",
             t0.elapsed().as_secs_f32(),
             artifacts.display()
@@ -469,11 +472,11 @@ fn cleanup_stale(ws: &Workspace, strict: bool) -> Result<()> {
     let (stale, live) = stale_runs(&tart_list()?, owner_alive)?;
     for vm in &live {
         if vm.owner.pid() != std::process::id() {
-            println!("VM {} belongs to a run still going (pid {}); left alone", vm.name, vm.owner.pid());
+            outln!("VM {} belongs to a run still going (pid {}); left alone", vm.name, vm.owner.pid());
         }
     }
     for vm in &stale {
-        println!("removing VM {}, left by a run that is gone (pid {})", vm.name, vm.owner.pid());
+        outln!("removing VM {}, left by a run that is gone (pid {})", vm.name, vm.owner.pid());
         if vm.running {
             // Its `tart run` (and any `tart exec`) exit once the VM stops.
             let _ = run_quiet(Command::new("tart").args(["stop", "--timeout", "5", &vm.name]), stop_wait(5));
@@ -481,18 +484,18 @@ fn cleanup_stale(ws: &Workspace, strict: bool) -> Result<()> {
         if let Err(e) = run_quiet(Command::new("tart").args(["delete", &vm.name]), Wait::teardown(TEARDOWN_MARGIN)) {
             let gone = tart_list().and_then(|l| image_listed(&l, &vm.name)).is_ok_and(|listed| !listed);
             if gone {
-                println!("VM {} is already gone (another run removed it)", vm.name);
+                outln!("VM {} is already gone (another run removed it)", vm.name);
             } else if strict {
                 return Err(e.context(format!("removing the stale VM {}", vm.name)));
             } else {
-                eprintln!("warning: could not remove the stale VM {}: {e:#}; carrying on", vm.name);
+                errln!("warning: could not remove the stale VM {}: {e:#}; carrying on", vm.name);
                 continue;
             }
         }
         let _ = std::fs::remove_dir_all(run_dir(ws, &vm.name).join("dist"));
     }
     if stale.is_empty() {
-        println!("no VMs left over by earlier runs");
+        outln!("no VMs left over by earlier runs");
     }
     Ok(())
 }
@@ -500,6 +503,7 @@ fn cleanup_stale(ws: &Workspace, strict: bool) -> Result<()> {
 // --- the golden image -------------------------------------------------------
 
 fn prepare(args: &SmokeVmArgs, ws: &Workspace) -> Result<()> {
+    check_image_name(&args.image)?;
     let boot = boot_timeout(std::env::var("BUGLE_SMOKE_VM_BOOT_TIMEOUT"))?;
     let host_version = command_stdout(Command::new("sw_vers").arg("-productVersion"))?;
     let from = match &args.from {
@@ -535,14 +539,14 @@ fn prepare(args: &SmokeVmArgs, ws: &Workspace) -> Result<()> {
     // Read on the host, so the decision is unit-tested on captured output.
     let sip = vm.exec_stdout(&["/usr/bin/csrutil", "status"])?;
     let version = vm.exec_stdout(&["/usr/bin/sw_vers", "-productVersion"])?;
-    println!("guest: macOS {version}; {}", sip.lines().next().unwrap_or("").trim());
+    outln!("guest: macOS {version}; {}", sip.lines().next().unwrap_or("").trim());
     let major = macos_major(&version)?;
     let allow_untested = std::env::var_os(UNTESTED_GUEST_VAR).is_some_and(|v| v == "1");
     let user_db = grant_plan(&from, &parse_sip(&sip), &sip, major, allow_untested)?;
 
     let exe = Path::new(GUEST_DIR).join(format!("{APP_NAME}.app")).join("Contents").join("MacOS").join(APP_EXECUTABLE);
     let script = guest_prepare_script(&ws.bundle_id, &exe.display().to_string(), user_db);
-    println!("$ tart exec {} /bin/bash -c <grant script>", args.image);
+    outln!("$ tart exec {} /bin/bash -c <grant script>", args.image);
     let status = interrupt::status(
         Command::new("tart").args(["exec", &args.image, "/bin/bash", "-c", &script]).stdin(Stdio::null()),
         Some(GRANT_LIMIT),
@@ -557,7 +561,19 @@ fn prepare(args: &SmokeVmArgs, ws: &Workspace) -> Result<()> {
     vm.keep = true;
     drop(vm);
     interrupt::check()?;
-    println!("prepared {:?} from {from}; `cargo xtask smoke-vm` now clones it for each run", args.image);
+    outln!("prepared {:?} from {from}; `cargo xtask smoke-vm` now clones it for each run", args.image);
+    Ok(())
+}
+
+/// A golden image must not look like a run clone: the stale cleanup would
+/// delete it once the `--prepare` that made it has exited.
+fn check_image_name(image: &str) -> Result<()> {
+    if parse_run_name(image).is_some() {
+        bail!(
+            "{image:?} looks like a per-run clone name ({RUN_PREFIX}…), which the stale-clone cleanup \
+             deletes; give the golden image another name"
+        );
+    }
     Ok(())
 }
 
@@ -886,7 +902,7 @@ impl Vm {
 
     fn boot(&mut self, args: &[OsString], log: &Path) -> Result<()> {
         let out = std::fs::File::create(log).with_context(|| format!("creating {}", log.display()))?;
-        println!(
+        outln!(
             "$ tart {}  (output in {})",
             args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "),
             log.display()
@@ -927,7 +943,7 @@ impl Vm {
                 Err(e) => return Err(e),
             };
             if ready {
-                println!("VM {} ready after {:.0}s", self.name, t0.elapsed().as_secs_f32());
+                outln!("VM {} ready after {:.0}s", self.name, t0.elapsed().as_secs_f32());
                 return Ok(());
             }
             if t0.elapsed() > limit {
@@ -981,12 +997,12 @@ impl Vm {
 impl Drop for Vm {
     fn drop(&mut self) {
         if let Some(sig) = interrupt::pending() {
-            eprintln!("{}: stopping and deleting VM {}", interrupt::Interrupted(sig), self.name);
+            errln!("{}: stopping and deleting VM {}", interrupt::Interrupted(sig), self.name);
         }
         // A VM about to be deleted needs no clean shutdown.
         let secs = if self.keep { self.stop_timeout } else { self.stop_timeout.min(5) };
         if let Err(e) = self.stop(secs) {
-            eprintln!("could not stop VM {} cleanly: {e:#}; its `tart run` was stopped instead", self.name);
+            errln!("could not stop VM {} cleanly: {e:#}; its `tart run` was stopped instead", self.name);
         }
         if self.keep {
             return;
@@ -995,7 +1011,7 @@ impl Drop for Vm {
         let exists = tart_list_teardown().and_then(|l| image_listed(&l, &self.name)).unwrap_or(true);
         if exists {
             if let Err(e) = run_quiet(Command::new("tart").args(["delete", &self.name]), Wait::teardown(TEARDOWN_MARGIN)) {
-                eprintln!("could not delete VM {}: {e:#}; {}", self.name, leftover_hint(&self.name));
+                errln!("could not delete VM {}: {e:#}; {}", self.name, leftover_hint(&self.name));
             }
         }
     }
@@ -1040,7 +1056,7 @@ fn sh_quote(s: &str) -> String {
 fn run_quiet(cmd: &mut Command, how: Wait) -> Result<()> {
     let shown: Vec<String> =
         std::iter::once(cmd.get_program()).chain(cmd.get_args()).map(|s| s.to_string_lossy().into_owned()).collect();
-    println!("$ {}", shown.join(" "));
+    outln!("$ {}", shown.join(" "));
     let out = interrupt::output(cmd.stdin(Stdio::null()), true, how).with_context(|| format!("running {}", shown.join(" ")))?;
     if !out.status.success() {
         bail!("{} failed ({}): {}", shown.join(" "), out.status, String::from_utf8_lossy(&out.stderr).trim());
@@ -1174,6 +1190,17 @@ mod tests {
         assert!(!owner_matches(&Owner::Legacy { pid: 1 }, 0, "zsh"));
         assert!(owner_matches(&Owner::Exact { pid: 1, start_us: 7 }, 7, "anything"));
         assert!(!owner_matches(&Owner::Exact { pid: 1, start_us: 7 }, 8, "xtask"));
+    }
+
+    #[test]
+    fn golden_images_cannot_take_run_names() {
+        check_image_name(GOLDEN_IMAGE).unwrap();
+        check_image_name("my-image").unwrap();
+        check_image_name("bugle-smoke-run-base").unwrap();
+        for run in ["bugle-smoke-run-1-p2-s3", "bugle-smoke-run-1700000000123-42"] {
+            let e = check_image_name(run).unwrap_err().to_string();
+            assert!(e.contains("per-run clone name"), "{e}");
+        }
     }
 
     #[test]

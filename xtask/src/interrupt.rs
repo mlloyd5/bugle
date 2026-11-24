@@ -235,7 +235,8 @@ pub fn status(cmd: &mut Command, limit: Option<Duration>) -> Result<ExitStatus> 
 /// inherited when `capture_stderr` is false), isolated and ended early as
 /// `how` says.
 pub fn output(cmd: &mut Command, capture_stderr: bool, how: Wait) -> Result<Output> {
-    cmd.stdout(Stdio::piped());
+    // As `Command::output` does: no stdin.
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped());
     if capture_stderr {
         cmd.stderr(Stdio::piped());
     }

@@ -624,7 +624,13 @@ left; the guard exists before the clone and deletes it only if `tart list`
 shows it. A VM about to be deleted is stopped with a 5 s timeout; the
 prepared image is shut down with 120 s, and a failed `tart stop` there deletes
 it instead of keeping a possibly unflushed image. `main` exits with 128 + the
-signal. Without the handlers (plain `bundle`, `verify`), the helpers are the
+signal, also for one that arrived after the last interruptible wait. All of
+xtask prints through `outln!`/`errln!`, which drop output that cannot be
+written: once the terminal has closed (EIO, the SIGHUP case) or a pipe's
+reader has quit (EPIPE), `println!` would panic, and a panic in `Vm`'s drop
+skipped the teardown (exit 101, clone left). `--prepare --image` refuses a
+name that parses as a run clone's, which the stale cleanup would delete.
+Without the handlers (plain `bundle`, `verify`), the helpers are the
 plain `std::process` calls. A SIGKILLed run leaves its clone (still running,
 with an orphaned `tart run`); `cleanup_stale`, run first by every run and by
 `--cleanup`, parses run names strictly (local VMs only). New names are

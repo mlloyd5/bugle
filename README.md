@@ -279,8 +279,12 @@ alone; a run that fails to delete a leftover warns and carries on (another
 run may be removing it), `--cleanup` fails. These were tried for real:
 SIGINT during the build, boot and test and a second one during the teardown,
 SIGTERM and SIGQUIT during the boot, SIGKILL during the boot and the test
-followed by `--cleanup` or a new run, and `--cleanup` beside a live run (left
-alone); each left no clone and no `tart`, `cargo` or `rustc` process behind.
+followed by `--cleanup` or a new run, `--cleanup` beside a live run (left
+alone), and SIGHUP (boot and test) and SIGINT (boot) with the terminal output
+going to a pipe whose reader had quit, as when a terminal closes or under
+`| head`; each left no clone and no `tart`, `cargo` or `rustc` process behind
+and exited with 128 + the signal. (Nothing xtask prints can fail it: output
+that cannot be written is dropped.)
 The hard limits on hung Tart commands are covered by unit tests only.
 `bundle --smoke-vm` (also with the VM step failing, which left `dist/`
 untouched) and `verify --smoke-vm` have run end to end with an ad-hoc

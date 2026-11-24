@@ -18,6 +18,26 @@
 //!   VM instead of on the host; `smoke-vm --prepare` makes its golden image
 //!   (see `smoke_vm.rs`).
 
+/// `println!` that never panics. Once the terminal is gone (SIGHUP) or the
+/// reader of a pipe has quit (`cargo xtask smoke-vm | head`), writing fails
+/// with EIO or EPIPE; `println!` would then panic, and a panic on the way
+/// out (in `Vm`'s drop, say) would skip the VM's teardown. Output that
+/// cannot be written is dropped instead.
+macro_rules! outln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
+/// `eprintln!` that never panics (see [`outln`]).
+macro_rules! errln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod icns;
 mod interrupt;
 mod plist;
@@ -142,10 +162,12 @@ struct BundleArgs {
 /// Exits with 1 on an error, or with 128 + the signal when one interrupted
 /// a command that handles them (see `interrupt.rs`).
 fn main() -> std::process::ExitCode {
-    match run_cli(Cli::parse().cmd) {
+    // A signal that arrived after the last interruptible wait still fails
+    // the command (the VM guards have run by now).
+    match run_cli(Cli::parse().cmd).and_then(|()| interrupt::check()) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("Error: {e:?}");
+            errln!("Error: {e:?}");
             std::process::ExitCode::from(interrupt::exit_code(&e).unwrap_or(1))
         }
     }
@@ -174,7 +196,7 @@ fn run_cli(cmd: Cmd) -> Result<()> {
             std::fs::create_dir_all(&out)?;
             std::fs::write(out.join(format!("{ICON_NAME}.icns")), icns::icns()?)?;
             std::fs::write(out.join(format!("{ICON_NAME}-1024.png")), icns::png(&icns::render(1024)?)?)?;
-            println!("wrote {}/{ICON_NAME}.icns and {ICON_NAME}-1024.png", out.display());
+            outln!("wrote {}/{ICON_NAME}.icns and {ICON_NAME}-1024.png", out.display());
             Ok(())
         }
         Cmd::Check => check(),
@@ -192,14 +214,14 @@ fn check() -> Result<()> {
     let mut failed = Vec::new();
     for (name, result) in [("clippy", clippy), ("tests", test)] {
         if let Err(e) = result {
-            eprintln!("{name}: {e:#}");
+            errln!("{name}: {e:#}");
             failed.push(name);
         }
     }
     if !failed.is_empty() {
         bail!("check failed: {}", failed.join(" and "));
     }
-    println!("check: clippy and tests passed");
+    outln!("check: clippy and tests passed");
     Ok(())
 }
 
@@ -340,7 +362,7 @@ fn bundle(args: &BundleArgs) -> Result<()> {
     std::fs::write(contents.join("Info.plist"), info)?;
     std::fs::write(contents.join("PkgInfo"), "APPL????")?;
     std::fs::write(resources.join(format!("{ICON_NAME}.icns")), icns::icns()?)?;
-    println!("assembled {}", app.display());
+    outln!("assembled {}", app.display());
 
     // Sign inside-out: the nested CLI first, then the bundle (which seals the
     // main executable, Info.plist and resources).
@@ -413,7 +435,7 @@ fn bundle(args: &BundleArgs) -> Result<()> {
     }
     std::fs::remove_dir_all(&staging)?;
     if !adhoc && notary.is_none() {
-        println!("not notarized; Gatekeeper will reject this bundle on other Macs (see --notarize)");
+        outln!("not notarized; Gatekeeper will reject this bundle on other Macs (see --notarize)");
     }
 
     let signature = match (adhoc, notary.is_some()) {
@@ -421,13 +443,13 @@ fn bundle(args: &BundleArgs) -> Result<()> {
         (false, false) => "Developer ID signature, not notarized",
         (false, true) => "Developer ID signature, notarized and stapled",
     };
-    println!("\n{APP_NAME}.app {VERSION} ({build_number}), {bundle_id}, {}, {signature}", archs.describe());
-    println!("  app: {}", final_app.display());
+    outln!("\n{APP_NAME}.app {VERSION} ({build_number}), {bundle_id}, {}, {signature}", archs.describe());
+    outln!("  app: {}", final_app.display());
     if zip.exists() {
-        println!("  zip: {}", zip.display());
+        outln!("  zip: {}", zip.display());
     }
     if dmg.exists() {
-        println!("  dmg: {}", dmg.display());
+        outln!("  dmg: {}", dmg.display());
     }
     Ok(())
 }
@@ -623,7 +645,7 @@ fn build_release(target: Option<&str>) -> Result<HashMap<&'static str, PathBuf>>
     // it, so consecutive runs still reuse target/release.
     cmd.env("MACOSX_DEPLOYMENT_TARGET", MIN_MACOS);
     let shown: Vec<&str> = args.iter().map(String::as_str).filter(|a| !a.starts_with("--message-format")).collect();
-    println!("$ cargo {}", shown.join(" "));
+    outln!("$ cargo {}", shown.join(" "));
     let out = interrupt::output(cmd.stderr(Stdio::inherit()), false, Wait::INTERRUPTIBLE).context("running cargo build")?;
     if !out.status.success() {
         bail!("cargo build failed ({})", out.status);
@@ -731,7 +753,7 @@ fn verify_dmg(dmg: &Path, ws: &Workspace, archs: Option<&[&str]>, signed: bool) 
     let mut guard = Attached { mount, detached: false };
     check_dmg_contents(&guard.mount, archs)?;
     guard.detach()?;
-    println!("verified {}", dmg.display());
+    outln!("verified {}", dmg.display());
     Ok(())
 }
 
@@ -774,7 +796,7 @@ fn check_dmg_contents(mount: &Path, archs: Option<&[&str]>) -> Result<()> {
         .filter(|n| !n.starts_with('.'))
         .collect();
     names.sort();
-    println!("  dmg contents: {}", names.join(", "));
+    outln!("  dmg contents: {}", names.join(", "));
     let app = mount.join(format!("{APP_NAME}.app"));
     if !app.is_dir() {
         bail!("the disk image has no {APP_NAME}.app");
@@ -786,7 +808,7 @@ fn check_dmg_contents(mount: &Path, archs: Option<&[&str]>) -> Result<()> {
     run(Command::new("codesign").args(["--verify", "--deep", "--strict", "--verbose=2"]).arg(&app))?;
     for exe in [APP_EXECUTABLE, CLI_EXECUTABLE] {
         let found = check_archs(&app.join("Contents").join("MacOS").join(exe), archs.unwrap_or(&[]))?;
-        println!("  dmg {exe}: {}", found.join(" "));
+        outln!("  dmg {exe}: {}", found.join(" "));
     }
     Ok(())
 }
@@ -822,7 +844,7 @@ fn verify(app: &Path, ws: &Workspace, archs: Option<&[&str]>) -> Result<()> {
         let flags = text.lines().find(|l| l.contains("flags=")).unwrap_or("").trim();
         let ident = text.lines().find(|l| l.starts_with("Identifier=")).unwrap_or("").trim();
         let found = check_archs(&contents.join("MacOS").join(name), archs.unwrap_or(&[]))?;
-        println!("  {name}: {ident}, {flags}, {}", found.join(" "));
+        outln!("  {name}: {ident}, {flags}, {}", found.join(" "));
         if !flags.contains("runtime") {
             bail!("{} is not signed with the hardened runtime", target.display());
         }
@@ -846,7 +868,7 @@ fn verify(app: &Path, ws: &Workspace, archs: Option<&[&str]>) -> Result<()> {
         .arg(&iconset)
         .arg(contents.join("Resources").join(format!("{ICON_NAME}.icns"))))?;
     let n = std::fs::read_dir(&iconset)?.count();
-    println!("  icon: {n} images");
+    outln!("  icon: {n} images");
     if n < icns::ICNS_ELEMENTS.len() {
         bail!("icon has {n} images, expected {}", icns::ICNS_ELEMENTS.len());
     }
@@ -861,11 +883,11 @@ fn verify(app: &Path, ws: &Workspace, archs: Option<&[&str]>) -> Result<()> {
             if slice == "x86_64" && *rosetta.get_or_init(rosetta_available) {
                 check_version(exe, Some(&slice), Command::new("arch").args(["-x86_64"]).arg(&path).arg("--version"))?;
             } else {
-                println!("  {exe} ({slice}): not executed, this Mac cannot run that slice (no Rosetta)");
+                outln!("  {exe} ({slice}): not executed, this Mac cannot run that slice (no Rosetta)");
             }
         }
     }
-    println!("verified {}", app.display());
+    outln!("verified {}", app.display());
     Ok(())
 }
 
@@ -873,7 +895,7 @@ fn check_version(exe: &str, slice: Option<&str>, cmd: &mut Command) -> Result<()
     let out = interrupt::output(cmd, true, Wait::INTERRUPTIBLE).with_context(|| format!("running {exe} --version"))?;
     let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let label = slice.map_or_else(|| exe.to_string(), |s| format!("{exe} ({s})"));
-    println!("  {label} --version: {line}");
+    outln!("  {label} --version: {line}");
     if !out.status.success() || !line.ends_with(VERSION) {
         bail!("{label} --version printed {line:?}, expected version {VERSION}");
     }
@@ -998,7 +1020,7 @@ impl SmokeDir {
 impl Drop for SmokeDir {
     fn drop(&mut self) {
         if std::env::var_os("BUGLE_SMOKE_KEEP").is_some() {
-            println!("smoke test files kept in {}", self.0.display());
+            outln!("smoke test files kept in {}", self.0.display());
         } else {
             let _ = std::fs::remove_dir_all(&self.0);
         }
@@ -1020,7 +1042,7 @@ fn smoke(app: &Path, limit: Duration) -> Result<()> {
     let dir = SmokeDir::create()?;
     let config = dir.0.join("config.toml");
     std::fs::write(&config, smoke_config(&dir.0)?).with_context(|| format!("writing {}", config.display()))?;
-    println!("$ {} --smoke-test --config {}  (limit {}s)", exe.display(), config.display(), limit.as_secs());
+    outln!("$ {} --smoke-test --config {}  (limit {}s)", exe.display(), config.display(), limit.as_secs());
     let mut child = Command::new(&exe)
         .arg("--smoke-test")
         .arg("--config")
@@ -1043,7 +1065,7 @@ fn smoke(app: &Path, limit: Duration) -> Result<()> {
             if !status.success() {
                 bail!("smoke test exited with {status}");
             }
-            println!("smoke test passed in {:.1}s", t0.elapsed().as_secs_f32());
+            outln!("smoke test passed in {:.1}s", t0.elapsed().as_secs_f32());
             return Ok(());
         }
         if t0.elapsed() > limit {
@@ -1091,14 +1113,14 @@ fn notarize(zip: &Path, creds: &NotaryCredentials) -> Result<()> {
     // Identifiers are masked so they stay out of CI logs.
     match creds {
         NotaryCredentials::Profile(p) => {
-            println!("$ xcrun notarytool submit {} --wait --keychain-profile ***", zip.display());
+            outln!("$ xcrun notarytool submit {} --wait --keychain-profile ***", zip.display());
             cmd.args(["--keychain-profile", p]);
         }
         NotaryCredentials::ApiKey { key, key_id, issuer } => {
             if !key.is_file() {
                 bail!("BUGLE_NOTARY_KEY does not name a file");
             }
-            println!("$ xcrun notarytool submit {} --wait --key *** --key-id *** --issuer ***", zip.display());
+            outln!("$ xcrun notarytool submit {} --wait --key *** --key-id *** --issuer ***", zip.display());
             cmd.arg("--key").arg(key).args(["--key-id", key_id, "--issuer", issuer]);
         }
     }
@@ -1122,7 +1144,7 @@ fn run(cmd: &mut Command) -> Result<()> {
             }
         })
         .collect();
-    println!("$ {}", shown.join(" "));
+    outln!("$ {}", shown.join(" "));
     let status = interrupt::status(cmd, None).with_context(|| format!("running {}", shown[0]))?;
     if !status.success() {
         bail!("{} failed ({status})", shown[0]);
@@ -1277,7 +1299,7 @@ mod tests {
             let out = dir.join(arch);
             let ok = Command::new("cc").args(["-arch", arch, "-o"]).arg(&out).arg(&src).status().is_ok_and(|s| s.success());
             if !ok {
-                eprintln!("skipping: cc cannot build {arch}");
+                errln!("skipping: cc cannot build {arch}");
                 return;
             }
             slices.push(out);
