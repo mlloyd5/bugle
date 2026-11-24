@@ -447,8 +447,11 @@ recordings.) A recording that stops by itself at an Agent API request's
 `max_seconds` is noticed on the housekeeping tick (about once a second):
 the app finalises it on a short-lived thread with `Engine::record_reap`,
 which announces it like a stop, and the next `record_stop` still returns
-its media record (until another recording starts, for up to 10 minutes).
-Quitting while a reap is still writing the file waits for it.
+its media record, or its finalisation error unchanged (typed, so the API
+maps it as for a failed stop), until another recording starts, for up to
+10 minutes. Quitting while a reap is still writing the file waits for it;
+a `record_start` meanwhile fails at once with `BugleError::Busy` (HTTP 409)
+rather than waiting or capturing alongside the save.
 When the process runs from `Bugle.app`, an *Open at Login* check item
 (`login.rs`) registers the bundle with `SMAppService`. Its check mark is
 re-read on the periodic tick (every 5 s) and set only for an enabled item; a

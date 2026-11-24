@@ -42,8 +42,22 @@ pub struct RecorderState {
     levels: Mutex<Option<AudioMixConfig>>,
     /// A recording [`Engine::record_reap`] finalised after it stopped by
     /// itself (and when), for the `record_stop` that comes for it; cleared
-    /// by the next start, ignored after [`REAPED_KEPT`].
-    reaped: Mutex<Option<(Instant, std::result::Result<MediaItem, String>)>>,
+    /// by the next start, ignored after [`REAPED_KEPT`]. The error keeps its
+    /// type, so the stop reports it as it would its own failure.
+    reaped: Mutex<Option<(Instant, Result<MediaItem>)>>,
+    /// Set while [`Engine::record_reap`] finalises a recording it took out
+    /// of the slot (set with `inner` locked), so a start meanwhile
+    /// answers "busy" at once instead of waiting for the save.
+    saving: AtomicBool,
+}
+
+/// Clears [`RecorderState::saving`] however the reap ends.
+struct SavingGuard<'a>(&'a AtomicBool);
+
+impl Drop for SavingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// How long a `record_stop` may still collect a recording that
@@ -496,11 +510,16 @@ impl Engine {
 
     /// Lock the recorder state with no recording in it. A recording whose
     /// backend already stopped by itself is finalised first (as
-    /// `record_stop` would); one that is still capturing is an error.
+    /// `record_stop` would); one that is still capturing is an error, and
+    /// one that [`Engine::record_reap`] is still saving is a
+    /// [`BugleError::Busy`] (retrying once the save is done works).
     fn idle_recorder(&self) -> Result<MutexGuard<'_, Option<Active>>> {
         loop {
             let mut g = self.recorder_state.inner.lock().unwrap();
             let state = match g.as_mut() {
+                None if self.recorder_state.saving.load(Ordering::SeqCst) => {
+                    return Err(BugleError::Busy("the previous recording (stopped at its max_seconds) is still being saved; try again in a moment".into()).into());
+                }
                 None => return Ok(g),
                 Some(a) => a.poll(),
             };
@@ -522,21 +541,31 @@ impl Engine {
     /// The next `record_stop`, until another recording starts and within
     /// [`REAPED_KEPT`], returns the
     /// same result, so a caller that asked for the auto-stop still gets its
-    /// media record.
+    /// media record, or its error with its type (as for a failed stop). The
+    /// result returned here is a copy whose error is the message alone.
+    /// A `record_start` meanwhile fails with [`BugleError::Busy`].
     pub fn record_reap(&self) -> Option<Result<MediaItem>> {
         let mut g = self.recorder_state.inner.lock().unwrap();
         if g.as_mut()?.poll() != RecordingState::Finishing {
             return None;
         }
         let finished = g.take().expect("checked above");
+        self.recorder_state.saving.store(true, Ordering::SeqCst);
+        let saving = SavingGuard(&self.recorder_state.saving);
         // Stored before the slot is seen to be free, so a `record_stop`
         // racing the finalisation finds the result once it is there.
         let mut reaped = self.recorder_state.reaped.lock().unwrap_or_else(|e| e.into_inner());
         drop(g);
         let r = self.finish(finished);
-        *reaped = Some((Instant::now(), r.as_ref().map(Clone::clone).map_err(|e| format!("{e:#}"))));
+        let copy = match &r {
+            Ok(m) => Ok(m.clone()),
+            Err(e) => Err(anyhow!("{e:#}")),
+        };
+        *reaped = Some((Instant::now(), r));
+        // Cleared before a start can get past the result lock (`install`).
+        drop(saving);
         drop(reaped);
-        Some(r)
+        Some(copy)
     }
 
     pub fn record_start(&self, req: &RecordRequest) -> Result<RecordingStatus> {
@@ -779,7 +808,7 @@ impl Engine {
             drop(g);
             let reaped = self.recorder_state.reaped.lock().unwrap_or_else(|e| e.into_inner()).take();
             return match reaped {
-                Some((at, r)) if at.elapsed() < REAPED_KEPT => r.map_err(|e| anyhow!(e)),
+                Some((at, r)) if at.elapsed() < REAPED_KEPT => r,
                 _ => Err(anyhow!("no recording in progress")),
             };
         };
@@ -1384,6 +1413,87 @@ mod tests {
         engine.recorder_state.reaped.lock().unwrap().as_mut().unwrap().0 = long_ago;
         let e = engine.record_stop().unwrap_err();
         assert!(e.to_string().contains("no recording in progress"), "{e}");
+    }
+
+    /// A reaped recording whose finalisation failed reports the same typed
+    /// error through `record_stop` as a failed explicit stop does.
+    #[test]
+    fn a_failed_reap_keeps_the_error_type_for_record_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _) = watched_engine(tmp.path());
+        let failing = || gif(Arc::new(AtomicBool::new(true)), || Err(BugleError::Unsupported("the encoder gave up".into()).into())).0;
+        let kind = |e: &anyhow::Error| e.chain().find_map(|c| c.downcast_ref::<BugleError>()).map(|k| format!("{k:?}"));
+
+        // Explicit stop of a recording that fails to finalise.
+        engine.install(engine.idle_recorder().unwrap(), active(failing(), tmp.path().join("a.gif"), None));
+        let explicit = engine.record_stop().unwrap_err();
+        assert_eq!(kind(&explicit).as_deref(), Some("Unsupported(\"the encoder gave up\")"), "{explicit:#}");
+
+        // The same failure after a max_seconds auto-stop, reaped.
+        engine.install(engine.idle_recorder().unwrap(), active(failing(), tmp.path().join("b.gif"), Some(1.0)));
+        wait_until(|| engine.record_status().state == RecordingState::Finishing);
+        let reap = engine.record_reap().unwrap().unwrap_err();
+        assert_eq!(format!("{reap:#}"), format!("{explicit:#}"));
+        assert_eq!(engine.record_status().state, RecordingState::Idle, "as after a failed stop");
+        let reaped = engine.record_stop().unwrap_err();
+        assert_eq!(format!("{reaped:#}"), format!("{explicit:#}"));
+        assert_eq!(kind(&reaped), kind(&explicit), "the type survives the reap: {reaped:#}");
+        let e = engine.record_stop().unwrap_err();
+        assert!(e.to_string().contains("no recording in progress"), "once: {e}");
+    }
+
+    /// A start while a reap is still saving answers at once with a
+    /// retryable busy error, and starts nothing; once saved it goes ahead.
+    #[test]
+    fn start_during_a_reap_is_busy_not_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _) = watched_engine(tmp.path());
+        let out = tmp.path().join("saving.gif");
+        let out2 = out.clone();
+        let saved = Arc::new(AtomicBool::new(false));
+        let saved2 = saved.clone();
+        // Capturing has ended; writing the file waits for `saved`.
+        let (backend, _) = gif(Arc::new(AtomicBool::new(true)), move || {
+            while !saved2.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let img = RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]));
+            GifEncoder::new(std::fs::File::create(&out2)?).encode_frames(std::iter::once(Frame::new(img)))?;
+            Ok(1)
+        });
+        engine.install(engine.idle_recorder().unwrap(), active(backend, out.clone(), Some(1.0)));
+        wait_until(|| engine.record_status().state == RecordingState::Finishing);
+        let reaper = {
+            let engine = engine.clone();
+            std::thread::spawn(move || engine.record_reap())
+        };
+        wait_until(|| engine.record_status().state == RecordingState::Idle);
+
+        // The save is blocked, so a start that waited would hang here.
+        let t0 = Instant::now();
+        let e = engine.idle_recorder().err().expect("busy while saving");
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        assert!(matches!(e.downcast_ref::<BugleError>(), Some(BugleError::Busy(_))), "{e:#}");
+        assert!(e.to_string().contains("still being saved"), "{e}");
+        assert!(!reaper.is_finished());
+
+        // Saved: the start goes ahead, and the reaped record is still there
+        // until it installs a recording.
+        saved.store(true, Ordering::Relaxed);
+        assert!(reaper.join().unwrap().unwrap().is_ok());
+        assert!(engine.idle_recorder().unwrap().is_none());
+        assert_eq!(engine.record_stop().unwrap().path, out);
+    }
+
+    /// `record_start` checks for a free (not saving) recorder before it
+    /// resolves the target, so a busy start never opens a picker.
+    #[test]
+    fn record_start_checks_the_recorder_before_the_target() {
+        let src = include_str!("record.rs");
+        let start = src.find("pub fn record_start(").unwrap();
+        let body = &src[start..];
+        let check = body.find("drop(self.idle_recorder()?);").expect("early idle_recorder check");
+        assert!(check < body.find("match &req.target").unwrap());
     }
 
     /// `record_start` must hand its recording to the UI host via `install`
