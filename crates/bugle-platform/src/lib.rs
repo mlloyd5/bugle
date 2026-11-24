@@ -2047,7 +2047,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(bugle_no_screen, ignore = "BUGLE_TEST_NO_SCREEN: needs a display from the window server")]
     fn lists_displays() {
         let d = displays().unwrap();
         assert!(!d.is_empty());

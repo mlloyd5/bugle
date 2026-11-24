@@ -62,10 +62,14 @@ jobs:
       - name: Fetch dependencies (Cargo.lock must be current)
         run: cargo fetch --locked
 
-      # What the runner reports for Screen Recording, Accessibility, the
-      # microphone and the displays, read without prompting.
+      # GitHub's macOS image grants the runner's shell Screen Recording,
+      # Accessibility and microphone access and has one virtual display, so
+      # the capture tests really capture. That is the image's choice and may
+      # change: print what the runner reports (never prompting) and fail if
+      # Screen Recording, a display or a small capture is missing, rather
+      # than let the capture tests skip their capture part and pass.
       - name: Runner permissions and displays
-        run: cargo run --locked -p bugle-platform --example ci_probe
+        run: cargo run --locked -p bugle-platform --example ci_probe -- --require-screen
 
       - name: cargo xtask check
         run: cargo xtask check

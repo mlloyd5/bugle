@@ -77,15 +77,16 @@ release, change that one line, fix whatever the new clippy reports in the same p
 request, and let CI confirm it. Your local clippy may be older than CI's and miss
 lints it reports.
 
-Before the checks, the workflow prints what the runner reports for Screen Recording,
-Accessibility and the microphone, plus its displays
-(`cargo run -p bugle-platform --example ci_probe`, which never prompts). Tests that
-capture the screen check Screen Recording access when they run. Setting
-`BUGLE_TEST_NO_SCREEN=1` compiles the tests marked
-`#[cfg_attr(bugle_no_screen, ignore = "...")]` in `bugle-platform` (currently
-`lists_displays`) as ignored, and the test output lists them as `ignored` with the
-reason. CI does not set it at the moment. The smoke test (`--smoke-test`,
-`cargo xtask smoke-vm`) is not run in CI.
+The runs so far show that GitHub's macOS image grants the runner's shell Screen
+Recording, Accessibility and microphone access, and gives it one virtual 1024x768
+display. Every test therefore runs there, including the ones that capture the
+screen for real. That is a property of GitHub's image, not of Bugle, so it could
+change. Before the checks, the workflow runs
+`cargo run -p bugle-platform --example ci_probe -- --require-screen`, which never
+prompts. It prints the runner's permissions and displays, and fails the job if
+Screen Recording is not granted, there is no display or a small capture fails.
+Without that guard, the capture tests would skip their capture part and still pass.
+The smoke test (`--smoke-test`, `cargo xtask smoke-vm`) is not run in CI.
 
 ### App bundle
 
