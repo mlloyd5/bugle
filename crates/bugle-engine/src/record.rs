@@ -25,6 +25,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+pub mod marker;
+
 /// GIF frames are kept decoded until the recording stops; stop capturing once
 /// they take this much memory.
 const GIF_MAX_BYTES: u64 = 1 << 30;
@@ -798,6 +800,8 @@ impl Engine {
     }
 
     fn recording_changed(&self) {
+        // Other Bugle processes (the menu-bar app) see the recording too.
+        self.sync_recording_marker();
         if let Some(host) = &self.ui_host {
             host.recording_changed();
         }
