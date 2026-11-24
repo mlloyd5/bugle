@@ -142,7 +142,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "record_start",
-            description: "Start a screen recording (mp4/mov via screencapture or, with system_audio, hide_cursor or cursor_events, the ScreenCaptureKit recorder; gif via a frame grab loop). Only one recording at a time.",
+            description: "Start a screen recording (mp4/mov via screencapture or, with system_audio, hide_cursor or cursor_events, the ScreenCaptureKit recorder; gif via a frame grab loop). Only one recording at a time; while the menu-bar app is still saving a recording that stopped at its max_seconds, fails at once with a busy error (HTTP 409) that a retry a moment later gets past.",
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -167,7 +167,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "record_stop",
-            description: "Stop the active recording and return its media record. After a max_seconds auto-stop that the menu-bar app already finalised, returns that recording's media record (once, until another recording starts or for 10 minutes).",
+            description: "Stop the active recording and return its media record. After a max_seconds auto-stop that the menu-bar app already finalised, returns that recording's media record, or the error its finalisation failed with (once, until another recording starts or for 10 minutes).",
             input_schema: json!({"type":"object","properties":{}}),
         },
         ToolSpec {
