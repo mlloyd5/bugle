@@ -70,14 +70,22 @@ line tools; no Xcode project is needed.
 
 GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs
 `cargo xtask check` on a GitHub-hosted macOS 26 arm64 runner for every pull request
-and every push to `main`. Hosted runners have no Screen Recording, Accessibility or
-microphone access, so the workflow sets `BUGLE_TEST_NO_SCREEN=1`: tests that need a
-display from the window server are then compiled as ignored and listed as `ignored`
-in the test output (mark one with
-`#[cfg_attr(bugle_no_screen, ignore = "BUGLE_TEST_NO_SCREEN: ...")]` in
-`bugle-platform`), and tests that capture the screen check Screen Recording access
-at run time. Unset, as on a developer Mac, every test runs. The smoke test
-(`--smoke-test`, `cargo xtask smoke-vm`) is not run in CI.
+and every push to `main`, after checking that `Cargo.lock` is current.
+
+CI pins its Rust toolchain (`RUST_TOOLCHAIN` in the workflow). To move to a newer
+release, change that one line, fix whatever the new clippy reports in the same pull
+request, and let CI confirm it. Your local clippy may be older than CI's and miss
+lints it reports.
+
+Before the checks, the workflow prints what the runner reports for Screen Recording,
+Accessibility and the microphone, plus its displays
+(`cargo run -p bugle-platform --example ci_probe`, which never prompts). Tests that
+capture the screen check Screen Recording access when they run. Setting
+`BUGLE_TEST_NO_SCREEN=1` compiles the tests marked
+`#[cfg_attr(bugle_no_screen, ignore = "...")]` in `bugle-platform` (currently
+`lists_displays`) as ignored, and the test output lists them as `ignored` with the
+reason. CI does not set it at the moment. The smoke test (`--smoke-test`,
+`cargo xtask smoke-vm`) is not run in CI.
 
 ### App bundle
 

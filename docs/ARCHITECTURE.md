@@ -560,14 +560,17 @@ the new image is renamed over the old one (never deleted first).
 `cargo xtask check` runs `cargo clippy --workspace --all-targets -- -D
 warnings` and `cargo test --workspace`. CI (`.github/workflows/ci.yml`) runs
 it on a GitHub-hosted `macos-26` arm64 runner for pull requests and pushes to
-`main`, with the stable toolchain and `BUGLE_TEST_NO_SCREEN=1`. That variable
-makes `bugle-platform`'s build script set `cfg(bugle_no_screen)`, and tests
-that need a display from the window server carry
-`#[cfg_attr(bugle_no_screen, ignore = "...")]`, so on the runner libtest
-reports them as ignored with the reason; capture tests already skip their
-capture part when `screen_access_preflight()` is false. Nothing else is
-gated: the AVFoundation, VideoToolbox, Vision and CoreText tests run on the
-runner as they do locally.
+`main`, with the toolchain pinned in the workflow (`RUST_TOOLCHAIN`; bumps
+are reviewed edits that fix the new clippy's lints), after `cargo fetch
+--locked`. A step first runs `bugle-platform`'s `ci_probe` example, which
+prints the Screen Recording preflight, Accessibility trust, microphone status
+and the display list without prompting, and captures only when access is
+already granted. `BUGLE_TEST_NO_SCREEN=1` makes `bugle-platform`'s build
+script set `cfg(bugle_no_screen)`, and tests that carry
+`#[cfg_attr(bugle_no_screen, ignore = "...")]` (currently `lists_displays`)
+are then reported by libtest as ignored, with the reason. CI does not set it
+for now. The capture test skips its capture part when
+`screen_access_preflight()` is false.
 
 `cargo xtask smoke-vm` (`smoke_vm.rs`) runs the smoke test in a throwaway
 Tart VM. `--prepare` `tart clone`s an already pulled Cirrus Labs image to the

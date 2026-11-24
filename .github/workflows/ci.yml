@@ -10,20 +10,18 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  # A new push to a pull request cancels its older run; every commit on main
-  # keeps its own.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  # One group per pull request, so a new push cancels that PR's older run;
+  # pushes to main group by commit, so each one is checked and none is
+  # cancelled or dropped by a later push.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-  # Hosted runners grant no Screen Recording, Accessibility or microphone
-  # access. Tests that need a display from the window server are compiled as
-  # ignored (see crates/bugle-platform/build.rs) and show up as "ignored" in
-  # the test output; tests that need Screen Recording check
-  # CGPreflightScreenCaptureAccess themselves.
-  BUGLE_TEST_NO_SCREEN: 1
+  # The Rust toolchain CI builds and lints with. clippy runs with -D warnings,
+  # so a new release can add lints; bump this deliberately, fix what the new
+  # clippy reports in the same change, and expect a local clippy to be older.
+  RUST_TOOLCHAIN: "1.100.0"
 
 jobs:
   check:
@@ -33,16 +31,16 @@ jobs:
     # showMouseClicks); the deployment target stays 13.0. Pinned rather than
     # macos-latest so an image change is a reviewed edit here.
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Install Rust (stable, clippy)
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} (clippy)
         run: |
-          rustup toolchain install stable --profile minimal --component clippy
-          rustup default stable
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup default "$RUST_TOOLCHAIN"
 
       - name: Show toolchain
         run: |
@@ -58,6 +56,16 @@ jobs:
         with:
           # Pull requests restore main's cache but do not write their own.
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Fails if Cargo.lock is out of date; `cargo xtask check` itself does not
+      # pass --locked, so local runs are unchanged.
+      - name: Fetch dependencies (Cargo.lock must be current)
+        run: cargo fetch --locked
+
+      # What the runner reports for Screen Recording, Accessibility, the
+      # microphone and the displays, read without prompting.
+      - name: Runner permissions and displays
+        run: cargo run --locked -p bugle-platform --example ci_probe
 
       - name: cargo xtask check
         run: cargo xtask check
