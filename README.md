@@ -477,6 +477,13 @@ file) · Open at Login (only when running from `Bugle.app`) · Quit. While recor
 a recording with system audio or the microphone (the ScreenCaptureKit recorder) adds a live level meter: one
 bar glyph per source after the time (microphone first) and, under Stop Recording, a line per source with its
 peak in dB and a `!` clip mark near full scale. Levels are measured as recorded, before any gain or ducking.
+A recording another Bugle process on this Mac makes with the same config (`bugle record start`,
+or `record_start` through `bugle serve` / `bugle mcp`) shows too, usually within a second or two of
+its start and stop: the status item shows its `● m:ss` (no level meter) and the Stop entry reads
+*Recording in another Bugle process (pid N)*, disabled: stop it where it was started. It also stops
+showing within about two seconds when the recording stops by itself (its `max_seconds`, the GIF
+length or memory cap, the system recorder exiting) though nobody has called `record_stop` yet, and
+when the recording process crashes or is killed.
 Other actions
 report through a small toast in the top-right corner (thumbnail and file name;
 click to open).

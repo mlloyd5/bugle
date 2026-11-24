@@ -155,6 +155,16 @@ the meter cannot read) is `null`; the field is
 absent when idle, finishing, recording a GIF, or on the `screencapture`
 recorder, which does not report levels.
 
+A recording belongs to the process that started it; `record_status` and
+`record_stop` act on that process's own engine. While one runs, the Bugle
+menu-bar app on the same Mac (same config) shows it in the menu bar within
+a second or two, whichever process started it (`bugle serve`, `bugle mcp`,
+`bugle record`), but cannot stop another process's recording: its Stop entry
+is disabled and names the recording process. Stop it with `record_stop` on the
+server that started it. Once a recording stops capturing by itself (its
+`max_seconds`, a GIF cap), the menu bar stops showing it even before that
+`record_stop`, which still returns its media record.
+
 `source` accepts a media id (or prefix), `latest`, or a file path.
 Target coordinates are screen points (top-left origin); annotation and OCR
 coordinates are image pixels.

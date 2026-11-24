@@ -25,6 +25,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+pub mod marker;
+
 /// GIF frames are kept decoded until the recording stops; stop capturing once
 /// they take this much memory.
 const GIF_MAX_BYTES: u64 = 1 << 30;
@@ -49,6 +51,9 @@ pub struct RecorderState {
     /// of the slot (set with `inner` locked), so a start meanwhile
     /// answers "busy" at once instead of waiting for the save.
     saving: AtomicBool,
+    /// Cancels the watchdog of the recording state last published
+    /// (`marker`).
+    marker_watch: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 /// Clears [`RecorderState::saving`] however the reap ends.
@@ -874,6 +879,9 @@ impl Engine {
         if let Some(host) = &self.ui_host {
             host.recording_changed();
         }
+        // Other Bugle processes (the menu-bar app) see the recording too;
+        // after the host, so a slow volume cannot delay its redraw.
+        self.sync_recording_marker();
     }
 
     /// Stop `active`'s backend (if still running), finish the file and add
