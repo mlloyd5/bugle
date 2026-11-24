@@ -748,6 +748,17 @@ impl App {
                 self.items.stop.set_enabled(enabled);
                 OTHER_SHOWN.store(shown.other.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
             }
+            // Monospaced digits while a title counts (this app's recording
+            // or another process's), so the item (and its neighbours) do not
+            // shift every second; set before the title, and the button's own
+            // font is back before the idle title is set.
+            let titled = shown.title.is_some();
+            if before.map(|s| s.title.is_some()) != Some(titled) {
+                if let Some(item) = self.tray.ns_status_item() {
+                    // SAFETY: the status item is alive; this is the main thread.
+                    unsafe { bugle_platform::status_item_mono_digits(&*item as *const _ as *mut std::ffi::c_void, titled) };
+                }
+            }
             self.tray.set_title(shown.title.as_deref());
             self.recording_shown = Some(shown);
         }

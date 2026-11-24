@@ -21,7 +21,7 @@
 
 use crate::level_meter::{self, Update};
 use crate::{AppEvent, Proxy};
-use bugle_core::audio_level::{meter_glyph, TrackLevel, FLOOR_DB, METER_RANGE_DB};
+use bugle_core::audio_level::{meter_glyph, TrackLevel, FLOOR_DB, METER_GLYPHS, METER_RANGE_DB};
 use bugle_core::{CaptureTarget, MediaKind, RecordRequest, RecordingFormat, RecordingState, Rect};
 use bugle_engine::Engine;
 use std::path::Path;
@@ -327,6 +327,15 @@ fn run(engine: &Engine, proxy: &Proxy, out: &Path) -> Result<(), Vec<String>> {
     let stop_at = Instant::now();
     let stopped = engine.record_stop();
     check_prompt("stop", false, stop_at, Instant::now(), &mut failures);
+    // The idle status item has its own font back: read it once more (the
+    // app redraws the recording UI before it opens the menu).
+    if probe.is_some() {
+        match ask().recv_timeout(Duration::from_secs(6)) {
+            Ok(Ok(json)) => check_restored(&json, &mut failures),
+            Ok(Err(e)) => failures.push(format!("status menu probe after the stop: {e}")),
+            Err(_) => failures.push("no report from the status menu probe after the stop".into()),
+        }
+    }
     match stopped {
         Ok(media) => {
             let info = bugle_platform::video_info(&media.path);
@@ -488,6 +497,9 @@ fn check_probe(json: &str, updates: &[Update], failures: &mut Vec<String>) -> Op
     if !title.starts_with("● ") || glyphs != last.glyphs {
         failures.push(format!("the status item title is {title:?}; want `● m:ss {}`", last.glyphs));
     }
+    if s["digits_monospaced"].as_bool() != Some(true) {
+        failures.push("the status item title's font does not draw its digits at one width".into());
+    }
     for (g, line) in glyphs.chars().zip(&meter) {
         if !glyph_matches(g, line) {
             failures.push(format!("title glyph {g} does not match {line:?}"));
@@ -496,10 +508,22 @@ fn check_probe(json: &str, updates: &[Update], failures: &mut Vec<String>) -> Op
     Some((line_changes, glyph_changes))
 }
 
+/// After the stop: the status item shows no title, in its own font (the
+/// menu-bar font's digits are proportional, so not the recording's).
+fn check_restored(json: &str, failures: &mut Vec<String>) {
+    let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    let s = &v["sample"];
+    if s["title"].as_str() != Some("") || s["digits_monospaced"].as_bool() != Some(false) {
+        failures.push(format!(
+            "after the stop the status item reads title {:?}, monospaced digits {:?}; want no title in its own font",
+            s["title"], s["digits_monospaced"]
+        ));
+    }
+}
+
 /// Whether the status-title glyph `g` fits the peak shown on `line`
 /// (`… -23 dB` or `… silent`), allowing one step for the line's rounding.
 fn glyph_matches(g: char, line: &str) -> bool {
-    const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let db = if line.trim_end().ends_with("silent") {
         METER_RANGE_DB
     } else {
@@ -511,7 +535,7 @@ fn glyph_matches(g: char, line: &str) -> bool {
             None => return false,
         }
     };
-    let idx = |c: char| GLYPHS.iter().position(|x| *x == c);
+    let idx = |c: char| METER_GLYPHS.iter().position(|x| *x == c);
     match (idx(g), idx(meter_glyph(db)), idx(meter_glyph(db - 0.5)), idx(meter_glyph(db + 0.5))) {
         (Some(a), Some(b), Some(lo), Some(hi)) => a == b || a == lo || a == hi,
         _ => false,
@@ -542,7 +566,7 @@ mod tests {
     fn report(sample_title: &str, sample_line: &str) -> String {
         serde_json::json!({
             "opened": true, "opened_at": 100.0, "closed_at": 101.5, "firings": 2,
-            "sample": {"t": 1.2, "mode": "NSEventTrackingRunLoopMode", "title": sample_title,
+            "sample": {"t": 1.2, "mode": "NSEventTrackingRunLoopMode", "title": sample_title, "digits_monospaced": true,
                        "items": ["Record", "Stop Recording", sample_line, "", "Audio Levels"], "width": 320.0}
         })
         .to_string()
@@ -569,6 +593,28 @@ mod tests {
         // and a menu line that is not what the app set is caught.
         let mut failures = Vec::new();
         check_probe(&report(&format!("● 0:01 {ga}"), &b), &ups[..3], &mut failures);
+        assert_eq!(failures.len(), 3, "{failures:?}");
+
+        // A title in proportional digits is caught.
+        let mut v: serde_json::Value = serde_json::from_str(&report(&format!("● 0:01 {gb}"), &b)).unwrap();
+        v["sample"]["digits_monospaced"] = false.into();
+        let mut failures = Vec::new();
+        check_probe(&v.to_string(), &ups, &mut failures);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("digits"), "{failures:?}");
+
+        // After the stop: no title, and the button's own font.
+        v["sample"]["title"] = "".into();
+        let mut failures = Vec::new();
+        check_restored(&v.to_string(), &mut failures);
+        assert!(failures.is_empty(), "{failures:?}");
+        for (title, mono) in [("", true), ("● 0:02", false)] {
+            v["sample"]["title"] = title.into();
+            v["sample"]["digits_monospaced"] = mono.into();
+            check_restored(&v.to_string(), &mut failures);
+        }
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        check_restored("not json", &mut failures);
         assert_eq!(failures.len(), 3, "{failures:?}");
     }
 }
