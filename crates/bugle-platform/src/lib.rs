@@ -1505,6 +1505,25 @@ mod tests {
         }
     }
 
+    /// Held while a test captures the screen. ScreenCaptureKit requests from
+    /// every process are served by one system service, and the bursts of
+    /// several test runs at once (checkouts tested side by side) can queue a
+    /// request past the shim's 15 s timeout. A file lock in the temp folder
+    /// serialises such tests across processes, not just threads; it is
+    /// released when the returned file is dropped (or the process dies).
+    fn screen_capture_lock() -> std::fs::File {
+        use std::os::fd::AsRawFd;
+        let path = std::env::temp_dir().join("bugle-tests-screen-capture.lock");
+        let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).unwrap();
+        loop {
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return f;
+            }
+            let e = std::io::Error::last_os_error();
+            assert_eq!(e.kind(), std::io::ErrorKind::Interrupted, "locking {}: {e}", path.display());
+        }
+    }
+
     /// Hammers capture/OCR from many threads with valid and invalid input
     /// and checks every error is the one its own call produced.
     #[test]
@@ -1513,6 +1532,7 @@ mod tests {
         if !screen {
             eprintln!("Screen Recording not granted: skipping the capture part of this test");
         }
+        let _lock = screen.then(screen_capture_lock);
         let threads: Vec<_> = (1..=8u32)
             .map(|t| {
                 std::thread::spawn(move || {
