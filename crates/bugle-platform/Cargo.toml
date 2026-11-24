@@ -3,6 +3,8 @@ name = "bugle-platform"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "macOS platform layer for Bugle: capture, OCR, registration, clipboard, overlays"
 build = "build.rs"
 

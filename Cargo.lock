@@ -431,7 +431,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs",
- "image",
  "serde",
  "serde_json",
  "tempfile",

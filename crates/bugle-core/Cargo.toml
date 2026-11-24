@@ -3,6 +3,8 @@ name = "bugle-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "Core types, configuration and history for Bugle"
 
 [dependencies]
@@ -14,7 +16,6 @@ toml.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 dirs.workspace = true
-image.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
