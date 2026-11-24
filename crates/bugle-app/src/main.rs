@@ -588,10 +588,12 @@ impl App {
             // The Stop hotkey while another process records: say why it
             // does nothing rather than ignore it.
             if let Some(r) = self.other_recordings.first() {
-                self.toast_error(&format!(
+                let msg = format!(
                     "{}: stop it where it was started (bugle record, or record_stop through bugle serve / bugle mcp)",
                     recording_view::other_process_label(r.pid)
-                ));
+                );
+                tracing::info!("Stop Recording: {msg}");
+                bugle_platform::toast_show(None, "Bugle", &msg, None, 4.0);
             }
             return;
         }
@@ -795,6 +797,7 @@ impl App {
     /// removed as they are found.
     fn scan_other_recordings(&mut self) {
         self.other_recordings = bugle_engine::record::marker::scan(&self.marker_dir, std::process::id());
+        *OTHER_FOUND.lock().unwrap_or_else(|e| e.into_inner()) = self.other_recordings.iter().map(|r| r.pid).collect();
     }
 
     /// How long the event loop may sleep before the next [`App::tick`].
@@ -949,12 +952,15 @@ fn main() -> Result<()> {
     let config_path = cli.config.clone().unwrap_or_else(Config::default_path);
     let mut config = Config::load_from(&config_path)?;
     // The smoke test never reads the user's history (a stale entry there hid
-    // a failing step): unless the config names one, it gets an empty file.
-    let smoke_history = (cli.smoke_test && config.general.history_path.is_none())
-        .then(|| std::env::temp_dir().join(format!("bugle-smoke-history-{}.jsonl", std::process::id())));
-    if let Some(p) = &smoke_history {
-        let _ = std::fs::remove_file(p);
-        config.general.history_path = Some(p.display().to_string());
+    // a failing step): unless the config names one, it gets an empty file in
+    // a folder of its own, which also holds its recording-state folder (so
+    // no other run's or process's recordings show), removed at exit.
+    let smoke_dir = (cli.smoke_test && config.general.history_path.is_none())
+        .then(|| std::env::temp_dir().join(format!("bugle-smoke-{}", std::process::id())));
+    if let Some(d) = &smoke_dir {
+        let _ = std::fs::remove_dir_all(d);
+        std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
+        config.general.history_path = Some(d.join("history.jsonl").display().to_string());
     }
 
     // The event loop must exist before anything touches NSApplication.
@@ -1111,8 +1117,8 @@ fn main() -> Result<()> {
                 if let Some(api) = app.api.take() {
                     api.stop();
                 }
-                if let Some(p) = &smoke_history {
-                    let _ = std::fs::remove_file(p);
+                if let Some(d) = &smoke_dir {
+                    let _ = std::fs::remove_dir_all(d);
                 }
                 if SMOKE_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
                     eprintln!("smoke test: FAILED");
@@ -1173,9 +1179,11 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
     t0
 }
 
-/// The pid of the other process whose recording the menu shows (0: none);
-/// written on the main thread, read by the `--smoke-test` step.
+/// For the `--smoke-test` step, written on the main thread: the pid of the
+/// other process whose recording the menu shows (0: none), and the pids of
+/// all the other recordings the last scan found.
 static OTHER_SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static OTHER_FOUND: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// Set by [`smoke_fail`]; the run then exits 1.
 static SMOKE_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1238,16 +1246,19 @@ fn smoke_pin(engine: &Engine, proxy: &Proxy) {
 
 /// `--smoke-test` step: a recording another Bugle process makes shows in
 /// the menu bar. A stand-in process (`sleep`) gets a recording-state file as
-/// an engine recording in it would write; the menu must show it (the Stop
-/// entry naming that process) within 3 s, then, once the process is killed
-/// without removing its file, stop showing it within 3 s, with the stale
-/// file removed.
+/// an engine recording in it would write; within 3 s the app must find it
+/// and show another process's recording (the oldest one: with a configured
+/// `history_path` a real one may be older), then, once the process is
+/// killed without removing its file, drop it within 3 s, with the stale file
+/// removed (and the folder, if the step created it).
 fn smoke_other_recording(engine: &Engine) {
     use bugle_engine::record::marker;
-    let wait_for = |want: u32| -> Option<Duration> {
+    let wait_for = |pid: u32, found: bool| -> Option<Duration> {
         let t = Instant::now();
         loop {
-            if OTHER_SHOWN.load(std::sync::atomic::Ordering::SeqCst) == want {
+            let is_found = OTHER_FOUND.lock().unwrap_or_else(|e| e.into_inner()).contains(&pid);
+            let shown = OTHER_SHOWN.load(std::sync::atomic::Ordering::SeqCst) != 0;
+            if is_found == found && (!found || shown) {
                 return Some(t.elapsed());
             }
             if t.elapsed() > Duration::from_secs(3) {
@@ -1258,23 +1269,28 @@ fn smoke_other_recording(engine: &Engine) {
     };
     let run = || -> Result<()> {
         let dir = marker::marker_dir(&engine.config);
+        let dir_existed = dir.exists();
         let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn()?;
         let pid = child.id();
         let rec = marker::LiveRecording {
             pid,
-            process_started_us: marker::process_started_us(pid).unwrap_or(0),
+            process_started_us: marker::process_start(pid).micros().unwrap_or(0),
             started_at: chrono::Utc::now() - chrono::Duration::seconds(61),
             format: RecordingFormat::Mp4,
             output: std::env::temp_dir().join("bugle-smoke-other-process.mp4"),
             max_seconds: None,
         };
         let published = marker::publish(&dir, &rec);
-        let shown = published.is_ok().then(|| wait_for(pid)).flatten();
+        let shown = published.is_ok().then(|| wait_for(pid, true)).flatten();
         let _ = child.kill();
         let _ = child.wait();
-        let cleared = wait_for(0);
+        let cleared = wait_for(pid, false);
         let left = dir.join(format!("{pid}.json")).exists();
         let _ = marker::clear(&dir, pid);
+        if !dir_existed {
+            // Only if empty: a Bugle process may have started recording.
+            let _ = std::fs::remove_dir(&dir);
+        }
         published?;
         eprintln!(
             "smoke test: another process's recording shown after {:?} (want some), cleared after its process died after {:?} (want some), stale file left: {left} (want false)",

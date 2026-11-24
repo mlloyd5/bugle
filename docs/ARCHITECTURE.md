@@ -446,22 +446,34 @@ likewise for the stop (both usually happen during the call). `bugle mcp`, `bugle
 the app through recording-state files (`bugle_engine::record::marker`). On the same
 `recording_changed` path, every engine writes `<pid>.json` (pid, the process's start time from
 `proc_pidinfo`, recording start, format, output, `max_seconds`) into `live-recordings/` next to
-the history file while a recording is in its slot, by writing a temp file and renaming it, and
-removes it once the slot is free. Each process only writes and removes its own file, so two
-recording processes never overwrite each other. On each housekeeping tick (about once a second,
-already running for the timer) the app lists that folder (`marker::scan`): it skips its own pid,
-shows the oldest recording whose owner is still running (pid alive *and* the same process start
-time, so a reused pid does not count), and removes files whose process is gone (crashed or
-killed), so no stale indicator survives a second. A file that does not parse is skipped, and
-removed only once its pid is gone. `recording_view::view` maps the app's own status and those
+the history file while a recording is in its slot and capturing, by writing a temp file and
+renaming it, and removes it once the slot is free. A recording that stops by itself keeps its slot
+until someone stops or reaps it, and `bugle serve` / `bugle mcp` have no reaper (they wait for the
+client's `record_stop`), so each published file gets a watchdog thread that checks once a second
+(`marker::WATCH_INTERVAL`) the signals `Backend::stopped_by_itself` uses that work without the
+recorder lock (the `max_seconds` deadline, the GIF loop's capture-done flag, which its length and
+memory caps set, and the system recorder's exit via `child_exited`) and removes the file once the
+recorder stopped; the next sync cancels it, so an old watchdog never removes a newer recording's
+file. A stream recorder that fails before its deadline is not caught (its engine does not see
+that either). Each process only writes and removes its own file, so two recording processes never
+overwrite each other. On each housekeeping tick (about once a second, already running for the
+timer) the app lists that folder (`marker::scan`): it skips its own pid, shows the oldest recording
+whose owner is still running (pid alive *and* the same process start time, so a reused pid does
+not count; a running pid whose start time the app may not read, such as root's under `sudo bugle
+record`, is trusted), and removes files whose process is gone (crashed or killed). A start, stop,
+self-stop or crash therefore shows within about one to two seconds (a tick, plus a watchdog
+interval for a self-stop). A file that does not parse is skipped, and removed only once its pid is
+gone. `recording_view::view` maps the app's own status and those
 files to the status item and menu: its own recording wins; another process's shows `● m:ss`
-(clamped to its `max_seconds`) with the Stop entry disabled and labelled *Recording in another
+(wall-clock time since its start, the only clock processes share, clamped to its `max_seconds`) with the Stop entry disabled and labelled *Recording in another
 Bugle process (pid N)*, since the app cannot stop it safely (a signal would quit `bugle serve` or
 `bugle mcp`); the Stop hotkey then says so in a toast. A polling tick was chosen over a
 distributed notification or a file watch: the app already wakes once a second, one directory
 listing is negligible, and nothing new runs in the shim or listens. The smoke test's
 "other process recording" step writes such a file for a stand-in `sleep` process, checks the
-menu shows it within 3 s, kills the process and checks the menu clears and the file goes. A recording that stops by itself at an Agent API request's
+app finds it and shows another process's recording within 3 s, kills the process and checks the
+app drops it and the file goes. Unless the config names a `history_path`, the smoke run keeps its
+history and recording-state folder in a folder of its own under `$TMPDIR`, removed at exit. A recording that stops by itself at an Agent API request's
 `max_seconds` is noticed on the housekeeping tick (about once a second):
 the app finalises it on a short-lived thread with `Engine::record_reap`,
 which announces it like a stop, and the next `record_stop` still returns
