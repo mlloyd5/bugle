@@ -1511,6 +1511,9 @@ mod tests {
     /// request past the shim's 15 s timeout. A file lock in the temp folder
     /// serialises such tests across processes, not just threads; it is
     /// released when the returned file is dropped (or the process dies).
+    /// Only test runs take it (this is the only test that reaches
+    /// ScreenCaptureKit), so other capturing processes, such as a running
+    /// Bugle, still compete: it narrows that contention, not removes it.
     fn screen_capture_lock() -> std::fs::File {
         use std::os::fd::AsRawFd;
         let path = std::env::temp_dir().join("bugle-tests-screen-capture.lock");
@@ -2053,6 +2056,40 @@ mod tests {
         let mut names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         names.sort();
         assert_eq!(names, ["clean.mp4", "cut.mov", "fixture.mp4", "pass.mp4", "spliced.mp4"]);
+    }
+
+    #[test]
+    fn staged_writes_keep_long_names_and_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // A name near the 255-byte limit still works: the staging folder's
+        // name does not depend on it.
+        let long = dir.path().join(format!("{}.mp4", "a".repeat(250)));
+        let mut w = VideoFrameWriter::create(&long, 64, 48, 10, true).unwrap();
+        for _ in 0..10 {
+            w.append(&solid(64, 48, [255, 0, 0])).unwrap();
+        }
+        w.finish().unwrap();
+        let copy = dir.path().join(format!("{}.mov", "b".repeat(250)));
+        export_video(&long, &copy, 0.0, 1.0, VideoExportPreset::Passthrough, false, None, None).unwrap();
+        export_mov(&long, &dir.path().join(format!("{}.mov", "c".repeat(250)))).unwrap();
+        // A failed (here: timed-out) export leaves a file already at the
+        // output alone; a complete one replaces it.
+        let keep = dir.path().join("keep.mp4");
+        std::fs::write(&keep, b"previous").unwrap();
+        assert!(export_video(&long, &keep, 0.0, 1.0, VideoExportPreset::Highest, true, None, Some(1e-6)).is_err());
+        assert_eq!(std::fs::read(&keep).unwrap(), b"previous");
+        export_video(&long, &keep, 0.0, 1.0, VideoExportPreset::Passthrough, true, None, None).unwrap();
+        assert!((media_duration(&keep).unwrap() - 1.0).abs() < 0.1);
+        // A failed remux leaves nothing.
+        let junk = dir.path().join("junk.mp4");
+        std::fs::write(&junk, b"not a movie").unwrap();
+        assert!(export_mov(&junk, &dir.path().join("junk.mov")).is_err());
+        let mut names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        let want = [copy.clone(), dir.path().join(format!("{}.mov", "c".repeat(250))), long.clone(), junk.clone(), keep.clone()];
+        let mut want: Vec<_> = want.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        want.sort();
+        assert_eq!(names, want);
     }
 
     #[test]
