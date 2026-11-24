@@ -765,14 +765,21 @@ impl App {
         if self.engine.record_status().state != RecordingState::Finishing || self.reaping.swap(true, Ordering::SeqCst) {
             return;
         }
-        let (engine, reaping) = (self.engine.clone(), self.reaping.clone());
+        /// Clears `reaping` however the reap thread ends (a panic too).
+        struct Reaping(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Reaping {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let (engine, reaping) = (self.engine.clone(), Reaping(self.reaping.clone()));
         let spawned = std::thread::Builder::new().name("bugle-reap".into()).spawn(move || {
+            let _reaping = reaping;
             match engine.record_reap() {
                 Some(Ok(m)) => tracing::info!("recording stopped by itself, saved to {}", m.path.display()),
                 Some(Err(e)) => tracing::warn!("finalising a recording that stopped by itself: {e:#}"),
                 None => {}
             }
-            reaping.store(false, Ordering::SeqCst);
         });
         if let Err(e) = spawned {
             tracing::warn!("could not start the thread finalising a recording: {e}");
