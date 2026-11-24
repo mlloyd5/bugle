@@ -95,8 +95,10 @@ cargo xtask bundle                 # → dist/Bugle.app, ad-hoc signed
 cargo xtask bundle --zip           # also dist/Bugle-<version>.zip
 cargo xtask dmg                    # also dist/Bugle-<version>.dmg (= bundle --dmg)
 cargo xtask bundle --universal     # arm64 + x86_64 in one bundle
-cargo xtask verify --smoke-test    # re-check a bundle, then run its smoke test (~30 s)
-cargo xtask smoke-vm               # the smoke test in a throwaway macOS VM (see Testing in a VM)
+cargo xtask bundle --smoke-vm      # then smoke-test that bundle in a throwaway macOS VM (see Testing in a VM)
+cargo xtask verify --smoke-vm      # re-check a bundle, then smoke-test it in a VM
+cargo xtask verify --smoke-test    # the same smoke test on this Mac (takes over the screen ~30 s)
+cargo xtask smoke-vm               # build and smoke-test in a VM (see Testing in a VM)
 ```
 
 `bundle` builds the release binaries (taking their paths from cargo, so a custom
@@ -110,7 +112,16 @@ the app is not sandboxed), then checked with `plutil -lint` (Info.plist and the
 entitlements embedded in each signature), `codesign --verify --deep --strict`,
 `iconutil` and `--version`. Only a bundle that passes replaces `dist/Bugle.app`.
 
-`--smoke-test` (on `verify` and `bundle`) then runs `bugle-app --smoke-test`
+`--smoke-vm` (on `verify` and `bundle`) runs the smoke test of that exact
+bundle in a throwaway macOS VM, as `cargo xtask smoke-vm --app` does (see
+Testing in a VM); it is the recommended way, including for release builds, and
+a missing `tart` or golden image fails before anything is built. On `bundle`
+it is the first step after signing and verification: the staged bundle is
+tested before it is notarized, made into a disk image or zip, or replaces
+`dist/Bugle.app`, so a bundle that fails it is never sent to Apple and nothing
+in `dist/` changes (the staging directory is left, as after any failed step,
+and removed by the next run).
+`--smoke-test` instead runs `bugle-app --smoke-test` on this Mac,
 from the bundle with a throwaway config in a temp directory: saves, history and
 `TMPDIR` go there, sync is off and no global hotkey is registered, so your own
 config, captures and sync destination are never read or touched; the directory
@@ -237,6 +248,8 @@ Then for each run:
 ```bash
 cargo xtask smoke-vm                     # build, run in a fresh clone, delete it
 cargo xtask smoke-vm --app dist/Bugle.app  # an existing bundle instead
+cargo xtask bundle --smoke-vm            # the release bundle, right after it is built
+cargo xtask smoke-vm --cleanup           # remove clones left by runs that were killed
 ```
 
 `--prepare` clones the pulled image (`--from`, default the Cirrus Labs
@@ -247,11 +260,21 @@ works because the Cirrus Labs `-base` and `-xcode` images have SIP disabled
 *inside the guest*; your Mac's SIP is never touched. With an image whose SIP is
 on, `--prepare` stops and says how to turn it off in that guest's recovery
 (`tart run --recovery <vm>`, then Options → Utilities → Terminal,
-`csrutil disable`). `--force` rebuilds an existing golden image, for instance
+`csrutil disable`). `--prepare` reads `csrutil status` and `sw_vers` from the
+booted guest and stops with the cause and the fix before writing anything when
+SIP is on, when it is a custom configuration that keeps Filesystem Protections
+on, when its output is not recognised, or when the guest's macOS is outside
+14–27, the versions whose TCC layout it knows (`BUGLE_SMOKE_VM_UNTESTED_GUEST=1`
+tries the macOS 27 layout on a newer guest). An image named for a macOS newer
+than this Mac's is refused before cloning, since Virtualization.framework
+cannot boot it. Only the macOS 26 (`tahoe`) image with SIP off has actually
+been prepared and run; the SIP-on, custom-SIP and other-version paths are
+covered by unit tests on `csrutil`/`sw_vers` output, not by real images.
+`--force` rebuilds an existing golden image, for instance
 after a month, when macOS may ask to re-confirm screen recording.
 
 A run builds the bundle into `target/xtask/smoke-vm/<run>/dist`, clones the
-golden image to `bugle-smoke-run-<millis>-<pid>` (copy-on-write, so it is
+golden image to `bugle-smoke-run-<millis>-p<pid>-s<start>` (copy-on-write, so it is
 quick and runs do not share state; macOS allows two VMs at a time), boots it
 without a window, host audio or a shared clipboard, and shares the bundle
 read-only and a run directory read-write. Through the Tart guest agent
@@ -261,12 +284,42 @@ plus `BUGLE_SMOKE_KEEP`, `BUGLE_SMOKE_CLIPBOARD=1` and `BUGLE_SMOKE_SAVE`
 (nothing leaves the VM, so the clipboard and export steps run too). The output
 streams to your terminal and to `share/smoke.log`; the guest's run directory
 (captures, history, kept temp files) comes back as `share/artifacts`. The VM is
-stopped and deleted afterwards, also on failure (after Ctrl-C, `tart list` and
-`tart delete bugle-smoke-run-…`). The run fails if the app fails, if it takes
+stopped and deleted afterwards, also on failure and on Ctrl-C (SIGINT,
+SIGTERM, SIGHUP or SIGQUIT in any phase: the build, boot or test is stopped, a
+clone in progress is allowed to finish (about a second) and then deleted, the
+run's bundle copy is removed with its logs kept, and the exit status is 128 +
+the signal; a signal inherited as ignored, as `nohup` does with SIGHUP, stays
+ignored). Every Tart command has a hard limit, the teardown's too (`tart
+stop` its own timeout plus 60 s, `tart delete` 60 s, `tart clone` 120 s, each
+boot probe 30 s and never past the boot limit), so a hung `tart` ends with an
+error naming what may be left rather than a wait that only SIGKILL ends. A
+run killed outright (SIGKILL, a crash) cannot clean up: every later run, and
+`--cleanup`, stops and deletes the clones whose owning process is gone. The
+name records the owner's pid and that process's start time, so the owner is
+recognised exactly (no clock is compared); for clones named
+`bugle-smoke-run-<millis>-<pid>` by older runs, any live `xtask` with that pid
+counts as the owner. Clones of runs still going and every other VM are left
+alone; a run that fails to delete a leftover warns and carries on (another
+run may be removing it), `--cleanup` fails. These were tried for real:
+SIGINT during the build, boot and test and a second one during the teardown,
+SIGTERM and SIGQUIT during the boot, SIGKILL during the boot and the test
+followed by `--cleanup` or a new run, `--cleanup` beside a live run (left
+alone), and SIGHUP (boot and test) and SIGINT (boot) with the terminal output
+going to a pipe whose reader had quit, as when a terminal closes or under
+`| head`; each left no clone and no `tart`, `cargo` or `rustc` process behind
+and exited with 128 + the signal. (Nothing xtask prints can fail it: output
+that cannot be written is dropped.)
+The hard limits on hung Tart commands are covered by unit tests only.
+`bundle --smoke-vm` (also with the VM step failing, which left `dist/`
+untouched) and `verify --smoke-vm` have run end to end with an ad-hoc
+host-architecture bundle; with `--universal`, `--dmg` or `--notarize` they
+have not. The run fails if the app fails, if it takes
 longer than `BUGLE_SMOKE_TIMEOUT` plus a minute for the copies, if the VM is not
 ready within `BUGLE_SMOKE_VM_BOOT_TIMEOUT` (300 s), or if the recording step
 was skipped for lack of Screen Recording access. Nothing is downloaded on its
-own: a missing `tart` or image is an error naming the command to run.
+own: a missing `tart` or image is an error naming the command to run. With the
+build cached, a run takes about 80–90 s on an M-series Mac: the VM is ready
+after 30–45 s and the smoke test takes about 50 s.
 
 ## Permissions
 
@@ -424,6 +477,13 @@ file) · Open at Login (only when running from `Bugle.app`) · Quit. While recor
 a recording with system audio or the microphone (the ScreenCaptureKit recorder) adds a live level meter: one
 bar glyph per source after the time (microphone first) and, under Stop Recording, a line per source with its
 peak in dB and a `!` clip mark near full scale. Levels are measured as recorded, before any gain or ducking.
+A recording another Bugle process on this Mac makes with the same config (`bugle record start`,
+or `record_start` through `bugle serve` / `bugle mcp`) shows too, usually within a second or two of
+its start and stop: the status item shows its `● m:ss` (no level meter) and the Stop entry reads
+*Recording in another Bugle process (pid N)*, disabled: stop it where it was started. It also stops
+showing within about two seconds when the recording stops by itself (its `max_seconds`, the GIF
+length or memory cap, the system recorder exiting) though nobody has called `record_stop` yet, and
+when the recording process crashes or is killed.
 Other actions
 report through a small toast in the top-right corner (thumbnail and file name;
 click to open).

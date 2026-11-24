@@ -1505,6 +1505,28 @@ mod tests {
         }
     }
 
+    /// Held while a test captures the screen. ScreenCaptureKit requests from
+    /// every process are served by one system service, and the bursts of
+    /// several test runs at once (checkouts tested side by side) can queue a
+    /// request past the shim's 15 s timeout. A file lock in the temp folder
+    /// serialises such tests across processes, not just threads; it is
+    /// released when the returned file is dropped (or the process dies).
+    /// Only test runs take it (this is the only test that reaches
+    /// ScreenCaptureKit), so other capturing processes, such as a running
+    /// Bugle, still compete: it narrows that contention, not removes it.
+    fn screen_capture_lock() -> std::fs::File {
+        use std::os::fd::AsRawFd;
+        let path = std::env::temp_dir().join("bugle-tests-screen-capture.lock");
+        let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).unwrap();
+        loop {
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return f;
+            }
+            let e = std::io::Error::last_os_error();
+            assert_eq!(e.kind(), std::io::ErrorKind::Interrupted, "locking {}: {e}", path.display());
+        }
+    }
+
     /// Hammers capture/OCR from many threads with valid and invalid input
     /// and checks every error is the one its own call produced.
     #[test]
@@ -1513,6 +1535,7 @@ mod tests {
         if !screen {
             eprintln!("Screen Recording not granted: skipping the capture part of this test");
         }
+        let _lock = screen.then(screen_capture_lock);
         let threads: Vec<_> = (1..=8u32)
             .map(|t| {
                 std::thread::spawn(move || {
@@ -2027,6 +2050,72 @@ mod tests {
         assert!(export_video(&dir.path().join("missing.mp4"), &bad, 0.0, 1.0, VideoExportPreset::Passthrough, true, None, None).is_err());
         assert!(!bad.exists());
         assert!(VideoFrameReader::open(&dir.path().join("missing.mp4"), 0.0).is_err());
+
+        // Nothing else is left behind: no temp files, and no late output from
+        // the cancelled export.
+        let mut names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, ["clean.mp4", "cut.mov", "fixture.mp4", "pass.mp4", "spliced.mp4"]);
+    }
+
+    #[test]
+    fn staged_writes_keep_long_names_and_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // A name near the 255-byte limit still works: the staging folder's
+        // name does not depend on it.
+        let long = dir.path().join(format!("{}.mp4", "a".repeat(250)));
+        let mut w = VideoFrameWriter::create(&long, 64, 48, 10, true).unwrap();
+        for _ in 0..10 {
+            w.append(&solid(64, 48, [255, 0, 0])).unwrap();
+        }
+        w.finish().unwrap();
+        let copy = dir.path().join(format!("{}.mov", "b".repeat(250)));
+        export_video(&long, &copy, 0.0, 1.0, VideoExportPreset::Passthrough, false, None, None).unwrap();
+        export_mov(&long, &dir.path().join(format!("{}.mov", "c".repeat(250)))).unwrap();
+        // A failed (here: timed-out) export leaves a file already at the
+        // output alone; a complete one replaces it.
+        let keep = dir.path().join("keep.mp4");
+        std::fs::write(&keep, b"previous").unwrap();
+        assert!(export_video(&long, &keep, 0.0, 1.0, VideoExportPreset::Highest, true, None, Some(1e-6)).is_err());
+        assert_eq!(std::fs::read(&keep).unwrap(), b"previous");
+        export_video(&long, &keep, 0.0, 1.0, VideoExportPreset::Passthrough, true, None, None).unwrap();
+        assert!((media_duration(&keep).unwrap() - 1.0).abs() < 0.1);
+        // So does a failed mix (the sample data is cut off) ...
+        let tones = dir.path().join("tones.mp4");
+        write_tone_fixture(&tones, &ToneFixture { tracks: 2, seconds: 1.0, video: true, ..Default::default() }).unwrap();
+        let full = std::fs::read(&tones).unwrap();
+        let cut = dir.path().join("cut.mp4");
+        std::fs::write(&cut, &full[..full.len() / 2]).unwrap();
+        let mixed = dir.path().join("mixed.mp4");
+        std::fs::write(&mixed, b"previous").unwrap();
+        assert!(mix_audio_tracks(&cut, &mixed).is_err());
+        assert_eq!(std::fs::read(&mixed).unwrap(), b"previous");
+        assert!(mix_audio_tracks(&tones, &mixed).unwrap());
+        assert_eq!(audio_track_count(&mixed).unwrap(), 1);
+        // ... and a frame-writer render that is dropped unfinished or fails
+        // to finish.
+        let render = dir.path().join("render.mp4");
+        std::fs::write(&render, b"previous").unwrap();
+        let mut w = VideoFrameWriter::create(&render, 64, 48, 10, true).unwrap();
+        w.append(&solid(64, 48, [0, 0, 255])).unwrap();
+        drop(w);
+        assert_eq!(std::fs::read(&render).unwrap(), b"previous");
+        assert!(VideoFrameWriter::create(&render, 64, 48, 10, true).unwrap().finish().is_err(), "no frames");
+        assert_eq!(std::fs::read(&render).unwrap(), b"previous");
+        let mut w = VideoFrameWriter::create(&render, 64, 48, 10, true).unwrap();
+        w.append(&solid(64, 48, [0, 0, 255])).unwrap();
+        w.finish().unwrap();
+        assert_eq!(video_size(&render).unwrap(), (64, 48));
+        // A failed remux leaves nothing.
+        let junk = dir.path().join("junk.mp4");
+        std::fs::write(&junk, b"not a movie").unwrap();
+        assert!(export_mov(&junk, &dir.path().join("junk.mov")).is_err());
+        let mut names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        let want = [copy.clone(), dir.path().join(format!("{}.mov", "c".repeat(250))), long.clone(), junk.clone(), keep.clone(), tones, cut, mixed, render];
+        let mut want: Vec<_> = want.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        want.sort();
+        assert_eq!(names, want);
     }
 
     #[test]

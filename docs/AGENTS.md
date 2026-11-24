@@ -97,8 +97,8 @@ curl -s -H "$H" -H 'content-type: application/json' \
 | `annotate` | `source`, `annotation`, `output`, `copy`, `inline_image` | `media` + image |
 | `annotate_schema` | – | example document |
 | `scroll_capture` | `rect`, `max_frames`, `step_lines`, `settle_ms`, `horizontal`, `output`, `inline_image` | `media`, `stats` |
-| `record_start` | `target`, `format` (mp4/mov/gif), `fps`, `microphone`, `system_audio`, `mix_audio`, `microphone_gain`, `system_audio_gain`, `ducking`, `ducking_amount_db` (levels of the mixed track, or of each separate track without `mix_audio`; defaults from `[recordings]`), `max_seconds`, `highlight_clicks`, `cursor_events` (writes `<file>.events.json`), `hide_cursor` (pointer left out of the frames; implies `cursor_events`), `output`, `label` | status |
-| `record_stop` | – | `media` (after a `max_seconds` auto-stop the menu-bar app already finalised: that recording's, once, within 10 minutes and before the next start) |
+| `record_start` | `target`, `format` (mp4/mov/gif), `fps`, `microphone`, `system_audio`, `mix_audio`, `microphone_gain`, `system_audio_gain`, `ducking`, `ducking_amount_db` (levels of the mixed track, or of each separate track without `mix_audio`; defaults from `[recordings]`), `max_seconds`, `highlight_clicks`, `cursor_events` (writes `<file>.events.json`), `hide_cursor` (pointer left out of the frames; implies `cursor_events`), `output`, `label` | status (HTTP 409 `busy` while the menu-bar app is still saving a recording that stopped at its `max_seconds`; retry a moment later) |
+| `record_stop` | – | `media` (after a `max_seconds` auto-stop the menu-bar app already finalised: that recording's, or its finalisation error with the same status as a failed stop, once, within 10 minutes and before the next start) |
 | `record_status` | – | status (`audio_levels` while capturing audio, see below) |
 | `transcribe` | `source`, `provider`, `language` | `transcript`, `srt` |
 | `subtitles` | `source`, `format` (srt/vtt), `provider`, `language`, `output` | `path`, `segments`, `text` |
@@ -154,6 +154,16 @@ capture (a microphone that could not be opened, or one whose sample format
 the meter cannot read) is `null`; the field is
 absent when idle, finishing, recording a GIF, or on the `screencapture`
 recorder, which does not report levels.
+
+A recording belongs to the process that started it; `record_status` and
+`record_stop` act on that process's own engine. While one runs, the Bugle
+menu-bar app on the same Mac (same config) shows it in the menu bar within
+a second or two, whichever process started it (`bugle serve`, `bugle mcp`,
+`bugle record`), but cannot stop another process's recording: its Stop entry
+is disabled and names the recording process. Stop it with `record_stop` on the
+server that started it. Once a recording stops capturing by itself (its
+`max_seconds`, a GIF cap), the menu bar stops showing it even before that
+`record_stop`, which still returns its media record.
 
 `source` accepts a media id (or prefix), `latest`, or a file path.
 Target coordinates are screen points (top-left origin); annotation and OCR
