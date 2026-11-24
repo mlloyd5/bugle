@@ -379,10 +379,13 @@ mod tests {
         log.watch_child(child.id());
         std::thread::sleep(Duration::from_millis(100));
         log.stop();
+        let stopped = bugle_platform::host_time_now();
         let at = log.logged.as_ref().unwrap().child_exited_at.expect("exit noticed");
         // The poll that notices the exit stamps it with the time it sampled
         // the pointer, which can be a moment before `reaped` was read here.
-        assert!((at - reaped).abs() < 0.1, "{}", at - reaped);
+        // How long after is up to the scheduler (a loaded machine can take
+        // longer than the sleep above), but never later than the stop.
+        assert!(at > reaped - 0.1 && at <= stopped, "{} (stopped {})", at - reaped, stopped - reaped);
         // So the video ends there, not at the start of the log. Keep the
         // events in time order: the pointer may have moved while this ran.
         let down = CursorEvent { t: at - 0.5, kind: EventKind::Down, button: Some(MouseButton::Left), x: 1.0, y: 1.0 };

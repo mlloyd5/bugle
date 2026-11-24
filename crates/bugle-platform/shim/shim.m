@@ -1172,12 +1172,73 @@ void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const c
 // Media helpers (AVFoundation)
 // ---------------------------------------------------------------------------
 
+// Staged output. AVFoundation writers do not leave their output folder
+// tidy on failure: an AVAssetWriter with shouldOptimizeForNetworkUse writes
+// through a hidden "<name>.sb-XXXXXXXX-XXXXXX" temp file that is deleted
+// only when the writer's internals are deallocated (possibly after we have
+// returned), and a cancelled AVAssetExportSession calls its completion
+// handler before its writer has necessarily created its files, so it can
+// still create the output and its temp file after we removed them. So each
+// write goes into a new hidden folder next to the output; the result is
+// renamed into place once complete, and otherwise the folder is removed.
+// Nothing can be created in a folder that no longer exists, so a late write
+// has nowhere to go.
+
+/// Make the staging folder for `out` (same folder, so the final rename stays
+/// on one volume). nil, with the error set, on failure.
+static NSURL *staging_create(NSURL *out, NSString *what) {
+    NSString *tmpl = [out.URLByDeletingLastPathComponent.path stringByAppendingPathComponent:@".bugle-export.XXXXXX"];
+    char buf[PATH_MAX];
+    if (![tmpl getFileSystemRepresentation:buf maxLength:sizeof(buf)]) {
+        set_error(@"%@: the folder of %@ has no usable file system path", what, out.path);
+        return nil;
+    }
+    if (!mkdtemp(buf)) {
+        set_error(@"%@: could not create a temp folder next to %@: %s", what, out.path, strerror(errno));
+        return nil;
+    }
+    return [NSURL fileURLWithFileSystemRepresentation:buf isDirectory:YES relativeToURL:nil];
+}
+
+/// Where the writer writes inside staging folder `dir`: the output's own
+/// name, so the extension (and anything keyed on it) is unchanged.
+static NSURL *staging_file(NSURL *dir, NSURL *out) {
+    return [dir URLByAppendingPathComponent:out.lastPathComponent];
+}
+
+/// Remove a staging folder and everything in it. Retried for a while: a
+/// cancelled writer may still be adding a file while the folder is emptied,
+/// and removal is slow on network volumes.
+static void staging_discard(NSURL *dir) {
+    if (!dir) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSError *err = nil;
+    for (int i = 0; i < 50; i++) {
+        if ([fm removeItemAtURL:dir error:&err] || ![fm fileExistsAtPath:dir.path]) return;
+        usleep(20000);
+    }
+    // Not an error for the caller (its result stands), but make the leftover
+    // visible: it is a hidden folder next to the output.
+    NSLog(@"bugle: could not remove the temp folder %@: %@", dir.path, err.localizedDescription);
+}
+
+/// Move the finished file into place (replacing any file at `out`), then
+/// remove the folder. NO, with the error set and nothing written, on failure.
+static BOOL staging_commit(NSURL *dir, NSURL *out, NSString *what) {
+    NSURL *staged = staging_file(dir, out);
+    BOOL ok = rename(staged.fileSystemRepresentation, out.fileSystemRepresentation) == 0;
+    if (!ok) set_error(@"%@: could not move the result to %@: %s", what, out.path, strerror(errno));
+    staging_discard(dir);
+    return ok;
+}
+
+static int32_t run_export_session(AVAssetExportSession *s, NSURL *out, double timeout, NSString *what);
+
 int32_t bugle_export_audio_m4a(const char *in_path, const char *out_path) {
     @autoreleasepool {
         clear_error();
         NSURL *in = [NSURL fileURLWithPath:[NSString stringWithUTF8String:in_path]];
         NSURL *out = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
-        [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
         AVURLAsset *asset = [AVURLAsset URLAssetWithURL:in options:nil];
         if ([asset tracksWithMediaType:AVMediaTypeAudio].count == 0) {
             set_error(@"no audio track in %s", in_path);
@@ -1185,16 +1246,8 @@ int32_t bugle_export_audio_m4a(const char *in_path, const char *out_path) {
         }
         AVAssetExportSession *s = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
         if (!s) { set_error(@"could not create export session"); return -1; }
-        s.outputURL = out;
         s.outputFileType = AVFileTypeAppleM4A;
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [s exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
-        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-        if (s.status != AVAssetExportSessionStatusCompleted) {
-            set_error(@"audio export failed: %@", s.error.localizedDescription);
-            return -1;
-        }
-        return 0;
+        return run_export_session(s, out, 0, @"audio export");
     }
 }
 
@@ -1203,21 +1256,12 @@ static int32_t remux(const char *in_path, const char *out_path, AVFileType type)
         clear_error();
         NSURL *in = [NSURL fileURLWithPath:[NSString stringWithUTF8String:in_path]];
         NSURL *out = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
-        [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
         AVURLAsset *asset = [AVURLAsset URLAssetWithURL:in options:nil];
         AVAssetExportSession *s = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetPassthrough];
         if (!s) { set_error(@"could not create export session"); return -1; }
-        s.outputURL = out;
         s.outputFileType = type;
         s.shouldOptimizeForNetworkUse = YES;
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [s exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
-        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-        if (s.status != AVAssetExportSessionStatusCompleted) {
-            set_error(@"%@ export failed: %@", type, s.error.localizedDescription);
-            return -1;
-        }
-        return 0;
+        return run_export_session(s, out, 0, [NSString stringWithFormat:@"%@ export", type]);
     }
 }
 
@@ -1430,6 +1474,11 @@ static CMSampleBufferRef mix_buffer(CMAudioFormatDescriptionRef fmt, const float
     return st == noErr ? sb : NULL;
 }
 
+// `staging` is __strong: the body runs in its own autorelease pool, which would
+// release an (implicitly __autoreleasing) out-parameter before the caller reads it.
+static int32_t mix_audio_tracks_into(NSURL *in, NSURL *out, NSURL *__strong *staging, const char *in_path, const char *out_path,
+                                     int32_t separate, bugle_mix_fn process, void *ctx);
+
 int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, int32_t separate, bugle_mix_fn process,
                                void *ctx) {
     @autoreleasepool {
@@ -1440,6 +1489,20 @@ int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, int32_
             set_error(@"mixing %s: input and output are the same file", in_path);
             return -1;
         }
+        NSURL *dir = nil;
+        int32_t rc = mix_audio_tracks_into(in, out, &dir, in_path, out_path, separate, process, ctx);
+        if (dir) {
+            // A writer ran (in `dir`): keep its file only if it completed.
+            if (rc == 0 && !staging_commit(dir, out, @"mixing the audio tracks")) rc = -1;
+            if (rc != 0) staging_discard(dir);
+        }
+        return rc;
+    }
+}
+
+static int32_t mix_audio_tracks_into(NSURL *in, NSURL *out, NSURL *__strong *staging, const char *in_path, const char *out_path,
+                                     int32_t separate, bugle_mix_fn process, void *ctx) {
+    @autoreleasepool {
         if (!process) { set_error(@"mixing %s: no mix function", in_path); return -1; }
         AVURLAsset *asset = [AVURLAsset URLAssetWithURL:in options:nil];
         NSMutableArray<AVAssetTrack *> *audio = [NSMutableArray array];
@@ -1449,8 +1512,13 @@ int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, int32_
         if (audio.count < 2) return 1;
         NSArray<AVAssetTrack *> *video = [asset tracksWithMediaType:AVMediaTypeVideo];
         NSError *err = nil;
-        [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
         AVFileType type = [out.pathExtension.lowercaseString isEqualToString:@"mov"] ? AVFileTypeQuickTimeMovie : AVFileTypeMPEG4;
+        // From here the writer writes in a staging folder, which the caller
+        // commits or discards; `out` names the file in it. A file already at
+        // the real output is replaced only by a complete mix.
+        *staging = staging_create(out, @"mixing the audio tracks");
+        if (!*staging) return -1;
+        out = staging_file(*staging, out);
         AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:out fileType:type error:&err];
         if (!writer) { set_error(@"AVAssetWriter: %@", err.localizedDescription); return -1; }
         writer.shouldOptimizeForNetworkUse = YES;
@@ -1905,6 +1973,31 @@ static AVMutableComposition *spliced_composition(AVAsset *asset, const double *r
     return comp;
 }
 
+/// Run export session `s` to `out` through a staging folder, waiting at most
+/// `timeout` seconds (<= 0: forever); `what` names it in errors. Returns 0,
+/// or -1 with the error set; a file already at `out` is replaced only by a
+/// complete result, never removed by a failed one.
+static int32_t run_export_session(AVAssetExportSession *s, NSURL *out, double timeout, NSString *what) {
+    NSURL *dir = staging_create(out, what);
+    if (!dir) return -1;
+    s.outputURL = staging_file(dir, out);
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [s exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
+    if (!wait_bounded(sem, timeout)) {
+        [s cancelExport];
+        wait_bounded(sem, 10);
+        staging_discard(dir);
+        set_error(@"%@ timed out after %.0f s and was cancelled", what, timeout);
+        return -1;
+    }
+    if (s.status != AVAssetExportSessionStatusCompleted) {
+        set_error(@"%@ failed: %@", what, s.error.localizedDescription ?: @"unknown error");
+        staging_discard(dir);
+        return -1;
+    }
+    return staging_commit(dir, out, what) ? 0 : -1;
+}
+
 int32_t bugle_export_video(const char *in_path, const char *out_path, const double *ranges, int32_t n_ranges, int32_t preset,
                            int32_t mp4, int32_t fps, double timeout) {
     @autoreleasepool {
@@ -1938,8 +2031,6 @@ int32_t bugle_export_video(const char *in_path, const char *out_path, const doub
             set_error(@"export preset %@ cannot write %@", name, type);
             return -1;
         }
-        [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
-        s.outputURL = out;
         s.outputFileType = type;
         s.shouldOptimizeForNetworkUse = YES;
         if (n_ranges == 1) s.timeRange = range_at(ranges, 0);
@@ -1957,21 +2048,7 @@ int32_t bugle_export_video(const char *in_path, const char *out_path, const doub
             }
             s.videoComposition = vc;
         }
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [s exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
-        if (!wait_bounded(sem, timeout)) {
-            [s cancelExport];
-            wait_bounded(sem, 10);
-            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
-            set_error(@"export timed out after %.0f s and was cancelled", timeout);
-            return -1;
-        }
-        if (s.status != AVAssetExportSessionStatusCompleted) {
-            set_error(@"export failed: %@", s.error.localizedDescription ?: @"unknown error");
-            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
-            return -1;
-        }
-        return 0;
+        return run_export_session(s, out, timeout, @"export");
     }
 }
 
@@ -2034,11 +2111,20 @@ static NSDictionary *bt709_properties(void) {
 @property(strong) AVAssetWriter *writer;
 @property(strong) AVAssetWriterInput *input;
 @property(strong) AVAssetWriterInputPixelBufferAdaptor *adaptor;
-@property(strong) NSURL *url;
+// The output, and the staging folder the writer actually writes in.
+@property(strong) NSURL *url, *dir;
 @property int32_t width, height, fps;
 @property int64_t frames;
+// Our own pool for the frames, not the adaptor's pixelBufferPool: that one
+// belongs to the VideoToolbox compression session, which may replace it at
+// any time, so a pointer read from the adaptor can dangle by the time
+// CoreVideo uses it (it then traps or faults, taking the process down).
+@property CVPixelBufferPoolRef pool;
 @end
 @implementation BugleFrameWriter
+- (void)dealloc {
+    CVPixelBufferPoolRelease(_pool);
+}
 @end
 
 void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int32_t mp4, int32_t hevc) {
@@ -2051,12 +2137,19 @@ void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int
         }
         if (fps < 1 || fps > 120) { set_error(@"writer: invalid frame rate %d", fps); return NULL; }
         NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
-        [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+        // Written in a staging folder, moved to `url` by a successful finish:
+        // a file already there is replaced only by a complete movie.
+        NSURL *dir = staging_create(url, @"writer");
+        if (!dir) return NULL;
         NSError *err = nil;
-        AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:url
+        AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:staging_file(dir, url)
                                                           fileType:(mp4 ? AVFileTypeMPEG4 : AVFileTypeQuickTimeMovie)
                                                              error:&err];
-        if (!writer) { set_error(@"AVAssetWriter: %@", err.localizedDescription); return NULL; }
+        if (!writer) {
+            set_error(@"AVAssetWriter: %@", err.localizedDescription);
+            staging_discard(dir);
+            return NULL;
+        }
         writer.shouldOptimizeForNetworkUse = YES;
         // Same budget as the recorder: ~0.1 bit per pixel per frame.
         double bitrate = fmax(1.0e6, fmin(40.0e6, (double)w * (double)h * (double)fps * 0.1));
@@ -2082,23 +2175,36 @@ void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int
             (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
             (id)kCVPixelBufferWidthKey: @(w),
             (id)kCVPixelBufferHeightKey: @(h),
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
         };
+        CVPixelBufferPoolRef pool = NULL;
+        if (CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)attrs, &pool) != kCVReturnSuccess) {
+            set_error(@"writer: could not create a pixel buffer pool for %dx%d frames", w, h);
+            staging_discard(dir);
+            return NULL;
+        }
         AVAssetWriterInputPixelBufferAdaptor *adaptor =
             [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:input
                                                                              sourcePixelBufferAttributes:attrs];
-        if (![writer canAddInput:input]) { set_error(@"writer refused the %@ video track", hevc ? @"HEVC" : @"H.264"); return NULL; }
+        BugleFrameWriter *fw = [[BugleFrameWriter alloc] init];
+        fw.pool = pool;  // released with fw, on every path from here
+        if (![writer canAddInput:input]) {
+            set_error(@"writer refused the %@ video track", hevc ? @"HEVC" : @"H.264");
+            staging_discard(dir);
+            return NULL;
+        }
         [writer addInput:input];
         if (![writer startWriting]) {
             set_error(@"could not start writing the movie: %@", writer.error.localizedDescription);
-            [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+            staging_discard(dir);
             return NULL;
         }
         [writer startSessionAtSourceTime:kCMTimeZero];
-        BugleFrameWriter *fw = [[BugleFrameWriter alloc] init];
         fw.writer = writer;
         fw.input = input;
         fw.adaptor = adaptor;
         fw.url = url;
+        fw.dir = dir;
         fw.width = w;
         fw.height = h;
         fw.fps = fps;
@@ -2115,18 +2221,19 @@ int32_t bugle_writer_append(void *handle, const uint8_t *rgba, size_t len, int32
             set_error(@"writer: frame %dx%d (%zu bytes) does not match %dx%d", w, h, len, fw.width, fw.height);
             return -1;
         }
-        // Not real time: wait (bounded) for the encoder to drain.
-        for (int i = 0; !fw.input.readyForMoreMediaData; i++) {
-            if (fw.writer.status != AVAssetWriterStatusWriting || i > 2000) {
+        // Not real time: wait (bounded) for the encoder to drain. A deadline,
+        // not a count: with many encoders busy at once the input can stay
+        // full for several seconds without anything being wrong.
+        uint64_t deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 30 * NSEC_PER_SEC;
+        while (!fw.input.readyForMoreMediaData) {
+            if (fw.writer.status != AVAssetWriterStatusWriting || clock_gettime_nsec_np(CLOCK_UPTIME_RAW) > deadline) {
                 set_error(@"writer stalled: %@", fw.writer.error.localizedDescription ?: @"encoder not ready");
                 return -1;
             }
             usleep(5000);
         }
         CVPixelBufferRef pb = NULL;
-        CVReturn rc = fw.adaptor.pixelBufferPool
-                          ? CVPixelBufferPoolCreatePixelBuffer(NULL, fw.adaptor.pixelBufferPool, &pb)
-                          : CVPixelBufferCreate(NULL, w, h, kCVPixelFormatType_32BGRA, NULL, &pb);
+        CVReturn rc = CVPixelBufferPoolCreatePixelBuffer(NULL, fw.pool, &pb);
         if (rc != kCVReturnSuccess || !pb) { set_error(@"writer: could not allocate a pixel buffer (%d)", rc); return -1; }
         CVPixelBufferLockBaseAddress(pb, 0);
         uint8_t *base = CVPixelBufferGetBaseAddress(pb);
@@ -2150,14 +2257,10 @@ int32_t bugle_writer_append(void *handle, const uint8_t *rgba, size_t len, int32
     }
 }
 
-int32_t bugle_writer_finish(void *handle, double timeout) {
+static int32_t writer_finish(BugleFrameWriter *fw, double timeout) {
     @autoreleasepool {
-        clear_error();
-        if (!handle) { set_error(@"writer: NULL handle"); return -1; }
-        BugleFrameWriter *fw = (__bridge_transfer BugleFrameWriter *)handle;
         if (fw.frames == 0) {
             [fw.writer cancelWriting];
-            [[NSFileManager defaultManager] removeItemAtURL:fw.url error:nil];
             set_error(@"writer: no frames were written");
             return -1;
         }
@@ -2169,16 +2272,30 @@ int32_t bugle_writer_finish(void *handle, double timeout) {
         if (!wait_bounded(sem, timeout)) {
             [fw.writer cancelWriting];
             wait_bounded(sem, 10);
-            [[NSFileManager defaultManager] removeItemAtURL:fw.url error:nil];
             set_error(@"finalising the movie timed out after %.0f s", timeout);
             return -1;
         }
         if (fw.writer.status != AVAssetWriterStatusCompleted) {
             set_error(@"finalising the movie failed: %@", fw.writer.error.localizedDescription);
-            [[NSFileManager defaultManager] removeItemAtURL:fw.url error:nil];
             return -1;
         }
         return 0;
+    }
+}
+
+int32_t bugle_writer_finish(void *handle, double timeout) {
+    @autoreleasepool {
+        clear_error();
+        if (!handle) { set_error(@"writer: NULL handle"); return -1; }
+        BugleFrameWriter *fw = (__bridge_transfer BugleFrameWriter *)handle;
+        NSURL *url = fw.url, *dir = fw.dir;
+        int32_t rc = writer_finish(fw, timeout);
+        fw = nil;
+        // Failed or timed out: the folder goes, with anything the cancelled
+        // writer still creates in it later.
+        if (rc == 0 && !staging_commit(dir, url, @"finalising the movie")) rc = -1;
+        if (rc != 0) staging_discard(dir);
+        return rc;
     }
 }
 
@@ -2186,8 +2303,10 @@ void bugle_writer_cancel(void *handle) {
     if (!handle) return;
     @autoreleasepool {
         BugleFrameWriter *fw = (__bridge_transfer BugleFrameWriter *)handle;
+        NSURL *dir = fw.dir;
         [fw.writer cancelWriting];
-        [[NSFileManager defaultManager] removeItemAtURL:fw.url error:nil];
+        fw = nil;
+        staging_discard(dir);
     }
 }
 
@@ -2307,25 +2426,9 @@ int32_t bugle_mux_audio(const char *video_path, const char *audio_path, const do
         AVAssetExportSession *x = [[AVAssetExportSession alloc] initWithAsset:comp presetName:AVAssetExportPresetPassthrough];
         if (!x) { set_error(@"mux: could not create export session"); return -1; }
         NSURL *out = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
-        [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
-        x.outputURL = out;
         x.outputFileType = mp4 ? AVFileTypeMPEG4 : AVFileTypeQuickTimeMovie;
         x.shouldOptimizeForNetworkUse = YES;
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [x exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
-        if (!wait_bounded(sem, timeout)) {
-            [x cancelExport];
-            wait_bounded(sem, 10);
-            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
-            set_error(@"mux timed out after %.0f s and was cancelled", timeout);
-            return -1;
-        }
-        if (x.status != AVAssetExportSessionStatusCompleted) {
-            set_error(@"mux failed: %@", x.error.localizedDescription ?: @"unknown error");
-            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
-            return -1;
-        }
-        return 0;
+        return run_export_session(x, out, timeout, @"mux");
     }
 }
 
