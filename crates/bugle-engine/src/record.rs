@@ -117,23 +117,6 @@ impl Drop for Backend {
     }
 }
 
-/// Give the child the default SIGINT action, whatever ours is. An ignored
-/// signal stays ignored across exec, so when Bugle itself runs with SIGINT
-/// ignored (started in the background by a shell, under `nohup`, ...) the
-/// recorder would ignore the SIGINT that stops it and finalises its file.
-fn default_sigint_in_child(cmd: &mut std::process::Command) -> &mut std::process::Command {
-    use std::os::unix::process::CommandExt;
-    // SAFETY: runs between fork and exec; signal(2) is async-signal-safe.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::signal(libc::SIGINT, libc::SIG_DFL) == libc::SIG_ERR {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        })
-    }
-}
-
 /// SIGINT a still-running child (screencapture finalises the file on
 /// SIGINT), wait for it, and kill it if it does not exit within 5 s.
 fn interrupt_child(child: &mut std::process::Child) {
@@ -724,7 +707,6 @@ impl Engine {
                     }
                     cmd.arg(&tmp_mov);
                     cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
-                    default_sigint_in_child(&mut cmd);
                     let mut child = cmd.spawn().context("starting screencapture")?;
                     // A bad window id or missing permission makes it exit
                     // straight away; report that now rather than at stop.
@@ -1043,33 +1025,24 @@ mod tests {
         }
     }
 
-    /// A child spawned the way screencapture is, by a process that ignores
-    /// SIGINT (as a test binary run in the background by a shell does).
-    fn spawn_like_screencapture(program: &str, args: &[&str]) -> std::process::Child {
+    /// A stand-in for screencapture that stops on SIGINT however the test
+    /// binary was started. An ignored SIGINT is inherited across exec, and a
+    /// test binary run as a background job has it ignored, so `/bin/sleep`
+    /// would ignore the SIGINT that stops it. The real screencapture installs
+    /// its own SIGINT handling (a dispatch source) and stops either way, so
+    /// only the stand-ins need the default action back.
+    fn video(program: &str, args: &[&str]) -> Backend {
         use std::os::unix::process::CommandExt;
         let mut cmd = std::process::Command::new(program);
         cmd.args(args).stderr(std::process::Stdio::piped());
-        // Inherited "ignore" first, then whatever the recorder does about it.
+        // SAFETY: runs between fork and exec; signal(2) is async-signal-safe.
         unsafe {
             cmd.pre_exec(|| {
-                libc::signal(libc::SIGINT, libc::SIG_IGN);
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
                 Ok(())
             });
         }
-        default_sigint_in_child(&mut cmd);
-        cmd.spawn().unwrap()
-    }
-
-    fn video(program: &str, args: &[&str]) -> Backend {
-        Backend::Video { child: spawn_like_screencapture(program, args), wants_mp4: false }
-    }
-
-    #[test]
-    fn recorder_child_stops_on_sigint_even_if_bugle_ignores_it() {
-        use std::os::unix::process::ExitStatusExt;
-        let mut child = spawn_like_screencapture("/bin/sleep", &["30"]);
-        interrupt_child(&mut child);
-        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGINT), "stopped by SIGINT, not killed");
+        Backend::Video { child: cmd.spawn().unwrap(), wants_mp4: false }
     }
 
     /// A GIF backend whose "frame loop" waits for the stop flag (or for
