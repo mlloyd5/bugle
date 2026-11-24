@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One group per pull request, so a new push cancels that PR's older run;
+  # pushes to main group by commit, so each one is checked and none is
+  # cancelled or dropped by a later push.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The Rust toolchain CI builds and lints with. clippy runs with -D warnings,
+  # so a new release can add lints; bump this deliberately, fix what the new
+  # clippy reports in the same change, and expect a local clippy to be older.
+  RUST_TOOLCHAIN: "1.100.0"
+
+jobs:
+  check:
+    name: cargo xtask check (macOS arm64)
+    # macOS 26 on Apple silicon, default Xcode 26.x with the macOS 26 SDK. The
+    # shim needs at least the macOS 15 SDK (SCStreamConfiguration
+    # showMouseClicks); the deployment target stays 13.0. Pinned rather than
+    # macos-latest so an image change is a reviewed edit here.
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} (clippy)
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcode-select -p
+          xcrun --show-sdk-version
+          rustc --version
+          cargo --version
+          cargo clippy --version
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Pull requests restore main's cache but do not write their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Fails if Cargo.lock is out of date; `cargo xtask check` itself does not
+      # pass --locked, so local runs are unchanged.
+      - name: Fetch dependencies (Cargo.lock must be current)
+        run: cargo fetch --locked
+
+      # GitHub's macOS image grants the runner's shell Screen Recording,
+      # Accessibility and microphone access and has one virtual display, so
+      # the capture tests really capture. That is the image's choice and may
+      # change: print what the runner reports (never prompting) and fail if
+      # Screen Recording, a display or a small capture is missing, rather
+      # than let the capture tests skip their capture part and pass.
+      - name: Runner permissions and displays
+        run: cargo run --locked -p bugle-platform --example ci_probe -- --require-screen
+
+      - name: cargo xtask check
+        run: cargo xtask check

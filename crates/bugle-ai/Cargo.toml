@@ -3,6 +3,8 @@ name = "bugle-ai"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "Pluggable AI providers (vision, text, speech-to-text) for Bugle"
 
 [dependencies]
