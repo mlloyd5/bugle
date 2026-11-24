@@ -150,4 +150,31 @@ mod tests {
         assert!(hi - lo > 0.0, "plain widths {lo:.2}..{hi:.2} pt");
         assert_eq!(status_title_width("a\0b", true), 0.0);
     }
+
+    #[test]
+    fn recording_title_with_meter_holds_its_width_across_levels() {
+        use bugle_core::audio_level::{meter_title, AudioLevels, METER_GLYPHS};
+        // Every glyph the title can show draws at one advance.
+        let w: Vec<f64> = METER_GLYPHS.iter().map(|g| status_title_width(&g.to_string(), true)).collect();
+        assert!(w.iter().all(|&x| (x - w[0]).abs() < 0.01 && x > 1.0), "glyph widths {w:?}");
+        // As does the title, for each source count and digit count, at any level.
+        let mut dbs = vec![f64::NEG_INFINITY, FLOOR_DB, 0.0, 20.0];
+        dbs.extend((0..=64).map(|i| -62.0 + i as f64));
+        let level = |db: f64| Some(TrackLevel { peak_db: db, rms_db: db });
+        for secs in [7u64, 599, 600, 3599] {
+            for two in [false, true] {
+                let widths: Vec<f64> = dbs
+                    .iter()
+                    .flat_map(|&a| dbs.iter().map(move |&b| (a, b)))
+                    .map(|(a, b)| {
+                        let levels = AudioLevels { microphone: level(a), system_audio: if two { level(b) } else { None } };
+                        let meter = meter_title(&levels).unwrap();
+                        status_title_width(&format!("● {}:{:02} {meter}", secs / 60, secs % 60), true)
+                    })
+                    .collect();
+                let (lo, hi) = widths.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &w| (lo.min(w), hi.max(w)));
+                assert!(hi - lo < 0.01, "{secs}s, two sources {two}: widths {lo:.2}..{hi:.2} pt");
+            }
+        }
+    }
 }

@@ -404,7 +404,9 @@ changes only the button's font, so its colouring is the system's and the
 item keeps one width as the seconds count; the button's own font is back
 when the recording ends).
 With audio levels in the record status, `level_meter.rs` appends one block
-glyph per source to that title and inserts a disabled line per source under
+glyph per source to that title (`▁`..`▇`, which the system font draws at one
+advance; the wider full block `█` is left out so a peak does not widen the
+item) and inserts a disabled line per source under
 *Stop Recording*: the source's name in the menu font, then a gauge
 (`audio_level::meter_gauge`: bar, `!` near full scale, peak dB or `silent`)
 of a fixed number of characters in Menlo at the same size, set as an
