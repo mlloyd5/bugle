@@ -3,6 +3,8 @@ name = "bugle-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "Bugle — screenshots, recordings, OCR and AI actions for macOS (CLI, HTTP API, MCP)"
 
 [[bin]]

@@ -1,5 +1,7 @@
 # Bugle
 
+[![CI](https://github.com/mlloyd5/bugle/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mlloyd5/bugle/actions/workflows/ci.yml)
+
 > *"Pictures! I need pictures of Spider-Man!"* — J. Jonah Jameson, editor, the Daily Bugle
 
 Bugle is a macOS screenshot and screen-recording tool written in Rust. It covers the
@@ -63,6 +65,28 @@ line tools; no Xcode project is needed.
 
 `cargo xtask check` runs `cargo clippy --workspace --all-targets -- -D warnings` and
 `cargo test --workspace` and exits non-zero if either fails; run it before sending a change.
+
+### CI
+
+GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs
+`cargo xtask check` on a GitHub-hosted macOS 26 arm64 runner for every pull request
+and every push to `main`, after checking that `Cargo.lock` is current.
+
+CI pins its Rust toolchain (`RUST_TOOLCHAIN` in the workflow). To move to a newer
+release, change that one line, fix whatever the new clippy reports in the same pull
+request, and let CI confirm it. Your local clippy may be older than CI's and miss
+lints it reports.
+
+The runs so far show that GitHub's macOS image grants the runner's shell Screen
+Recording, Accessibility and microphone access, and gives it one virtual 1024x768
+display. Every test therefore runs there, including the ones that capture the
+screen for real. That is a property of GitHub's image, not of Bugle, so it could
+change. Before the checks, the workflow runs
+`cargo run -p bugle-platform --example ci_probe -- --require-screen`, which never
+prompts. It prints the runner's permissions and displays, and fails the job if
+Screen Recording is not granted, there is no display or a small capture fails.
+Without that guard, the capture tests would skip their capture part and still pass.
+The smoke test (`--smoke-test`, `cargo xtask smoke-vm`) is not run in CI.
 
 ### App bundle
 

@@ -486,8 +486,8 @@ fn spotlight(img: &mut RgbaImage, r: &Rect, dim: f32) {
                 continue;
             }
             let p = img.get_pixel_mut(x, y);
-            for i in 0..3 {
-                p.0[i] = (p.0[i] as f32 * keep) as u8;
+            for c in p.0.iter_mut().take(3) {
+                *c = (*c as f32 * keep) as u8;
             }
         }
     }
