@@ -1212,10 +1212,14 @@ static NSURL *staging_file(NSURL *dir, NSURL *out) {
 static void staging_discard(NSURL *dir) {
     if (!dir) return;
     NSFileManager *fm = [NSFileManager defaultManager];
+    NSError *err = nil;
     for (int i = 0; i < 50; i++) {
-        if ([fm removeItemAtURL:dir error:nil] || ![fm fileExistsAtPath:dir.path]) return;
+        if ([fm removeItemAtURL:dir error:&err] || ![fm fileExistsAtPath:dir.path]) return;
         usleep(20000);
     }
+    // Not an error for the caller (its result stands), but make the leftover
+    // visible: it is a hidden folder next to the output.
+    NSLog(@"bugle: could not remove the temp folder %@: %@", dir.path, err.localizedDescription);
 }
 
 /// Move the finished file into place (replacing any file at `out`), then
@@ -1508,10 +1512,10 @@ static int32_t mix_audio_tracks_into(NSURL *in, NSURL *out, NSURL *__strong *sta
         if (audio.count < 2) return 1;
         NSArray<AVAssetTrack *> *video = [asset tracksWithMediaType:AVMediaTypeVideo];
         NSError *err = nil;
-        [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
         AVFileType type = [out.pathExtension.lowercaseString isEqualToString:@"mov"] ? AVFileTypeQuickTimeMovie : AVFileTypeMPEG4;
         // From here the writer writes in a staging folder, which the caller
-        // commits or discards; `out` names the file in it.
+        // commits or discards; `out` names the file in it. A file already at
+        // the real output is replaced only by a complete mix.
         *staging = staging_create(out, @"mixing the audio tracks");
         if (!*staging) return -1;
         out = staging_file(*staging, out);
@@ -2133,8 +2137,8 @@ void *bugle_writer_open(const char *path, int32_t w, int32_t h, int32_t fps, int
         }
         if (fps < 1 || fps > 120) { set_error(@"writer: invalid frame rate %d", fps); return NULL; }
         NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
-        [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
-        // Written in a staging folder, moved to `url` by a successful finish.
+        // Written in a staging folder, moved to `url` by a successful finish:
+        // a file already there is replaced only by a complete movie.
         NSURL *dir = staging_create(url, @"writer");
         if (!dir) return NULL;
         NSError *err = nil;

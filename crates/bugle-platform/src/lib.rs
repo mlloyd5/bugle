@@ -2080,13 +2080,39 @@ mod tests {
         assert_eq!(std::fs::read(&keep).unwrap(), b"previous");
         export_video(&long, &keep, 0.0, 1.0, VideoExportPreset::Passthrough, true, None, None).unwrap();
         assert!((media_duration(&keep).unwrap() - 1.0).abs() < 0.1);
+        // So does a failed mix (the sample data is cut off) ...
+        let tones = dir.path().join("tones.mp4");
+        write_tone_fixture(&tones, &ToneFixture { tracks: 2, seconds: 1.0, video: true, ..Default::default() }).unwrap();
+        let full = std::fs::read(&tones).unwrap();
+        let cut = dir.path().join("cut.mp4");
+        std::fs::write(&cut, &full[..full.len() / 2]).unwrap();
+        let mixed = dir.path().join("mixed.mp4");
+        std::fs::write(&mixed, b"previous").unwrap();
+        assert!(mix_audio_tracks(&cut, &mixed).is_err());
+        assert_eq!(std::fs::read(&mixed).unwrap(), b"previous");
+        assert!(mix_audio_tracks(&tones, &mixed).unwrap());
+        assert_eq!(audio_track_count(&mixed).unwrap(), 1);
+        // ... and a frame-writer render that is dropped unfinished or fails
+        // to finish.
+        let render = dir.path().join("render.mp4");
+        std::fs::write(&render, b"previous").unwrap();
+        let mut w = VideoFrameWriter::create(&render, 64, 48, 10, true).unwrap();
+        w.append(&solid(64, 48, [0, 0, 255])).unwrap();
+        drop(w);
+        assert_eq!(std::fs::read(&render).unwrap(), b"previous");
+        assert!(VideoFrameWriter::create(&render, 64, 48, 10, true).unwrap().finish().is_err(), "no frames");
+        assert_eq!(std::fs::read(&render).unwrap(), b"previous");
+        let mut w = VideoFrameWriter::create(&render, 64, 48, 10, true).unwrap();
+        w.append(&solid(64, 48, [0, 0, 255])).unwrap();
+        w.finish().unwrap();
+        assert_eq!(video_size(&render).unwrap(), (64, 48));
         // A failed remux leaves nothing.
         let junk = dir.path().join("junk.mp4");
         std::fs::write(&junk, b"not a movie").unwrap();
         assert!(export_mov(&junk, &dir.path().join("junk.mov")).is_err());
         let mut names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         names.sort();
-        let want = [copy.clone(), dir.path().join(format!("{}.mov", "c".repeat(250))), long.clone(), junk.clone(), keep.clone()];
+        let want = [copy.clone(), dir.path().join(format!("{}.mov", "c".repeat(250))), long.clone(), junk.clone(), keep.clone(), tones, cut, mixed, render];
         let mut want: Vec<_> = want.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         want.sort();
         assert_eq!(names, want);
