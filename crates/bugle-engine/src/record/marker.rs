@@ -10,20 +10,32 @@
 //!   a reader sees the old file or the new one, never half of one. It is
 //!   written when a recording starts and removed when its slot is freed
 //!   (stop, auto-stop reap, or a new start finalising the previous one); see
-//!   [`Engine::sync_recording_marker`].
+//!   [`Engine::sync_recording_marker`]. A recording that stops by itself
+//!   keeps its slot until someone stops or reaps it (`bugle serve` and
+//!   `bugle mcp` wait for the client's `record_stop`), so a watchdog thread
+//!   ([`WATCH_INTERVAL`]) removes the file as soon as the recorder is seen
+//!   to have stopped capturing: its `max_seconds` passed, the GIF loop hit
+//!   its length or memory cap, or the system recorder exited.
 //! * The file names the owner by pid *and* the owner's process start time,
 //!   so a pid the system reused for another process does not keep a dead
 //!   owner's recording alive. A reader ([`scan`]) ignores and removes the
 //!   file of a process that is gone (crashed, killed), and leaves alone a
 //!   file it cannot parse while its pid is still running (its owner will
-//!   replace or remove it).
+//!   replace or remove it). A running owner whose start time the reader may
+//!   not read (another user's process, `sudo bugle record`) is trusted.
 
 use crate::Engine;
 use bugle_core::{Config, RecordingFormat};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// How often the watchdog of a published recording checks whether its
+/// recorder stopped capturing by itself.
+pub const WATCH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The folder holding the recording-state files for `config`.
 pub fn marker_dir(config: &Config) -> PathBuf {
@@ -50,7 +62,10 @@ pub struct LiveRecording {
 
 impl LiveRecording {
     /// Seconds recorded at `now`: never negative (a clock that stepped back)
-    /// and never more than `max_seconds`, like the owner's own status.
+    /// and never more than `max_seconds`, like the owner's own status. Across
+    /// processes only the wall clock is shared, so this is `now -
+    /// started_at` (the owner's own status uses a monotonic clock); a clock
+    /// change while recording shifts it, within those bounds.
     pub fn elapsed_seconds(&self, now: DateTime<Utc>) -> f64 {
         let e = ((now - self.started_at).num_milliseconds() as f64 / 1000.0).max(0.0);
         match self.max_seconds {
@@ -60,11 +75,34 @@ impl LiveRecording {
     }
 
     /// Whether the process that wrote this is still the one running under
-    /// its pid.
+    /// its pid. When its start time cannot be read, a running pid is
+    /// trusted.
     pub fn owner_alive(&self) -> bool {
-        match process_started_us(self.pid) {
-            Some(t) => self.process_started_us == 0 || t == self.process_started_us,
-            None => false,
+        match process_start(self.pid) {
+            ProcessStart::Gone => false,
+            ProcessStart::Unknown => true,
+            ProcessStart::At(t) => self.process_started_us == 0 || t == self.process_started_us,
+        }
+    }
+}
+
+/// What a reader can tell about a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessStart {
+    /// No such process runs (or only its zombie).
+    Gone,
+    /// It runs, but its start time may not be read (another user's).
+    Unknown,
+    /// It runs and started at this time (microseconds since the Unix epoch).
+    At(u64),
+}
+
+impl ProcessStart {
+    /// The start time when known.
+    pub fn micros(self) -> Option<u64> {
+        match self {
+            ProcessStart::At(t) => Some(t),
+            _ => None,
         }
     }
 }
@@ -130,7 +168,7 @@ pub fn scan(dir: &Path, own_pid: u32) -> Vec<LiveRecording> {
             .filter(|r| r.pid == pid);
         let stale = match &parsed {
             Some(rec) => !rec.owner_alive(),
-            None => process_started_us(pid).is_none(),
+            None => process_start(pid) == ProcessStart::Gone,
         };
         if stale {
             tracing::debug!("removing the recording state of process {pid}, which is gone: {}", path.display());
@@ -143,37 +181,95 @@ pub fn scan(dir: &Path, own_pid: u32) -> Vec<LiveRecording> {
     live
 }
 
-/// When process `pid` started (microseconds since the Unix epoch); `None`
-/// when no such process is running (a zombie counts as gone).
+/// Whether process `pid` runs and, when this process may read it, when it
+/// started (a zombie counts as gone).
 #[cfg(target_os = "macos")]
-pub fn process_started_us(pid: u32) -> Option<u64> {
-    let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
+pub fn process_start(pid: u32) -> ProcessStart {
+    let Some(pid) = i32::try_from(pid).ok().filter(|p| *p > 0) else {
+        return ProcessStart::Gone;
+    };
     // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
     let n = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size) };
-    if n != size {
-        // EPERM: running, but not ours to inspect; still alive.
-        let alive = unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-        return alive.then_some(0);
+    if n == size {
+        return match info.pbi_status {
+            libc::SZOMB => ProcessStart::Gone,
+            _ => ProcessStart::At(info.pbi_start_tvsec.saturating_mul(1_000_000).saturating_add(info.pbi_start_tvusec)),
+        };
     }
-    (info.pbi_status != libc::SZOMB).then(|| info.pbi_start_tvsec.saturating_mul(1_000_000).saturating_add(info.pbi_start_tvusec))
+    // Not readable (another user's process answers EPERM): ask whether it
+    // runs at all; EPERM from `kill` means it does.
+    let runs = unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    if runs {
+        ProcessStart::Unknown
+    } else {
+        ProcessStart::Gone
+    }
 }
 
-/// When process `pid` started; elsewhere only whether it runs (0).
+/// Elsewhere only whether the process runs.
 #[cfg(not(target_os = "macos"))]
-pub fn process_started_us(pid: u32) -> Option<u64> {
-    let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
-    (unsafe { libc::kill(pid, 0) } == 0).then_some(0)
+pub fn process_start(pid: u32) -> ProcessStart {
+    match i32::try_from(pid).ok().filter(|p| *p > 0) {
+        Some(p) if unsafe { libc::kill(p, 0) } == 0 => ProcessStart::Unknown,
+        _ => ProcessStart::Gone,
+    }
 }
 
-/// This process's pid and start time, read once.
+/// This process's pid and start time (0 if unreadable), read once.
 fn own_identity() -> (u32, u64) {
     static ID: std::sync::OnceLock<(u32, u64)> = std::sync::OnceLock::new();
     *ID.get_or_init(|| {
         let pid = std::process::id();
-        (pid, process_started_us(pid).unwrap_or(0))
+        (pid, process_start(pid).micros().unwrap_or(0))
     })
+}
+
+/// A check whether `active`'s recorder has stopped capturing by itself, that
+/// a watchdog thread can run without the recorder lock: the same signals as
+/// `Backend::stopped_by_itself`, minus the ones only the slot can see.
+fn stopped_probe(active: &super::Active) -> Box<dyn Fn() -> bool + Send> {
+    let (started, max_seconds) = (active.started, active.max_seconds);
+    let deadline = move || super::deadline_passed(started.elapsed().as_secs_f64(), max_seconds);
+    match &active.backend {
+        super::Backend::Gif { capture_done, .. } => {
+            let done = capture_done.clone();
+            Box::new(move || done.load(Ordering::Relaxed) || deadline())
+        }
+        super::Backend::Video { child, .. } => {
+            let pid = child.id();
+            Box::new(move || bugle_platform::child_exited(pid) || deadline())
+        }
+        // The stream recorder stops at its deadline and reports nothing else.
+        super::Backend::Sck { .. } => Box::new(deadline),
+    }
+}
+
+/// Watch a published recording: once `stopped()` says its recorder stopped
+/// capturing, remove `pid`'s file from `dir` (unless `cancel` was set first,
+/// by the next sync: that one owns the file now). One check per
+/// [`WATCH_INTERVAL`]; exits after removing the file or on `cancel`.
+fn spawn_watchdog(dir: PathBuf, pid: u32, stopped: Box<dyn Fn() -> bool + Send>, cancel: Arc<AtomicBool>) {
+    let spawned = std::thread::Builder::new().name("bugle-rec-watch".into()).spawn(move || loop {
+        std::thread::sleep(WATCH_INTERVAL);
+        if cancel.load(Ordering::SeqCst) {
+            return;
+        }
+        if stopped() {
+            let _serial = SYNC.lock().unwrap_or_else(|e| e.into_inner());
+            if !cancel.load(Ordering::SeqCst) {
+                tracing::debug!("the recording stopped by itself; removing its recording state");
+                if let Err(e) = clear(&dir, pid) {
+                    tracing::warn!("could not remove the recording state in {}: {e}", dir.display());
+                }
+            }
+            return;
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!("could not start the recording-state watchdog (a recording that stops by itself shows until it is stopped): {e}");
+    }
 }
 
 /// Serialises [`Engine::sync_recording_marker`], so the file always ends up
@@ -182,24 +278,35 @@ static SYNC: Mutex<()> = Mutex::new(());
 
 impl Engine {
     /// Make this process's state file match its recorder: written while a
-    /// recording is in the slot, removed once it is free. Called at every
-    /// start and stop (with `recording_changed`), never with the recorder
-    /// locked. Failures are logged: other processes then just do not see
-    /// the recording.
+    /// recording is in the slot and capturing, removed once it is free or
+    /// has stopped capturing (a watchdog removes it then, see
+    /// [`spawn_watchdog`]). Called at every start and stop (with
+    /// `recording_changed`), never with the recorder locked. Failures are
+    /// logged: other processes then just do not see the recording.
     pub(super) fn sync_recording_marker(&self) {
         let _serial = SYNC.lock().unwrap_or_else(|e| e.into_inner());
         let (pid, process_started_us) = own_identity();
-        let live = self.recorder_state.inner.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|a| LiveRecording {
-            pid,
-            process_started_us,
-            started_at: a.started_at,
-            format: a.format,
-            output: a.output.clone(),
-            max_seconds: a.max_seconds,
+        let mut slot = self.recorder_state.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let capturing = slot.as_mut().is_some_and(|a| a.poll() == bugle_core::RecordingState::Active);
+        let live = slot.as_ref().filter(|_| capturing).map(|a| {
+            let rec = LiveRecording {
+                pid,
+                process_started_us,
+                started_at: a.started_at,
+                format: a.format,
+                output: a.output.clone(),
+                max_seconds: a.max_seconds,
+            };
+            (rec, stopped_probe(a))
         });
+        drop(slot);
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(old) = self.recorder_state.marker_watch.lock().unwrap_or_else(|e| e.into_inner()).replace(cancel.clone()) {
+            old.store(true, Ordering::SeqCst);
+        }
         let dir = marker_dir(&self.config);
-        let r = match &live {
-            Some(rec) => publish(&dir, rec),
+        let r = match live {
+            Some((rec, stopped)) => publish(&dir, &rec).map(|()| spawn_watchdog(dir.clone(), pid, stopped, cancel)),
             None => clear(&dir, pid),
         };
         if let Err(e) = r {
@@ -215,7 +322,7 @@ mod tests {
     fn rec(pid: u32) -> LiveRecording {
         LiveRecording {
             pid,
-            process_started_us: process_started_us(pid).unwrap_or(0),
+            process_started_us: process_start(pid).micros().unwrap_or(0),
             started_at: Utc::now(),
             format: RecordingFormat::Mp4,
             output: PathBuf::from("/tmp/x.mp4"),
@@ -285,7 +392,7 @@ mod tests {
     fn a_dead_owner_is_ignored_and_cleaned_up() {
         let tmp = tempfile::tempdir().unwrap();
         let pid = dead_pid();
-        assert_eq!(process_started_us(pid), None);
+        assert_eq!(process_start(pid), ProcessStart::Gone);
         publish(tmp.path(), &LiveRecording { process_started_us: 1, ..rec(pid) }).unwrap();
         std::fs::write(tmp.path().join(format!(".{pid}.json.tmp")), b"{").unwrap();
         assert!(scan(tmp.path(), 0).is_empty());
@@ -349,13 +456,18 @@ mod tests {
     /// A GIF recording whose frame loop waits for the stop flag, then
     /// writes one frame to `out` (or fails, without `ok`).
     fn gif_active(out: &Path, ok: bool) -> super::super::Active {
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-        use std::sync::Arc;
+        gif_active_with(out, ok, Arc::new(AtomicBool::new(false)), Some(90.0))
+    }
+
+    /// The same, but the loop also stops capturing by itself once `release`
+    /// is set (as at its length or memory cap).
+    fn gif_active_with(out: &Path, ok: bool, release: Arc<AtomicBool>, max_seconds: Option<f64>) -> super::super::Active {
+        use std::sync::atomic::AtomicU64;
         let stop = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
         let (stop2, done2, out2) = (stop.clone(), done.clone(), out.to_path_buf());
         let handle = std::thread::spawn(move || {
-            while !stop2.load(Ordering::Relaxed) {
+            while !stop2.load(Ordering::Relaxed) && !release.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             done2.store(true, Ordering::Relaxed);
@@ -374,7 +486,7 @@ mod tests {
             source: "test".into(),
             backend: super::super::Backend::Gif { stop, capture_done: done, handle: Some(handle) },
             frames: Arc::new(AtomicU64::new(0)),
-            max_seconds: Some(90.0),
+            max_seconds,
             finished_at: None,
             events: None,
         }
@@ -409,6 +521,93 @@ mod tests {
         assert_eq!(scan(&dir, 0).len(), 1);
         assert!(engine.record_stop().is_err());
         assert!(scan(&dir, 0).is_empty());
+    }
+
+    fn engine_in(tmp: &Path) -> Engine {
+        let mut cfg = Config::default();
+        cfg.general.save_dir = tmp.join("save").display().to_string();
+        cfg.general.history_path = Some(tmp.join("history.jsonl").display().to_string());
+        Engine::new(cfg, false).unwrap()
+    }
+
+    /// Wait (at most 3 watchdog intervals plus slack) for `f`.
+    fn eventually(mut f: impl FnMut() -> bool) -> bool {
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < WATCH_INTERVAL * 3 + Duration::from_secs(2) {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn a_recording_that_stops_capturing_by_itself_is_unpublished() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_in(tmp.path());
+        let dir = marker_dir(&engine.config);
+
+        // No max_seconds; the GIF loop stops by itself (a cap). Nobody
+        // reaps it (as under `bugle serve`): the file still goes.
+        let release = Arc::new(AtomicBool::new(false));
+        let out = tmp.path().join("cap.gif");
+        engine.install(engine.idle_recorder().unwrap(), gif_active_with(&out, true, release.clone(), None));
+        assert_eq!(scan(&dir, 0).len(), 1);
+        release.store(true, Ordering::Relaxed);
+        assert!(eventually(|| scan(&dir, 0).is_empty()), "the file outlived the capture");
+        assert_eq!(engine.record_status().state, bugle_core::RecordingState::Finishing, "the slot is kept for record_stop");
+        engine.record_stop().unwrap();
+        assert!(scan(&dir, 0).is_empty());
+
+        // max_seconds passed and nobody calls record_stop.
+        let out = tmp.path().join("deadline.gif");
+        engine.install(engine.idle_recorder().unwrap(), gif_active_with(&out, true, Default::default(), Some(0.2)));
+        assert!(eventually(|| scan(&dir, 0).is_empty()), "the file outlived max_seconds");
+        engine.record_stop().unwrap();
+    }
+
+    #[test]
+    fn a_previous_recordings_watchdog_leaves_the_next_one_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_in(tmp.path());
+        let dir = marker_dir(&engine.config);
+        let release = Arc::new(AtomicBool::new(false));
+        engine.install(engine.idle_recorder().unwrap(), gif_active_with(&tmp.path().join("a.gif"), true, release.clone(), None));
+        engine.record_stop().unwrap();
+        // The first one's capture flag is set now; its watchdog must not
+        // take the second recording's file.
+        engine.install(engine.idle_recorder().unwrap(), gif_active(&tmp.path().join("b.gif"), true));
+        std::thread::sleep(WATCH_INTERVAL * 2 + Duration::from_millis(300));
+        assert_eq!(scan(&dir, 0).len(), 1);
+        engine.record_stop().unwrap();
+        assert!(scan(&dir, 0).is_empty());
+    }
+
+    #[test]
+    fn the_system_recorder_exiting_counts_as_stopped() {
+        let child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let mut a = gif_active(Path::new("/nonexistent/x.mov"), true);
+        // Swap in a system-recorder backend; the GIF one stops on drop.
+        a.backend = super::super::Backend::Video { child, wants_mp4: false };
+        let stopped = stopped_probe(&a);
+        assert!(eventually(&stopped));
+    }
+
+    #[test]
+    fn a_running_owner_that_cannot_be_inspected_is_trusted() {
+        // launchd (pid 1) belongs to root: its start time is not readable
+        // here, as with `sudo bugle record`.
+        if process_start(1) != ProcessStart::Unknown {
+            eprintln!("skipped: pid 1's start time is readable (running as root?)");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let r = LiveRecording { process_started_us: 1_234_567, ..rec(1) };
+        assert!(r.owner_alive());
+        publish(tmp.path(), &r).unwrap();
+        assert_eq!(scan(tmp.path(), 0), vec![r]);
+        assert!(file_for(tmp.path(), 1).exists());
     }
 
     #[test]

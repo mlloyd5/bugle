@@ -46,6 +46,9 @@ pub struct RecorderState {
     /// itself (and when), for the `record_stop` that comes for it; cleared
     /// by the next start, ignored after [`REAPED_KEPT`].
     reaped: Mutex<Option<(Instant, std::result::Result<MediaItem, String>)>>,
+    /// Cancels the watchdog of the recording state last published
+    /// (`marker`).
+    marker_watch: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 /// How long a `record_stop` may still collect a recording that
@@ -800,11 +803,12 @@ impl Engine {
     }
 
     fn recording_changed(&self) {
-        // Other Bugle processes (the menu-bar app) see the recording too.
-        self.sync_recording_marker();
         if let Some(host) = &self.ui_host {
             host.recording_changed();
         }
+        // Other Bugle processes (the menu-bar app) see the recording too;
+        // after the host, so a slow volume cannot delay its redraw.
+        self.sync_recording_marker();
     }
 
     /// Stop `active`'s backend (if still running), finish the file and add
