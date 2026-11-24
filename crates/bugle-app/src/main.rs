@@ -519,10 +519,10 @@ struct App {
     hotkeys: HashMap<u32, Command>,
     _hotkey_manager: GlobalHotKeyManager,
     history_mtime: Option<SystemTime>,
-    /// Checks the files of the Recent items on show off the main thread, so
-    /// one deleted in Finder drops out without a history change, on an
-    /// external or network volume too, without a `stat` there blocking the
-    /// tick.
+    /// Checks the files of the Recent rows on show off the main thread, so
+    /// one deleted in Finder drops out (and a row's enabled state follows
+    /// its file) without a history change, on an external or network volume
+    /// too, without a `stat` there blocking the tick.
     recent_probe: recent_probe::RecentProbe,
     proxy: Proxy,
     last_tick: Instant,
@@ -772,18 +772,21 @@ impl App {
 
     fn refresh_recent(&mut self) {
         let mtime = std::fs::metadata(self.engine.history.path()).and_then(|m| m.modified()).ok();
-        if mtime == self.history_mtime && !self.items.recent.items().is_empty() && !self.recent_probe.file_gone() {
+        if mtime == self.history_mtime && !self.items.recent.items().is_empty() && !self.recent_probe.changed() {
             return;
         }
         self.history_mtime = mtime;
         while self.items.recent.remove_at(0).is_some() {}
-        let recent = self.engine.history.recent(5).unwrap_or_default();
+        let recent: Vec<recent_probe::Row> = self.engine.history.recent(5).unwrap_or_default().into_iter().map(|m| {
+            let exists = m.path.exists();
+            (m, exists)
+        }).collect();
         self.recent_probe.watch(recent.clone());
         if recent.is_empty() {
             let _ = self.items.recent.append(&MenuItem::with_id("recent:none", "No captures yet", false, None));
             return;
         }
-        for m in recent {
+        for (m, exists) in recent {
             let kind = match m.kind {
                 MediaKind::Screenshot => "screenshot",
                 MediaKind::ScrollCapture => "scrolling",
@@ -796,7 +799,7 @@ impl App {
             };
             let text = format!("{}  ({kind}, {})", file_name(&m.path), m.created_at.with_timezone(&chrono_local()).format("%H:%M"));
             let id = format!("recent:{}", m.path.display());
-            let _ = self.items.recent.append(&MenuItem::with_id(id, text, m.path.exists(), None));
+            let _ = self.items.recent.append(&MenuItem::with_id(id, text, exists, None));
         }
     }
 
