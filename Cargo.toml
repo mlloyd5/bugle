@@ -59,7 +59,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 cc = "1"
 libc = "0.2"
 futures = "0.3"
-bytes = "1"
 tempfile = "3"
 
 [profile.release]
