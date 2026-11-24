@@ -2027,6 +2027,12 @@ mod tests {
         assert!(export_video(&dir.path().join("missing.mp4"), &bad, 0.0, 1.0, VideoExportPreset::Passthrough, true, None, None).is_err());
         assert!(!bad.exists());
         assert!(VideoFrameReader::open(&dir.path().join("missing.mp4"), 0.0).is_err());
+
+        // Nothing else is left behind: no temp files, and no late output from
+        // the cancelled export.
+        let mut names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, ["clean.mp4", "cut.mov", "fixture.mp4", "pass.mp4", "spliced.mp4"]);
     }
 
     #[test]

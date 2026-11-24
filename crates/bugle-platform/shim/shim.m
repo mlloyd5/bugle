@@ -1172,6 +1172,23 @@ void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const c
 // Media helpers (AVFoundation)
 // ---------------------------------------------------------------------------
 
+// An AVAssetWriter with shouldOptimizeForNetworkUse writes through a hidden
+// temp file next to its output ("<name>.sb-XXXXXXXX-XXXXXX") and deletes it
+// only when its internals are deallocated, whether it finished, failed or was
+// cancelled. That can happen after the writing function has returned (the
+// last reference may be held by a dispatch queue: a queued pump block or
+// AVFoundation's own), so the temp file could still be next to the output
+// when the caller looks, or stay there if the process exits first. Call this
+// once the writer is done with to remove it straight away.
+static void remove_writer_temps(NSURL *out) {
+    NSString *dir = out.URLByDeletingLastPathComponent.path;
+    NSString *prefix = [out.lastPathComponent stringByAppendingString:@".sb-"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *name in [fm contentsOfDirectoryAtPath:dir error:nil]) {
+        if ([name hasPrefix:prefix]) [fm removeItemAtPath:[dir stringByAppendingPathComponent:name] error:nil];
+    }
+}
+
 int32_t bugle_export_audio_m4a(const char *in_path, const char *out_path) {
     @autoreleasepool {
         clear_error();
@@ -1430,6 +1447,9 @@ static CMSampleBufferRef mix_buffer(CMAudioFormatDescriptionRef fmt, const float
     return st == noErr ? sb : NULL;
 }
 
+static int32_t mix_audio_tracks_into(NSURL *in, NSURL *out, const char *in_path, const char *out_path, int32_t separate,
+                                     bugle_mix_fn process, void *ctx);
+
 int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, int32_t separate, bugle_mix_fn process,
                                void *ctx) {
     @autoreleasepool {
@@ -1440,6 +1460,15 @@ int32_t bugle_mix_audio_tracks(const char *in_path, const char *out_path, int32_
             set_error(@"mixing %s: input and output are the same file", in_path);
             return -1;
         }
+        int32_t rc = mix_audio_tracks_into(in, out, in_path, out_path, separate, process, ctx);
+        remove_writer_temps(out);
+        return rc;
+    }
+}
+
+static int32_t mix_audio_tracks_into(NSURL *in, NSURL *out, const char *in_path, const char *out_path, int32_t separate,
+                                     bugle_mix_fn process, void *ctx) {
+    @autoreleasepool {
         if (!process) { set_error(@"mixing %s: no mix function", in_path); return -1; }
         AVURLAsset *asset = [AVURLAsset URLAssetWithURL:in options:nil];
         NSMutableArray<AVAssetTrack *> *audio = [NSMutableArray array];
@@ -1905,6 +1934,63 @@ static AVMutableComposition *spliced_composition(AVAsset *asset, const double *r
     return comp;
 }
 
+/// Remove a staging folder and everything in it. Retried: a cancelled export
+/// may still be adding a file while the folder is emptied.
+static void remove_staging(NSURL *dir) {
+    for (int i = 0; i < 5; i++) {
+        if ([[NSFileManager defaultManager] removeItemAtURL:dir error:nil] ||
+            ![[NSFileManager defaultManager] fileExistsAtPath:dir.path]) {
+            return;
+        }
+        usleep(10000);
+    }
+}
+
+/// Run export session `s` to `out`, waiting at most `timeout` seconds (<= 0:
+/// forever); `what` names it in errors. Returns 0, or -1 with the error set
+/// and nothing left at `out`.
+///
+/// The session writes into a new hidden folder next to `out`, and the result
+/// is moved into place once complete. A cancelled session (a timeout) calls
+/// its completion handler before its writer has necessarily even created its
+/// files: it can still create `out` and its own temp files afterwards, so
+/// removing them would not be enough. Removing the folder is, since nothing
+/// can be created in a folder that no longer exists.
+static int32_t run_export_session(AVAssetExportSession *s, NSURL *out, double timeout, NSString *what) {
+    [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+    NSString *tmpl = [out.URLByDeletingLastPathComponent.path
+        stringByAppendingPathComponent:[NSString stringWithFormat:@".%@.XXXXXX", out.lastPathComponent]];
+    char buf[PATH_MAX];
+    if (![tmpl getFileSystemRepresentation:buf maxLength:sizeof(buf)] || !mkdtemp(buf)) {
+        set_error(@"%@: could not create a temp folder next to %@: %s", what, out.path, strerror(errno));
+        return -1;
+    }
+    NSURL *dir = [NSURL fileURLWithFileSystemRepresentation:buf isDirectory:YES relativeToURL:nil];
+    NSURL *staged = [dir URLByAppendingPathComponent:out.lastPathComponent];
+    s.outputURL = staged;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [s exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
+    if (!wait_bounded(sem, timeout)) {
+        [s cancelExport];
+        wait_bounded(sem, 10);
+        remove_staging(dir);
+        set_error(@"%@ timed out after %.0f s and was cancelled", what, timeout);
+        return -1;
+    }
+    if (s.status != AVAssetExportSessionStatusCompleted) {
+        set_error(@"%@ failed: %@", what, s.error.localizedDescription ?: @"unknown error");
+        remove_staging(dir);
+        return -1;
+    }
+    if (rename(staged.fileSystemRepresentation, out.fileSystemRepresentation) != 0) {
+        set_error(@"%@: could not move the result to %@: %s", what, out.path, strerror(errno));
+        remove_staging(dir);
+        return -1;
+    }
+    remove_staging(dir);
+    return 0;
+}
+
 int32_t bugle_export_video(const char *in_path, const char *out_path, const double *ranges, int32_t n_ranges, int32_t preset,
                            int32_t mp4, int32_t fps, double timeout) {
     @autoreleasepool {
@@ -1938,8 +2024,6 @@ int32_t bugle_export_video(const char *in_path, const char *out_path, const doub
             set_error(@"export preset %@ cannot write %@", name, type);
             return -1;
         }
-        [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
-        s.outputURL = out;
         s.outputFileType = type;
         s.shouldOptimizeForNetworkUse = YES;
         if (n_ranges == 1) s.timeRange = range_at(ranges, 0);
@@ -1957,21 +2041,7 @@ int32_t bugle_export_video(const char *in_path, const char *out_path, const doub
             }
             s.videoComposition = vc;
         }
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [s exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
-        if (!wait_bounded(sem, timeout)) {
-            [s cancelExport];
-            wait_bounded(sem, 10);
-            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
-            set_error(@"export timed out after %.0f s and was cancelled", timeout);
-            return -1;
-        }
-        if (s.status != AVAssetExportSessionStatusCompleted) {
-            set_error(@"export failed: %@", s.error.localizedDescription ?: @"unknown error");
-            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
-            return -1;
-        }
-        return 0;
+        return run_export_session(s, out, timeout, @"export");
     }
 }
 
@@ -2150,11 +2220,8 @@ int32_t bugle_writer_append(void *handle, const uint8_t *rgba, size_t len, int32
     }
 }
 
-int32_t bugle_writer_finish(void *handle, double timeout) {
+static int32_t writer_finish(BugleFrameWriter *fw, double timeout) {
     @autoreleasepool {
-        clear_error();
-        if (!handle) { set_error(@"writer: NULL handle"); return -1; }
-        BugleFrameWriter *fw = (__bridge_transfer BugleFrameWriter *)handle;
         if (fw.frames == 0) {
             [fw.writer cancelWriting];
             [[NSFileManager defaultManager] removeItemAtURL:fw.url error:nil];
@@ -2182,12 +2249,28 @@ int32_t bugle_writer_finish(void *handle, double timeout) {
     }
 }
 
+int32_t bugle_writer_finish(void *handle, double timeout) {
+    @autoreleasepool {
+        clear_error();
+        if (!handle) { set_error(@"writer: NULL handle"); return -1; }
+        BugleFrameWriter *fw = (__bridge_transfer BugleFrameWriter *)handle;
+        NSURL *url = fw.url;
+        int32_t rc = writer_finish(fw, timeout);
+        fw = nil;
+        remove_writer_temps(url);
+        return rc;
+    }
+}
+
 void bugle_writer_cancel(void *handle) {
     if (!handle) return;
     @autoreleasepool {
         BugleFrameWriter *fw = (__bridge_transfer BugleFrameWriter *)handle;
+        NSURL *url = fw.url;
         [fw.writer cancelWriting];
-        [[NSFileManager defaultManager] removeItemAtURL:fw.url error:nil];
+        fw = nil;
+        [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+        remove_writer_temps(url);
     }
 }
 
@@ -2307,25 +2390,9 @@ int32_t bugle_mux_audio(const char *video_path, const char *audio_path, const do
         AVAssetExportSession *x = [[AVAssetExportSession alloc] initWithAsset:comp presetName:AVAssetExportPresetPassthrough];
         if (!x) { set_error(@"mux: could not create export session"); return -1; }
         NSURL *out = [NSURL fileURLWithPath:[NSString stringWithUTF8String:out_path]];
-        [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
-        x.outputURL = out;
         x.outputFileType = mp4 ? AVFileTypeMPEG4 : AVFileTypeQuickTimeMovie;
         x.shouldOptimizeForNetworkUse = YES;
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [x exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
-        if (!wait_bounded(sem, timeout)) {
-            [x cancelExport];
-            wait_bounded(sem, 10);
-            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
-            set_error(@"mux timed out after %.0f s and was cancelled", timeout);
-            return -1;
-        }
-        if (x.status != AVAssetExportSessionStatusCompleted) {
-            set_error(@"mux failed: %@", x.error.localizedDescription ?: @"unknown error");
-            [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
-            return -1;
-        }
-        return 0;
+        return run_export_session(x, out, timeout, @"mux");
     }
 }
 
