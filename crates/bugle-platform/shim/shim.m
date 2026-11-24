@@ -2200,9 +2200,12 @@ int32_t bugle_writer_append(void *handle, const uint8_t *rgba, size_t len, int32
             set_error(@"writer: frame %dx%d (%zu bytes) does not match %dx%d", w, h, len, fw.width, fw.height);
             return -1;
         }
-        // Not real time: wait (bounded) for the encoder to drain.
-        for (int i = 0; !fw.input.readyForMoreMediaData; i++) {
-            if (fw.writer.status != AVAssetWriterStatusWriting || i > 2000) {
+        // Not real time: wait (bounded) for the encoder to drain. A deadline,
+        // not a count: with many encoders busy at once the input can stay
+        // full for several seconds without anything being wrong.
+        uint64_t deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 30 * NSEC_PER_SEC;
+        while (!fw.input.readyForMoreMediaData) {
+            if (fw.writer.status != AVAssetWriterStatusWriting || clock_gettime_nsec_np(CLOCK_UPTIME_RAW) > deadline) {
                 set_error(@"writer stalled: %@", fw.writer.error.localizedDescription ?: @"encoder not ready");
                 return -1;
             }

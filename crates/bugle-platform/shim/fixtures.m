@@ -19,7 +19,11 @@ static char *fixture_error(NSString *fmt, ...) {
 // writing: appending to a writer that has failed or stopped raises an
 // Objective-C exception, which must not cross into Rust.
 static BOOL ready_to_append(AVAssetWriter *writer, AVAssetWriterInput *in, NSString **failure) {
-    for (int w = 0; w < 5000 && !in.readyForMoreMediaData && writer.status == AVAssetWriterStatusWriting; w++) {
+    // A deadline rather than a count: with many encoders busy at once (test
+    // binaries run side by side) the input can stay full for seconds.
+    uint64_t deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 30 * NSEC_PER_SEC;
+    while (!in.readyForMoreMediaData && writer.status == AVAssetWriterStatusWriting &&
+           clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < deadline) {
         usleep(1000);
     }
     if (writer.status != AVAssetWriterStatusWriting) {
