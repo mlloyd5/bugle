@@ -73,12 +73,16 @@ pub fn meter_fraction(db: f64) -> f64 {
     ((db - METER_RANGE_DB) / -METER_RANGE_DB).clamp(0.0, 1.0)
 }
 
-/// One block glyph (`▁`..`█`) for the status-item title; silence is the
-/// lowest one, so the meter keeps its width.
+/// The status-item title's meter glyphs, lowest first. `▇` is the top: the
+/// system font draws `▁`..`▇` at one advance but the full block `█` wider,
+/// which would widen the status item while a source peaks.
+pub const METER_GLYPHS: [char; 7] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇'];
+
+/// One block glyph (`▁`..`▇`, [`METER_GLYPHS`]) for the status-item title;
+/// silence is the lowest one, so the meter keeps its width.
 pub fn meter_glyph(db: f64) -> char {
-    const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let i = (meter_fraction(db) * GLYPHS.len() as f64).ceil() as usize;
-    GLYPHS[i.saturating_sub(1).min(GLYPHS.len() - 1)]
+    let i = (meter_fraction(db) * METER_GLYPHS.len() as f64).ceil() as usize;
+    METER_GLYPHS[i.saturating_sub(1).min(METER_GLYPHS.len() - 1)]
 }
 
 /// A `width`-segment bar (`▮` lit, `▯` dark) for a menu item.
@@ -155,10 +159,11 @@ mod tests {
     fn glyphs_cover_the_range() {
         assert_eq!(meter_glyph(FLOOR_DB), '▁');
         assert_eq!(meter_glyph(-59.0), '▁');
-        assert_eq!(meter_glyph(-30.0), '▄');
-        assert_eq!(meter_glyph(-29.0), '▅');
-        assert_eq!(meter_glyph(0.0), '█');
-        assert_eq!(meter_glyph(-0.1), '█');
+        assert_eq!(meter_glyph(-26.0), '▄');
+        assert_eq!(meter_glyph(-25.0), '▅');
+        assert_eq!(meter_glyph(-8.0), '▇');
+        assert_eq!(meter_glyph(0.0), '▇');
+        assert_eq!(meter_glyph(20.0), '▇');
         // Monotonic.
         let mut last = '▁';
         for i in 0..=70 {
@@ -225,7 +230,7 @@ mod tests {
         assert_eq!(meter_title(&AudioLevels::default()), None);
         let mic = TrackLevel { peak_db: 0.0, rms_db: -3.0 };
         let sys = TrackLevel { peak_db: FLOOR_DB, rms_db: FLOOR_DB };
-        assert_eq!(meter_title(&AudioLevels { microphone: Some(mic), system_audio: Some(sys) }).as_deref(), Some("█▁"));
+        assert_eq!(meter_title(&AudioLevels { microphone: Some(mic), system_audio: Some(sys) }).as_deref(), Some("▇▁"));
         assert_eq!(meter_title(&AudioLevels { microphone: None, system_audio: Some(sys) }).as_deref(), Some("▁"));
     }
 
