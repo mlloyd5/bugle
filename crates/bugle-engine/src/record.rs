@@ -1098,9 +1098,24 @@ mod tests {
         }
     }
 
+    /// A stand-in for screencapture that stops on SIGINT however the test
+    /// binary was started. An ignored SIGINT is inherited across exec, and a
+    /// test binary run as a background job has it ignored, so `/bin/sleep`
+    /// would ignore the SIGINT that stops it. The real screencapture installs
+    /// its own SIGINT handling (a dispatch source) and stops either way, so
+    /// only the stand-ins need the default action back.
     fn video(program: &str, args: &[&str]) -> Backend {
-        let child = std::process::Command::new(program).args(args).stderr(std::process::Stdio::piped()).spawn().unwrap();
-        Backend::Video { child, wants_mp4: false }
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args).stderr(std::process::Stdio::piped());
+        // SAFETY: runs between fork and exec; signal(2) is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        Backend::Video { child: cmd.spawn().unwrap(), wants_mp4: false }
     }
 
     /// A GIF backend whose "frame loop" waits for the stop flag (or for

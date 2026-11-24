@@ -1344,6 +1344,13 @@ mod tests {
     use super::*;
     use bugle_core::Config;
 
+    /// The entries of `dir`, sorted.
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
     fn engine_in(tmp: &Path) -> Engine {
         let mut cfg = Config::default();
         cfg.general.save_dir = tmp.join("save").display().to_string();
@@ -1687,12 +1694,8 @@ mod tests {
         assert_eq!(std::fs::read(&src).unwrap(), before, "source untouched");
         let latest = engine.history.latest().unwrap().unwrap();
         assert_eq!((latest.id.as_str(), latest.label.as_deref()), (m.id.as_str(), Some("demo")));
-        let leftovers = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".bugle-edit-"))
-            .count();
-        assert_eq!(leftovers, 0);
+        // No temp files or staging folders left behind.
+        assert_eq!(dir_names(dir.path()), ["cut.mp4", "history.jsonl", "history.jsonl.lock", "save", "src.mp4"]);
 
         // "latest" is a history item, so the next edit records it as parent.
         let req = EditRequest { source: "latest".into(), end: Some(0.5), output: Some(path_str(&dir.path().join("again.mp4"))), ..Default::default() };
@@ -2193,8 +2196,8 @@ mod tests {
         assert!(near(f.get_pixel(20, 60), RED) && near(f.get_pixel(140, 60), BLUE));
         let f = r.frame_at(1.05).unwrap();
         assert!(near(f.get_pixel(5, 60), BLUE) && near(f.get_pixel(155, 60), BLUE));
-        let leftovers = std::fs::read_dir(dir.path()).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with(".bugle-edit-")).count();
-        assert_eq!(leftovers, 0);
+        // No temp files or staging folders left behind.
+        assert_eq!(dir_names(dir.path()), ["history.jsonl", "history.jsonl.lock", "save", "split.mp4", "split.mp4.events.json", "zoomed.mp4"]);
 
         // To GIF, the same effects apply.
         let gif = dir.path().join("zoomed.gif");

@@ -586,17 +586,33 @@ fails, because the capture test would otherwise skip its capture part (when
 Tart VM. `--prepare` `tart clone`s an already pulled Cirrus Labs image to the
 golden image `bugle-smoke-base`, boots it, and through `tart exec` (gRPC to
 the Tart guest agent, a LaunchAgent in the auto-logged-in `admin` session, so
-commands run in the GUI session with the window server) checks
-`csrutil status` and `INSERT OR REPLACE`s `kTCCServiceScreenCapture`,
+commands run in the GUI session with the window server) reads `csrutil
+status` and `sw_vers -productVersion` and decides on the host (`parse_sip`,
+`grant_plan`, unit-tested on captured output): SIP disabled, or a custom
+configuration with Filesystem Protections off, passes; enabled, custom with
+them on, or unrecognised output stops with the fix (`csrutil disable` from the
+guest's recovery). The old in-guest `grep -q disabled` would have passed a
+custom configuration with Filesystem Protections on and then failed in
+`sqlite3`. Guests outside macOS 14–27 stop too (the user-database location is
+only known for those; `BUGLE_SMOKE_VM_UNTESTED_GUEST=1` tries the 27 layout),
+and a Cirrus Labs image named for a macOS newer than the host is refused
+before cloning (Virtualization.framework cannot boot it; an early `tart run`
+exit quotes its log for other images). The script then
+`INSERT OR REPLACE`s `kTCCServiceScreenCapture`,
 `Microphone`, `Accessibility` and `PostEvent` rows for the bundle id
 (`client_type` 0) and the fixed guest executable path (`client_type` 1), with
 no code requirement so ad-hoc rebuilds still match, into the system and the
 user `TCC.db` (macOS 27: the user database is found through `tccd`'s open
-files), the same way the image build grants its guest agent. Writing TCC.db
+files), the same way the image build grants its guest agent; a `sqlite3`
+failure exits 6 and is reported with its error. Writing TCC.db
 needs SIP off, which those images already are in the guest (their build runs
 `csrutil disable` from guest recovery); the host is never asked to change SIP.
-A run checks
-for `tart` (and `tart exec`) and the golden image, assembles a bundle with
+A run (`VmSmoke`; `bundle --smoke-vm` and `verify --smoke-vm` make one before
+building or verifying; `bundle` runs it on the staged, signed bundle as the
+first release step, before notarization, the disk image, the zip and
+replacing `dist/`, and `verify` on the bundle it checked) checks
+for `tart` (and `tart exec`), the time limits and the golden image, removes
+stale clones, assembles a bundle with
 `bundle` into its own `target/xtask/smoke-vm/<run>/dist`, writes
 `smoke_config` for the guest path `/Users/admin/bugle-smoke/run` and the guest
 script, clones the golden image, and `tart run --no-graphics --no-audio
@@ -609,8 +625,49 @@ microphone is not attached. Readiness is `tart exec <vm> test -e
 "/Volumes/My Shared Files/run/run.sh"` (agent up, user logged in, shares
 mounted). The script copies the bundle off the share, runs it, tees the log
 into the share and `ditto`s the run directory back; the host enforces the time
-limit and a `Vm` guard stops and deletes the clone on every exit path but a
-signal.
+limit and a `Vm` guard stops and deletes the clone on every exit path.
+
+Signals (`interrupt.rs`): commands that own a VM install SIGINT, SIGTERM,
+SIGHUP and SIGQUIT handlers that only record the signal (a signal inherited as
+ignored stays ignored, so `nohup` works). Every child process `bundle`,
+`verify` and `smoke-vm` start goes through `interrupt::{status, output}` or
+`isolate`, which then put it in its own process group with a null stdin (a
+background group reading the terminal would stop on SIGTTIN), so a terminal's
+Ctrl-C reaches xtask alone; the one exception is the host `--smoke-test`
+launch, which never runs with the handlers installed. Every wait polls
+(`Wait`): interruptible waits (the build, codesign, notarytool, the boot
+probes, the test's `tart exec`, the sleeps between probes) notice the signal,
+SIGTERM (then SIGKILL after 5 s) the child's whole group and return
+`Interrupted`; unwinding drops the `Vm` guard, which runs `tart stop` and
+`tart delete` with `Wait::teardown`, not cut short by a second Ctrl-C. Every
+Tart wait also has a limit (`TimedOut`): queries 60 s, a boot probe 30 s and
+never past the boot limit, `tart clone` 120 s, `tart stop` its timeout plus
+60 s, `tart delete` 60 s, the grant script 300 s; a teardown step that times
+out says what may be left and how to remove it. `tart clone` is always
+waited for (bounded) and the signal checked after it, so no half-made clone is
+left; the guard exists before the clone and deletes it only if `tart list`
+shows it. A VM about to be deleted is stopped with a 5 s timeout; the
+prepared image is shut down with 120 s, and a failed `tart stop` there deletes
+it instead of keeping a possibly unflushed image. `main` exits with 128 + the
+signal, also for one that arrived after the last interruptible wait. All of
+xtask prints through `outln!`/`errln!`, which drop output that cannot be
+written: once the terminal has closed (EIO, the SIGHUP case) or a pipe's
+reader has quit (EPIPE), `println!` would panic, and a panic in `Vm`'s drop
+skipped the teardown (exit 101, clone left). `--prepare --image` refuses a
+name that parses as a run clone's, which the stale cleanup would delete.
+Without the handlers (plain `bundle`, `verify`), the helpers are the
+plain `std::process` calls. A SIGKILLed run leaves its clone (still running,
+with an orphaned `tart run`); `cleanup_stale`, run first by every run and by
+`--cleanup`, parses run names strictly (local VMs only). New names are
+`bugle-smoke-run-<millis>-p<pid>-s<start µs>`, the start time being the
+owner's own `proc_pidinfo` start time: the clone is stale only when that pid
+does not exist or now has another start time (equality, so clock steps cannot
+make a live run look stale). Older `<millis>-<pid>` names are stale only when
+the pid does not exist or belongs to a process not named `xtask`. A process
+that cannot be inspected counts as alive. A running stale clone is stopped
+first, which ends its orphaned `tart run` and `tart exec`. In a run's
+preflight a leftover that cannot be deleted is a warning (two runs may race
+to remove it, so the list is read again); with `--cleanup` it is an error.
 
 After a capture the app shows the quick-access panel instead of the toast
 (`[quick_access]`, on by default). `quick_access.rs` is the platform-free part:
