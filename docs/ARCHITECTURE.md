@@ -40,7 +40,11 @@ volume keeps its entries), no synced `url`, and older than a minute. Only
 `bugle history prune` (the `history_prune` action) tombstones them, also keeping
 entries under an empty directory (an offline mount point) and videos whose
 subtitle entry stays; it never touches a file, and it re-checks its candidates
-under the writer lock. `audio_mix` holds the sample
+under the writer lock. `History::delete` writes a tombstone plus a
+`DELETE <id> user <time>` marker (older readers skip it), so a sync that moved
+the file meanwhile (`History::record_synced`) leaves a deleted entry deleted,
+and removes the moved file when the delete asked for the file, while an entry
+pruned mid-move (a plain tombstone) is recorded again. `audio_mix` holds the sample
 math for the mixed recording track (per-source gain, ducking, peak limiter),
 so it is tested on synthetic buffers without AVFoundation. `events` defines a recording's
 pointer/click event track, the `<file>.events.json` sidecar named after the
@@ -359,6 +363,13 @@ built by walking it and `[hotkeys]` keys are resolved against its names, so ever
 item is bindable and the two cannot drift. Unknown keys, unparsable or duplicate
 combinations and bindings the OS refuses are logged, summarised in one toast and
 skipped. Menu and hotkey events are forwarded to the loop as user events.
+*Recent Captures* is rebuilt when the history file changes or when
+`recent_probe.rs` finds a row stale: every 2 s a background thread checks each
+file on show, on any volume, on a thread of its own, so a hung external or
+network volume delays only its own files. Stale means `looks_deleted` (the
+rebuild hides it) or existence differing from the row's enabled state (an
+uploaded item deleted locally, a drive unplugged or back). A drive unplugged
+together with its mount point leaves its files listed, disabled.
 *Capture Window* and *Record Window* open the window picker (`picker.rs`): the main thread snapshots
 the on-screen window list, shows the shim's overlay and, on every pointer move,
 asks `window_at` — a pure function over the z-ordered list that skips Bugle's
