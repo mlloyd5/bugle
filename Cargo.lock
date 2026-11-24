@@ -4499,6 +4499,7 @@ dependencies = [
  "bugle-core",
  "clap",
  "image",
+ "libc",
  "serde_json",
  "toml",
 ]
