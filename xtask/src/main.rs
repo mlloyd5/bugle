@@ -10,6 +10,8 @@
 //!   `--dmg` also writes a compressed disk image.
 //! * `dmg` is `bundle --dmg`.
 //! * `verify` re-runs the checks on an existing bundle.
+//! * `--smoke-vm` (on `bundle` and `verify`) runs the bundle's smoke test in
+//!   a throwaway VM through `smoke_vm.rs`; `--smoke-test` runs it on this Mac.
 //! * `icon` writes the `.icns` and a 1024 px PNG preview.
 //! * `check` runs clippy (warnings are errors) and the workspace tests.
 //! * `smoke-vm` runs the bundle's `--smoke-test` in a throwaway Tart macOS
@@ -17,6 +19,7 @@
 //!   (see `smoke_vm.rs`).
 
 mod icns;
+mod interrupt;
 mod plist;
 mod smoke_vm;
 
@@ -60,6 +63,11 @@ enum Cmd {
         /// config (killed after 180 s, or BUGLE_SMOKE_TIMEOUT seconds).
         #[arg(long)]
         smoke_test: bool,
+        /// Also run the smoke test in a throwaway Tart VM (as `smoke-vm
+        /// --app`), so nothing shows on this Mac. Needs the golden image
+        /// (`smoke-vm --prepare`); BUGLE_SMOKE_VM_IMAGE names another.
+        #[arg(long, conflicts_with = "smoke_test")]
+        smoke_vm: bool,
     },
     /// Write Bugle.icns and a 1024 px PNG of the app icon.
     Icon {
@@ -118,22 +126,45 @@ struct BundleArgs {
     /// any of that is missing.
     #[arg(long)]
     notarize: bool,
-    /// Launch the bundled app with `--smoke-test` after verifying.
+    /// Launch the bundled app with `--smoke-test` after verifying, on this
+    /// Mac (it takes over the screen for about 30 s; see --smoke-vm).
     #[arg(long)]
     smoke_test: bool,
+    /// Run the finished bundle's smoke test in a throwaway Tart VM instead
+    /// of on this Mac (as `smoke-vm --app`). Needs the golden image
+    /// (`smoke-vm --prepare`); BUGLE_SMOKE_VM_IMAGE names another. Checked
+    /// before anything is built.
+    #[arg(long, conflicts_with = "smoke_test")]
+    smoke_vm: bool,
 }
 
-fn main() -> Result<()> {
-    match Cli::parse().cmd {
+/// Exits with 1 on an error, or with 128 + the signal when one interrupted
+/// a command that handles them (see `interrupt.rs`).
+fn main() -> std::process::ExitCode {
+    match run_cli(Cli::parse().cmd) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            std::process::ExitCode::from(interrupt::exit_code(&e).unwrap_or(1))
+        }
+    }
+}
+
+fn run_cli(cmd: Cmd) -> Result<()> {
+    match cmd {
         Cmd::Bundle(args) => bundle(&args),
         Cmd::Dmg(args) => bundle(&BundleArgs { dmg: true, ..args }),
-        Cmd::Verify { app, smoke_test } => {
+        Cmd::Verify { app, smoke_test, smoke_vm } => {
             let ws = Workspace::load()?;
             let app = app.unwrap_or_else(|| default_dist().join(format!("{APP_NAME}.app")));
             let smoke_limit = smoke_test.then(smoke_timeout_from_env).transpose()?;
+            let vm_smoke = smoke_vm.then(|| smoke_vm::VmSmoke::preflight(&smoke_vm::image_from_env(), &ws)).transpose()?;
             verify(&app, &ws, None)?;
             if let Some(limit) = smoke_limit {
                 smoke(&app, limit)?;
+            }
+            if let Some(vm) = vm_smoke {
+                vm.run(&ws, Some(&app))?;
             }
             Ok(())
         }
@@ -265,6 +296,9 @@ fn bundle(args: &BundleArgs) -> Result<()> {
     validate_bundle_id(&bundle_id)?;
     // Before anything is built, so a bad BUGLE_SMOKE_TIMEOUT fails early.
     let smoke_limit = args.smoke_test.then(smoke_timeout_from_env).transpose()?;
+    // Likewise a missing `tart` or golden image (this also turns Ctrl-C into
+    // an orderly stop for the rest of the run).
+    let vm_smoke = args.smoke_vm.then(|| smoke_vm::VmSmoke::preflight(&smoke_vm::image_from_env(), &ws)).transpose()?;
     let adhoc = args.sign == "-";
     // An explicit --notarize that cannot run is an error, not a silent skip.
     let notary = if args.notarize {
@@ -325,6 +359,7 @@ fn bundle(args: &BundleArgs) -> Result<()> {
         zip: args.zip || args.notarize,
         dmg: args.dmg,
         smoke_test: args.smoke_test,
+        smoke_vm: args.smoke_vm,
     });
     for step in steps {
         match step {
@@ -372,6 +407,7 @@ fn bundle(args: &BundleArgs) -> Result<()> {
             }
             Step::Zip => make_zip(&final_app, &zip)?,
             Step::Smoke => smoke(&final_app, smoke_limit.expect("planned only with --smoke-test"))?,
+            Step::SmokeVm => vm_smoke.as_ref().expect("planned only with --smoke-vm").run(&ws, Some(&final_app))?,
         }
     }
     std::fs::remove_dir_all(&staging)?;
@@ -403,6 +439,7 @@ struct ReleaseOptions {
     zip: bool,
     dmg: bool,
     smoke_test: bool,
+    smoke_vm: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,6 +455,7 @@ enum Step {
     RemoveStaleZip,
     Zip,
     Smoke,
+    SmokeVm,
 }
 
 /// The order of the release steps. Everything that can fail on the staged
@@ -444,6 +482,9 @@ fn release_steps(o: &ReleaseOptions) -> Vec<Step> {
     steps.push(if o.zip { Step::Zip } else { Step::RemoveStaleZip });
     if o.smoke_test {
         steps.push(Step::Smoke);
+    }
+    if o.smoke_vm {
+        steps.push(Step::SmokeVm);
     }
     steps
 }
@@ -577,7 +618,7 @@ fn build_release(target: Option<&str>) -> Result<HashMap<&'static str, PathBuf>>
     cmd.env("MACOSX_DEPLOYMENT_TARGET", MIN_MACOS);
     let shown: Vec<&str> = args.iter().map(String::as_str).filter(|a| !a.starts_with("--message-format")).collect();
     println!("$ cargo {}", shown.join(" "));
-    let out = cmd.stderr(Stdio::inherit()).output().context("running cargo build")?;
+    let out = interrupt::output(cmd.stderr(Stdio::inherit()), false, true).context("running cargo build")?;
     if !out.status.success() {
         bail!("cargo build failed ({})", out.status);
     }
@@ -1076,7 +1117,7 @@ fn run(cmd: &mut Command) -> Result<()> {
         })
         .collect();
     println!("$ {}", shown.join(" "));
-    let status = cmd.status().with_context(|| format!("running {}", shown[0]))?;
+    let status = interrupt::status(cmd).with_context(|| format!("running {}", shown[0]))?;
     if !status.success() {
         bail!("{} failed ({status})", shown[0]);
     }
@@ -1119,6 +1160,12 @@ mod tests {
         let Cmd::Dmg(a) = parse(&["dmg", "--universal"]) else { panic!() };
         assert!(a.universal);
         assert!(Cli::try_parse_from(["cargo xtask", "bundle", "--universal=yes"]).is_err());
+        let Cmd::Bundle(a) = parse(&["bundle", "--smoke-vm", "--zip"]) else { panic!() };
+        assert!(a.smoke_vm && !a.smoke_test && a.zip);
+        assert!(Cli::try_parse_from(["cargo xtask", "bundle", "--smoke-vm", "--smoke-test"]).is_err());
+        let Cmd::Verify { smoke_vm, smoke_test, .. } = parse(&["verify", "--smoke-vm"]) else { panic!() };
+        assert!(smoke_vm && !smoke_test);
+        assert!(Cli::try_parse_from(["cargo xtask", "verify", "--smoke-vm", "--smoke-test"]).is_err());
     }
 
     #[test]
@@ -1166,7 +1213,8 @@ mod tests {
 
     #[test]
     fn release_steps_touch_the_output_last() {
-        let opts = |notarize, signed, zip, dmg| ReleaseOptions { notarize, signed, zip, dmg, smoke_test: false };
+        let opts =
+            |notarize, signed, zip, dmg| ReleaseOptions { notarize, signed, zip, dmg, smoke_test: false, smoke_vm: false };
         use Step::*;
         assert_eq!(release_steps(&opts(false, false, false, false)), [ReplaceApp, RemoveStaleDmg, RemoveStaleZip]);
         assert_eq!(
@@ -1178,6 +1226,11 @@ mod tests {
             [NotarizeApp, MakeDmg, SignDmg, NotarizeDmg, VerifyDmg, ReplaceApp, ReplaceDmg, Zip]
         );
         assert_eq!(release_steps(&ReleaseOptions { smoke_test: true, ..opts(false, true, false, true) }).last(), Some(&Smoke));
+        // The VM smoke test also runs on the finished bundle, after the zip.
+        assert_eq!(
+            release_steps(&ReleaseOptions { smoke_vm: true, ..opts(false, false, true, false) }),
+            [ReplaceApp, RemoveStaleDmg, Zip, SmokeVm]
+        );
         // Nothing in the output directory changes before every check on the
         // staged bundle and image has passed, and the old image is never
         // deleted when a new one is being made.

@@ -561,17 +561,31 @@ the new image is renamed over the old one (never deleted first).
 Tart VM. `--prepare` `tart clone`s an already pulled Cirrus Labs image to the
 golden image `bugle-smoke-base`, boots it, and through `tart exec` (gRPC to
 the Tart guest agent, a LaunchAgent in the auto-logged-in `admin` session, so
-commands run in the GUI session with the window server) checks
-`csrutil status` and `INSERT OR REPLACE`s `kTCCServiceScreenCapture`,
+commands run in the GUI session with the window server) reads `csrutil
+status` and `sw_vers -productVersion` and decides on the host (`parse_sip`,
+`grant_plan`, unit-tested on captured output): SIP disabled, or a custom
+configuration with Filesystem Protections off, passes; enabled, custom with
+them on, or unrecognised output stops with the fix (`csrutil disable` from the
+guest's recovery). The old in-guest `grep -q disabled` would have passed a
+custom configuration with Filesystem Protections on and then failed in
+`sqlite3`. Guests outside macOS 14–27 stop too (the user-database location is
+only known for those; `BUGLE_SMOKE_VM_UNTESTED_GUEST=1` tries the 27 layout),
+and a Cirrus Labs image named for a macOS newer than the host is refused
+before cloning (Virtualization.framework cannot boot it; an early `tart run`
+exit quotes its log for other images). The script then
+`INSERT OR REPLACE`s `kTCCServiceScreenCapture`,
 `Microphone`, `Accessibility` and `PostEvent` rows for the bundle id
 (`client_type` 0) and the fixed guest executable path (`client_type` 1), with
 no code requirement so ad-hoc rebuilds still match, into the system and the
 user `TCC.db` (macOS 27: the user database is found through `tccd`'s open
-files), the same way the image build grants its guest agent. Writing TCC.db
+files), the same way the image build grants its guest agent; a `sqlite3`
+failure exits 6 and is reported with its error. Writing TCC.db
 needs SIP off, which those images already are in the guest (their build runs
 `csrutil disable` from guest recovery); the host is never asked to change SIP.
-A run checks
-for `tart` (and `tart exec`) and the golden image, assembles a bundle with
+A run (`VmSmoke`; `bundle --smoke-vm` and `verify --smoke-vm` make one before
+building or verifying and pass it the finished bundle as `--app` would) checks
+for `tart` (and `tart exec`), the time limits and the golden image, removes
+stale clones, assembles a bundle with
 `bundle` into its own `target/xtask/smoke-vm/<run>/dist`, writes
 `smoke_config` for the guest path `/Users/admin/bugle-smoke/run` and the guest
 script, clones the golden image, and `tart run --no-graphics --no-audio
@@ -584,8 +598,28 @@ microphone is not attached. Readiness is `tart exec <vm> test -e
 "/Volumes/My Shared Files/run/run.sh"` (agent up, user logged in, shares
 mounted). The script copies the bundle off the share, runs it, tees the log
 into the share and `ditto`s the run directory back; the host enforces the time
-limit and a `Vm` guard stops and deletes the clone on every exit path but a
-signal.
+limit and a `Vm` guard stops and deletes the clone on every exit path.
+
+Signals (`interrupt.rs`): commands that own a VM install SIGINT, SIGTERM and
+SIGHUP handlers that only record the signal, and start every child (`cargo
+build`, `tart clone/run/exec/stop/delete`, codesign…) in its own process group,
+so a terminal's Ctrl-C reaches xtask alone. Every wait polls: the build, the
+boot probes, the `tart exec` of the test and the sleeps between probes notice
+the signal, SIGTERM (then SIGKILL after 5 s) the child's whole group and
+return `Interrupted`; unwinding drops the `Vm` guard, which runs `tart stop`
+and `tart delete` without that check, so a second Ctrl-C cannot cut the
+teardown short. `tart clone` is also always waited for and the signal checked
+after it, so no half-made clone is left; the guard exists before the clone and
+deletes it only if `tart list` shows it. `main` exits with 128 + the signal.
+Without the handlers (plain `bundle`, `verify`), the helpers are the plain
+`std::process` calls. A SIGKILLed run leaves its clone (still running, with an
+orphaned `tart run`); `cleanup_stale`, run first by every run and by
+`--cleanup`, parses `bugle-smoke-run-<millis>-<pid>` names strictly (local VMs
+only) and removes a clone only when its owner is certainly gone: the pid does
+not exist, or `proc_pidinfo` says it started after `<millis>` (a reused pid)
+or is not named `xtask`; if the process cannot be inspected it is assumed
+alive. A running stale clone is stopped first, which ends its orphaned
+`tart run` and `tart exec`.
 
 After a capture the app shows the quick-access panel instead of the toast
 (`[quick_access]`, on by default). `quick_access.rs` is the platform-free part:

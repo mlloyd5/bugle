@@ -71,8 +71,10 @@ cargo xtask bundle                 # → dist/Bugle.app, ad-hoc signed
 cargo xtask bundle --zip           # also dist/Bugle-<version>.zip
 cargo xtask dmg                    # also dist/Bugle-<version>.dmg (= bundle --dmg)
 cargo xtask bundle --universal     # arm64 + x86_64 in one bundle
-cargo xtask verify --smoke-test    # re-check a bundle, then run its smoke test (~30 s)
-cargo xtask smoke-vm               # the smoke test in a throwaway macOS VM (see Testing in a VM)
+cargo xtask bundle --smoke-vm      # then smoke-test that bundle in a throwaway macOS VM (see Testing in a VM)
+cargo xtask verify --smoke-vm      # re-check a bundle, then smoke-test it in a VM
+cargo xtask verify --smoke-test    # the same smoke test on this Mac (takes over the screen ~30 s)
+cargo xtask smoke-vm               # build and smoke-test in a VM (see Testing in a VM)
 ```
 
 `bundle` builds the release binaries (taking their paths from cargo, so a custom
@@ -86,7 +88,11 @@ the app is not sandboxed), then checked with `plutil -lint` (Info.plist and the
 entitlements embedded in each signature), `codesign --verify --deep --strict`,
 `iconutil` and `--version`. Only a bundle that passes replaces `dist/Bugle.app`.
 
-`--smoke-test` (on `verify` and `bundle`) then runs `bugle-app --smoke-test`
+`--smoke-vm` (on `verify` and `bundle`) runs the smoke test of that exact
+bundle in a throwaway macOS VM, as `cargo xtask smoke-vm --app` does (see
+Testing in a VM); it is the recommended way, including for release builds, and
+a missing `tart` or golden image fails before anything is built.
+`--smoke-test` instead runs `bugle-app --smoke-test` on this Mac,
 from the bundle with a throwaway config in a temp directory: saves, history and
 `TMPDIR` go there, sync is off and no global hotkey is registered, so your own
 config, captures and sync destination are never read or touched; the directory
@@ -213,6 +219,8 @@ Then for each run:
 ```bash
 cargo xtask smoke-vm                     # build, run in a fresh clone, delete it
 cargo xtask smoke-vm --app dist/Bugle.app  # an existing bundle instead
+cargo xtask bundle --smoke-vm            # the release bundle, right after it is built
+cargo xtask smoke-vm --cleanup           # remove clones left by runs that were killed
 ```
 
 `--prepare` clones the pulled image (`--from`, default the Cirrus Labs
@@ -223,7 +231,17 @@ works because the Cirrus Labs `-base` and `-xcode` images have SIP disabled
 *inside the guest*; your Mac's SIP is never touched. With an image whose SIP is
 on, `--prepare` stops and says how to turn it off in that guest's recovery
 (`tart run --recovery <vm>`, then Options → Utilities → Terminal,
-`csrutil disable`). `--force` rebuilds an existing golden image, for instance
+`csrutil disable`). `--prepare` reads `csrutil status` and `sw_vers` from the
+booted guest and stops with the cause and the fix before writing anything when
+SIP is on, when it is a custom configuration that keeps Filesystem Protections
+on, when its output is not recognised, or when the guest's macOS is outside
+14–27, the versions whose TCC layout it knows (`BUGLE_SMOKE_VM_UNTESTED_GUEST=1`
+tries the macOS 27 layout on a newer guest). An image named for a macOS newer
+than this Mac's is refused before cloning, since Virtualization.framework
+cannot boot it. Only the macOS 26 (`tahoe`) image with SIP off has actually
+been prepared and run; the SIP-on, custom-SIP and other-version paths are
+covered by unit tests on `csrutil`/`sw_vers` output, not by real images.
+`--force` rebuilds an existing golden image, for instance
 after a month, when macOS may ask to re-confirm screen recording.
 
 A run builds the bundle into `target/xtask/smoke-vm/<run>/dist`, clones the
@@ -237,12 +255,26 @@ plus `BUGLE_SMOKE_KEEP`, `BUGLE_SMOKE_CLIPBOARD=1` and `BUGLE_SMOKE_SAVE`
 (nothing leaves the VM, so the clipboard and export steps run too). The output
 streams to your terminal and to `share/smoke.log`; the guest's run directory
 (captures, history, kept temp files) comes back as `share/artifacts`. The VM is
-stopped and deleted afterwards, also on failure (after Ctrl-C, `tart list` and
-`tart delete bugle-smoke-run-…`). The run fails if the app fails, if it takes
+stopped and deleted afterwards, also on failure and on Ctrl-C (SIGINT,
+SIGTERM or SIGHUP in any phase: the build, clone, boot or test is stopped, the
+clone deleted, the run's bundle copy removed with its logs kept, and the exit
+status is 128 + the signal). A run killed outright (SIGKILL, a crash) cannot
+clean up: every later run, and `--cleanup`, stops and deletes the
+`bugle-smoke-run-<millis>-<pid>` clones whose owning process is gone (the pid
+no longer exists, started after the run, or is not `xtask`); clones of runs
+still going and every other VM are left alone. These were tried for real:
+SIGINT during the build, boot and test and a second one during the teardown,
+SIGTERM during the boot, and SIGKILL during the boot and the test followed by
+`--cleanup` or a new run; each left no clone and no `tart`, `cargo` or `rustc`
+process behind. `bundle --smoke-vm` and `verify --smoke-vm` have run end to
+end with an ad-hoc host-architecture bundle; with `--universal`, `--dmg` or
+`--notarize` they have not. The run fails if the app fails, if it takes
 longer than `BUGLE_SMOKE_TIMEOUT` plus a minute for the copies, if the VM is not
 ready within `BUGLE_SMOKE_VM_BOOT_TIMEOUT` (300 s), or if the recording step
 was skipped for lack of Screen Recording access. Nothing is downloaded on its
-own: a missing `tart` or image is an error naming the command to run.
+own: a missing `tart` or image is an error naming the command to run. With the
+build cached, a run takes about 80–90 s on an M-series Mac: the VM is ready
+after 30–45 s and the smoke test takes about 50 s.
 
 ## Permissions
 
