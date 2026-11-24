@@ -557,6 +557,23 @@ the bundle's signature and architectures, and detaches. `release_steps`
 fixes the order: all of that happens before `dist/Bugle.app` is replaced, and
 the new image is renamed over the old one (never deleted first).
 
+`cargo xtask check` runs `cargo clippy --workspace --all-targets -- -D
+warnings` and `cargo test --workspace`. CI (`.github/workflows/ci.yml`) runs
+it on a GitHub-hosted `macos-26` arm64 runner for pull requests and pushes to
+`main`, with the toolchain pinned in the workflow (`RUST_TOOLCHAIN`; bumps
+are reviewed edits that fix the new clippy's lints), after `cargo fetch
+--locked`. GitHub's macOS image pre-grants the runner's shell Screen
+Recording, Accessibility and microphone access and runs a GUI session with
+one virtual display (1024x768 on the runs so far), so the whole suite runs
+there, real captures included. Because that is the image's doing and could
+change, a step first runs `bugle-platform`'s `ci_probe` example with
+`--require-screen`. The example prints the Screen Recording preflight,
+Accessibility trust, microphone status and display list without prompting,
+and takes one small capture only when access is already granted. With that
+flag it fails if access is missing, there is no display or the capture
+fails, because the capture test would otherwise skip its capture part (when
+`screen_access_preflight()` is false) and still pass.
+
 `cargo xtask smoke-vm` (`smoke_vm.rs`) runs the smoke test in a throwaway
 Tart VM. `--prepare` `tart clone`s an already pulled Cirrus Labs image to the
 golden image `bugle-smoke-base`, boots it, and through `tart exec` (gRPC to
