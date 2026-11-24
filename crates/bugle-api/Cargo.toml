@@ -3,6 +3,8 @@ name = "bugle-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "Agent-facing HTTP and MCP servers for Bugle"
 
 [dependencies]
