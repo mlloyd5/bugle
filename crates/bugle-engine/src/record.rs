@@ -508,17 +508,29 @@ impl Engine {
         }
     }
 
+    /// [`Engine::free_recorder`] that answers busy (as `record_start`).
+    #[cfg(test)]
+    fn idle_recorder(&self) -> Result<MutexGuard<'_, Option<Active>>> {
+        self.free_recorder(false)
+    }
+
     /// Lock the recorder state with no recording in it. A recording whose
     /// backend already stopped by itself is finalised first (as
     /// `record_stop` would); one that is still capturing is an error, and
     /// one that [`Engine::record_reap`] is still saving is a
-    /// [`BugleError::Busy`] (retrying once the save is done works).
-    fn idle_recorder(&self) -> Result<MutexGuard<'_, Option<Active>>> {
+    /// [`BugleError::Busy`] (retrying once the save is done works), or with
+    /// `wait_for_save` waited for.
+    fn free_recorder(&self, wait_for_save: bool) -> Result<MutexGuard<'_, Option<Active>>> {
         loop {
             let mut g = self.recorder_state.inner.lock().unwrap();
             let state = match g.as_mut() {
                 None if self.recorder_state.saving.load(Ordering::SeqCst) => {
-                    return Err(BugleError::Busy("the previous recording (stopped at its max_seconds) is still being saved; try again in a moment".into()).into());
+                    if !wait_for_save {
+                        return Err(BugleError::Busy("the previous recording (stopped at its max_seconds) is still being saved; try again in a moment".into()).into());
+                    }
+                    drop(g);
+                    self.wait_for_recording_save();
+                    continue;
                 }
                 None => return Ok(g),
                 Some(a) => a.poll(),
@@ -568,14 +580,46 @@ impl Engine {
         Some(copy)
     }
 
+    /// Whether [`Engine::record_reap`] is saving a recording right now (the
+    /// status reads idle meanwhile, and a [`Engine::record_start`] is busy).
+    pub fn recording_saving(&self) -> bool {
+        self.recorder_state.saving.load(Ordering::SeqCst)
+    }
+
+    /// Block until no [`Engine::record_reap`] is saving a recording. For a
+    /// front end about to ask the user for a selection to record, so the
+    /// selection is not wasted on a busy start.
+    pub fn wait_for_recording_save(&self) {
+        while self.recording_saving() {
+            // The reap holds the result lock for the whole save (taken just
+            // after `saving` is set; hence the loop).
+            drop(self.recorder_state.reaped.lock().unwrap_or_else(|e| e.into_inner()));
+            if self.recording_saving() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    /// Start a recording. While [`Engine::record_reap`] is saving a
+    /// previous one this fails at once with [`BugleError::Busy`].
     pub fn record_start(&self, req: &RecordRequest) -> Result<RecordingStatus> {
+        self.start_recording(req, false)
+    }
+
+    /// [`Engine::record_start`], but waiting for a reap's save instead of
+    /// failing busy: for a front end whose user already chose the target.
+    pub fn record_start_after_save(&self, req: &RecordRequest) -> Result<RecordingStatus> {
+        self.start_recording(req, true)
+    }
+
+    fn start_recording(&self, req: &RecordRequest, wait_for_save: bool) -> Result<RecordingStatus> {
         self.check_target_host(&req.target)?;
         if !bugle_platform::screen_access_preflight() {
             return Err(bugle_core::BugleError::PermissionDenied.into());
         }
         // Fail before asking the user for a selection; checked again below
         // since the lock is not held while the target is resolved.
-        drop(self.idle_recorder()?);
+        drop(self.free_recorder(wait_for_save)?);
         let (rect, window) = match &req.target {
             CaptureTarget::Screen { display } => {
                 let d = match display {
@@ -607,7 +651,7 @@ impl Engine {
             }
         };
         validate_record_rect(&rect)?;
-        let g = self.idle_recorder()?;
+        let g = self.free_recorder(wait_for_save)?;
         let mut vars = HashMap::new();
         vars.insert("kind", "recording".to_string());
         if let Some(w) = &window {
@@ -1476,11 +1520,27 @@ mod tests {
         assert!(matches!(e.downcast_ref::<BugleError>(), Some(BugleError::Busy(_))), "{e:#}");
         assert!(e.to_string().contains("still being saved"), "{e}");
         assert!(!reaper.is_finished());
+        assert!(engine.recording_saving());
+
+        // The front end's waiting forms (`wait_for_recording_save` before a
+        // picker, `record_start_after_save` after it) wait for the save.
+        let waiter = {
+            let engine = engine.clone();
+            std::thread::spawn(move || {
+                engine.wait_for_recording_save();
+                let free = engine.free_recorder(true).map(|g| g.is_none());
+                (engine.recording_saving(), free.unwrap())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!waiter.is_finished(), "waits while the save is blocked");
 
         // Saved: the start goes ahead, and the reaped record is still there
         // until it installs a recording.
         saved.store(true, Ordering::Relaxed);
+        assert_eq!(waiter.join().unwrap(), (false, true));
         assert!(reaper.join().unwrap().unwrap().is_ok());
+        assert!(!engine.recording_saving());
         assert!(engine.idle_recorder().unwrap().is_none());
         assert_eq!(engine.record_stop().unwrap().path, out);
     }
@@ -1490,10 +1550,11 @@ mod tests {
     #[test]
     fn record_start_checks_the_recorder_before_the_target() {
         let src = include_str!("record.rs");
-        let start = src.find("pub fn record_start(").unwrap();
-        let body = &src[start..];
-        let check = body.find("drop(self.idle_recorder()?);").expect("early idle_recorder check");
-        assert!(check < body.find("match &req.target").unwrap());
+        let start = src.find("fn start_recording(").unwrap();
+        let end = start + src[start..].find("\n    }\n").unwrap();
+        let body = &src[start..end];
+        let check = body.find("drop(self.free_recorder(wait_for_save)?);").expect("early recorder check");
+        assert!(check < body.find("match &req.target").expect("target resolved in start_recording"));
     }
 
     /// `record_start` must hand its recording to the UI host via `install`
@@ -1501,7 +1562,7 @@ mod tests {
     #[test]
     fn record_start_goes_through_install() {
         let src = include_str!("record.rs");
-        let start = src.find("pub fn record_start(").unwrap();
+        let start = src.find("fn start_recording(").unwrap();
         let end = start + src[start..].find("\n    }\n").unwrap();
         let body = &src[start..end];
         assert!(body.contains("self.install(g, Active {"), "record_start no longer calls install");

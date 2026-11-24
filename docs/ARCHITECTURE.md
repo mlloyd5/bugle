@@ -450,8 +450,13 @@ which announces it like a stop, and the next `record_stop` still returns
 its media record, or its finalisation error unchanged (typed, so the API
 maps it as for a failed stop), until another recording starts, for up to
 10 minutes. Quitting while a reap is still writing the file waits for it;
-a `record_start` meanwhile fails at once with `BugleError::Busy` (HTTP 409)
-rather than waiting or capturing alongside the save.
+an API `record_start` meanwhile fails at once with `BugleError::Busy`
+(HTTP 409) rather than waiting or capturing alongside the save. The menu's
+own Record items instead wait for the save before opening the picker
+(`Engine::wait_for_recording_save`) and start with
+`Engine::record_start_after_save`, so a selection is never discarded. (The
+busy answer covers the reap only: a start that finds an auto-stopped
+recording not yet reaped still finalises it itself first.)
 When the process runs from `Bugle.app`, an *Open at Login* check item
 (`login.rs`) registers the bundle with `SMAppService`. Its check mark is
 re-read on the periodic tick (every 5 s) and set only for an enabled item; a

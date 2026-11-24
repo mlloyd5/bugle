@@ -240,6 +240,11 @@ fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<N
         }
         Action::RecordVideo | Action::RecordGif | Action::RecordWindow => {
             let format = if action == Action::RecordGif { RecordingFormat::Gif } else { RecordingFormat::Mp4 };
+            // A recording that stopped at an API request's max_seconds may
+            // still be saving (the menu reads idle): let it finish before
+            // the user picks, and start with `record_start_after_save`, so
+            // a selection is never thrown away on a busy start.
+            engine.wait_for_recording_save();
             let target = if engine.config.screenshots.window_picker {
                 let start = if action == Action::RecordWindow { picker::Mode::Window } else { picker::Mode::Area };
                 let Some(picked) = picker::pick(proxy, start, true, picker::PICK_TIMEOUT)? else { return Ok(None) };
@@ -267,7 +272,7 @@ fn run_action(engine: &Engine, action: Action, proxy: &Proxy) -> Result<Option<N
                 output: None,
                 label: None,
             };
-            let status = match engine.record_start(&req) {
+            let status = match engine.record_start_after_save(&req) {
                 Ok(s) => s,
                 Err(e) if is_cancelled(&e) => return Ok(None),
                 Err(e) => return Err(e),
