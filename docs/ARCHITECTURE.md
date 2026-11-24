@@ -40,7 +40,11 @@ volume keeps its entries), no synced `url`, and older than a minute. Only
 `bugle history prune` (the `history_prune` action) tombstones them, also keeping
 entries under an empty directory (an offline mount point) and videos whose
 subtitle entry stays; it never touches a file, and it re-checks its candidates
-under the writer lock. `audio_mix` holds the sample
+under the writer lock. `History::delete` writes a tombstone plus a
+`DELETE <id> user <time>` marker (older readers skip it), so a sync that moved
+the file meanwhile (`History::record_synced`) leaves a deleted entry deleted,
+and removes the moved file when the delete asked for the file, while an entry
+pruned mid-move (a plain tombstone) is recorded again. `audio_mix` holds the sample
 math for the mixed recording track (per-source gain, ducking, peak limiter),
 so it is tested on synthetic buffers without AVFoundation. `events` defines a recording's
 pointer/click event track, the `<file>.events.json` sidecar named after the

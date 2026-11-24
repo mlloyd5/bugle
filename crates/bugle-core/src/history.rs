@@ -5,12 +5,32 @@
 //! the item recorded before them (a record for the same id appended after a
 //! tombstone adds it again, at the end).
 //!
+//! Line format (readers built before markers existed match a `DELETE ` line's
+//! whole trimmed remainder against the ids, so they skip a marker line):
+//!
+//! ```text
+//! {"id":"…",…}                         a record (the newest one for an id wins)
+//! DELETE <id>                          tombstone: written by `prune_missing`, and by
+//!                                      older builds for every delete
+//! DELETE <id> user <time>              marker: the user deleted <id> at <time> (RFC 3339)
+//! DELETE <id> user+file <time>         … and asked for its file to be removed too
+//! ```
+//!
+//! [`History::delete`] writes a tombstone followed by a marker in one write,
+//! so every reader drops the entry. The marker is what lets a sync that moved
+//! the file meanwhile tell a deliberate delete (which stays, see
+//! [`History::record_synced`]) from a prune that saw the file mid-move (which
+//! the sync undoes). A plain tombstone, including one written by an older
+//! build, counts as the latter, as it always did. Readers take the first
+//! word after `DELETE ` as the id and ignore words they do not know.
+//!
 //! Several processes (CLI, menu-bar app, API server) may append to the same
 //! file. Every writer takes an exclusive advisory lock on a sidecar
 //! `<file>.lock` and writes each record with a single `write_all`, so lines
 //! never interleave. When the file holds more dead lines (superseded records,
 //! tombstones and the items they removed) than live items, `open` compacts it
-//! under the same lock.
+//! under the same lock, keeping the markers of the last [`MARKER_KEEP`] (a
+//! sync still moving the file needs to see them).
 //!
 //! Entries whose file was deleted outside Bugle are hidden by
 //! [`History::recent`] (every listing) but stay in the file, so a file put
@@ -34,6 +54,45 @@ pub const MIN_PREFIX_LEN: usize = 4;
 /// Entries younger than this are never hidden or pruned: a save or a sync
 /// move may be between writing the file and recording its new path.
 pub const PRUNE_GRACE: chrono::Duration = chrono::Duration::seconds(60);
+
+/// How long compaction keeps a delete marker (see the module docs): far
+/// longer than any sync move takes.
+pub const MARKER_KEEP: chrono::Duration = chrono::Duration::days(1);
+
+const TOMBSTONE: &str = "DELETE ";
+const BY_USER: &str = "user";
+const BY_USER_WITH_FILE: &str = "user+file";
+
+/// What [`History::record_synced`] did with an item a sync touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncRecord {
+    /// The entry already held the item's path, URL and names.
+    Unchanged,
+    /// The entry now holds the item's new path / URL / names.
+    Updated,
+    /// The entry had gone (a prune saw the file mid-move) and is back.
+    Restored,
+    /// The user deleted the entry meanwhile; it stays deleted.
+    /// `remove_file`: they asked for its file to be removed as well.
+    Deleted { remove_file: bool },
+    /// There is no entry, and nothing says it should come back.
+    Absent,
+}
+
+/// A user's delete, from a marker line.
+#[derive(Debug, Clone)]
+struct UserDelete {
+    remove_file: bool,
+    at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl UserDelete {
+    fn line(&self, id: &str) -> String {
+        let by = if self.remove_file { BY_USER_WITH_FILE } else { BY_USER };
+        let at = self.at.unwrap_or_else(chrono::Utc::now).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        format!("{TOMBSTONE}{id} {by} {at}\n")
+    }
+}
 
 /// Whether `m` points at a local file that looks deleted: its path is
 /// absolute, the file is `NotFound` (not a permission or I/O error; a broken
@@ -67,8 +126,26 @@ pub struct History {
 struct Parsed {
     /// Live items, oldest first.
     items: Vec<MediaItem>,
-    /// Non-empty lines in the file (records, tombstones and unparseable lines).
+    /// Non-empty lines in the file (records, tombstones, markers and
+    /// unparseable lines).
     lines: usize,
+    /// Ids the user deleted (marker lines) and that were not recorded again.
+    deleted: HashMap<String, UserDelete>,
+}
+
+impl Parsed {
+    /// The markers compaction keeps: those younger than [`MARKER_KEEP`].
+    fn kept_markers(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<(&String, &UserDelete)> {
+        let mut kept: Vec<_> = self.deleted.iter().filter(|(_, d)| d.at.is_some_and(|at| now - at < MARKER_KEEP)).collect();
+        kept.sort_by(|a, b| a.1.at.cmp(&b.1.at).then(a.0.cmp(b.0)));
+        kept
+    }
+
+    /// Whether more lines are dead than live (kept markers count as live).
+    fn mostly_dead(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        let live = self.items.len() + self.kept_markers(now).len();
+        self.lines.saturating_sub(live) > self.items.len()
+    }
 }
 
 /// Exclusive cross-process lock on `<history>.lock`; released on drop.
@@ -153,11 +230,14 @@ impl History {
     fn read_unlocked(&self) -> Result<Parsed> {
         let f = match File::open(&self.path) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Parsed { items: vec![], lines: 0 }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Parsed { items: vec![], lines: 0, deleted: HashMap::new() })
+            }
             Err(e) => return Err(e.into()),
         };
         let mut slots: Vec<Option<MediaItem>> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
+        let mut deleted: HashMap<String, UserDelete> = HashMap::new();
         let mut lines = 0;
         for line in BufReader::new(f).lines() {
             let line = line?;
@@ -165,16 +245,26 @@ impl History {
                 continue;
             }
             lines += 1;
-            if let Some(id) = line.strip_prefix("DELETE ") {
-                if let Some(i) = index.remove(id.trim()) {
+            if let Some(rest) = line.strip_prefix(TOMBSTONE) {
+                let mut words = rest.split_whitespace();
+                let Some(id) = words.next() else { continue };
+                if let Some(i) = index.remove(id) {
                     slots[i] = None;
                 }
+                let remove_file = match words.next() {
+                    Some(BY_USER) => false,
+                    Some(BY_USER_WITH_FILE) => true,
+                    _ => continue,
+                };
+                let at = words.next().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|t| t.to_utc());
+                deleted.insert(id.to_string(), UserDelete { remove_file, at });
                 continue;
             }
             match serde_json::from_str::<MediaItem>(&line) {
                 Ok(m) => match index.get(&m.id) {
                     Some(&i) => slots[i] = Some(m),
                     None => {
+                        deleted.remove(&m.id);
                         index.insert(m.id.clone(), slots.len());
                         slots.push(Some(m));
                     }
@@ -182,11 +272,11 @@ impl History {
                 Err(e) => tracing::warn!("skipping bad history line: {e}"),
             }
         }
-        Ok(Parsed { items: slots.into_iter().flatten().collect(), lines })
+        Ok(Parsed { items: slots.into_iter().flatten().collect(), lines, deleted })
     }
 
-    /// Rewrite the file with only the live items when it has more dead lines
-    /// than live ones.
+    /// Rewrite the file with only the live items (and the delete markers of
+    /// the last [`MARKER_KEEP`]) when it has more dead lines than live ones.
     ///
     /// Safety against concurrent writers: every append in this module holds
     /// the exclusive lock on `<file>.lock` (a separate file, so it is never
@@ -200,8 +290,8 @@ impl History {
     fn compact_if_needed(&self) -> Result<bool> {
         let _g = self.lock.lock().unwrap();
         // Cheap check first, without touching the lock file.
-        let parsed = self.read_unlocked()?;
-        if parsed.lines - parsed.items.len() <= parsed.items.len() {
+        let now = chrono::Utc::now();
+        if !self.read_unlocked()?.mostly_dead(now) {
             return Ok(false);
         }
         let f = self.lock_file()?;
@@ -213,7 +303,7 @@ impl History {
         let _fl = FileLock(f);
         // Re-read under the lock: another process may have appended.
         let parsed = self.read_unlocked()?;
-        if parsed.lines - parsed.items.len() <= parsed.items.len() {
+        if !parsed.mostly_dead(now) {
             return Ok(false);
         }
         let dir = self.path.parent().unwrap_or(Path::new("."));
@@ -227,6 +317,9 @@ impl History {
             for m in &parsed.items {
                 serde_json::to_writer(&mut buf, m)?;
                 buf.push(b'\n');
+            }
+            for (id, d) in parsed.kept_markers(now) {
+                buf.extend_from_slice(d.line(id).as_bytes());
             }
             let mut out = File::create(&tmp)?;
             out.write_all(&buf)?;
@@ -307,7 +400,7 @@ impl History {
         if candidates.is_empty() {
             return Ok(candidates);
         }
-        let buf: String = candidates.iter().map(|m| format!("DELETE {}\n", m.id)).collect();
+        let buf: String = candidates.iter().map(|m| format!("{TOMBSTONE}{}\n", m.id)).collect();
         let mut f = OpenOptions::new().append(true).open(&self.path)?;
         f.write_all(buf.as_bytes())?;
         Ok(candidates)
@@ -346,14 +439,21 @@ impl History {
         Ok(self.all()?.into_iter().last())
     }
 
-    /// Remove from history and optionally delete the file on disk. The id is
-    /// resolved like [`History::get`].
+    /// Remove from history and optionally delete the file on disk (and its
+    /// cursor event track). The id is resolved like [`History::get`].
+    ///
+    /// Writes a tombstone and a marker (see the module docs), so a sync
+    /// moving the file meanwhile leaves the entry deleted. The entry is read
+    /// again under the writer lock and the file removed is the one it names
+    /// then: a sync that recorded a new path first has its moved file
+    /// removed here, one that records later sees the marker and removes the
+    /// moved file itself ([`SyncRecord::Deleted`]).
     pub fn delete(&self, id: &str, remove_file: bool) -> Result<bool> {
         let item = match self.get(id)? {
             Some(m) => m,
             None => return Ok(false),
         };
-        self.append(format!("DELETE {}\n", item.id).as_bytes())?;
+        let item = self.tombstone_by_user(item, remove_file)?;
         if remove_file && item.path.exists() {
             std::fs::remove_file(&item.path).with_context(|| format!("removing {}", item.path.display()))?;
             // The cursor event track belongs to the file.
@@ -362,6 +462,53 @@ impl History {
             }
         }
         Ok(true)
+    }
+
+    /// The locked half of [`History::delete`]: append the tombstone and
+    /// marker for `found`'s id and return its current record (`found` when
+    /// it went meanwhile).
+    fn tombstone_by_user(&self, found: MediaItem, remove_file: bool) -> Result<MediaItem> {
+        let _g = self.lock.lock().unwrap();
+        let _fl = self.lock_exclusive()?;
+        let item = self.read_unlocked()?.items.into_iter().find(|m| m.id == found.id).unwrap_or(found);
+        let marker = UserDelete { remove_file, at: Some(chrono::Utc::now()) };
+        let buf = format!("{TOMBSTONE}{}\n{}", item.id, marker.line(&item.id));
+        let mut f = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        f.write_all(buf.as_bytes())?;
+        Ok(item)
+    }
+
+    /// Record what a sync did to `item` (new path, URL, synced name, event
+    /// track), checked and written under the writer lock. `moved`: the sync
+    /// moved the file away from the path the entry had.
+    ///
+    /// When the entry has gone meanwhile it is recorded again only if the
+    /// file moved and the user did not delete it: a prune (in this or
+    /// another process) can have seen the old path empty mid-move, and the
+    /// moved file would otherwise have no entry; a copy or upload leaves the
+    /// old path in place, so nothing but a delete removes the entry then. A
+    /// user's delete always stays ([`SyncRecord::Deleted`]); the caller
+    /// removes the moved file when the delete asked for that.
+    pub fn record_synced(&self, item: &MediaItem, moved: bool) -> Result<SyncRecord> {
+        let _g = self.lock.lock().unwrap();
+        let _fl = self.lock_exclusive()?;
+        let parsed = self.read_unlocked()?;
+        let outcome = match parsed.items.iter().find(|m| m.id == item.id) {
+            Some(s) if s.path == item.path && s.url == item.url && s.synced_as == item.synced_as && s.events == item.events => {
+                return Ok(SyncRecord::Unchanged)
+            }
+            Some(_) => SyncRecord::Updated,
+            None => match parsed.deleted.get(&item.id) {
+                Some(d) => return Ok(SyncRecord::Deleted { remove_file: d.remove_file }),
+                None if moved => SyncRecord::Restored,
+                None => return Ok(SyncRecord::Absent),
+            },
+        };
+        let mut buf = serde_json::to_vec(item)?;
+        buf.push(b'\n');
+        let mut f = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        f.write_all(&buf)?;
+        Ok(outcome)
     }
 }
 
@@ -468,8 +615,9 @@ mod tests {
         h.delete("aaaa00000001", false).unwrap();
         let text = std::fs::read_to_string(h.path()).unwrap();
         assert!(text.ends_with('\n'));
-        assert_eq!(text.lines().count(), 2);
+        assert_eq!(text.lines().count(), 3);
         assert_eq!(text.lines().nth(1), Some("DELETE aaaa00000001"));
+        assert!(text.lines().nth(2).unwrap().starts_with("DELETE aaaa00000001 user 20"), "{text}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -545,13 +693,15 @@ mod tests {
         h.push(&gone).unwrap();
         h.delete(&gone.id, false).unwrap();
         h.push(&item("last00000001")).unwrap();
-        // 9 lines, 2 live.
-        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 9);
+        // 10 lines (the delete is a tombstone and a marker), 2 live.
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 10);
         let before = h.all().unwrap();
 
         let h = History::open(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(text.lines().count(), 2, "{text}");
+        // The live items and the recent delete marker.
+        assert_eq!(text.lines().count(), 3, "{text}");
+        assert!(text.lines().nth(2).unwrap().starts_with("DELETE gone00000001 user "), "{text}");
         let after = h.all().unwrap();
         assert_eq!(after.iter().map(|m| &m.id).collect::<Vec<_>>(), before.iter().map(|m| &m.id).collect::<Vec<_>>());
         assert_eq!(after[0].label.as_deref(), Some("v4"));
@@ -757,6 +907,119 @@ mod tests {
         assert_eq!(total, 1);
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.matches("DELETE gone00000001").count(), 1, "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// How a reader built before markers existed parses a file: a `DELETE `
+    /// line's trimmed remainder must equal an id.
+    fn old_reader_ids(path: &Path) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for line in std::fs::read_to_string(path).unwrap().lines().filter(|l| !l.trim().is_empty()) {
+            if let Some(id) = line.strip_prefix("DELETE ") {
+                ids.retain(|i| i != id.trim());
+            } else if let Ok(m) = serde_json::from_str::<MediaItem>(line) {
+                if !ids.contains(&m.id) {
+                    ids.push(m.id);
+                }
+            } else {
+                panic!("an older reader would skip (and warn about) {line:?}");
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn delete_markers_are_compatible_both_ways() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        // A file written by an older build: plain tombstones only, odd spacing.
+        let mut old = String::new();
+        for id in ["aaaa00000001", "bbbb00000001", "cccc00000001"] {
+            old.push_str(&serde_json::to_string(&item(id)).unwrap());
+            old.push('\n');
+        }
+        old.push_str("DELETE bbbb00000001\nDELETE  cccc00000001 \n");
+        std::fs::write(&path, &old).unwrap();
+        let h = History { path: path.clone(), lock: Mutex::new(()) };
+        assert_eq!(ids(&h.all().unwrap()), ["aaaa00000001"]);
+        // An older tombstone is not a user's delete: a moved file comes back.
+        let mut moved = item("bbbb00000001");
+        moved.path = "/nonexistent/synced/bbbb.png".into();
+        assert_eq!(h.record_synced(&moved, true).unwrap(), SyncRecord::Restored);
+        assert_eq!(h.record_synced(&item("cccc00000001"), false).unwrap(), SyncRecord::Absent);
+
+        // A delete written now drops the entry for older readers too, silently.
+        h.push(&item("dddd00000001")).unwrap();
+        h.delete("dddd00000001", true).unwrap();
+        h.delete("aaaa00000001", false).unwrap();
+        assert_eq!(old_reader_ids(&path), ["bbbb00000001"]);
+        assert_eq!(ids(&h.all().unwrap()), ["bbbb00000001"]);
+        assert_eq!(h.record_synced(&item("dddd00000001"), true).unwrap(), SyncRecord::Deleted { remove_file: true });
+        assert_eq!(h.record_synced(&item("aaaa00000001"), true).unwrap(), SyncRecord::Deleted { remove_file: false });
+        assert!(h.get("dddd00000001").unwrap().is_none(), "record_synced never brings a user's delete back");
+
+        // Recording the item again (a deliberate push) clears the marker.
+        h.push(&item("aaaa00000001")).unwrap();
+        h.delete("aaaa00000001", false).unwrap();
+        h.push(&item("aaaa00000001")).unwrap();
+        let mut renamed = item("aaaa00000001");
+        renamed.path = "/nonexistent/renamed.png".into();
+        assert_eq!(h.record_synced(&renamed, true).unwrap(), SyncRecord::Updated);
+        assert_eq!(h.record_synced(&renamed, true).unwrap(), SyncRecord::Unchanged);
+        // Unknown words after the id: still a tombstone, nothing more.
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"DELETE aaaa00000001 later-flag\n").unwrap();
+        assert!(h.get("aaaa00000001").unwrap().is_none());
+        assert_eq!(h.record_synced(&renamed, true).unwrap(), SyncRecord::Restored);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compaction_drops_old_markers() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        let long_ago = (chrono::Utc::now() - MARKER_KEEP - chrono::Duration::minutes(1)).to_rfc3339();
+        let mut text = String::new();
+        for id in ["keep00000001", "old000000001", "new000000001", "bare00000001"] {
+            text.push_str(&serde_json::to_string(&item(id)).unwrap());
+            text.push('\n');
+        }
+        text.push_str(&format!("DELETE old000000001\nDELETE old000000001 user+file {long_ago}\n"));
+        // A marker without a time is dropped by the next compaction.
+        text.push_str("DELETE bare00000001\nDELETE bare00000001 user\n");
+        std::fs::write(&path, text).unwrap();
+        let h = History { path: path.clone(), lock: Mutex::new(()) };
+        h.delete("new000000001", true).unwrap();
+        History::open(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines[0].contains("keep00000001"), "{text}");
+        assert!(lines[1].starts_with("DELETE new000000001 user+file "), "{text}");
+        assert_eq!(h.record_synced(&item("new000000001"), true).unwrap(), SyncRecord::Deleted { remove_file: true });
+        // Small and recent: opening again leaves it alone.
+        History::open(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn delete_removes_the_file_the_entry_names_under_the_lock() {
+        // The id was resolved, then a sync recorded the moved path before
+        // the delete took the lock: the moved file goes, not the old path.
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join("synced")).unwrap();
+        let h = History::open(dir.join("history.jsonl")).unwrap();
+        let before = item_at("move00000001", &dir.join("shot.png"));
+        h.push(&before).unwrap();
+        let mut after = before.clone();
+        after.path = dir.join("synced/shot.png");
+        std::fs::write(&after.path, b"x").unwrap();
+        History::open(h.path()).unwrap().update(&after).unwrap();
+        let current = h.tombstone_by_user(before, true).unwrap();
+        assert_eq!(current.path, after.path);
+        assert!(h.all().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

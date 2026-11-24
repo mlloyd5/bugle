@@ -14,6 +14,7 @@
 use crate::Engine;
 use anyhow::{anyhow, bail, Context, Result};
 use bugle_core::config::{S3Config, SyncDestination, SyncMode};
+use bugle_core::history::SyncRecord;
 use bugle_core::{BugleError, Config, MediaItem, MediaKind};
 use ring::{digest, hmac};
 use std::io::{Read, Seek, SeekFrom};
@@ -81,31 +82,30 @@ impl Engine {
     /// `recorded_path` is the path its history entry had before the sync
     /// (`None` when it was not in history).
     ///
-    /// If the entry has gone meanwhile and the sync moved the file, it is
-    /// recorded again: a `bugle history prune` in another process can have
-    /// seen the old path missing mid-move, and the synced file would
-    /// otherwise have no entry. A copy or upload leaves the old path in
-    /// place, so prune cannot have removed the entry and a vanished entry
-    /// was deleted on purpose; it stays deleted. The trade-off: a `bugle
-    /// delete` that lands during a move is undone (the two cannot be told
-    /// apart, both write the same tombstone), which keeps the moved file
-    /// findable rather than orphaned in the sync folder.
+    /// If the entry has gone meanwhile (see [`History::record_synced`]): a
+    /// prune that saw the old path missing mid-move is undone, so the moved
+    /// file keeps its entry; a user's delete (`bugle delete`, `DELETE
+    /// /v1/media/{id}`) stays, and when it asked for the file to go, the
+    /// moved file and event track it could not see are removed here.
+    ///
+    /// [`History::record_synced`]: bugle_core::History::record_synced
     fn record_sync(&self, item: &MediaItem, recorded_path: Option<&Path>) {
-        let stored = match self.history.get(&item.id) {
-            Ok(Some(s)) => s,
-            Ok(None) if recorded_path.is_some_and(|p| p != item.path) => {
-                tracing::warn!("history entry {} vanished during its sync; recording it again", item.id);
-                if let Err(e) = self.history.push(item) {
-                    tracing::warn!("could not record the sync of {}: {e:#}", item.path.display());
+        let Some(recorded_path) = recorded_path else { return };
+        let moved = recorded_path != item.path;
+        match self.history.record_synced(item, moved) {
+            Ok(SyncRecord::Restored) => tracing::warn!("history entry {} vanished during its sync; recorded it again", item.id),
+            Ok(SyncRecord::Deleted { remove_file }) => {
+                tracing::info!("history entry {} was deleted during its sync; it stays deleted", item.id);
+                if remove_file && moved {
+                    for p in std::iter::once(&item.path).chain(item.events.as_ref()).filter(|p| p.is_file()) {
+                        if let Err(e) = std::fs::remove_file(p) {
+                            tracing::warn!("could not remove {} after its entry was deleted: {e}", p.display());
+                        }
+                    }
                 }
-                return;
             }
-            _ => return,
-        };
-        if stored.path != item.path || stored.url != item.url || stored.synced_as != item.synced_as || stored.events != item.events {
-            if let Err(e) = self.history.update(item) {
-                tracing::warn!("could not record the sync of {}: {e:#}", item.path.display());
-            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("could not record the sync of {}: {e:#}", item.path.display()),
         }
     }
 
@@ -1170,7 +1170,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bugle_core::MediaKind;
+    use bugle_core::{History, MediaKind};
 
     const ACCESS: &str = "AKIAIOSFODNN7EXAMPLE";
     const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
@@ -1300,6 +1300,57 @@ mod tests {
         copied.synced_as = Some("shot.png".into());
         engine.record_sync(&copied, Some(&copied.path.clone()));
         assert!(engine.history.get(&copied.id).unwrap().is_none());
+    }
+
+    /// A `bugle delete` (or `DELETE /v1/media/{id}`) that lands while a sync
+    /// is moving the file wins: the entry stays deleted, and the moved file
+    /// stays or goes as the delete asked.
+    #[test]
+    fn a_delete_during_the_move_stays_deleted() {
+        for remove_file in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let engine = engine_in(tmp.path(), SyncMode::Move);
+            let src = engine.config.save_dir().join("clip.mp4");
+            std::fs::write(&src, b"not really a video").unwrap();
+            let events = engine.config.save_dir().join("clip.mp4.events.json");
+            std::fs::write(&events, b"{}").unwrap();
+            let mut item = MediaItem::new(MediaKind::Video, &src);
+            item.events = Some(events.clone());
+            engine.history.push(&item).unwrap();
+
+            let mut moving = item.clone();
+            engine.sync_item(&mut moving).unwrap().unwrap();
+            assert!(!src.exists() && moving.path.is_file());
+            let moved_events = moving.events.clone().unwrap();
+            assert_ne!(moved_events, events);
+            // The window between the move and record_sync, from another process.
+            let other = History::open(engine.history.path()).unwrap();
+            assert!(other.delete(&item.id, remove_file).unwrap());
+            engine.record_sync(&moving, Some(&src));
+
+            assert!(engine.history.get(&item.id).unwrap().is_none(), "remove_file={remove_file}");
+            assert!(History::open(engine.history.path()).unwrap().all().unwrap().is_empty());
+            assert_eq!(moving.path.is_file(), !remove_file, "the moved file follows the delete");
+            assert_eq!(moved_events.is_file(), !remove_file, "so does its event track");
+        }
+    }
+
+    /// The delete reads the entry after the sync recorded the new path: it
+    /// removes the moved file, not the old path.
+    #[test]
+    fn a_delete_after_the_record_removes_the_moved_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_in(tmp.path(), SyncMode::Move);
+        let src = engine.config.save_dir().join("shot.png");
+        std::fs::write(&src, b"not really a png").unwrap();
+        let item = MediaItem::new(MediaKind::Screenshot, &src);
+        engine.history.push(&item).unwrap();
+        let mut moving = item.clone();
+        engine.sync_item(&mut moving).unwrap().unwrap();
+        engine.record_sync(&moving, Some(&src));
+        assert!(History::open(engine.history.path()).unwrap().delete(&item.id[..6], true).unwrap());
+        assert!(!moving.path.exists());
+        assert!(engine.history.get(&item.id).unwrap().is_none());
     }
 
     #[test]
