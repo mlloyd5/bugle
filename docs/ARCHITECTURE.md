@@ -441,9 +441,27 @@ away: the engine calls `UiHost::recording_changed` on every start and stop
 finalised), which `bugle-app` turns into a `RecordingChanged` event on its
 loop. The step requires that event to be handled and the status item to
 switch by 500 ms after the call that starts the recording returns, and
-likewise for the stop (both usually happen during the call). (`bugle mcp` and `bugle serve` are separate processes with
-their own engine and no UI host, so the app does not see their
-recordings.) A recording that stops by itself at an Agent API request's
+likewise for the stop (both usually happen during the call). `bugle mcp`, `bugle serve` and
+`bugle record` are separate processes with their own engine and no UI host; their recordings reach
+the app through recording-state files (`bugle_engine::record::marker`). On the same
+`recording_changed` path, every engine writes `<pid>.json` (pid, the process's start time from
+`proc_pidinfo`, recording start, format, output, `max_seconds`) into `live-recordings/` next to
+the history file while a recording is in its slot, by writing a temp file and renaming it, and
+removes it once the slot is free. Each process only writes and removes its own file, so two
+recording processes never overwrite each other. On each housekeeping tick (about once a second,
+already running for the timer) the app lists that folder (`marker::scan`): it skips its own pid,
+shows the oldest recording whose owner is still running (pid alive *and* the same process start
+time, so a reused pid does not count), and removes files whose process is gone (crashed or
+killed), so no stale indicator survives a second. A file that does not parse is skipped, and
+removed only once its pid is gone. `recording_view::view` maps the app's own status and those
+files to the status item and menu: its own recording wins; another process's shows `● m:ss`
+(clamped to its `max_seconds`) with the Stop entry disabled and labelled *Recording in another
+Bugle process (pid N)*, since the app cannot stop it safely (a signal would quit `bugle serve` or
+`bugle mcp`); the Stop hotkey then says so in a toast. A polling tick was chosen over a
+distributed notification or a file watch: the app already wakes once a second, one directory
+listing is negligible, and nothing new runs in the shim or listens. The smoke test's
+"other process recording" step writes such a file for a stand-in `sleep` process, checks the
+menu shows it within 3 s, kills the process and checks the menu clears and the file goes. A recording that stops by itself at an Agent API request's
 `max_seconds` is noticed on the housekeeping tick (about once a second):
 the app finalises it on a short-lived thread with `Engine::record_reap`,
 which announces it like a stop, and the next `record_stop` still returns

@@ -18,6 +18,7 @@ mod notifications;
 mod picker;
 mod quick_access;
 mod quick_panel;
+mod recording_view;
 mod smoke_input;
 mod video_editor;
 mod video_editor_window;
@@ -545,8 +546,13 @@ struct App {
     metering: bool,
     last_meter: Instant,
     /// What the status item and recording entries show now, so a redraw
-    /// changes only what moved: (title, recording).
-    recording_shown: Option<(Option<String>, bool)>,
+    /// changes only what moved.
+    recording_shown: Option<recording_view::RecordingView>,
+    /// Where Bugle processes sharing this config say they are recording,
+    /// and the recordings of other processes found there on the last
+    /// housekeeping tick ([`App::scan_other_recordings`]).
+    marker_dir: PathBuf,
+    other_recordings: Vec<bugle_engine::record::marker::LiveRecording>,
     /// A thread is finalising a recording that stopped by itself
     /// ([`App::reap_auto_stopped`]).
     reaping: Arc<std::sync::atomic::AtomicBool>,
@@ -579,6 +585,14 @@ impl App {
             action = Action::StopRecording;
         }
         if action == Action::StopRecording && !recording {
+            // The Stop hotkey while another process records: say why it
+            // does nothing rather than ignore it.
+            if let Some(r) = self.other_recordings.first() {
+                self.toast_error(&format!(
+                    "{}: stop it where it was started (bugle record, or record_stop through bugle serve / bugle mcp)",
+                    recording_view::other_process_label(r.pid)
+                ));
+            }
             return;
         }
         if self.busy || bugle_platform::select_rect_active() || bugle_platform::window_pick_active() {
@@ -712,23 +726,22 @@ impl App {
 
     fn update_recording_ui(&mut self) {
         let st = self.engine.record_status();
-        let recording = st.state != RecordingState::Idle;
-        let title = recording.then(|| {
-            let secs = st.elapsed_seconds as u64;
-            let meter = st.audio_levels.as_ref().and_then(bugle_core::audio_level::meter_title);
-            let meter = meter.map(|m| format!(" {m}")).unwrap_or_default();
-            format!("● {}:{:02}{meter}", secs / 60, secs % 60)
-        });
-        let shown = (title, recording);
+        let shown = recording_view::view(&st, &self.other_recordings, chrono::Utc::now());
         if self.recording_shown.as_ref() != Some(&shown) {
-            if self.recording_shown.as_ref().map(|s| s.1) != Some(recording) {
-                level_meter::note_shown(recording);
-                self.items.stop.set_enabled(recording);
-                self.items.record.set_enabled(!recording);
-                self.items.record_gif.set_enabled(!recording);
-                self.items.record_window.set_enabled(!recording);
+            let before = self.recording_shown.as_ref();
+            if before.map(|s| s.own) != Some(shown.own) {
+                level_meter::note_shown(shown.own);
+                self.items.record.set_enabled(!shown.own);
+                self.items.record_gif.set_enabled(!shown.own);
+                self.items.record_window.set_enabled(!shown.own);
             }
-            self.tray.set_title(shown.0.as_deref());
+            if before.map(|s| (s.own, s.other)) != Some((shown.own, shown.other)) {
+                let (label, enabled) = shown.stop_item();
+                self.items.stop.set_text(label);
+                self.items.stop.set_enabled(enabled);
+                OTHER_SHOWN.store(shown.other.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
+            }
+            self.tray.set_title(shown.title.as_deref());
             self.recording_shown = Some(shown);
         }
         if let Err(e) = self.items.meter.update(&self.items.menu, st.audio_levels.as_ref()) {
@@ -743,7 +756,7 @@ impl App {
     /// remains a fallback.
     fn on_recording_changed(&mut self) {
         self.update_recording_ui();
-        level_meter::note_event(self.recording_shown.as_ref().is_some_and(|s| s.1));
+        level_meter::note_event(self.recording_shown.as_ref().is_some_and(|s| s.own));
         // A stop the app did not ask for: its panels come back and the
         // recording joins the recent list (a no-op while busy or recording).
         self.quick_after_action();
@@ -773,6 +786,15 @@ impl App {
             tracing::warn!("could not start the thread finalising a recording: {e}");
             self.reaping.store(false, Ordering::SeqCst);
         }
+    }
+
+    /// Read which recordings other Bugle processes sharing this config are
+    /// making (`bugle record`, `bugle serve`, `bugle mcp`: each runs its own
+    /// engine, which writes a state file while it records). One directory
+    /// listing per housekeeping tick; files of processes that are gone are
+    /// removed as they are found.
+    fn scan_other_recordings(&mut self) {
+        self.other_recordings = bugle_engine::record::marker::scan(&self.marker_dir, std::process::id());
     }
 
     /// How long the event loop may sleep before the next [`App::tick`].
@@ -882,6 +904,9 @@ impl App {
     fn tick(&mut self) {
         self.quick_tick();
         let housekeeping = self.last_tick.elapsed() >= Duration::from_millis(900);
+        if housekeeping {
+            self.scan_other_recordings();
+        }
         if housekeeping || (self.metering && self.last_meter.elapsed() >= level_meter::INTERVAL) {
             self.update_recording_ui();
         }
@@ -1017,12 +1042,15 @@ fn main() -> Result<()> {
         metering: false,
         last_meter: Instant::now(),
         recording_shown: None,
+        marker_dir: bugle_engine::record::marker::marker_dir(&engine.config),
+        other_recordings: Vec::new(),
         reaping: Default::default(),
         quick: quick_access::QuickAccess::new(engine.config.quick_access.clone()),
         editor_generation: 0,
         video_editor_generation: 0,
     };
     app.refresh_recent();
+    app.scan_other_recordings();
     app.update_recording_ui();
     if cli.serve {
         app.toggle_api();
@@ -1134,6 +1162,7 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
         if !smoke_input::smoke(&proxy) {
             smoke_fail("input", "one or more checks failed, see the lines above");
         }
+        smoke_other_recording(&engine);
         // Last: it records.
         if let Err(e) = meter_smoke::smoke(&engine, &proxy) {
             smoke_fail("level meter", e);
@@ -1143,6 +1172,10 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
     });
     t0
 }
+
+/// The pid of the other process whose recording the menu shows (0: none);
+/// written on the main thread, read by the `--smoke-test` step.
+static OTHER_SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Set by [`smoke_fail`]; the run then exits 1.
 static SMOKE_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1200,6 +1233,60 @@ fn smoke_pin(engine: &Engine, proxy: &Proxy) {
     };
     if let Err(e) = run() {
         smoke_fail("pin", format!("{e:#}"));
+    }
+}
+
+/// `--smoke-test` step: a recording another Bugle process makes shows in
+/// the menu bar. A stand-in process (`sleep`) gets a recording-state file as
+/// an engine recording in it would write; the menu must show it (the Stop
+/// entry naming that process) within 3 s, then, once the process is killed
+/// without removing its file, stop showing it within 3 s, with the stale
+/// file removed.
+fn smoke_other_recording(engine: &Engine) {
+    use bugle_engine::record::marker;
+    let wait_for = |want: u32| -> Option<Duration> {
+        let t = Instant::now();
+        loop {
+            if OTHER_SHOWN.load(std::sync::atomic::Ordering::SeqCst) == want {
+                return Some(t.elapsed());
+            }
+            if t.elapsed() > Duration::from_secs(3) {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let run = || -> Result<()> {
+        let dir = marker::marker_dir(&engine.config);
+        let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn()?;
+        let pid = child.id();
+        let rec = marker::LiveRecording {
+            pid,
+            process_started_us: marker::process_started_us(pid).unwrap_or(0),
+            started_at: chrono::Utc::now() - chrono::Duration::seconds(61),
+            format: RecordingFormat::Mp4,
+            output: std::env::temp_dir().join("bugle-smoke-other-process.mp4"),
+            max_seconds: None,
+        };
+        let published = marker::publish(&dir, &rec);
+        let shown = published.is_ok().then(|| wait_for(pid)).flatten();
+        let _ = child.kill();
+        let _ = child.wait();
+        let cleared = wait_for(0);
+        let left = dir.join(format!("{pid}.json")).exists();
+        let _ = marker::clear(&dir, pid);
+        published?;
+        eprintln!(
+            "smoke test: another process's recording shown after {:?} (want some), cleared after its process died after {:?} (want some), stale file left: {left} (want false)",
+            shown, cleared
+        );
+        if shown.is_none() || cleared.is_none() || left {
+            anyhow::bail!("the menu did not follow the other process's recording");
+        }
+        Ok(())
+    };
+    if let Err(e) = run() {
+        smoke_fail("other process recording", format!("{e:#}"));
     }
 }
 
