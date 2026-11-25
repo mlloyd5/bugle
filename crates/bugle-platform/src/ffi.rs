@@ -197,7 +197,10 @@ extern "C" {
         out: *mut f64,
     ) -> i32;
     pub fn bugle_fixture_sck_recorder() -> *mut c_void;
-    pub fn bugle_fixture_sck_stream_failed(handle: *mut c_void, message: *const c_char);
+    pub fn bugle_fixture_sck_stream_failed(handle: *mut c_void, message: *const c_char, user_stopped: i32);
+    pub fn bugle_fixture_sck_writer_failed(handle: *mut c_void) -> *mut c_char;
+    pub fn bugle_fixture_sck_stop_capture(handle: *mut c_void);
+    pub fn bugle_fixture_sck_stopped_at(handle: *mut c_void) -> f64;
     pub fn bugle_media_duration(path: *const c_char) -> f64;
     pub fn bugle_video_frame(path: *const c_char, seconds: f64) -> bugle_image_t;
     pub fn bugle_video_info(path: *const c_char, out: *mut bugle_video_info_t) -> i32;

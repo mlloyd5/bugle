@@ -176,8 +176,16 @@ int32_t bugle_fixture_audio_level(int32_t format, int32_t channels, int32_t inte
 void *bugle_fixture_sck_recorder(void);
 // Tell `handle`'s stream delegate that the stream stopped with `message`, as
 // ScreenCaptureKit does when capture fails (permission revoked, display
-// gone).
-void bugle_fixture_sck_stream_failed(void *handle, const char *message);
+// gone), or with `user_stopped` as when the user stops it from the system's
+// screen-sharing control.
+void bugle_fixture_sck_stream_failed(void *handle, const char *message, int32_t user_stopped);
+// Put a writer that failed on `handle` and deliver an empty (idle) screen
+// buffer. Returns a malloc'd error, NULL on success.
+char *bugle_fixture_sck_writer_failed(void *handle);
+// Run the recorder's stopCapture (what a stop does first), and read the host
+// time (seconds) its capture ended at, NaN before.
+void bugle_fixture_sck_stop_capture(void *handle);
+double bugle_fixture_sck_stopped_at(void *handle);
 double bugle_media_duration(const char *path);
 bugle_image_t bugle_video_frame(const char *path, double seconds);
 

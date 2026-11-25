@@ -2565,6 +2565,10 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
 @implementation BugleSckStopState
 @end
 
+// The test fixtures (fixtures.m) create this class with `init` and no stream,
+// call its `stream:didStopWithError:` and `stream:didOutputSampleBuffer:ofType:`
+// delegate methods, set `writer`, and call `stopCapture` and `stoppedAt`:
+// keep those selectors in step with the fixtures' declaration.
 @interface BugleSckRecorder : NSObject <SCStreamOutput, SCStreamDelegate, AVCaptureAudioDataOutputSampleBufferDelegate>
 @property (nonatomic, strong, readonly) BugleSckStopState *stopState;
 @property (nonatomic, strong) SCStream *stream;
@@ -2592,6 +2596,9 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
 @property (nonatomic, strong) NSMutableArray<NSString *> *warnings;
 @property (nonatomic) bugle_level_t systemLevel;   // guarded by `lock`
 @property (nonatomic) bugle_level_t micLevel;      // guarded by `lock`
+@property (nonatomic) CMTime failedAt;             // guarded by `lock`; when capture failed
+@property (nonatomic) BOOL streamStopped;          // guarded by `lock`; the stream stopped by itself
+@property (atomic) double stoppedAt;               // host seconds capture ended at; NaN before
 @end
 
 @implementation BugleSckRecorder
@@ -2606,6 +2613,8 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
         _stopState = [[BugleSckStopState alloc] init];
         _sessionStart = kCMTimeInvalid;
         _lastPts = kCMTimeInvalid;
+        _failedAt = kCMTimeInvalid;
+        _stoppedAt = NAN;
     }
     return self;
 }
@@ -2629,7 +2638,7 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
     if (self.writer.status == AVAssetWriterStatusFailed && !self.failure) {
         self.failure = self.writer.error.localizedDescription ?: @"asset writer failed";
         // Nothing more can be written: the recording has stopped.
-        [self noteStoppedBecause:[NSString stringWithFormat:@"writing the recording failed: %@", self.failure]];
+        [self failedBecause:[NSString stringWithFormat:@"writing the recording failed: %@", self.failure]];
     }
 }
 
@@ -2638,6 +2647,18 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
 - (void)noteStoppedBecause:(NSString *)why {
     if (why && !self.stopState.failure) self.stopState.failure = why;
     self.stopState.stopped = YES;
+}
+
+// Capture failed (or was stopped from outside) now. Caller holds `lock`.
+// Says so, fixes the recording's end at this moment, and tears capture down
+// (microphone, stream) off this thread: `stopCapture` waits for the stream,
+// and this runs on a sample or delegate queue, under `lock`. Weak, like the
+// `max_seconds` timer: a recording stopped meanwhile is already torn down.
+- (void)failedBecause:(NSString *)why {
+    if (!CMTIME_IS_VALID(self.failedAt)) self.failedAt = CMClockGetTime(CMClockGetHostTimeClock());
+    [self noteStoppedBecause:why];
+    __weak BugleSckRecorder *weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ [weakSelf stopCapture]; });
 }
 
 // --- SCStreamOutput ---------------------------------------------------------
@@ -2669,6 +2690,11 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
 }
 
 - (void)handleScreen:(CMSampleBufferRef)sb {
+    // Every buffer checks the writer first: a failed writer may never take
+    // an append (inputs not ready, or a static screen sending idle frames).
+    [self.lock lock];
+    [self noteWriterFailure];
+    [self.lock unlock];
     CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, false);
     if (atts && CFArrayGetCount(atts) > 0) {
         NSDictionary *d = (__bridge NSDictionary *)CFArrayGetValueAtIndex(atts, 0);
@@ -2698,8 +2724,9 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
 }
 
 - (void)handleAudio:(CMSampleBufferRef)sb input:(AVAssetWriterInput *)input {
-    if (!input) return;
     [self.lock lock];
+    [self noteWriterFailure];
+    if (!input) { [self.lock unlock]; return; }
     if (self.stopping || !self.sessionStarted) { [self.lock unlock]; return; }
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
     if (CMTimeCompare(pts, self.sessionStart) < 0) { [self.lock unlock]; return; }
@@ -2712,15 +2739,23 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
 // --- SCStreamDelegate -------------------------------------------------------
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
+    // The system's own screen-sharing control stops a stream this way too.
+    BOOL byUser = [error.domain isEqualToString:SCStreamErrorDomain] && error.code == SCStreamErrorUserStopped;
+    NSString *desc = error.localizedDescription ?: @"unknown error";
+    NSString *why = byUser ? @"the capture was stopped by the user"
+                           : [NSString stringWithFormat:@"the capture stream stopped: %@", desc];
+    NSString *warning = byUser ? why : [NSString stringWithFormat:@"capture stream stopped early: %@", desc];
     [self.lock lock];
     BOOL expected = self.stopping;
+    if (!expected) {
+        self.streamStopped = YES;
+        // No more frames come: say so, so the engine (and other processes
+        // through its recording-state file) stop showing a recording, and
+        // stop the rest (the microphone) at this moment.
+        [self failedBecause:why];
+    }
     [self.lock unlock];
-    if (expected) return;
-    NSString *why = error.localizedDescription ?: @"unknown error";
-    [self warn:@"capture stream stopped early: %@", why];
-    // No more frames come: say so, so the engine (and other processes
-    // through its recording-state file) stop showing a recording.
-    [self noteStoppedBecause:[NSString stringWithFormat:@"the capture stream stopped: %@", why]];
+    if (!expected) [self warn:@"%@", warning];
 }
 
 // --- AVCaptureAudioDataOutputSampleBufferDelegate (microphone) --------------
@@ -2888,12 +2923,17 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
         BOOL already = self.stopping;
         self.stopping = YES;
         CMTime stopTime = CMClockGetTime(CMClockGetHostTimeClock());
+        // After a failure the recording ends where capture failed, however
+        // much later this runs.
+        if (CMTIME_IS_VALID(self.failedAt) && CMTimeCompare(self.failedAt, stopTime) < 0) stopTime = self.failedAt;
+        BOOL streamStopped = self.streamStopped;
         [self.lock unlock];
         if (already) return;
+        self.stoppedAt = CMTimeGetSeconds(stopTime);
         // The auto-stop at `max_seconds` (or the final stop) ends capture.
         [self noteStoppedBecause:nil];
         if (self.micSession) [self.micSession stopRunning];
-        if (self.stream && self.captureRequested) {
+        if (self.stream && self.captureRequested && !streamStopped) {
             dispatch_semaphore_t sem = dispatch_semaphore_create(0);
             [self.stream stopCaptureWithCompletionHandler:^(NSError *e) { dispatch_semaphore_signal(sem); }];
             dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));

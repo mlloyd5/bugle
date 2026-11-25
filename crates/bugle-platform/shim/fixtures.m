@@ -4,6 +4,7 @@
 
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
+#import <ScreenCaptureKit/ScreenCaptureKit.h>
 #include "shim.h"
 
 static char *fixture_error(NSString *fmt, ...) {
@@ -257,19 +258,63 @@ int32_t bugle_fixture_audio_level(int32_t format, int32_t channels, int32_t inte
 
 // The stream recorder (shim.m), as far as the fixtures below drive it.
 @interface BugleSckRecorder : NSObject
+@property (nonatomic, strong) AVAssetWriter *writer;
+@property (atomic) double stoppedAt;
 - (void)stream:(id)stream didStopWithError:(NSError *)error;
+- (void)stream:(id)stream didOutputSampleBuffer:(CMSampleBufferRef)sb ofType:(NSInteger)type;
+- (void)stopCapture;
 @end
 
 void *bugle_fixture_sck_recorder(void) {
     return (__bridge_retained void *)[[BugleSckRecorder alloc] init];
 }
 
-void bugle_fixture_sck_stream_failed(void *handle, const char *message) {
+void bugle_fixture_sck_stream_failed(void *handle, const char *message, int32_t user_stopped) {
     if (!handle) return;
     @autoreleasepool {
         BugleSckRecorder *rec = (__bridge BugleSckRecorder *)handle;
         NSString *m = [NSString stringWithUTF8String:message ? message : ""] ?: @"";
-        NSError *e = [NSError errorWithDomain:@"BugleFixture" code:-3801 userInfo:@{NSLocalizedDescriptionKey: m}];
+        NSError *e = user_stopped ? [NSError errorWithDomain:SCStreamErrorDomain code:SCStreamErrorUserStopped userInfo:nil]
+                                  : [NSError errorWithDomain:@"BugleFixture" code:-3801 userInfo:@{NSLocalizedDescriptionKey: m}];
         [rec stream:nil didStopWithError:e];
     }
+}
+
+char *bugle_fixture_sck_writer_failed(void *handle) {
+    if (!handle) return fixture_error(@"no recorder");
+    @autoreleasepool {
+        BugleSckRecorder *rec = (__bridge BugleSckRecorder *)handle;
+        // A writer whose folder does not exist fails as it starts.
+        NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
+        NSURL *url = [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:@"x.mp4"]];
+        NSError *err = nil;
+        AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:url fileType:AVFileTypeMPEG4 error:&err];
+        if (!writer) return fixture_error(@"AVAssetWriter: %@", err.localizedDescription);
+        AVAssetWriterInput *in = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:@{
+            AVVideoCodecKey: AVVideoCodecTypeH264, AVVideoWidthKey: @64, AVVideoHeightKey: @64,
+        }];
+        in.expectsMediaDataInRealTime = YES;
+        if ([writer canAddInput:in]) [writer addInput:in];
+        if ([writer startWriting] || writer.status != AVAssetWriterStatusFailed) {
+            [writer cancelWriting];
+            return fixture_error(@"the writer did not fail (status %ld)", (long)writer.status);
+        }
+        rec.writer = writer;
+        // An empty buffer with no image, as an idle frame of a static screen.
+        CMSampleBufferRef sb = NULL;
+        if (CMSampleBufferCreate(kCFAllocatorDefault, NULL, true, NULL, NULL, NULL, 0, 0, NULL, 0, NULL, &sb) != noErr || !sb) {
+            return fixture_error(@"could not create a sample buffer");
+        }
+        [rec stream:nil didOutputSampleBuffer:sb ofType:SCStreamOutputTypeScreen];
+        CFRelease(sb);
+        return NULL;
+    }
+}
+
+void bugle_fixture_sck_stop_capture(void *handle) {
+    if (handle) [(__bridge BugleSckRecorder *)handle stopCapture];
+}
+
+double bugle_fixture_sck_stopped_at(void *handle) {
+    return handle ? ((__bridge BugleSckRecorder *)handle).stoppedAt : NAN;
 }
