@@ -475,11 +475,23 @@ old watchdog never removes a newer recording's file. The stream recorder's probe
 `BugleSckStopState` object the recorder owns and a probe retains, so it is read without the
 recorder: it is set when capture stops at the `max_seconds` auto-stop, when the `SCStream`
 delegate's `didStopWithError` reports a stop nobody asked for (permission revoked, display or
-window gone), and when the `AVAssetWriter` fails, the last two with a reason. The engine's own
-status then turns `Finishing` with that reason in `RecordingStatus::failure`, the app reaps it as
-it does an auto-stop, `bugle record start` stops waiting and finalises it, and the stop keeps what
-was captured (or fails with "no frames were captured"). Tests drive that path with a shim fixture
-recorder that has no stream (`SckRecorder::fixture`). Each process only writes and removes its own file, so two recording processes never
+window gone; `SCStreamErrorUserStopped`, the system's own screen-sharing control, is worded as
+stopped by the user), and when the `AVAssetWriter` is seen to have failed (checked at the top of
+every sample buffer, so an idle static screen or inputs that stay not-ready still notice it), the
+last two with a reason. Those two also fix the recording's end at the failure and `dispatch_async`
+a teardown (`stopCapture`, weak like the `max_seconds` timer) onto a global queue, never on the
+sample or delegate queue, where it would block under the recorder's lock: the microphone session
+stops at once, a stream that stopped by itself is not stopped again, and a later stop finds
+capture already ended, so the last frame is padded only up to the failure. The engine's own status
+then turns `Finishing` with that reason in `RecordingStatus::failure`, the app reaps it as it does
+an auto-stop (logged as a warning), and `bugle record start` stops waiting and finalises it. After
+a stream stop the file keeps what was captured and the media record carries the reason in
+`MediaItem::failure` (so a `record_stop` after the app's reap still sees it, and history keeps it);
+with nothing captured the error says "no frames were captured (<why>)". After a writer failure
+the shim's stop fails with "recording failed: <cause>" and the file is removed, as before. Tests
+drive these paths with a shim fixture recorder that has no stream (`SckRecorder::fixture`): a
+simulated `didStopWithError` (also with the user-stopped code), and a writer that failed to
+start plus an idle screen buffer. Each process only writes and removes its own file, so two recording processes never
 overwrite each other. On each housekeeping tick (about once a second, already running for the
 timer) the app lists that folder (`marker::scan`): it skips its own pid, shows the oldest recording
 whose owner is still running (pid alive *and* the same process start time, so a reused pid does

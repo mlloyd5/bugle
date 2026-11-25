@@ -768,10 +768,11 @@ impl App {
     }
 
     /// A recording that stopped by itself (an Agent API request's
-    /// `max_seconds`) stays in the engine, shown as running, until something
-    /// finalises it: do that off the main thread (an MP4 export can take a
-    /// while). The engine then sends `RecordingChanged`, and a later
-    /// `record_stop` from the API still gets the media record.
+    /// `max_seconds`, a GIF cap, or its capture stream failing) stays in the
+    /// engine until something finalises it: do that off the main thread (an
+    /// MP4 export can take a while). The engine then sends
+    /// `RecordingChanged`, and a later `record_stop` from the API still gets
+    /// the media record (with its `failure`, if capture stopped early).
     fn reap_auto_stopped(&self) {
         use std::sync::atomic::Ordering;
         if self.engine.record_status().state != RecordingState::Finishing || self.reaping.swap(true, Ordering::SeqCst) {
@@ -788,7 +789,10 @@ impl App {
         let spawned = std::thread::Builder::new().name("bugle-reap".into()).spawn(move || {
             let _reaping = reaping;
             match engine.record_reap() {
-                Some(Ok(m)) => tracing::info!("recording stopped by itself, saved to {}", m.path.display()),
+                Some(Ok(m)) => match &m.failure {
+                    Some(why) => tracing::warn!("recording stopped early ({why}), saved what was captured to {}", m.path.display()),
+                    None => tracing::info!("recording stopped by itself, saved to {}", m.path.display()),
+                },
                 Some(Err(e)) => tracing::warn!("finalising a recording that stopped by itself: {e:#}"),
                 None => {}
             }

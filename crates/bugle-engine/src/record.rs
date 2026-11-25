@@ -906,6 +906,9 @@ impl Engine {
         // here, before anything is finalised) cannot have seen it: the
         // moment it was interrupted, or seen to exit while waited for.
         let mut video_ended_at = None;
+        // Why the stream recorder stopped capturing early, if it did: kept
+        // with the result, which a reaper may hand out long after.
+        let mut stopped_early = None;
         if let Some(log) = active.events.as_mut() {
             log.stop();
         }
@@ -976,16 +979,28 @@ impl Engine {
                 let written = if wants_mov { temp_path(&active.output, "mp4") } else { active.output.clone() };
                 let warnings = rec.warnings();
                 let frames = rec.frames();
+                stopped_early = rec.probe().failure();
                 if let Err(e) = rec.stop() {
                     let _ = std::fs::remove_file(&written);
-                    return Err(e);
+                    // Say why capture stopped, unless the error already
+                    // does (a failed writer's "recording failed: <cause>").
+                    return Err(match &stopped_early {
+                        Some(why) if !format!("{e:#}").contains(why.split_once(": ").map_or(why.as_str(), |(_, cause)| cause)) => anyhow!("{e:#} ({why})"),
+                        _ => e,
+                    });
                 }
                 if let Some(w) = warnings {
                     tracing::warn!("{w}");
                 }
                 if frames == 0 {
                     let _ = std::fs::remove_file(&written);
-                    bail!("no frames were captured");
+                    match &stopped_early {
+                        Some(why) => bail!("no frames were captured ({why})"),
+                        None => bail!("no frames were captured"),
+                    }
+                }
+                if let Some(why) = &stopped_early {
+                    tracing::warn!("the recording stopped early ({why}); keeping what was captured");
                 }
                 let (pass, levels) = (audio.map(|(p, _)| p), audio.map(|(_, l)| l).unwrap_or_default());
                 let mix = |src: &Path, dst: &Path| pass.unwrap_or(AudioPass::Mix).run(src, dst, &levels);
@@ -1001,6 +1016,7 @@ impl Engine {
         });
         m.label = active.label.take();
         m.source = Some(std::mem::take(&mut active.source));
+        m.failure = stopped_early;
         if let Some(log) = active.events.take() {
             // The video track's length (an audio track may run longer).
             let video_seconds = bugle_platform::video_info(&active.output).map(|i| i.end()).ok().filter(|d| d.is_finite() && *d > 0.0);

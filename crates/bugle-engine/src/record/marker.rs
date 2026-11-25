@@ -610,9 +610,10 @@ mod tests {
         assert_eq!(st.state, RecordingState::Finishing, "the engine's own status is not a phantom recording");
         let why = st.failure.unwrap_or_default();
         assert!(why.contains("capture stream stopped") && why.contains("display removed"), "{why}");
-        // The stop reports what came of it (here: nothing was captured).
+        // The stop reports what came of it (here: nothing was captured), and
+        // why.
         let e = engine.record_stop().unwrap_err().to_string();
-        assert!(e.contains("no frames were captured"), "{e}");
+        assert!(e.contains("no frames were captured") && e.contains("display removed"), "{e}");
         assert!(scan(&dir, 0).is_empty());
         assert_eq!(engine.record_status().state, RecordingState::Idle);
 
@@ -622,6 +623,9 @@ mod tests {
         fail_stream(&engine, "permission revoked");
         assert!(engine.record_reap().is_some_and(|r| r.is_err()));
         assert!(scan(&dir, 0).is_empty());
+        // The stop that comes for it later still says why.
+        let e = engine.record_stop().unwrap_err().to_string();
+        assert!(e.contains("permission revoked"), "{e}");
         engine.install(engine.idle_recorder().unwrap(), sck_active(&tmp.path().join("c.mp4")));
         fail_stream(&engine, "permission revoked");
         drop(engine.free_recorder(false).unwrap());
@@ -637,6 +641,23 @@ mod tests {
         engine.install(engine.idle_recorder().unwrap(), a);
         assert!(scan(&dir, 0).is_empty());
         assert!(engine.record_stop().is_err());
+    }
+
+    #[test]
+    fn a_stream_recording_at_its_max_seconds_is_no_failure() {
+        use bugle_core::RecordingState;
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_in(tmp.path());
+        let dir = marker_dir(&engine.config);
+        let mut a = sck_active(&tmp.path().join("a.mp4"));
+        a.max_seconds = Some(0.2);
+        engine.install(engine.idle_recorder().unwrap(), a);
+        assert!(eventually(|| scan(&dir, 0).is_empty()), "the file outlived max_seconds");
+        let st = engine.record_status();
+        assert_eq!((st.state, st.failure), (RecordingState::Finishing, None));
+        // The fixture captured nothing; the error does not claim a failure.
+        let e = engine.record_stop().unwrap_err().to_string();
+        assert!(!e.contains('('), "{e}");
     }
 
     #[test]
