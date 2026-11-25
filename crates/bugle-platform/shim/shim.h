@@ -170,6 +170,14 @@ char *bugle_fixture_write_tones(const char *out_path, int32_t tracks, double sec
 // peak, RMS and duration in seconds in `out[3]`; -1 when it cannot be measured.
 int32_t bugle_fixture_audio_level(int32_t format, int32_t channels, int32_t interleaved, const float *samples,
                                   int32_t frames, double rate, double *out);
+// A ScreenCaptureKit recorder handle (as bugle_sck_record_start returns)
+// with no stream and no writer, so tests can drive its delegate without
+// screen recording access. Stopping it fails with "no frames were captured".
+void *bugle_fixture_sck_recorder(void);
+// Tell `handle`'s stream delegate that the stream stopped with `message`, as
+// ScreenCaptureKit does when capture fails (permission revoked, display
+// gone).
+void bugle_fixture_sck_stream_failed(void *handle, const char *message);
 double bugle_media_duration(const char *path);
 bugle_image_t bugle_video_frame(const char *path, double seconds);
 
@@ -253,6 +261,15 @@ int32_t bugle_audio_buffer_stats(const void *sample_buffer, double *peak, double
 double bugle_sck_record_session_start(void *handle);
 char *bugle_sck_record_warnings(void *handle);   // malloc'd, NULL when none
 int32_t bugle_sck_record_stop(void *handle);
+// Whether a recording stopped capturing before it was stopped: its
+// `max_seconds` passed, the stream stopped with an error, or the file writer
+// failed. A probe answers that without the handle (it may outlive the
+// recording); release each one with bugle_sck_probe_release. `failure`
+// (malloc'd, NULL when none) is why it stopped, when that was a failure.
+void *bugle_sck_record_probe(void *handle);
+int32_t bugle_sck_probe_stopped(void *probe);
+char *bugle_sck_probe_failure(void *probe);
+void bugle_sck_probe_release(void *probe);
 
 // Window picker overlay (picker.m). `cb` gets kind 0 for every pointer move
 // (global top-left points), then exactly one final call: 1 = clicked at

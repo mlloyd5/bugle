@@ -1314,6 +1314,29 @@ impl SckRecorder {
         }
     }
 
+    /// A probe saying whether this recording has stopped capturing by
+    /// itself, usable from any thread without the recorder.
+    pub fn probe(&self) -> SckStopProbe {
+        SckStopProbe { probe: unsafe { ffi::bugle_sck_record_probe(self.handle) } }
+    }
+
+    /// Test fixture: a recorder with no stream and no writer, whose stream
+    /// failures [`SckRecorder::fixture_stream_failed`] simulates. Stopping
+    /// it fails with "no frames were captured".
+    #[doc(hidden)]
+    pub fn fixture() -> Self {
+        Self { handle: unsafe { ffi::bugle_fixture_sck_recorder() } }
+    }
+
+    /// Test fixture: tell the stream delegate the stream stopped with
+    /// `message`, as ScreenCaptureKit does when capture fails.
+    #[doc(hidden)]
+    pub fn fixture_stream_failed(&self, message: &str) {
+        if let Ok(m) = cstr(message) {
+            unsafe { ffi::bugle_fixture_sck_stream_failed(self.handle, m.as_ptr()) }
+        }
+    }
+
     /// Stop capturing and finalise the file.
     pub fn stop(mut self) -> Result<()> {
         self.stop_inner()
@@ -1334,6 +1357,45 @@ impl SckRecorder {
 impl Drop for SckRecorder {
     fn drop(&mut self) {
         let _ = self.stop_inner();
+    }
+}
+
+/// Whether an [`SckRecorder`] has stopped capturing without being stopped:
+/// its `max_seconds` passed, the capture stream stopped with an error
+/// (screen recording permission revoked, the display or window gone), or
+/// writing the file failed. Outlives the recorder (it then keeps answering
+/// what it last saw).
+pub struct SckStopProbe {
+    probe: *mut libc::c_void,
+}
+
+// The probed object's properties are atomic.
+unsafe impl Send for SckStopProbe {}
+unsafe impl Sync for SckStopProbe {}
+
+impl SckStopProbe {
+    /// Whether the recording stopped capturing.
+    pub fn stopped(&self) -> bool {
+        unsafe { ffi::bugle_sck_probe_stopped(self.probe) != 0 }
+    }
+
+    /// Why it stopped, when that was a failure (not its `max_seconds`).
+    pub fn failure(&self) -> Option<String> {
+        unsafe {
+            let p = ffi::bugle_sck_probe_failure(self.probe);
+            if p.is_null() {
+                return None;
+            }
+            let s = CStr::from_ptr(p).to_string_lossy().into_owned();
+            ffi::bugle_free(p as *mut _);
+            Some(s)
+        }
+    }
+}
+
+impl Drop for SckStopProbe {
+    fn drop(&mut self) {
+        unsafe { ffi::bugle_sck_probe_release(self.probe) }
     }
 }
 
@@ -2140,5 +2202,33 @@ mod tests {
         let d = displays().unwrap();
         assert!(!d.is_empty());
         assert!(d.iter().any(|d| d.is_main));
+    }
+
+    #[test]
+    fn a_stream_that_fails_shows_as_stopped() {
+        let rec = SckRecorder::fixture();
+        let probe = rec.probe();
+        assert!(!probe.stopped());
+        assert_eq!(probe.failure(), None);
+        rec.fixture_stream_failed("The user declined TCCs for application, window, display capture");
+        assert!(probe.stopped());
+        let why = probe.failure().unwrap();
+        assert!(why.starts_with("the capture stream stopped: ") && why.contains("declined"), "{why}");
+        assert!(rec.warnings().unwrap().contains("capture stream stopped early"));
+        // A second failure does not replace the first reason.
+        rec.fixture_stream_failed("display removed");
+        assert_eq!(probe.failure().as_deref(), Some(why.as_str()));
+        // Nothing was written: the stop says so. The probe outlives it.
+        let e = rec.stop().unwrap_err().to_string();
+        assert!(e.contains("no frames were captured"), "{e}");
+        assert!(probe.stopped());
+        drop(probe);
+
+        // A stop that was asked for is not a failure.
+        let rec = SckRecorder::fixture();
+        let probe = rec.probe();
+        let _ = rec.stop();
+        assert!(probe.stopped());
+        assert_eq!(probe.failure(), None);
     }
 }

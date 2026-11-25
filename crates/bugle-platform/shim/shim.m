@@ -2554,7 +2554,19 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
     return l;
 }
 
+// Whether a stream recording has stopped capturing, and why when it failed.
+// Its own object so a probe (bugle_sck_record_probe) can read it without the
+// recorder, from any thread.
+@interface BugleSckStopState : NSObject
+@property (atomic) BOOL stopped;
+@property (atomic, copy) NSString *failure;
+@end
+
+@implementation BugleSckStopState
+@end
+
 @interface BugleSckRecorder : NSObject <SCStreamOutput, SCStreamDelegate, AVCaptureAudioDataOutputSampleBufferDelegate>
+@property (nonatomic, strong, readonly) BugleSckStopState *stopState;
 @property (nonatomic, strong) SCStream *stream;
 @property (nonatomic, strong) AVAssetWriter *writer;
 @property (nonatomic, strong) AVAssetWriterInput *videoInput;
@@ -2591,6 +2603,7 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
         _micQueue = dispatch_queue_create("bugle.sck.mic", DISPATCH_QUEUE_SERIAL);
         _lock = [[NSLock alloc] init];
         _warnings = [NSMutableArray array];
+        _stopState = [[BugleSckStopState alloc] init];
         _sessionStart = kCMTimeInvalid;
         _lastPts = kCMTimeInvalid;
     }
@@ -2615,7 +2628,16 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
 - (void)noteWriterFailure {
     if (self.writer.status == AVAssetWriterStatusFailed && !self.failure) {
         self.failure = self.writer.error.localizedDescription ?: @"asset writer failed";
+        // Nothing more can be written: the recording has stopped.
+        [self noteStoppedBecause:[NSString stringWithFormat:@"writing the recording failed: %@", self.failure]];
     }
+}
+
+// The recording stopped capturing (`why`: a failure, nil for a planned stop).
+// The first failure is kept.
+- (void)noteStoppedBecause:(NSString *)why {
+    if (why && !self.stopState.failure) self.stopState.failure = why;
+    self.stopState.stopped = YES;
 }
 
 // --- SCStreamOutput ---------------------------------------------------------
@@ -2693,7 +2715,12 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
     [self.lock lock];
     BOOL expected = self.stopping;
     [self.lock unlock];
-    if (!expected) [self warn:@"capture stream stopped early: %@", error.localizedDescription];
+    if (expected) return;
+    NSString *why = error.localizedDescription ?: @"unknown error";
+    [self warn:@"capture stream stopped early: %@", why];
+    // No more frames come: say so, so the engine (and other processes
+    // through its recording-state file) stop showing a recording.
+    [self noteStoppedBecause:[NSString stringWithFormat:@"the capture stream stopped: %@", why]];
 }
 
 // --- AVCaptureAudioDataOutputSampleBufferDelegate (microphone) --------------
@@ -2863,6 +2890,8 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
         CMTime stopTime = CMClockGetTime(CMClockGetHostTimeClock());
         [self.lock unlock];
         if (already) return;
+        // The auto-stop at `max_seconds` (or the final stop) ends capture.
+        [self noteStoppedBecause:nil];
         if (self.micSession) [self.micSession stopRunning];
         if (self.stream && self.captureRequested) {
             dispatch_semaphore_t sem = dispatch_semaphore_create(0);
@@ -3080,6 +3109,31 @@ char *bugle_sck_record_warnings(void *handle) {
         [rec.lock unlock];
         return s ? strdup(s.UTF8String) : NULL;
     }
+}
+
+void *bugle_sck_record_probe(void *handle) {
+    if (!handle) return NULL;
+    BugleSckRecorder *rec = (__bridge BugleSckRecorder *)handle;
+    return (__bridge_retained void *)rec.stopState;
+}
+
+int32_t bugle_sck_probe_stopped(void *probe) {
+    if (!probe) return 1;
+    return ((__bridge BugleSckStopState *)probe).stopped ? 1 : 0;
+}
+
+char *bugle_sck_probe_failure(void *probe) {
+    if (!probe) return NULL;
+    @autoreleasepool {
+        NSString *s = ((__bridge BugleSckStopState *)probe).failure;
+        return s ? strdup(s.UTF8String ?: "") : NULL;
+    }
+}
+
+void bugle_sck_probe_release(void *probe) {
+    if (!probe) return;
+    BugleSckStopState *s = (__bridge_transfer BugleSckStopState *)probe;
+    (void)s;
 }
 
 int32_t bugle_sck_record_stop(void *handle) {

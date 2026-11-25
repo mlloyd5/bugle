@@ -196,6 +196,8 @@ extern "C" {
         rate: f64,
         out: *mut f64,
     ) -> i32;
+    pub fn bugle_fixture_sck_recorder() -> *mut c_void;
+    pub fn bugle_fixture_sck_stream_failed(handle: *mut c_void, message: *const c_char);
     pub fn bugle_media_duration(path: *const c_char) -> f64;
     pub fn bugle_video_frame(path: *const c_char, seconds: f64) -> bugle_image_t;
     pub fn bugle_video_info(path: *const c_char, out: *mut bugle_video_info_t) -> i32;
@@ -254,6 +256,10 @@ extern "C" {
     pub fn bugle_sck_record_session_start(handle: *mut c_void) -> f64;
     pub fn bugle_sck_record_warnings(handle: *mut c_void) -> *mut c_char;
     pub fn bugle_sck_record_stop(handle: *mut c_void) -> i32;
+    pub fn bugle_sck_record_probe(handle: *mut c_void) -> *mut c_void;
+    pub fn bugle_sck_probe_stopped(probe: *mut c_void) -> i32;
+    pub fn bugle_sck_probe_failure(probe: *mut c_void) -> *mut c_char;
+    pub fn bugle_sck_probe_release(probe: *mut c_void);
 }
 
 // The level meter's ballistics, for tests (see `bugle_level_t`).

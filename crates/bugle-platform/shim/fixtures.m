@@ -254,3 +254,22 @@ int32_t bugle_fixture_audio_level(int32_t format, int32_t channels, int32_t inte
     free(data);
     return rc;
 }
+
+// The stream recorder (shim.m), as far as the fixtures below drive it.
+@interface BugleSckRecorder : NSObject
+- (void)stream:(id)stream didStopWithError:(NSError *)error;
+@end
+
+void *bugle_fixture_sck_recorder(void) {
+    return (__bridge_retained void *)[[BugleSckRecorder alloc] init];
+}
+
+void bugle_fixture_sck_stream_failed(void *handle, const char *message) {
+    if (!handle) return;
+    @autoreleasepool {
+        BugleSckRecorder *rec = (__bridge BugleSckRecorder *)handle;
+        NSString *m = [NSString stringWithUTF8String:message ? message : ""] ?: @"";
+        NSError *e = [NSError errorWithDomain:@"BugleFixture" code:-3801 userInfo:@{NSLocalizedDescriptionKey: m}];
+        [rec stream:nil didStopWithError:e];
+    }
+}
