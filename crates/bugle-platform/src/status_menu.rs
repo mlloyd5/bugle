@@ -28,7 +28,7 @@ unsafe extern "C" fn call(ctx: *mut c_void, json: *const c_char) {
 /// later main-loop turn, read it once `sample_at` seconds after it opens,
 /// close it after `seconds`, and pass the report (JSON: `opened`,
 /// `opened_at` and `closed_at` in Unix seconds, `firings` of the probe's own
-/// timers, `sample` with `t`, `mode`, `title`, `items`, `width`) to `done`
+/// timers, `sample` with `t`, `mode`, `title`, `items`, `enabled`, `width`) to `done`
 /// on the main thread. Returns `false` without taking `done` when a probe is
 /// running, a pointer is null, or off the main thread.
 ///
@@ -100,6 +100,24 @@ pub fn status_title_width(text: &str, mono: bool) -> f64 {
 pub fn attributed_width(title: &NSAttributedString) -> f64 {
     // SAFETY: a live NSAttributedString; the shim only reads it.
     unsafe { bugle_attributed_width(title as *const NSAttributedString as *mut c_void) }
+}
+
+extern "C" {
+    fn bugle_status_item_frame(status_item: *mut c_void, out: *mut f64) -> i32;
+}
+
+/// `status_item`'s (an `NSStatusItem`'s) frame on screen in global points,
+/// top-left origin, as [`crate::windows`] gives window frames. Any thread:
+/// off the main thread it waits at most a second for the main queue. `None`
+/// for a null or windowless item, or on that timeout.
+///
+/// # Safety
+/// `status_item` must be null or point to a live `NSStatusItem` that stays
+/// alive for the call.
+pub unsafe fn status_item_frame(status_item: *mut c_void) -> Option<bugle_core::Rect> {
+    let mut out = [0.0f64; 4];
+    (unsafe { bugle_status_item_frame(status_item, out.as_mut_ptr()) } == 1)
+        .then(|| bugle_core::Rect::new(out[0], out[1], out[2], out[3]))
 }
 
 #[cfg(test)]
