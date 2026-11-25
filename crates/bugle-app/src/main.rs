@@ -574,59 +574,32 @@ impl App {
         notifications::post("Bugle", msg, None, None);
     }
 
-    fn dispatch(&mut self, mut action: Action) {
-        let recording = self.is_recording();
-        let is_record = |a: Action| matches!(a, Action::RecordVideo | Action::RecordGif | Action::RecordWindow);
-        if is_record(action) && recording {
-            action = Action::StopRecording;
-        }
-        if action == Action::StopRecording && !recording {
-            // The Stop hotkey while this app saves a recording or another
-            // process records: say why it does nothing rather than ignore it.
-            if let Some(note) = self.saving_note() {
-                tracing::info!("Stop Recording: {note}");
-                bugle_platform::toast_show(None, "Bugle", note, None, 4.0);
-            } else if let Some(r) = self.other_recordings.first() {
-                let msg = format!(
-                    "{}: stop it where it was started (bugle record, or record_stop through bugle serve / bugle mcp)",
-                    recording_view::other_process_label(r.pid)
-                );
-                tracing::info!("Stop Recording: {msg}");
+    fn dispatch(&mut self, action: Action) {
+        // Fresh, so a Record that waits for a save shows so straight away.
+        self.update_recording_ui();
+        let Some(shown) = self.recording_shown.as_ref() else { return };
+        let (action, record) = match recording_view::command(action, shown) {
+            recording_view::Step::Send { action, record } => (action, record),
+            recording_view::Step::Toast(msg) => {
+                tracing::info!("{action:?}: {msg}");
                 bugle_platform::toast_show(None, "Bugle", &msg, None, 4.0);
-            }
-            return;
-        }
-        if is_record(action) && self.record_running {
-            // A Record hotkey while a Record waits for a save (its menu
-            // entries are off then): not queued behind it, and not dropped
-            // without a word either.
-            if let Some(note) = self.saving_note() {
-                tracing::info!("ignoring {action:?}: {note}");
-                bugle_platform::toast_show(None, "Bugle", note, None, 4.0);
                 return;
             }
-        }
+            recording_view::Step::Ignore => return,
+        };
         if self.busy || bugle_platform::select_rect_active() || bugle_platform::window_pick_active() {
             tracing::debug!("ignoring {action:?}: busy");
             return;
         }
         self.quick_before_action(action);
         self.busy = true;
-        self.record_running = is_record(action);
+        self.record_running = record;
         if self.worker_tx.send(action).is_err() {
             self.busy = false;
             self.record_running = false;
             self.toast_error("worker thread is gone");
         }
-        // A Record that waits for a save shows so straight away.
         self.update_recording_ui();
-    }
-
-    /// What a save in progress in this app's engine means for the user
-    /// (`None`: there is none), after a redraw so the menu agrees.
-    fn saving_note(&mut self) -> Option<&'static str> {
-        self.update_recording_ui();
-        self.recording_shown.as_ref().and_then(recording_view::RecordingView::saving_note)
     }
 
     fn on_menu(&mut self, id: &MenuId, control_flow: &mut ControlFlow) {
@@ -769,8 +742,9 @@ impl App {
                 self.items.stop.set_enabled(enabled);
                 OTHER_SHOWN.store(shown.other.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
             }
-            // Monospaced digits while a title counts (this app's recording
-            // or another process's), so the item (and its neighbours) do not
+            // Monospaced digits while there is a title (a count of this
+            // app's recording or another process's, or *Saving…*, where it
+            // changes nothing), so the item (and its neighbours) do not
             // shift every second; set before the title, and the button's own
             // font is back before the idle title is set.
             let titled = shown.title.is_some();
@@ -805,21 +779,28 @@ impl App {
     /// A recording that stopped by itself (an Agent API request's
     /// `max_seconds`) stays in the engine, shown as running, until something
     /// finalises it: do that off the main thread (an MP4 export can take a
-    /// while). The engine then sends `RecordingChanged`, and a later
+    /// while). The thread then sends `RecordingChanged` itself (the
+    /// engine's own come while it still saves), on a panic too, and a later
     /// `record_stop` from the API still gets the media record.
     fn reap_auto_stopped(&self) {
         use std::sync::atomic::Ordering;
         if self.engine.record_status().state != RecordingState::Finishing || self.reaping.swap(true, Ordering::SeqCst) {
             return;
         }
-        /// Clears `reaping` however the reap thread ends (a panic too).
-        struct Reaping(Arc<std::sync::atomic::AtomicBool>);
+        /// Clears `reaping` however the reap thread ends (a panic too), and
+        /// redraws then: the engine's own announcements come while it is
+        /// still saving (`recording_saving`), so *Saving…* clears at once,
+        /// written, failed or panicked.
+        struct Reaping(Arc<std::sync::atomic::AtomicBool>, Option<Proxy>);
         impl Drop for Reaping {
             fn drop(&mut self) {
                 self.0.store(false, Ordering::SeqCst);
+                if let Some(proxy) = self.1.take() {
+                    proxy.send(AppEvent::RecordingChanged);
+                }
             }
         }
-        let (engine, reaping, proxy) = (self.engine.clone(), Reaping(self.reaping.clone()), self.proxy.clone());
+        let (engine, reaping) = (self.engine.clone(), Reaping(self.reaping.clone(), Some(self.proxy.clone())));
         let spawned = std::thread::Builder::new().name("bugle-reap".into()).spawn(move || {
             let _reaping = reaping;
             match engine.record_reap() {
@@ -827,10 +808,6 @@ impl App {
                 Some(Err(e)) => tracing::warn!("finalising a recording that stopped by itself: {e:#}"),
                 None => {}
             }
-            // The engine's own announcements come while it is still saving
-            // (`recording_saving`): redraw now that it is not, so *Saving…*
-            // clears at once, written or failed.
-            proxy.send(AppEvent::RecordingChanged);
         });
         if let Err(e) = spawned {
             tracing::warn!("could not start the thread finalising a recording: {e}");

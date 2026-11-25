@@ -5,6 +5,7 @@
 //! the save of a recording this app's engine finalises after it stopped by
 //! itself, which a new recording from the menu waits for.
 
+use crate::Action;
 use bugle_core::{RecordingState, RecordingStatus};
 use bugle_engine::record::marker::LiveRecording;
 use chrono::{DateTime, Utc};
@@ -121,6 +122,47 @@ pub fn view(own: &RecordingStatus, saving: Saving, others: &[LiveRecording], now
         Some(r) => RecordingView { title: Some(clock(r.elapsed_seconds(now))), own: false, other: Some(r.pid), saving },
         None => RecordingView { title: None, own: false, other: None, saving },
     }
+}
+
+/// What the app does with a command from the menu or a hotkey, before its
+/// busy check ([`command`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Step {
+    /// Go on with this action (a Record turns into Stop while recording);
+    /// `record`: it is a Record, which may wait for a save
+    /// (the app's `record_running` while it is with the worker).
+    Send { action: Action, record: bool },
+    /// Do nothing but say this in a toast.
+    Toast(String),
+    /// Do nothing, without a word (Stop with nothing to stop).
+    Ignore,
+}
+
+/// What a Record or Stop command does given what the app shows (`shown`,
+/// fresh); any other action goes on unchanged. While this app records,
+/// Record means Stop. Stop with nothing of this app's to stop explains a
+/// save in progress or another process's recording. A Record while one
+/// already waits for a save is not queued behind it; one during a plain
+/// save goes on and becomes the waiting Record.
+pub fn command(action: Action, shown: &RecordingView) -> Step {
+    let record = matches!(action, Action::RecordVideo | Action::RecordGif | Action::RecordWindow);
+    if record && shown.own {
+        return Step::Send { action: Action::StopRecording, record: false };
+    }
+    if action == Action::StopRecording && !shown.own {
+        return match (shown.saving_note(), shown.other) {
+            (Some(note), _) => Step::Toast(note.to_string()),
+            (None, Some(pid)) => Step::Toast(format!(
+                "{}: stop it where it was started (bugle record, or record_stop through bugle serve / bugle mcp)",
+                other_process_label(pid)
+            )),
+            (None, None) => Step::Ignore,
+        };
+    }
+    if record && shown.saving == Saving::RecordWaits {
+        return Step::Toast(shown.saving_note().unwrap_or_default().to_string());
+    }
+    Step::Send { action, record }
 }
 
 #[cfg(test)]
@@ -265,5 +307,71 @@ mod tests {
         let st = RecordingStatus { state: RecordingState::Active, elapsed_seconds: 3.0, ..idle() };
         let v = view(&st, Saving::RecordWaits, &[], Utc::now());
         assert_eq!(v, RecordingView { title: Some("● 0:03".into()), own: true, other: None, saving: Saving::No });
+    }
+
+    fn shown(saving: Saving) -> RecordingView {
+        view(&idle(), saving, &[], Utc::now())
+    }
+
+    const RECORDS: [Action; 3] = [Action::RecordVideo, Action::RecordGif, Action::RecordWindow];
+
+    #[test]
+    fn record_without_a_save_goes_on() {
+        for a in RECORDS {
+            assert_eq!(command(a, &shown(Saving::No)), Step::Send { action: a, record: true });
+        }
+    }
+
+    #[test]
+    fn record_during_a_save_becomes_the_waiting_record() {
+        for a in RECORDS {
+            assert_eq!(command(a, &shown(Saving::Previous)), Step::Send { action: a, record: true });
+        }
+    }
+
+    #[test]
+    fn second_record_is_not_queued() {
+        for a in RECORDS {
+            assert_eq!(
+                command(a, &shown(Saving::RecordWaits)),
+                Step::Toast("Saving the previous recording; the new one starts once it is saved".into())
+            );
+        }
+    }
+
+    #[test]
+    fn stop_hotkey_during_a_save_says_so() {
+        assert_eq!(command(Action::StopRecording, &shown(Saving::Previous)), Step::Toast("Saving the previous recording…".into()));
+        assert_eq!(
+            command(Action::StopRecording, &shown(Saving::RecordWaits)),
+            Step::Toast("Saving the previous recording; the new one starts once it is saved".into())
+        );
+        assert_eq!(command(Action::StopRecording, &shown(Saving::No)), Step::Ignore);
+    }
+
+    #[test]
+    fn stop_hotkey_during_another_process_recording() {
+        let now = Utc::now();
+        let v = view(&idle(), Saving::No, &[other(4242, now)], now);
+        let Step::Toast(msg) = command(Action::StopRecording, &v) else { panic!("no toast") };
+        assert!(msg.starts_with("Recording in another Bugle process (pid 4242): stop it where it was started"), "{msg}");
+    }
+
+    #[test]
+    fn record_while_recording_stops() {
+        let st = RecordingStatus { state: RecordingState::Active, ..idle() };
+        let v = view(&st, Saving::No, &[], Utc::now());
+        for a in RECORDS.into_iter().chain([Action::StopRecording]) {
+            assert_eq!(command(a, &v), Step::Send { action: Action::StopRecording, record: false });
+        }
+    }
+
+    #[test]
+    fn other_actions_never_wait_for_a_save() {
+        for saving in [Saving::No, Saving::Previous, Saving::RecordWaits] {
+            for a in [Action::CaptureArea, Action::CaptureScreen, Action::OcrLatest, Action::SyncLatest] {
+                assert_eq!(command(a, &shown(saving)), Step::Send { action: a, record: false });
+            }
+        }
     }
 }
