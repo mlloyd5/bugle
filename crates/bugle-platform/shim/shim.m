@@ -13,6 +13,8 @@
 #import <ApplicationServices/ApplicationServices.h>
 #include "shim.h"
 #include <sys/wait.h>
+#include <sys/file.h>
+#include <fcntl.h>
 
 // ---------------------------------------------------------------------------
 // Errors / memory
@@ -1063,7 +1065,8 @@ int32_t bugle_pin_close_all(void) {
 
 // ---------------------------------------------------------------------------
 // Toast: a small non-activating panel in the corner of the main screen that
-// shows a thumbnail and two lines of text, then fades out. Clicking it opens
+// shows a thumbnail, a title and a subtitle of up to four lines, then fades
+// out. Clicking it opens
 // the file. Used by the menu-bar app as its "capture done" notification;
 // unbundled binaries cannot post user notifications.
 // ---------------------------------------------------------------------------
@@ -1100,6 +1103,15 @@ static void toast_dismiss(void) {
     }];
 }
 
+// Toasts stay out of screen captures (NSWindowSharingNone) unless this is
+// set: `bugle-app --smoke-test` sets it while it takes screenshots of the UI
+// for review.
+static _Atomic int32_t g_toast_capturable = 0;
+
+void bugle_toast_set_capturable(int32_t on) {
+    g_toast_capturable = on ? 1 : 0;
+}
+
 void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const char *subtitle, const char *open_path,
                       double seconds) {
     @autoreleasepool {
@@ -1110,7 +1122,22 @@ void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const c
             g_toast_timer = nil;
         }
         NSImage *img = (png && len) ? [[NSImage alloc] initWithData:[NSData dataWithBytes:png length:len]] : nil;
-        CGFloat pad = 10, thumb = img ? 56 : 0, width = 320, height = 76;
+        CGFloat pad = 10, thumb = img ? 56 : 0, width = 320;
+        CGFloat tx = img ? pad + thumb + pad : pad, textW = width - tx - pad;
+        // The subtitle wraps (a message saying what to do must be read in
+        // full) up to four lines, the last truncated at its tail; the toast
+        // grows to fit. (A wrapping label cannot truncate its last line in
+        // the middle: with that mode AppKit clips it without an ellipsis.)
+        NSTextField *s = [NSTextField wrappingLabelWithString:subtitle ? [NSString stringWithUTF8String:subtitle] : @""];
+        s.font = [NSFont systemFontOfSize:11];
+        s.textColor = [NSColor colorWithWhite:1 alpha:0.75];
+        s.maximumNumberOfLines = 4;
+        s.cell.truncatesLastVisibleLine = YES;
+        s.preferredMaxLayoutWidth = textW;
+        CGFloat subH = ceil([s sizeThatFits:NSMakeSize(textW, CGFLOAT_MAX)].height);
+        CGFloat titleH = 18, gap = 4, block = titleH + gap + subH;
+        CGFloat height = MAX(76, block + 2 * 14);
+        CGFloat y0 = floor((height - block) / 2);
         NSRect vf = [NSScreen mainScreen].visibleFrame;
         NSRect frame = NSMakeRect(NSMaxX(vf) - width - 16, NSMaxY(vf) - height - 16, width, height);
         NSPanel *panel = [[NSPanel alloc] initWithContentRect:frame
@@ -1124,7 +1151,11 @@ void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const c
         panel.backgroundColor = [NSColor clearColor];
         panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
         panel.hidesOnDeactivate = NO;
-        panel.sharingType = NSWindowSharingNone; // keep it out of screen captures where honoured
+        // Kept out of screen captures where honoured.
+        panel.sharingType = g_toast_capturable ? NSWindowSharingReadOnly : NSWindowSharingNone;
+        // Always the dark HUD: the text is white, and in the light
+        // appearance the HUD material is pale enough to lose it.
+        panel.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
 
         BugleToastView *root = [[BugleToastView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
         root.material = NSVisualEffectMaterialHUDWindow;
@@ -1135,7 +1166,6 @@ void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const c
         root.layer.masksToBounds = YES;
         root.openPath = open_path ? [NSString stringWithUTF8String:open_path] : nil;
 
-        CGFloat tx = pad;
         if (img) {
             NSImageView *iv = [[NSImageView alloc] initWithFrame:NSMakeRect(pad, (height - thumb) / 2, thumb, thumb)];
             iv.image = img;
@@ -1144,19 +1174,14 @@ void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const c
             iv.layer.cornerRadius = 6;
             iv.layer.masksToBounds = YES;
             [root addSubview:iv];
-            tx = pad + thumb + pad;
         }
         NSTextField *t = [NSTextField labelWithString:title ? [NSString stringWithUTF8String:title] : @""];
         t.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
         t.textColor = [NSColor whiteColor];
         t.lineBreakMode = NSLineBreakByTruncatingTail;
-        t.frame = NSMakeRect(tx, height / 2 + 2, width - tx - pad, 18);
+        t.frame = NSMakeRect(tx, y0 + subH + gap, textW, titleH);
         [root addSubview:t];
-        NSTextField *s = [NSTextField labelWithString:subtitle ? [NSString stringWithUTF8String:subtitle] : @""];
-        s.font = [NSFont systemFontOfSize:11];
-        s.textColor = [NSColor colorWithWhite:1 alpha:0.75];
-        s.lineBreakMode = NSLineBreakByTruncatingMiddle;
-        s.frame = NSMakeRect(tx, height / 2 - 18, width - tx - pad, 16);
+        s.frame = NSMakeRect(tx, y0, textW, subH);
         [root addSubview:s];
         panel.contentView = root;
         panel.alphaValue = 1.0;
@@ -1183,9 +1208,63 @@ void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const c
 // renamed into place once complete, and otherwise the folder is removed.
 // Nothing can be created in a folder that no longer exists, so a late write
 // has nowhere to go.
+//
+// A process killed mid-write leaves its folder behind, so each folder is
+// held under an exclusive flock(2) on a descriptor of its own from just after
+// it is created until it is removed. The kernel drops the lock when the
+// process exits, however it exits, so the sweeper (src/staging.rs, which
+// knows the name pattern below) removes a folder only once it can take the
+// lock. The descriptor is close-on-exec: a helper process must not keep a
+// dead export's folder looking live.
+
+/// Lock descriptors of this process's staging folders, by folder path.
+static NSMutableDictionary<NSString *, NSNumber *> *staging_locks(void) {
+    static NSMutableDictionary *locks;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ locks = [NSMutableDictionary dictionary]; });
+    return locks;
+}
+
+/// Take the lock on new staging folder `dir` (at file system path `fsp`).
+/// Best effort: a volume without flock support, or a failed open, leaves the
+/// folder unlocked, and the sweeper then goes by its idle time alone. The
+/// sweeper never tries the lock of a folder this new; should something else
+/// hold it for a moment, the lock is tried again for up to ~300 ms.
+static void staging_lock(NSURL *dir, const char *fsp) {
+    int fd = open(fsp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return;
+    int rc = -1, err = 0;
+    for (int i = 0; i < 10; i++) {
+        rc = flock(fd, LOCK_EX | LOCK_NB);
+        err = errno;
+        if (rc == 0 || err != EWOULDBLOCK) break;
+        usleep(30000);
+    }
+    if (rc != 0) {
+        // Expected on a volume without locks; anything else is worth a line.
+        if (err != ENOTSUP && err != EOPNOTSUPP) NSLog(@"bugle: could not lock the temp folder %s: %s", fsp, strerror(err));
+        close(fd);
+        return;
+    }
+    NSMutableDictionary *locks = staging_locks();
+    @synchronized(locks) { locks[dir.path] = @(fd); }
+}
+
+/// Release the lock on `dir`, if this process holds one (once: a second call
+/// does nothing).
+static void staging_unlock(NSURL *dir) {
+    NSMutableDictionary *locks = staging_locks();
+    NSNumber *fd = nil;
+    @synchronized(locks) {
+        fd = locks[dir.path];
+        [locks removeObjectForKey:dir.path];
+    }
+    if (fd) close(fd.intValue);
+}
 
 /// Make the staging folder for `out` (same folder, so the final rename stays
-/// on one volume). nil, with the error set, on failure.
+/// on one volume), locked until staging_discard. nil, with the error set, on
+/// failure.
 static NSURL *staging_create(NSURL *out, NSString *what) {
     NSString *tmpl = [out.URLByDeletingLastPathComponent.path stringByAppendingPathComponent:@".bugle-export.XXXXXX"];
     char buf[PATH_MAX];
@@ -1197,7 +1276,9 @@ static NSURL *staging_create(NSURL *out, NSString *what) {
         set_error(@"%@: could not create a temp folder next to %@: %s", what, out.path, strerror(errno));
         return nil;
     }
-    return [NSURL fileURLWithFileSystemRepresentation:buf isDirectory:YES relativeToURL:nil];
+    NSURL *dir = [NSURL fileURLWithFileSystemRepresentation:buf isDirectory:YES relativeToURL:nil];
+    staging_lock(dir, buf);
+    return dir;
 }
 
 /// Where the writer writes inside staging folder `dir`: the output's own
@@ -1206,20 +1287,24 @@ static NSURL *staging_file(NSURL *dir, NSURL *out) {
     return [dir URLByAppendingPathComponent:out.lastPathComponent];
 }
 
-/// Remove a staging folder and everything in it. Retried for a while: a
-/// cancelled writer may still be adding a file while the folder is emptied,
-/// and removal is slow on network volumes.
+/// Remove a staging folder and everything in it, then release its lock.
+/// Retried for a while: a cancelled writer may still be adding a file while
+/// the folder is emptied, and removal is slow on network volumes.
 static void staging_discard(NSURL *dir) {
     if (!dir) return;
     NSFileManager *fm = [NSFileManager defaultManager];
     NSError *err = nil;
-    for (int i = 0; i < 50; i++) {
-        if ([fm removeItemAtURL:dir error:&err] || ![fm fileExistsAtPath:dir.path]) return;
-        usleep(20000);
+    BOOL gone = NO;
+    for (int i = 0; i < 50 && !gone; i++) {
+        gone = [fm removeItemAtURL:dir error:&err] || ![fm fileExistsAtPath:dir.path];
+        if (!gone) usleep(20000);
     }
+    // Unlocked only now, so a sweeper cannot take the folder while it is
+    // still being emptied; a leftover is then the sweeper's to remove.
+    staging_unlock(dir);
     // Not an error for the caller (its result stands), but make the leftover
     // visible: it is a hidden folder next to the output.
-    NSLog(@"bugle: could not remove the temp folder %@: %@", dir.path, err.localizedDescription);
+    if (!gone) NSLog(@"bugle: could not remove the temp folder %@: %@", dir.path, err.localizedDescription);
 }
 
 /// Move the finished file into place (replacing any file at `out`), then
@@ -2554,7 +2639,23 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
     return l;
 }
 
+// Whether a stream recording has stopped capturing, and why when it failed.
+// Its own object so a probe (bugle_sck_record_probe) can read it without the
+// recorder, from any thread.
+@interface BugleSckStopState : NSObject
+@property (atomic) BOOL stopped;
+@property (atomic, copy) NSString *failure;
+@end
+
+@implementation BugleSckStopState
+@end
+
+// The test fixtures (fixtures.m) create this class with `init` and no stream,
+// call its `stream:didStopWithError:` and `stream:didOutputSampleBuffer:ofType:`
+// delegate methods, set `writer`, and call `stopCapture` and `stoppedAt`:
+// keep those selectors in step with the fixtures' declaration.
 @interface BugleSckRecorder : NSObject <SCStreamOutput, SCStreamDelegate, AVCaptureAudioDataOutputSampleBufferDelegate>
+@property (nonatomic, strong, readonly) BugleSckStopState *stopState;
 @property (nonatomic, strong) SCStream *stream;
 @property (nonatomic, strong) AVAssetWriter *writer;
 @property (nonatomic, strong) AVAssetWriterInput *videoInput;
@@ -2580,6 +2681,9 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
 @property (nonatomic, strong) NSMutableArray<NSString *> *warnings;
 @property (nonatomic) bugle_level_t systemLevel;   // guarded by `lock`
 @property (nonatomic) bugle_level_t micLevel;      // guarded by `lock`
+@property (nonatomic) CMTime failedAt;             // guarded by `lock`; when capture failed
+@property (nonatomic) BOOL streamStopped;          // guarded by `lock`; the stream stopped by itself
+@property (atomic) double stoppedAt;               // host seconds capture ended at; NaN before
 @end
 
 @implementation BugleSckRecorder
@@ -2591,8 +2695,11 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
         _micQueue = dispatch_queue_create("bugle.sck.mic", DISPATCH_QUEUE_SERIAL);
         _lock = [[NSLock alloc] init];
         _warnings = [NSMutableArray array];
+        _stopState = [[BugleSckStopState alloc] init];
         _sessionStart = kCMTimeInvalid;
         _lastPts = kCMTimeInvalid;
+        _failedAt = kCMTimeInvalid;
+        _stoppedAt = NAN;
     }
     return self;
 }
@@ -2615,7 +2722,28 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
 - (void)noteWriterFailure {
     if (self.writer.status == AVAssetWriterStatusFailed && !self.failure) {
         self.failure = self.writer.error.localizedDescription ?: @"asset writer failed";
+        // Nothing more can be written: the recording has stopped.
+        [self failedBecause:[NSString stringWithFormat:@"writing the recording failed: %@", self.failure]];
     }
+}
+
+// The recording stopped capturing (`why`: a failure, nil for a planned stop).
+// The first failure is kept.
+- (void)noteStoppedBecause:(NSString *)why {
+    if (why && !self.stopState.failure) self.stopState.failure = why;
+    self.stopState.stopped = YES;
+}
+
+// Capture failed (or was stopped from outside) now. Caller holds `lock`.
+// Says so, fixes the recording's end at this moment, and tears capture down
+// (microphone, stream) off this thread: `stopCapture` waits for the stream,
+// and this runs on a sample or delegate queue, under `lock`. Weak, like the
+// `max_seconds` timer: a recording stopped meanwhile is already torn down.
+- (void)failedBecause:(NSString *)why {
+    if (!CMTIME_IS_VALID(self.failedAt)) self.failedAt = CMClockGetTime(CMClockGetHostTimeClock());
+    [self noteStoppedBecause:why];
+    __weak BugleSckRecorder *weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ [weakSelf stopCapture]; });
 }
 
 // --- SCStreamOutput ---------------------------------------------------------
@@ -2647,6 +2775,11 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
 }
 
 - (void)handleScreen:(CMSampleBufferRef)sb {
+    // Every buffer checks the writer first: a failed writer may never take
+    // an append (inputs not ready, or a static screen sending idle frames).
+    [self.lock lock];
+    [self noteWriterFailure];
+    [self.lock unlock];
     CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, false);
     if (atts && CFArrayGetCount(atts) > 0) {
         NSDictionary *d = (__bridge NSDictionary *)CFArrayGetValueAtIndex(atts, 0);
@@ -2676,8 +2809,9 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
 }
 
 - (void)handleAudio:(CMSampleBufferRef)sb input:(AVAssetWriterInput *)input {
-    if (!input) return;
     [self.lock lock];
+    [self noteWriterFailure];
+    if (!input) { [self.lock unlock]; return; }
     if (self.stopping || !self.sessionStarted) { [self.lock unlock]; return; }
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
     if (CMTimeCompare(pts, self.sessionStart) < 0) { [self.lock unlock]; return; }
@@ -2690,10 +2824,23 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
 // --- SCStreamDelegate -------------------------------------------------------
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
+    // The system's own screen-sharing control stops a stream this way too.
+    BOOL byUser = [error.domain isEqualToString:SCStreamErrorDomain] && error.code == SCStreamErrorUserStopped;
+    NSString *desc = error.localizedDescription ?: @"unknown error";
+    NSString *why = byUser ? @"the capture was stopped by the user"
+                           : [NSString stringWithFormat:@"the capture stream stopped: %@", desc];
+    NSString *warning = byUser ? why : [NSString stringWithFormat:@"capture stream stopped early: %@", desc];
     [self.lock lock];
     BOOL expected = self.stopping;
+    if (!expected) {
+        self.streamStopped = YES;
+        // No more frames come: say so, so the engine (and other processes
+        // through its recording-state file) stop showing a recording, and
+        // stop the rest (the microphone) at this moment.
+        [self failedBecause:why];
+    }
     [self.lock unlock];
-    if (!expected) [self warn:@"capture stream stopped early: %@", error.localizedDescription];
+    if (!expected) [self warn:@"%@", warning];
 }
 
 // --- AVCaptureAudioDataOutputSampleBufferDelegate (microphone) --------------
@@ -2861,10 +3008,17 @@ bugle_level_t bugle_level_at(const bugle_level_t *in, double now) {
         BOOL already = self.stopping;
         self.stopping = YES;
         CMTime stopTime = CMClockGetTime(CMClockGetHostTimeClock());
+        // After a failure the recording ends where capture failed, however
+        // much later this runs.
+        if (CMTIME_IS_VALID(self.failedAt) && CMTimeCompare(self.failedAt, stopTime) < 0) stopTime = self.failedAt;
+        BOOL streamStopped = self.streamStopped;
         [self.lock unlock];
         if (already) return;
+        self.stoppedAt = CMTimeGetSeconds(stopTime);
+        // The auto-stop at `max_seconds` (or the final stop) ends capture.
+        [self noteStoppedBecause:nil];
         if (self.micSession) [self.micSession stopRunning];
-        if (self.stream && self.captureRequested) {
+        if (self.stream && self.captureRequested && !streamStopped) {
             dispatch_semaphore_t sem = dispatch_semaphore_create(0);
             [self.stream stopCaptureWithCompletionHandler:^(NSError *e) { dispatch_semaphore_signal(sem); }];
             dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
@@ -3080,6 +3234,31 @@ char *bugle_sck_record_warnings(void *handle) {
         [rec.lock unlock];
         return s ? strdup(s.UTF8String) : NULL;
     }
+}
+
+void *bugle_sck_record_probe(void *handle) {
+    if (!handle) return NULL;
+    BugleSckRecorder *rec = (__bridge BugleSckRecorder *)handle;
+    return (__bridge_retained void *)rec.stopState;
+}
+
+int32_t bugle_sck_probe_stopped(void *probe) {
+    if (!probe) return 1;
+    return ((__bridge BugleSckStopState *)probe).stopped ? 1 : 0;
+}
+
+char *bugle_sck_probe_failure(void *probe) {
+    if (!probe) return NULL;
+    @autoreleasepool {
+        NSString *s = ((__bridge BugleSckStopState *)probe).failure;
+        return s ? strdup(s.UTF8String ?: "") : NULL;
+    }
+}
+
+void bugle_sck_probe_release(void *probe) {
+    if (!probe) return;
+    BugleSckStopState *s = (__bridge_transfer BugleSckStopState *)probe;
+    (void)s;
 }
 
 int32_t bugle_sck_record_stop(void *handle) {

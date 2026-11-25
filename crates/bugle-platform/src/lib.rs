@@ -31,7 +31,9 @@ pub use prompt::{prompt_active, prompt_answer, prompt_text};
 #[cfg(target_os = "macos")]
 mod status_menu;
 #[cfg(target_os = "macos")]
-pub use status_menu::{attributed_width, menu_title_mono_tail, status_item_mono_digits, status_menu_probe, status_title_width};
+pub use status_menu::{
+    attributed_width, menu_title_mono_tail, status_item_frame, status_item_mono_digits, status_menu_probe, status_title_width,
+};
 #[cfg(target_os = "macos")]
 mod editor;
 #[cfg(target_os = "macos")]
@@ -49,6 +51,7 @@ pub use video_editor::{
 };
 #[cfg(target_os = "macos")]
 pub use video_editor::{video_editor_track_frame, video_editor_waveform};
+pub mod staging;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bugle_core::audio_level::{AudioLevels, TrackLevel};
@@ -591,6 +594,13 @@ pub fn toast_show(png: Option<&[u8]>, title: &str, subtitle: &str, open_path: Op
     }
 }
 
+/// Whether toasts shown from now on appear in screen captures. They do not
+/// by default (`NSWindowSharingNone`); `bugle-app --smoke-test` lets them
+/// while it takes screenshots of its UI for review. Any thread.
+pub fn toast_set_capturable(on: bool) {
+    unsafe { ffi::bugle_toast_set_capturable(on as i32) }
+}
+
 // ---------------------------------------------------------------------------
 // MediaItem
 // ---------------------------------------------------------------------------
@@ -600,6 +610,7 @@ pub fn toast_show(png: Option<&[u8]>, title: &str, subtitle: &str, open_path: Op
 pub fn export_audio_m4a(input: &Path, output: &Path) -> Result<()> {
     let i = path_cstr(input)?;
     let o = path_cstr(output)?;
+    staging::sweep_beside(output);
     match unsafe { ffi::bugle_export_audio_m4a(i.as_ptr(), o.as_ptr()) } {
         0 => Ok(()),
         -2 => bail!("{} has no audio track", input.display()),
@@ -611,6 +622,7 @@ pub fn export_audio_m4a(input: &Path, output: &Path) -> Result<()> {
 pub fn export_mp4(input: &Path, output: &Path) -> Result<()> {
     let i = path_cstr(input)?;
     let o = path_cstr(output)?;
+    staging::sweep_beside(output);
     if unsafe { ffi::bugle_export_mp4(i.as_ptr(), o.as_ptr()) } != 0 {
         bail!("{}", last_error());
     }
@@ -621,6 +633,7 @@ pub fn export_mp4(input: &Path, output: &Path) -> Result<()> {
 pub fn export_mov(input: &Path, output: &Path) -> Result<()> {
     let i = path_cstr(input)?;
     let o = path_cstr(output)?;
+    staging::sweep_beside(output);
     if unsafe { ffi::bugle_export_mov(i.as_ptr(), o.as_ptr()) } != 0 {
         bail!("{}", last_error());
     }
@@ -703,6 +716,7 @@ fn run_audio_pass(input: &Path, output: &Path, levels: &AudioMixConfig, separate
     levels.validate().map_err(BugleError::Invalid)?;
     let i = path_cstr(input)?;
     let o = path_cstr(output)?;
+    staging::sweep_beside(output);
     let mut state = MixState { levels: *levels, separate, processor: None };
     let ctx = &mut state as *mut MixState as *mut libc::c_void;
     match unsafe { ffi::bugle_mix_audio_tracks(i.as_ptr(), o.as_ptr(), separate as i32, mix_block, ctx) } {
@@ -1026,6 +1040,7 @@ pub fn export_video_ranges(
     let (r, n) = flat_ranges(ranges)?;
     let fps = fps.map(|f| f.min(240) as i32).unwrap_or(0);
     let timeout = timeout.filter(|t| t.is_finite() && *t > 0.0).unwrap_or(0.0);
+    staging::sweep_beside(output);
     if unsafe { ffi::bugle_export_video(i.as_ptr(), o.as_ptr(), r.as_ptr(), n, preset.code(), mp4 as i32, fps, timeout) } != 0 {
         bail!("{}", last_error());
     }
@@ -1095,6 +1110,7 @@ impl VideoFrameWriter {
             return Err(BugleError::Invalid(format!("frame size {width}x{height} is too large")).into());
         };
         let fps = i32::try_from(fps).unwrap_or(i32::MAX);
+        staging::sweep_beside(path);
         let handle = unsafe { ffi::bugle_writer_open(p.as_ptr(), w, h, fps, mp4 as i32, hevc as i32) };
         if handle.is_null() {
             bail!("{}", last_error());
@@ -1201,6 +1217,7 @@ pub fn mux_audio_ranges(video: &Path, audio_source: &Path, ranges: &[(f64, f64)]
     let (v, a, o) = (path_cstr(video)?, path_cstr(audio_source)?, path_cstr(output)?);
     let (r, n) = flat_ranges(ranges)?;
     let timeout = timeout.filter(|t| t.is_finite() && *t > 0.0).unwrap_or(0.0);
+    staging::sweep_beside(output);
     match unsafe { ffi::bugle_mux_audio(v.as_ptr(), a.as_ptr(), r.as_ptr(), n, o.as_ptr(), mp4 as i32, timeout) } {
         0 => Ok(true),
         1 => Ok(false),
@@ -1314,6 +1331,61 @@ impl SckRecorder {
         }
     }
 
+    /// A probe saying whether this recording has stopped capturing by
+    /// itself, usable from any thread without the recorder.
+    pub fn probe(&self) -> SckStopProbe {
+        SckStopProbe { probe: unsafe { ffi::bugle_sck_record_probe(self.handle) } }
+    }
+
+    /// Test fixture: a recorder with no stream and no writer, whose stream
+    /// failures [`SckRecorder::fixture_stream_failed`] simulates. Stopping
+    /// it fails with "no frames were captured".
+    #[doc(hidden)]
+    pub fn fixture() -> Self {
+        Self { handle: unsafe { ffi::bugle_fixture_sck_recorder() } }
+    }
+
+    /// Test fixture: tell the stream delegate the stream stopped with
+    /// `message`, as ScreenCaptureKit does when capture fails.
+    #[doc(hidden)]
+    pub fn fixture_stream_failed(&self, message: &str) {
+        if let Ok(m) = cstr(message) {
+            unsafe { ffi::bugle_fixture_sck_stream_failed(self.handle, m.as_ptr(), 0) }
+        }
+    }
+
+    /// Test fixture: the stream stops as when the user stops it from the
+    /// system's screen-sharing control.
+    #[doc(hidden)]
+    pub fn fixture_stream_stopped_by_user(&self) {
+        unsafe { ffi::bugle_fixture_sck_stream_failed(self.handle, std::ptr::null(), 1) }
+    }
+
+    /// Test fixture: put a writer that failed on the recorder and deliver an
+    /// idle screen buffer (no image, nothing appended).
+    #[doc(hidden)]
+    pub fn fixture_writer_failed(&self) -> Result<()> {
+        let e = unsafe { ffi::bugle_fixture_sck_writer_failed(self.handle) };
+        if !e.is_null() {
+            let msg = unsafe { CStr::from_ptr(e) }.to_string_lossy().into_owned();
+            unsafe { ffi::bugle_free(e as *mut _) };
+            bail!("{msg}");
+        }
+        Ok(())
+    }
+
+    /// Test fixture: run what a stop does first (end capture), and read the
+    /// host time ([`host_time_now`]) capture ended at.
+    #[doc(hidden)]
+    pub fn fixture_stop_capture(&self) {
+        unsafe { ffi::bugle_fixture_sck_stop_capture(self.handle) }
+    }
+
+    #[doc(hidden)]
+    pub fn fixture_stopped_at(&self) -> Option<f64> {
+        Some(unsafe { ffi::bugle_fixture_sck_stopped_at(self.handle) }).filter(|t| t.is_finite())
+    }
+
     /// Stop capturing and finalise the file.
     pub fn stop(mut self) -> Result<()> {
         self.stop_inner()
@@ -1334,6 +1406,45 @@ impl SckRecorder {
 impl Drop for SckRecorder {
     fn drop(&mut self) {
         let _ = self.stop_inner();
+    }
+}
+
+/// Whether an [`SckRecorder`] has stopped capturing without being stopped:
+/// its `max_seconds` passed, the capture stream stopped with an error
+/// (screen recording permission revoked, the display or window gone), or
+/// writing the file failed. Outlives the recorder (it then keeps answering
+/// what it last saw).
+pub struct SckStopProbe {
+    probe: *mut libc::c_void,
+}
+
+// The probed object's properties are atomic.
+unsafe impl Send for SckStopProbe {}
+unsafe impl Sync for SckStopProbe {}
+
+impl SckStopProbe {
+    /// Whether the recording stopped capturing.
+    pub fn stopped(&self) -> bool {
+        unsafe { ffi::bugle_sck_probe_stopped(self.probe) != 0 }
+    }
+
+    /// Why it stopped, when that was a failure (not its `max_seconds`).
+    pub fn failure(&self) -> Option<String> {
+        unsafe {
+            let p = ffi::bugle_sck_probe_failure(self.probe);
+            if p.is_null() {
+                return None;
+            }
+            let s = CStr::from_ptr(p).to_string_lossy().into_owned();
+            ffi::bugle_free(p as *mut _);
+            Some(s)
+        }
+    }
+}
+
+impl Drop for SckStopProbe {
+    fn drop(&mut self) {
+        unsafe { ffi::bugle_sck_probe_release(self.probe) }
     }
 }
 
@@ -2119,6 +2230,23 @@ mod tests {
     }
 
     #[test]
+    fn a_live_writer_keeps_its_staging_folder_from_the_sweeper() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("live.mp4");
+        let mut w = VideoFrameWriter::create(&out, 64, 48, 10, true).unwrap();
+        w.append(&solid(64, 48, [0, 255, 0])).unwrap();
+        let staged: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(staged.len(), 1);
+        assert!(staging::is_staging_name(staged[0].file_name().unwrap()), "{}", staged[0].display());
+        // No age floor: only the shim's lock keeps it.
+        assert_eq!(staging::sweep_with(dir.path(), &staging::Floors::ZERO), 0);
+        assert!(staged[0].is_dir());
+        w.finish().unwrap();
+        assert_eq!(video_size(&out).unwrap(), (64, 48));
+        assert!(!staged[0].exists());
+    }
+
+    #[test]
     fn frame_writer_rejects_bad_sizes_and_cleans_up() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("x.mp4");
@@ -2140,5 +2268,92 @@ mod tests {
         let d = displays().unwrap();
         assert!(!d.is_empty());
         assert!(d.iter().any(|d| d.is_main));
+    }
+
+    #[test]
+    fn a_stream_that_fails_shows_as_stopped() {
+        let rec = SckRecorder::fixture();
+        let probe = rec.probe();
+        assert!(!probe.stopped());
+        assert_eq!(probe.failure(), None);
+        rec.fixture_stream_failed("The user declined TCCs for application, window, display capture");
+        assert!(probe.stopped());
+        let why = probe.failure().unwrap();
+        assert!(why.starts_with("the capture stream stopped: ") && why.contains("declined"), "{why}");
+        assert!(rec.warnings().unwrap().contains("capture stream stopped early"));
+        // A second failure does not replace the first reason.
+        rec.fixture_stream_failed("display removed");
+        assert_eq!(probe.failure().as_deref(), Some(why.as_str()));
+        // Nothing was written: the stop says so. The probe outlives it.
+        let e = rec.stop().unwrap_err().to_string();
+        assert!(e.contains("no frames were captured"), "{e}");
+        assert!(probe.stopped());
+        drop(probe);
+
+        // A stop that was asked for is not a failure.
+        let rec = SckRecorder::fixture();
+        let probe = rec.probe();
+        let _ = rec.stop();
+        assert!(probe.stopped());
+        assert_eq!(probe.failure(), None);
+    }
+
+    /// Wait up to 5 s for `f`.
+    fn soon(f: impl Fn() -> bool) -> bool {
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_secs(5) {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn a_failed_stream_is_torn_down_at_the_failure() {
+        let rec = SckRecorder::fixture();
+        let before = host_time_now();
+        rec.fixture_stream_failed("display removed");
+        let after = host_time_now();
+        // Capture is ended off the delegate's thread, at the failure's time.
+        assert!(soon(|| rec.fixture_stopped_at().is_some()), "capture was not torn down");
+        let at = rec.fixture_stopped_at().unwrap();
+        assert!(before <= at && at <= after, "{before} <= {at} <= {after}");
+        // A later stop neither moves the end nor replaces the reason.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        rec.fixture_stop_capture();
+        assert_eq!(rec.fixture_stopped_at(), Some(at));
+        assert!(rec.probe().failure().unwrap().contains("display removed"));
+        drop(rec);
+
+        // A planned stop ends capture when it runs.
+        let rec = SckRecorder::fixture();
+        let before = host_time_now();
+        rec.fixture_stop_capture();
+        assert!(rec.fixture_stopped_at().is_some_and(|t| t >= before));
+        assert_eq!(rec.probe().failure(), None);
+    }
+
+    #[test]
+    fn a_stop_from_the_system_control_is_the_users() {
+        let rec = SckRecorder::fixture();
+        rec.fixture_stream_stopped_by_user();
+        assert!(rec.probe().stopped());
+        assert_eq!(rec.probe().failure().as_deref(), Some("the capture was stopped by the user"));
+        assert!(rec.warnings().unwrap().contains("stopped by the user"));
+    }
+
+    #[test]
+    fn a_failed_writer_is_noticed_without_an_append() {
+        let rec = SckRecorder::fixture();
+        let probe = rec.probe();
+        rec.fixture_writer_failed().unwrap();
+        assert!(probe.stopped());
+        let why = probe.failure().unwrap();
+        assert!(why.starts_with("writing the recording failed: "), "{why}");
+        assert!(soon(|| rec.fixture_stopped_at().is_some()), "capture was not torn down");
+        // Nothing is kept from a failed writer.
+        assert!(rec.stop().is_err());
     }
 }

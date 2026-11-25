@@ -180,6 +180,7 @@ mod tests {
             frames: 0,
             output: None,
             audio_levels: None,
+            failure: None,
         }
     }
 

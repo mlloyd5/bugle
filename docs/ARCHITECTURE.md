@@ -88,6 +88,33 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `prompt_text`, `prompt_active`, `prompt_answer` | A non-modal `NSPanel` with a text field and OK/Cancel (`shim/prompt.m`): returns at once and reports the answer through a callback, one prompt at a time (a second open brings the first to the front); the panel maps ⌘A/C/V/X/Z itself (no Edit menu) and hands the focus on like the editors (`bugle_editor_window_closed`) when it closes |
 | `notify::{start, state, refresh, post}` | `UNUserNotificationCenter` (`shim/notify.m`, UserNotifications): delegate (banner while active, click opens the file), `requestAuthorizationWithOptions` or `getNotificationSettings`, `addNotificationRequest` with an optional `UNNotificationAttachment` (a PNG copy it consumes); nothing is called outside an app bundle |
 
+Staged writes: every shim writer (the exports, remuxes, audio mix/level,
+`mux_audio`, `VideoFrameWriter`) writes into a new hidden
+`.bugle-export.XXXXXX` folder (`mkdtemp`) next to its output and renames the
+finished file out of it; a failed or cancelled write removes the folder. While
+the folder exists the shim holds an exclusive `flock` on a close-on-exec
+descriptor of it (tried again for up to ~300 ms if busy), which the kernel
+drops when the process exits. A process killed mid-write leaves the folder
+behind, and `staging::sweep` removes it: only names matching the pattern
+exactly, directly in the swept folder, real directories (never a symlink,
+opened `O_NOFOLLOW`) at least a minute old by their own modification time
+(younger ones are not even probed, so a sweep cannot take the lock of a
+folder whose writer has not locked it yet), whose lock it can take, that the
+path still names (device and inode of the locked descriptor, checked before
+the contents are read and again just before removal), and which, with
+everything directly in them, were untouched for the idle floor. The floor is
+15 minutes on a local volume where the lock was taken. A flock only reaches
+processes on the same Mac, so on a volume that is not local (`MNT_LOCAL`
+unset: a file share another Mac may write to) or that has no flock support,
+liveness cannot be checked and the floor is 24 hours; an export there that
+stays idle that long could be removed by another Mac's sweep. A lock call
+that fails any other way (`ENOLCK`, ...) keeps the folder. A writer that does
+not lock (an older build) is protected by the idle floor alone. Every staged
+write first sweeps its output's folder (at most once per folder every 10
+minutes per process), and `bugle-app`, `bugle serve` and `bugle mcp` sweep
+the save folder on a background thread at start. Sweeping never fails a
+caller.
+
 Window shadows: ScreenCaptureKit clips single-window screenshots to the window
 bounds, so the shadow path uses `CGWindowListCreateImage` (deprecated but
 functional on macOS 26).
@@ -469,10 +496,29 @@ until someone stops or reaps it, and `bugle serve` / `bugle mcp` have no reaper 
 client's `record_stop`), so each published file gets a watchdog thread that checks once a second
 (`marker::WATCH_INTERVAL`) the signals `Backend::stopped_by_itself` uses that work without the
 recorder lock (the `max_seconds` deadline, the GIF loop's capture-done flag, which its length and
-memory caps set, and the system recorder's exit via `child_exited`) and removes the file once the
-recorder stopped; the next sync cancels it, so an old watchdog never removes a newer recording's
-file. A stream recorder that fails before its deadline is not caught (its engine does not see
-that either). Each process only writes and removes its own file, so two recording processes never
+memory caps set, the system recorder's exit via `child_exited`, and the stream recorder's
+`SckStopProbe`) and removes the file once the recorder stopped; the next sync cancels it, so an
+old watchdog never removes a newer recording's file. The stream recorder's probe is a small
+`BugleSckStopState` object the recorder owns and a probe retains, so it is read without the
+recorder: it is set when capture stops at the `max_seconds` auto-stop, when the `SCStream`
+delegate's `didStopWithError` reports a stop nobody asked for (permission revoked, display or
+window gone; `SCStreamErrorUserStopped`, the system's own screen-sharing control, is worded as
+stopped by the user), and when the `AVAssetWriter` is seen to have failed (checked at the top of
+every sample buffer, so an idle static screen or inputs that stay not-ready still notice it), the
+last two with a reason. Those two also fix the recording's end at the failure and `dispatch_async`
+a teardown (`stopCapture`, weak like the `max_seconds` timer) onto a global queue, never on the
+sample or delegate queue, where it would block under the recorder's lock: the microphone session
+stops at once, a stream that stopped by itself is not stopped again, and a later stop finds
+capture already ended, so the last frame is padded only up to the failure. The engine's own status
+then turns `Finishing` with that reason in `RecordingStatus::failure`, the app reaps it as it does
+an auto-stop (logged as a warning), and `bugle record start` stops waiting and finalises it. After
+a stream stop the file keeps what was captured and the media record carries the reason in
+`MediaItem::failure` (so a `record_stop` after the app's reap still sees it, and history keeps it);
+with nothing captured the error says "no frames were captured (<why>)". After a writer failure
+the shim's stop fails with "recording failed: <cause>" and the file is removed, as before. Tests
+drive these paths with a shim fixture recorder that has no stream (`SckRecorder::fixture`): a
+simulated `didStopWithError` (also with the user-stopped code), and a writer that failed to
+start plus an idle screen buffer. Each process only writes and removes its own file, so two recording processes never
 overwrite each other. On each housekeeping tick (about once a second, already running for the
 timer) the app lists that folder (`marker::scan`): it skips its own pid, shows the oldest recording
 whose owner is still running (pid alive *and* the same process start time, so a reused pid does
