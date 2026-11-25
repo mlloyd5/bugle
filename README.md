@@ -268,8 +268,10 @@ on, when its output is not recognised, or when the guest's macOS is outside
 tries the macOS 27 layout on a newer guest). An image named for a macOS newer
 than this Mac's is refused before cloning, since Virtualization.framework
 cannot boot it. Only the macOS 26 (`tahoe`) image with SIP off has actually
-been prepared and run; the SIP-on, custom-SIP and other-version paths are
-covered by unit tests on `csrutil`/`sw_vers` output, not by real images.
+been prepared and run (the current `--prepare` from a local copy of it, with
+`--from` and another `--image`, then a smoke run cloning the result); the
+SIP-on, custom-SIP and other-version paths are covered by unit tests on
+`csrutil`/`sw_vers` output, not by real images.
 `--force` rebuilds an existing golden image, for instance
 after a month, when macOS may ask to re-confirm screen recording.
 
@@ -300,10 +302,17 @@ toast, which keeps itself out of screen captures, is let in while shots are on.
 They add about three seconds to a run. A shot that fails is a warning, not a
 failed run. The guest's display is 1024×768 at 1×, and its appearance is light:
 switching a running guest to dark mode needs System Events (an Automation
-grant the guest agent lacks) or a new login, so dark mode is not shown.
+grant the guest agent lacks) or a new login, so dark mode is not shown. On
+the macOS 26 image, macOS asks whether `tart-guest-agent` (the process the
+smoke test runs under) may keep bypassing the window picker, in an alert in
+the middle of the screen that stays there for the run; it does not affect
+the test, but it is in the pictures.
 
-The VM is
-stopped and deleted afterwards, also on failure and on Ctrl-C (SIGINT,
+Every `tart clone` runs with `TART_NO_AUTO_PRUNE`: on a disk with less free
+space than the source's full size, Tart otherwise deletes pulled images from
+its cache to make room, though a copy-on-write clone needs almost none.
+
+The VM is stopped and deleted afterwards, also on failure and on Ctrl-C (SIGINT,
 SIGTERM, SIGHUP or SIGQUIT in any phase: the build, boot or test is stopped, a
 clone in progress is allowed to finish (about a second) and then deleted, the
 run's bundle copy is removed with its logs kept, and the exit status is 128 +

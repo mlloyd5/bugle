@@ -23,7 +23,7 @@
 //!   throwaway config from [`crate::smoke_config`], streams its output,
 //!   copies the guest's run directory back (with the app's screenshots of
 //!   its menu-bar UI, listed at the end: [`report_screenshots`]) and deletes
-//!   the VM.
+//!   the VM. Clones never let Tart prune its image cache ([`clone_command`]).
 //! * SIGINT, SIGTERM, SIGHUP and SIGQUIT in any phase stop the child
 //!   processes, stop and delete the clone and exit with 128 + the signal
 //!   ([`crate::interrupt`]); every Tart wait, the teardown's included, has a
@@ -876,6 +876,17 @@ fn run_vm_name(since_epoch: Duration, pid: u32, start_us: u64) -> String {
     format!("{RUN_PREFIX}{}-p{pid}-s{start_us}", since_epoch.as_millis())
 }
 
+/// `tart clone source name` without Tart's automatic pruning: on a disk
+/// short of the source's full size, `tart clone` would otherwise delete
+/// pulled OCI images from Tart's cache to make room, the tens of GB a
+/// `--prepare` needs among them, though a copy-on-write clone takes almost
+/// no space at first.
+fn clone_command(source: &str, name: &str) -> Command {
+    let mut cmd = Command::new("tart");
+    cmd.args(["clone", source, name]).env("TART_NO_AUTO_PRUNE", "1");
+    cmd
+}
+
 /// How to wait for `tart stop --timeout <secs>`: never cut short by a
 /// signal, never longer than its timeout plus [`TEARDOWN_MARGIN`].
 fn stop_wait(secs: u32) -> Wait {
@@ -935,7 +946,7 @@ impl Vm {
     /// meanwhile is reported after it.
     fn clone_from(source: &str, name: &str, stop_timeout: u32) -> Result<Self> {
         let vm = Self { name: name.into(), run: None, log: None, keep: false, stop_timeout };
-        run_quiet(Command::new("tart").args(["clone", source, name]), Wait::teardown(CLONE_LIMIT))
+        run_quiet(&mut clone_command(source, name), Wait::teardown(CLONE_LIMIT))
             .with_context(|| format!("cloning {source} to {name}"))?;
         interrupt::check()?;
         Ok(vm)
@@ -1521,6 +1532,14 @@ mod tests {
         }
         assert!(guest_run_script("Bugle.app").contains("BUGLE_SMOKE_SAVE=1 \\\n  '/Users/admin"));
         assert!(guest_run_script("Bugle.app").contains("BUGLE_SMOKE_SCREENSHOTS='/Users/admin/bugle-smoke/run/screenshots' "));
+    }
+
+    #[test]
+    fn clones_never_prune_tart_caches() {
+        let cmd = clone_command("base", "run");
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["clone", "base", "run"]);
+        assert!(cmd.get_envs().any(|(k, v)| k == "TART_NO_AUTO_PRUNE" && v.is_some()));
     }
 
     #[test]
