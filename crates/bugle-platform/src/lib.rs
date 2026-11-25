@@ -1331,6 +1331,61 @@ impl SckRecorder {
         }
     }
 
+    /// A probe saying whether this recording has stopped capturing by
+    /// itself, usable from any thread without the recorder.
+    pub fn probe(&self) -> SckStopProbe {
+        SckStopProbe { probe: unsafe { ffi::bugle_sck_record_probe(self.handle) } }
+    }
+
+    /// Test fixture: a recorder with no stream and no writer, whose stream
+    /// failures [`SckRecorder::fixture_stream_failed`] simulates. Stopping
+    /// it fails with "no frames were captured".
+    #[doc(hidden)]
+    pub fn fixture() -> Self {
+        Self { handle: unsafe { ffi::bugle_fixture_sck_recorder() } }
+    }
+
+    /// Test fixture: tell the stream delegate the stream stopped with
+    /// `message`, as ScreenCaptureKit does when capture fails.
+    #[doc(hidden)]
+    pub fn fixture_stream_failed(&self, message: &str) {
+        if let Ok(m) = cstr(message) {
+            unsafe { ffi::bugle_fixture_sck_stream_failed(self.handle, m.as_ptr(), 0) }
+        }
+    }
+
+    /// Test fixture: the stream stops as when the user stops it from the
+    /// system's screen-sharing control.
+    #[doc(hidden)]
+    pub fn fixture_stream_stopped_by_user(&self) {
+        unsafe { ffi::bugle_fixture_sck_stream_failed(self.handle, std::ptr::null(), 1) }
+    }
+
+    /// Test fixture: put a writer that failed on the recorder and deliver an
+    /// idle screen buffer (no image, nothing appended).
+    #[doc(hidden)]
+    pub fn fixture_writer_failed(&self) -> Result<()> {
+        let e = unsafe { ffi::bugle_fixture_sck_writer_failed(self.handle) };
+        if !e.is_null() {
+            let msg = unsafe { CStr::from_ptr(e) }.to_string_lossy().into_owned();
+            unsafe { ffi::bugle_free(e as *mut _) };
+            bail!("{msg}");
+        }
+        Ok(())
+    }
+
+    /// Test fixture: run what a stop does first (end capture), and read the
+    /// host time ([`host_time_now`]) capture ended at.
+    #[doc(hidden)]
+    pub fn fixture_stop_capture(&self) {
+        unsafe { ffi::bugle_fixture_sck_stop_capture(self.handle) }
+    }
+
+    #[doc(hidden)]
+    pub fn fixture_stopped_at(&self) -> Option<f64> {
+        Some(unsafe { ffi::bugle_fixture_sck_stopped_at(self.handle) }).filter(|t| t.is_finite())
+    }
+
     /// Stop capturing and finalise the file.
     pub fn stop(mut self) -> Result<()> {
         self.stop_inner()
@@ -1351,6 +1406,45 @@ impl SckRecorder {
 impl Drop for SckRecorder {
     fn drop(&mut self) {
         let _ = self.stop_inner();
+    }
+}
+
+/// Whether an [`SckRecorder`] has stopped capturing without being stopped:
+/// its `max_seconds` passed, the capture stream stopped with an error
+/// (screen recording permission revoked, the display or window gone), or
+/// writing the file failed. Outlives the recorder (it then keeps answering
+/// what it last saw).
+pub struct SckStopProbe {
+    probe: *mut libc::c_void,
+}
+
+// The probed object's properties are atomic.
+unsafe impl Send for SckStopProbe {}
+unsafe impl Sync for SckStopProbe {}
+
+impl SckStopProbe {
+    /// Whether the recording stopped capturing.
+    pub fn stopped(&self) -> bool {
+        unsafe { ffi::bugle_sck_probe_stopped(self.probe) != 0 }
+    }
+
+    /// Why it stopped, when that was a failure (not its `max_seconds`).
+    pub fn failure(&self) -> Option<String> {
+        unsafe {
+            let p = ffi::bugle_sck_probe_failure(self.probe);
+            if p.is_null() {
+                return None;
+            }
+            let s = CStr::from_ptr(p).to_string_lossy().into_owned();
+            ffi::bugle_free(p as *mut _);
+            Some(s)
+        }
+    }
+}
+
+impl Drop for SckStopProbe {
+    fn drop(&mut self) {
+        unsafe { ffi::bugle_sck_probe_release(self.probe) }
     }
 }
 
@@ -2174,5 +2268,92 @@ mod tests {
         let d = displays().unwrap();
         assert!(!d.is_empty());
         assert!(d.iter().any(|d| d.is_main));
+    }
+
+    #[test]
+    fn a_stream_that_fails_shows_as_stopped() {
+        let rec = SckRecorder::fixture();
+        let probe = rec.probe();
+        assert!(!probe.stopped());
+        assert_eq!(probe.failure(), None);
+        rec.fixture_stream_failed("The user declined TCCs for application, window, display capture");
+        assert!(probe.stopped());
+        let why = probe.failure().unwrap();
+        assert!(why.starts_with("the capture stream stopped: ") && why.contains("declined"), "{why}");
+        assert!(rec.warnings().unwrap().contains("capture stream stopped early"));
+        // A second failure does not replace the first reason.
+        rec.fixture_stream_failed("display removed");
+        assert_eq!(probe.failure().as_deref(), Some(why.as_str()));
+        // Nothing was written: the stop says so. The probe outlives it.
+        let e = rec.stop().unwrap_err().to_string();
+        assert!(e.contains("no frames were captured"), "{e}");
+        assert!(probe.stopped());
+        drop(probe);
+
+        // A stop that was asked for is not a failure.
+        let rec = SckRecorder::fixture();
+        let probe = rec.probe();
+        let _ = rec.stop();
+        assert!(probe.stopped());
+        assert_eq!(probe.failure(), None);
+    }
+
+    /// Wait up to 5 s for `f`.
+    fn soon(f: impl Fn() -> bool) -> bool {
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_secs(5) {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn a_failed_stream_is_torn_down_at_the_failure() {
+        let rec = SckRecorder::fixture();
+        let before = host_time_now();
+        rec.fixture_stream_failed("display removed");
+        let after = host_time_now();
+        // Capture is ended off the delegate's thread, at the failure's time.
+        assert!(soon(|| rec.fixture_stopped_at().is_some()), "capture was not torn down");
+        let at = rec.fixture_stopped_at().unwrap();
+        assert!(before <= at && at <= after, "{before} <= {at} <= {after}");
+        // A later stop neither moves the end nor replaces the reason.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        rec.fixture_stop_capture();
+        assert_eq!(rec.fixture_stopped_at(), Some(at));
+        assert!(rec.probe().failure().unwrap().contains("display removed"));
+        drop(rec);
+
+        // A planned stop ends capture when it runs.
+        let rec = SckRecorder::fixture();
+        let before = host_time_now();
+        rec.fixture_stop_capture();
+        assert!(rec.fixture_stopped_at().is_some_and(|t| t >= before));
+        assert_eq!(rec.probe().failure(), None);
+    }
+
+    #[test]
+    fn a_stop_from_the_system_control_is_the_users() {
+        let rec = SckRecorder::fixture();
+        rec.fixture_stream_stopped_by_user();
+        assert!(rec.probe().stopped());
+        assert_eq!(rec.probe().failure().as_deref(), Some("the capture was stopped by the user"));
+        assert!(rec.warnings().unwrap().contains("stopped by the user"));
+    }
+
+    #[test]
+    fn a_failed_writer_is_noticed_without_an_append() {
+        let rec = SckRecorder::fixture();
+        let probe = rec.probe();
+        rec.fixture_writer_failed().unwrap();
+        assert!(probe.stopped());
+        let why = probe.failure().unwrap();
+        assert!(why.starts_with("writing the recording failed: "), "{why}");
+        assert!(soon(|| rec.fixture_stopped_at().is_some()), "capture was not torn down");
+        // Nothing is kept from a failed writer.
+        assert!(rec.stop().is_err());
     }
 }

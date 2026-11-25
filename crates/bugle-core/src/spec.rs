@@ -285,6 +285,13 @@ pub struct RecordingStatus {
     /// recording without audio or with a recorder that does not report them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_levels: Option<crate::audio_level::AudioLevels>,
+    /// Why a `Finishing` recording stopped capturing before it was stopped
+    /// or reached its `max_seconds`: the capture stream failed (screen
+    /// recording permission revoked, the display or window gone) or writing
+    /// the file failed. Stopping it still saves what was captured, if
+    /// anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
 
 /// Transcript produced by a speech-to-text provider.

@@ -51,6 +51,12 @@ pub struct MediaItem {
     /// video.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<PathBuf>,
+    /// Why a recording ended before it was stopped or reached its
+    /// `max_seconds` (its capture stream failed, or the user stopped it from
+    /// the system's screen-sharing control): the file holds what was
+    /// captured until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
 
 impl MediaItem {
@@ -72,6 +78,7 @@ impl MediaItem {
             url: None,
             synced_as: None,
             events: None,
+            failure: None,
         }
     }
 

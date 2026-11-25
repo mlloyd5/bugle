@@ -162,8 +162,22 @@ a second or two, whichever process started it (`bugle serve`, `bugle mcp`,
 `bugle record`), but cannot stop another process's recording: its Stop entry
 is disabled and names the recording process. Stop it with `record_stop` on the
 server that started it. Once a recording stops capturing by itself (its
-`max_seconds`, a GIF cap), the menu bar stops showing it even before that
+`max_seconds`, a GIF cap, or a failure), the menu bar stops showing it even before that
 `record_stop`, which still returns its media record.
+
+When the ScreenCaptureKit recorder stops capturing early, `record_status`
+turns `finishing` and carries `failure`, a message saying why, and capture
+(microphone included) ends at that moment. What `record_stop` returns then
+depends on the cause:
+
+* The capture stream stopped (screen recording permission revoked, the
+  recorded display unplugged or the window closed, or the user stopping it
+  from the system's screen-sharing control): the recording is saved up to
+  that point, and the media record carries the same `failure` (also when the
+  menu-bar app already finalised it). With nothing captured, it fails with
+  "no frames were captured (<why>)".
+* Writing the file failed: nothing is kept, and `record_stop` fails with
+  "recording failed: <cause>".
 
 `source` accepts a media id (or prefix), `latest`, or a file path.
 Target coordinates are screen points (top-left origin); annotation and OCR
