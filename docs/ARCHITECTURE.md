@@ -469,10 +469,17 @@ until someone stops or reaps it, and `bugle serve` / `bugle mcp` have no reaper 
 client's `record_stop`), so each published file gets a watchdog thread that checks once a second
 (`marker::WATCH_INTERVAL`) the signals `Backend::stopped_by_itself` uses that work without the
 recorder lock (the `max_seconds` deadline, the GIF loop's capture-done flag, which its length and
-memory caps set, and the system recorder's exit via `child_exited`) and removes the file once the
-recorder stopped; the next sync cancels it, so an old watchdog never removes a newer recording's
-file. A stream recorder that fails before its deadline is not caught (its engine does not see
-that either). Each process only writes and removes its own file, so two recording processes never
+memory caps set, the system recorder's exit via `child_exited`, and the stream recorder's
+`SckStopProbe`) and removes the file once the recorder stopped; the next sync cancels it, so an
+old watchdog never removes a newer recording's file. The stream recorder's probe is a small
+`BugleSckStopState` object the recorder owns and a probe retains, so it is read without the
+recorder: it is set when capture stops at the `max_seconds` auto-stop, when the `SCStream`
+delegate's `didStopWithError` reports a stop nobody asked for (permission revoked, display or
+window gone), and when the `AVAssetWriter` fails, the last two with a reason. The engine's own
+status then turns `Finishing` with that reason in `RecordingStatus::failure`, the app reaps it as
+it does an auto-stop, `bugle record start` stops waiting and finalises it, and the stop keeps what
+was captured (or fails with "no frames were captured"). Tests drive that path with a shim fixture
+recorder that has no stream (`SckRecorder::fixture`). Each process only writes and removes its own file, so two recording processes never
 overwrite each other. On each housekeeping tick (about once a second, already running for the
 timer) the app lists that folder (`marker::scan`): it skips its own pid, shows the oldest recording
 whose owner is still running (pid alive *and* the same process start time, so a reused pid does

@@ -3,7 +3,7 @@ use bugle_core::audio_mix::AudioMixOverrides;
 use bugle_markup::{Annotation, Shape, Style};
 use bugle_core::{
     BugleError, CaptureOptions, CaptureRequest, CaptureTarget, Config, DescribeRequest, ImageFormat, OcrOptions, Point, RecordRequest,
-    RecordingFormat, Rect, ScrollCaptureRequest, SubtitleFormat,
+    RecordingFormat, RecordingState, Rect, ScrollCaptureRequest, SubtitleFormat,
 };
 use bugle_engine::Engine;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -697,13 +697,31 @@ pub async fn run(cli: Cli) -> Result<()> {
                 };
                 let status = engine.record_start(&req)?;
                 eprintln!("recording → {}  (Ctrl-C to stop)", status.output.as_deref().unwrap_or("?"));
-                match a.seconds {
-                    Some(s) => {
-                        let deadline = tokio::time::sleep(std::time::Duration::from_secs_f64(s + 0.2));
-                        tokio::select! { _ = deadline => {}, _ = tokio::signal::ctrl_c() => {} }
+                // Until Ctrl-C, the deadline, or the recorder stopping by
+                // itself (its capture stream failed, a GIF hit its cap, the
+                // system recorder exited): no waiting on a dead recording.
+                let deadline = async {
+                    match a.seconds {
+                        Some(s) => tokio::time::sleep(std::time::Duration::from_secs_f64(s + 0.2)).await,
+                        None => std::future::pending().await,
                     }
-                    None => {
-                        tokio::signal::ctrl_c().await?;
+                };
+                let stopped = async {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        let st = engine.record_status();
+                        if st.state == RecordingState::Finishing {
+                            break st.failure;
+                        }
+                    }
+                };
+                tokio::select! {
+                    _ = deadline => {}
+                    r = tokio::signal::ctrl_c() => r?,
+                    failure = stopped => {
+                        if let Some(why) = failure {
+                            eprintln!("recording stopped early: {why}");
+                        }
                     }
                 }
                 let media = engine.record_stop()?;

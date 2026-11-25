@@ -113,9 +113,9 @@ impl Backend {
                 capture_done.load(Ordering::Relaxed) || handle.as_ref().is_none_or(|h| h.is_finished())
             }
             Backend::Video { child, .. } => !matches!(child.try_wait(), Ok(None)),
-            // The stream stops itself at the deadline; the recorder exposes
-            // no other "finished" signal.
-            Backend::Sck { rec, .. } => rec.is_none() || deadline_passed(elapsed, max_seconds),
+            // The stream stops itself at the deadline, and stops early when
+            // capture fails (permission revoked, display gone, writer error).
+            Backend::Sck { rec, .. } => rec.as_ref().is_none_or(|r| r.probe().stopped()) || deadline_passed(elapsed, max_seconds),
         }
     }
 }
@@ -201,9 +201,19 @@ impl Active {
         }
     }
 
+    /// Why the recorder stopped capturing before it was stopped, when it
+    /// failed (only the stream recorder tells).
+    fn failure(&self) -> Option<String> {
+        match &self.backend {
+            Backend::Sck { rec: Some(rec), .. } => rec.probe().failure(),
+            _ => None,
+        }
+    }
+
     fn status(&mut self) -> RecordingStatus {
         let state = self.poll();
         RecordingStatus {
+            failure: if state == RecordingState::Finishing { self.failure() } else { None },
             audio_levels: if state == RecordingState::Active { self.audio_levels() } else { None },
             state,
             format: Some(self.format),
@@ -508,6 +518,7 @@ impl Engine {
                 frames: 0,
                 output: None,
                 audio_levels: None,
+                failure: None,
             },
             Some(a) => a.status(),
         }

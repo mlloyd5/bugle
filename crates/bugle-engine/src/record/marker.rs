@@ -15,7 +15,8 @@
 //!   `bugle mcp` wait for the client's `record_stop`), so a watchdog thread
 //!   ([`WATCH_INTERVAL`]) removes the file as soon as the recorder is seen
 //!   to have stopped capturing: its `max_seconds` passed, the GIF loop hit
-//!   its length or memory cap, or the system recorder exited.
+//!   its length or memory cap, the system recorder exited, or the stream
+//!   recorder's capture stream or file writer failed.
 //! * The file names the owner by pid *and* the owner's process start time,
 //!   so a pid the system reused for another process does not keep a dead
 //!   owner's recording alive. A reader ([`scan`]) ignores and removes the
@@ -241,8 +242,12 @@ fn stopped_probe(active: &super::Active) -> Box<dyn Fn() -> bool + Send> {
             let pid = child.id();
             Box::new(move || bugle_platform::child_exited(pid) || deadline())
         }
-        // The stream recorder stops at its deadline and reports nothing else.
-        super::Backend::Sck { .. } => Box::new(deadline),
+        // The stream recorder stops at its deadline, or early when capture
+        // or writing fails; its probe says so without the recorder.
+        super::Backend::Sck { rec, .. } => {
+            let probe = rec.as_ref().map(|r| r.probe());
+            Box::new(move || probe.as_ref().is_none_or(|p| p.stopped()) || deadline())
+        }
     }
 }
 
@@ -565,6 +570,73 @@ mod tests {
         engine.install(engine.idle_recorder().unwrap(), gif_active_with(&out, true, Default::default(), Some(0.2)));
         assert!(eventually(|| scan(&dir, 0).is_empty()), "the file outlived max_seconds");
         engine.record_stop().unwrap();
+    }
+
+    /// A stream recording (a fixture recorder: no stream, no writer) into
+    /// `out`, with no `max_seconds`.
+    fn sck_active(out: &Path) -> super::super::Active {
+        let mut a = gif_active(out, true);
+        // The GIF backend stops on drop.
+        a.backend = super::super::Backend::Sck { rec: Some(bugle_platform::SckRecorder::fixture()), wants_mov: false, audio: None };
+        a.format = RecordingFormat::Mp4;
+        a.max_seconds = None;
+        a
+    }
+
+    /// Make the stream of the stream recording in `engine`'s slot fail.
+    fn fail_stream(engine: &Engine, why: &str) {
+        let g = engine.recorder_state.inner.lock().unwrap();
+        match g.as_ref().map(|a| &a.backend) {
+            Some(super::super::Backend::Sck { rec: Some(rec), .. }) => rec.fixture_stream_failed(why),
+            _ => panic!("no stream recording in the slot"),
+        }
+    }
+
+    #[test]
+    fn a_stream_recording_that_fails_early_is_unpublished_and_reported() {
+        use bugle_core::RecordingState;
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_in(tmp.path());
+        let dir = marker_dir(&engine.config);
+
+        // Nobody reaps it (as under `bugle serve` or `bugle record`).
+        engine.install(engine.idle_recorder().unwrap(), sck_active(&tmp.path().join("a.mp4")));
+        assert_eq!(scan(&dir, 0).len(), 1);
+        let st = engine.record_status();
+        assert_eq!((st.state, st.failure), (RecordingState::Active, None));
+        fail_stream(&engine, "display removed");
+        assert!(eventually(|| scan(&dir, 0).is_empty()), "the file outlived the stream");
+        let st = engine.record_status();
+        assert_eq!(st.state, RecordingState::Finishing, "the engine's own status is not a phantom recording");
+        let why = st.failure.unwrap_or_default();
+        assert!(why.contains("capture stream stopped") && why.contains("display removed"), "{why}");
+        // The stop reports what came of it (here: nothing was captured).
+        let e = engine.record_stop().unwrap_err().to_string();
+        assert!(e.contains("no frames were captured"), "{e}");
+        assert!(scan(&dir, 0).is_empty());
+        assert_eq!(engine.record_status().state, RecordingState::Idle);
+
+        // Where a reaper runs (the menu-bar app), it finalises it, and a new
+        // recording can start meanwhile without an explicit stop.
+        engine.install(engine.idle_recorder().unwrap(), sck_active(&tmp.path().join("b.mp4")));
+        fail_stream(&engine, "permission revoked");
+        assert!(engine.record_reap().is_some_and(|r| r.is_err()));
+        assert!(scan(&dir, 0).is_empty());
+        engine.install(engine.idle_recorder().unwrap(), sck_active(&tmp.path().join("c.mp4")));
+        fail_stream(&engine, "permission revoked");
+        drop(engine.free_recorder(false).unwrap());
+        assert!(scan(&dir, 0).is_empty());
+
+        // A stream that fails before the recording is published (between
+        // its start and the first sync) is never published.
+        let mut a = sck_active(&tmp.path().join("d.mp4"));
+        if let super::super::Backend::Sck { rec: Some(rec), .. } = &a.backend {
+            rec.fixture_stream_failed("stopped at once");
+        }
+        a.started = std::time::Instant::now();
+        engine.install(engine.idle_recorder().unwrap(), a);
+        assert!(scan(&dir, 0).is_empty());
+        assert!(engine.record_stop().is_err());
     }
 
     #[test]
