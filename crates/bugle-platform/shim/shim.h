@@ -131,6 +131,7 @@ int32_t bugle_pin_image_show(const uint8_t *png, size_t len, double x, double y,
 int32_t bugle_pin_close_all(void);
 void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const char *subtitle, const char *open_path,
                       double seconds);
+void bugle_toast_set_capturable(int32_t on);
 
 int32_t bugle_export_audio_m4a(const char *in_path, const char *out_path);
 int32_t bugle_export_mp4(const char *in_path, const char *out_path);

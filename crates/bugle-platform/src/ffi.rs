@@ -164,6 +164,7 @@ extern "C" {
         open_path: *const c_char,
         seconds: f64,
     );
+    pub fn bugle_toast_set_capturable(on: i32);
 
     pub fn bugle_export_audio_m4a(in_path: *const c_char, out_path: *const c_char) -> i32;
     pub fn bugle_export_mp4(in_path: *const c_char, out_path: *const c_char) -> i32;
