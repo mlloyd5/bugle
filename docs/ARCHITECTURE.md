@@ -501,7 +501,20 @@ an API `record_start` meanwhile fails at once with `BugleError::Busy`
 (HTTP 409) rather than waiting or capturing alongside the save. The menu's
 own Record items instead wait for the save before opening the picker
 (`Engine::wait_for_recording_save`) and start with
-`Engine::record_start_after_save`, so a selection is never discarded. (The
+`Engine::record_start_after_save`, so a selection is never discarded.
+While the engine saves (`Engine::recording_saving`; its status reads idle
+meanwhile) `recording_view::view` shows *Saving…* as the status item's title
+and *Saving the previous recording…* in the disabled Stop entry; once a
+Record waits for that save (the app's `record_running`, set when it hands a
+Record to the worker and cleared on its `Done`, whether it started, failed or
+was cancelled), the entry reads *Saving the previous recording; the new one
+starts once it is saved* and the three Record entries are disabled. A Record
+or Stop hotkey meanwhile gets that text in a toast and is not queued: one
+Record at a time waits. The reap thread sends a `RecordingChanged` once
+`record_reap` returns (the engine's own announcements come while it still
+saves), so the state clears as soon as the file is written or failed. The
+app's own recording wins over its save, and its save over another process's
+recording (the app never waits for those). (The
 busy answer covers the reap only: a start that finds an auto-stopped
 recording not yet reaped still finalises it itself first.)
 When the process runs from `Bugle.app`, an *Open at Login* check item

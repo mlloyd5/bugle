@@ -1,7 +1,9 @@
 //! What the status item and the recording entries show: this app's own
 //! recording, or failing that one another Bugle process on this Mac is
 //! making (`bugle record`, `bugle serve`, `bugle mcp`), read from the
-//! engine's recording-state files (`bugle_engine::record::marker`).
+//! engine's recording-state files (`bugle_engine::record::marker`), and
+//! the save of a recording this app's engine finalises after it stopped by
+//! itself, which a new recording from the menu waits for.
 
 use bugle_core::{RecordingState, RecordingStatus};
 use bugle_engine::record::marker::LiveRecording;
@@ -10,27 +12,81 @@ use chrono::{DateTime, Utc};
 /// The label of the *Stop Recording* entry while nothing else is recording.
 pub const STOP_LABEL: &str = "Stop Recording";
 
+/// The status item's title while this app's engine saves a recording.
+pub const SAVING_TITLE: &str = "Saving…";
+
+/// Whether this app's engine is saving a recording that stopped by itself
+/// (`Engine::recording_saving`: the reap took it out of the slot, so its
+/// status reads idle until the file is written).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Saving {
+    #[default]
+    No,
+    /// Saving, and nothing waits for it.
+    Previous,
+    /// Saving, and a Record from the menu or a hotkey waits for the save
+    /// before it opens the picker and starts.
+    RecordWaits,
+}
+
+impl Saving {
+    /// From the engine's `recording_saving` and whether a Record action is
+    /// with the worker (its `Done` not handled yet). A Record that is no
+    /// longer waiting (the save is over; the picker is up) is not shown.
+    pub fn of(saving: bool, record_running: bool) -> Saving {
+        match (saving, record_running) {
+            (false, _) => Saving::No,
+            (true, false) => Saving::Previous,
+            (true, true) => Saving::RecordWaits,
+        }
+    }
+}
+
 /// One state of the recording UI; the app redraws only when it changes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordingView {
     /// The status item's title (`● m:ss`, plus the level meter for this
-    /// app's own recording); `None` shows the icon alone.
+    /// app's own recording, or [`SAVING_TITLE`]); `None` shows the icon
+    /// alone.
     pub title: Option<String>,
     /// This app's engine is recording: Stop works, Record turns into Stop.
     pub own: bool,
     /// Another process is recording (and this app is not): its pid.
     pub other: Option<u32>,
+    /// This app's engine is saving a recording (and not recording).
+    pub saving: Saving,
 }
 
 impl RecordingView {
     /// The *Stop Recording* entry: its label, and whether it is enabled. A
     /// recording of another process cannot be stopped from here (`bugle
     /// serve` and `bugle mcp` would quit on a signal), so the entry says
-    /// where it runs instead of offering a Stop that does nothing.
+    /// where it runs instead of offering a Stop that does nothing; a save
+    /// in progress says so the same way.
     pub fn stop_item(&self) -> (String, bool) {
+        if let Some(note) = self.saving_note() {
+            return (note.to_string(), false);
+        }
         match (self.own, self.other) {
             (false, Some(pid)) => (other_process_label(pid), false),
             (own, _) => (STOP_LABEL.to_string(), own),
+        }
+    }
+
+    /// Whether the Record entries are enabled: not while this app records
+    /// (Stop is the way out) nor while a Record already waits for a save, so
+    /// a second one cannot be queued behind it.
+    pub fn record_enabled(&self) -> bool {
+        !self.own && self.saving != Saving::RecordWaits
+    }
+
+    /// What a save in progress means for the user, for the Stop entry and
+    /// for the toast a Record or Stop hotkey gets meanwhile.
+    pub fn saving_note(&self) -> Option<&'static str> {
+        match self.saving {
+            Saving::No => None,
+            Saving::Previous => Some("Saving the previous recording…"),
+            Saving::RecordWaits => Some("Saving the previous recording; the new one starts once it is saved"),
         }
     }
 }
@@ -45,19 +101,25 @@ fn clock(secs: f64) -> String {
     format!("● {}:{:02}", secs / 60, secs % 60)
 }
 
-/// The view for this app's recorder status `own` and the recordings other
-/// processes make (`others`, oldest first, as `marker::scan` returns them),
-/// at `now`. The app's own recording wins; otherwise the oldest other one
-/// shows, without a level meter (its levels stay in that process).
-pub fn view(own: &RecordingStatus, others: &[LiveRecording], now: DateTime<Utc>) -> RecordingView {
+/// The view for this app's recorder status `own`, its save in progress
+/// `saving`, and the recordings other processes make (`others`, oldest
+/// first, as `marker::scan` returns them), at `now`. The app's own
+/// recording wins, then its own save (another process's recording is not
+/// one the app waits for); otherwise the oldest other one shows, without a
+/// level meter (its levels stay in that process).
+pub fn view(own: &RecordingStatus, saving: Saving, others: &[LiveRecording], now: DateTime<Utc>) -> RecordingView {
     if own.state != RecordingState::Idle {
         let meter = own.audio_levels.as_ref().and_then(bugle_core::audio_level::meter_title);
         let meter = meter.map(|m| format!(" {m}")).unwrap_or_default();
-        return RecordingView { title: Some(format!("{}{meter}", clock(own.elapsed_seconds))), own: true, other: None };
+        let title = Some(format!("{}{meter}", clock(own.elapsed_seconds)));
+        return RecordingView { title, own: true, other: None, saving: Saving::No };
+    }
+    if saving != Saving::No {
+        return RecordingView { title: Some(SAVING_TITLE.to_string()), own: false, other: None, saving };
     }
     match others.first() {
-        Some(r) => RecordingView { title: Some(clock(r.elapsed_seconds(now))), own: false, other: Some(r.pid) },
-        None => RecordingView { title: None, own: false, other: None },
+        Some(r) => RecordingView { title: Some(clock(r.elapsed_seconds(now))), own: false, other: Some(r.pid), saving },
+        None => RecordingView { title: None, own: false, other: None, saving },
     }
 }
 
@@ -90,28 +152,28 @@ mod tests {
 
     #[test]
     fn nothing_recording() {
-        let v = view(&idle(), &[], Utc::now());
-        assert_eq!(v, RecordingView { title: None, own: false, other: None });
+        let v = view(&idle(), Saving::No, &[], Utc::now());
+        assert_eq!(v, RecordingView { title: None, own: false, other: None, saving: Saving::No });
         assert_eq!(v.stop_item(), (STOP_LABEL.to_string(), false));
     }
 
     #[test]
     fn own_recording() {
         let st = RecordingStatus { state: RecordingState::Active, elapsed_seconds: 65.9, ..idle() };
-        let v = view(&st, &[], Utc::now());
-        assert_eq!(v, RecordingView { title: Some("● 1:05".into()), own: true, other: None });
+        let v = view(&st, Saving::No, &[], Utc::now());
+        assert_eq!(v, RecordingView { title: Some("● 1:05".into()), own: true, other: None, saving: Saving::No });
         assert_eq!(v.stop_item(), (STOP_LABEL.to_string(), true));
         // Finishing (stopped by itself, not finalised yet) still counts.
         let st = RecordingStatus { state: RecordingState::Finishing, ..st };
-        assert!(view(&st, &[], Utc::now()).own);
+        assert!(view(&st, Saving::No, &[], Utc::now()).own);
     }
 
     #[test]
     fn another_process_recording() {
         let now = Utc::now();
         let others = [other(4242, now - chrono::Duration::seconds(125)), other(77, now - chrono::Duration::seconds(3))];
-        let v = view(&idle(), &others, now);
-        assert_eq!(v, RecordingView { title: Some("● 2:05".into()), own: false, other: Some(4242) });
+        let v = view(&idle(), Saving::No, &others, now);
+        assert_eq!(v, RecordingView { title: Some("● 2:05".into()), own: false, other: Some(4242), saving: Saving::No });
         let (label, enabled) = v.stop_item();
         assert!(!enabled, "a Stop that cannot stop it is not offered");
         assert_eq!(label, "Recording in another Bugle process (pid 4242)");
@@ -122,17 +184,86 @@ mod tests {
         let now = Utc::now();
         let mut r = other(9, now - chrono::Duration::seconds(600));
         r.max_seconds = Some(30.0);
-        assert_eq!(view(&idle(), &[r.clone()], now).title.as_deref(), Some("● 0:30"));
+        assert_eq!(view(&idle(), Saving::No, &[r.clone()], now).title.as_deref(), Some("● 0:30"));
         r.started_at = now + chrono::Duration::seconds(10);
-        assert_eq!(view(&idle(), &[r], now).title.as_deref(), Some("● 0:00"));
+        assert_eq!(view(&idle(), Saving::No, &[r], now).title.as_deref(), Some("● 0:00"));
     }
 
     #[test]
     fn own_recording_wins_over_another_process() {
         let now = Utc::now();
         let st = RecordingStatus { state: RecordingState::Active, elapsed_seconds: 2.0, ..idle() };
-        let v = view(&st, &[other(4242, now - chrono::Duration::seconds(500))], now);
-        assert_eq!(v, RecordingView { title: Some("● 0:02".into()), own: true, other: None });
+        let v = view(&st, Saving::No, &[other(4242, now - chrono::Duration::seconds(500))], now);
+        assert_eq!(v, RecordingView { title: Some("● 0:02".into()), own: true, other: None, saving: Saving::No });
         assert_eq!(v.stop_item(), (STOP_LABEL.to_string(), true));
+    }
+
+    #[test]
+    fn saving_follows_the_engine_and_a_waiting_record() {
+        assert_eq!(Saving::of(false, false), Saving::No);
+        // A Record past its wait (picker up, starting) is not a save.
+        assert_eq!(Saving::of(false, true), Saving::No);
+        assert_eq!(Saving::of(true, false), Saving::Previous);
+        assert_eq!(Saving::of(true, true), Saving::RecordWaits);
+    }
+
+    #[test]
+    fn saving_the_previous_recording() {
+        let v = view(&idle(), Saving::Previous, &[], Utc::now());
+        assert_eq!(v, RecordingView { title: Some(SAVING_TITLE.into()), own: false, other: None, saving: Saving::Previous });
+        let (label, enabled) = v.stop_item();
+        assert!(!enabled, "nothing to stop while the file is written");
+        assert_eq!(label, "Saving the previous recording…");
+        // A Record meanwhile waits for the save; it may still be asked for.
+        assert!(v.record_enabled());
+    }
+
+    #[test]
+    fn record_waiting_for_the_save() {
+        let v = view(&idle(), Saving::RecordWaits, &[], Utc::now());
+        assert_eq!(v.title.as_deref(), Some(SAVING_TITLE));
+        assert_eq!(v.stop_item(), ("Saving the previous recording; the new one starts once it is saved".to_string(), false));
+        // A second Record is not queued behind the first: the entries are
+        // off, and a hotkey gets this note in a toast instead.
+        assert!(!v.record_enabled());
+        assert_eq!(v.saving_note(), Some(v.stop_item().0.as_str()));
+    }
+
+    #[test]
+    fn saving_clears_with_the_engine() {
+        // The save over (written or failed) or the start done: nothing left.
+        let v = view(&idle(), Saving::of(false, true), &[], Utc::now());
+        assert_eq!(v, RecordingView { title: None, own: false, other: None, saving: Saving::No });
+        assert_eq!(v.saving_note(), None);
+        assert!(v.record_enabled());
+        assert_eq!(v.stop_item(), (STOP_LABEL.to_string(), false));
+        // The new recording then shows as any other.
+        let st = RecordingStatus { state: RecordingState::Active, elapsed_seconds: 1.0, ..idle() };
+        let v = view(&st, Saving::of(false, false), &[], Utc::now());
+        assert!(v.own && !v.record_enabled());
+        assert_eq!(v.stop_item(), (STOP_LABEL.to_string(), true));
+    }
+
+    #[test]
+    fn own_save_wins_over_another_process_recording() {
+        let now = Utc::now();
+        let others = [other(4242, now - chrono::Duration::seconds(5))];
+        let v = view(&idle(), Saving::RecordWaits, &others, now);
+        assert_eq!(v.title.as_deref(), Some(SAVING_TITLE));
+        assert_eq!(v.other, None, "the other recording is not what the title shows");
+        assert!(!v.stop_item().1);
+        // Once saved, the other process's recording shows again.
+        let v = view(&idle(), Saving::No, &others, now);
+        assert_eq!(v.other, Some(4242));
+        assert!(v.record_enabled(), "another process's recording never blocks Record");
+    }
+
+    #[test]
+    fn own_recording_shows_no_save() {
+        // Saving is only ever set while the slot is empty; a recording in
+        // it (the next one already started) wins regardless.
+        let st = RecordingStatus { state: RecordingState::Active, elapsed_seconds: 3.0, ..idle() };
+        let v = view(&st, Saving::RecordWaits, &[], Utc::now());
+        assert_eq!(v, RecordingView { title: Some("● 0:03".into()), own: true, other: None, saving: Saving::No });
     }
 }
