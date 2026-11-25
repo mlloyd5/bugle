@@ -5,9 +5,9 @@
 //! what they look like: the recording timer, the menu and the toast while
 //! another process records, the live level meter.
 //!
-//! Each shot is the main display (`NN-<name>.png`), the right part of the
-//! menu bar from a little left of the status item (`NN-<name>-bar.png`, the
-//! same strip every time, so the timer's width can be compared between
+//! Each shot is the main display (`NN-<name>.png`), the rightmost
+//! [`BAR_WIDTH`] points of the menu bar (`NN-<name>-bar.png`, the same strip
+//! of the display every time, so the timer's width can be compared between
 //! shots) and, while a menu or toast of this app is up, a crop around it and
 //! the status item (`NN-<name>-crop.png`). They are captured through
 //! ScreenCaptureKit from a worker thread, so the main thread keeps running
@@ -43,8 +43,9 @@ const MENU_LEVEL: i32 = 101;
 const STATUS_LEVEL: i32 = 25;
 /// Points kept around the status item, menu and toast in the crop.
 const MARGIN: f64 = 24.0;
-/// How much of the menu bar left of the status item the bar strip shows.
-const BAR_LEFT: f64 = 160.0;
+/// How much of the menu bar, from the display's right edge, the bar strip
+/// shows.
+const BAR_WIDTH: f64 = 400.0;
 
 fn say(msg: impl AsRef<str>) {
     eprintln!("smoke test: screenshot {}", msg.as_ref());
@@ -71,13 +72,17 @@ pub fn set_status_item(tray: &tray_icon::TrayIcon) {
 static LAST_FRAME: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
 
 /// The status item's frame on screen (global points, top-left origin), and
-/// whether it is the one the last shot found (while a menu is open the main
-/// thread is tracking it and does not answer).
-fn status_item_frame() -> Option<(Rect, bool)> {
+/// whether it is the one the last shot found. While a menu of this app is
+/// open it is not asked: the frame comes from the main thread, which then
+/// runs the menu's tracking loop and does not serve the main queue (the
+/// request would wait out its second), and a request posted to it must not
+/// add a wake-up of the main run loop to the level-meter step's count.
+fn status_item_frame(menu_open: bool) -> Option<(Rect, bool)> {
     let item = STATUS_ITEM.load(Ordering::SeqCst);
     let mut last = LAST_FRAME.lock().unwrap_or_else(|e| e.into_inner());
+    let ask = item != 0 && !menu_open;
     // SAFETY: set from the tray icon, which lives as long as the app.
-    match (item != 0).then(|| unsafe { bugle_platform::status_item_frame(item as *mut std::ffi::c_void) }).flatten() {
+    match ask.then(|| unsafe { bugle_platform::status_item_frame(item as *mut std::ffi::c_void) }).flatten() {
         Some(r) => {
             *last = Some(r);
             Some((r, false))
@@ -97,15 +102,18 @@ fn menus_and_toasts() -> Vec<WindowInfo> {
         .collect()
 }
 
-/// A toast: a panel at the status level, below the menu bar, of a toast's
-/// size (this app keeps other, transparent windows at that level).
+/// A toast: a panel at the status level of a toast's size (this app keeps
+/// other, larger and transparent windows at that level; its status item's
+/// window is not its own in the window list).
 fn is_toast(w: &WindowInfo) -> bool {
-    w.layer == STATUS_LEVEL && w.frame.y >= 30.0 && w.frame.w <= 400.0 && w.frame.h <= 240.0
+    w.layer == STATUS_LEVEL && w.frame.w <= 400.0 && w.frame.h <= 240.0
 }
 
-/// How many toasts of this app are on screen.
-pub fn toasts() -> usize {
-    menus_and_toasts().iter().filter(|w| w.layer == STATUS_LEVEL).count()
+/// The window ids of this app's toasts on screen. A new toast is a new
+/// window (one shown over another replaces it), so a toast appeared when an
+/// id not seen before is listed.
+pub fn toast_ids() -> std::collections::HashSet<u32> {
+    menus_and_toasts().iter().filter(|w| w.layer == STATUS_LEVEL).map(|w| w.id).collect()
 }
 
 /// Whether one of this process's menus is open on screen.
@@ -156,15 +164,17 @@ fn take(dir: &std::path::Path, stem: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     let display = bugle_platform::main_display()?;
     let ws = menus_and_toasts();
+    let menu_open = ws.iter().any(|w| w.layer == MENU_LEVEL);
     let img = bugle_platform::capture_display(Some(display.id), false)?;
     img.save(dir.join(format!("{stem}.png")))?;
     let scale = img.width() as f64 / display.frame.w;
     let mut notes = vec![format!("{}×{} px", img.width(), img.height())];
-    let item = match status_item_frame() {
+    let item = match status_item_frame(menu_open) {
         Some((r, stale)) => {
             let when = if stale { ", as the last shot found it" } else { "" };
             notes.push(format!("status item x {:.0}..{:.0} ({:.0}×{:.0} pt{when})", r.x, r.x + r.w, r.w, r.h));
-            let bar = Rect::new(r.x - BAR_LEFT, display.frame.y, display.frame.x + display.frame.w - (r.x - BAR_LEFT), r.y + r.h - display.frame.y);
+            let right = display.frame.x + display.frame.w;
+            let bar = Rect::new(right - BAR_WIDTH, display.frame.y, BAR_WIDTH, r.y + r.h - display.frame.y);
             if let Some(bar) = clamp(&bar, &display.frame) {
                 crop(&img, &bar, &display.frame, scale).save(dir.join(format!("{stem}-bar.png")))?;
             }

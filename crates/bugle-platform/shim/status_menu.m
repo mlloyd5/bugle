@@ -185,9 +185,11 @@ double bugle_status_title_width(const char *text, int32_t mono) {
 
 // The status item's frame on screen in global points, top-left origin (the
 // window server's), into `out` (x, y, w, h); for `bugle-app --smoke-test`'s
-// screenshots. Any thread: off the main thread it asks the main queue (which
-// an open menu's tracking loop also serves) and waits at most a second.
-// Returns 0 for a null or windowless item or on that timeout.
+// screenshots. Any thread: off the main thread it asks the main queue and
+// waits at most a second. While a menu tracks, the main thread does not
+// serve the main queue, so that wait runs out (and the block runs once the
+// menu closes); callers do not ask then. Returns 0 for a null or windowless
+// item or on that timeout.
 int32_t bugle_status_item_frame(void *status_item, double *out) {
     if (!status_item || !out) return 0;
     NSStatusItem *item = (__bridge NSStatusItem *)status_item;

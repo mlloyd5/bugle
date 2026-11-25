@@ -294,8 +294,9 @@ end of the run: the status item while another Bugle process records, the open
 menu with that process's disabled entry, the toast *Stop Recording* shows then,
 the recording timer and level meter in the status item a second or two apart,
 the open menu with the meter, and the idle menu after the stop. Each is the
-whole guest display, `-bar` (the right part of the menu bar, the same strip in
-every shot, so the timer's width can be compared) and, while a menu or toast is
+whole guest display, `-bar` (the rightmost 400 points of the menu bar, the
+same strip of the display in every shot, so the timer's width can be compared)
+and, while a menu or toast is
 up, `-crop` around it. The status item's position is printed with each shot.
 They are taken in the app with ScreenCaptureKit while the menu stays open; the
 toast, which keeps itself out of screen captures, is let in while shots are on.

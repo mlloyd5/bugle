@@ -1336,18 +1336,35 @@ fn smoke_other_recording_ui(proxy: &Proxy, pid: u32) -> Result<()> {
         std::thread::sleep(Duration::from_millis(400));
         smoke_shots::shoot("other-recording-timer");
     }
-    let shot = smoke_shots::shoot_open_menu_soon("other-recording-menu");
-    let report = meter_smoke::ask_probe(proxy).recv_timeout(Duration::from_secs(6));
-    if let Some(s) = shot {
-        let _ = s.join();
+    // Opened again once if something closed it before it was read, as the
+    // level-meter step does.
+    let mut json = String::new();
+    for attempt in 1..=2 {
+        let shot = smoke_shots::shoot_open_menu_soon("other-recording-menu");
+        let report = meter_smoke::ask_probe(proxy).recv_timeout(Duration::from_secs(6));
+        if let Some(s) = shot {
+            let _ = s.join();
+        }
+        json = match report {
+            Ok(Ok(json)) => json,
+            Ok(Err(e)) => anyhow::bail!("status menu probe: {e}"),
+            Err(_) => anyhow::bail!("no report from the status menu probe"),
+        };
+        match meter_smoke::closed_early(&json) {
+            Some(after) if attempt == 1 => eprintln!(
+                "smoke test: other process recording: the status menu was closed from outside after {after:.2}s, before it was read; opening it again"
+            ),
+            _ => break,
+        }
     }
-    let json = match report {
-        Ok(Ok(json)) => json,
-        Ok(Err(e)) => anyhow::bail!("status menu probe: {e}"),
-        Err(_) => anyhow::bail!("no report from the status menu probe"),
-    };
     let v: serde_json::Value = serde_json::from_str(&json).context("status menu probe report")?;
+    if v["opened"] != serde_json::Value::Bool(true) {
+        anyhow::bail!("the status menu did not open");
+    }
     let s = &v["sample"];
+    if s.is_null() {
+        anyhow::bail!("the status menu closed before it was read, twice");
+    }
     let want = recording_view::other_process_label(pid);
     let items = s["items"].as_array().cloned().unwrap_or_default();
     let at = items.iter().position(|i| i.as_str() == Some(want.as_str()));
@@ -1360,23 +1377,33 @@ fn smoke_other_recording_ui(proxy: &Proxy, pid: u32) -> Result<()> {
         anyhow::bail!("the open menu does not show {want:?} as a disabled entry");
     }
 
-    let before = smoke_shots::toasts();
+    let before = smoke_shots::toast_ids();
     proxy.send(AppEvent::Menu(MenuId("stop_recording".into())));
     let t = Instant::now();
     let mut appeared = None;
     while t.elapsed() < Duration::from_secs(2) {
-        if smoke_shots::toasts() > before {
-            appeared = Some(t.elapsed());
+        if let Some(&id) = smoke_shots::toast_ids().difference(&before).next() {
+            appeared = Some((t.elapsed(), id));
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    // Past the toast's fade-in.
-    std::thread::sleep(Duration::from_millis(500));
-    smoke_shots::shoot("other-recording-stop-toast");
-    eprintln!("smoke test: other process recording: Stop Recording showed a toast after {appeared:?} (want some)");
-    if appeared.is_none() {
+    eprintln!(
+        "smoke test: other process recording: Stop Recording showed a toast after {:?} (want some)",
+        appeared.map(|(after, _)| after)
+    );
+    let Some((_, toast)) = appeared else {
         anyhow::bail!("Stop Recording while another process records showed no toast");
+    };
+    if smoke_shots::enabled() {
+        // Let the window server draw it.
+        std::thread::sleep(Duration::from_millis(500));
+        smoke_shots::shoot("other-recording-stop-toast");
+        // Gone (4 s) before the next step, so it is not in that step's shots.
+        let t = Instant::now();
+        while smoke_shots::toast_ids().contains(&toast) && t.elapsed() < Duration::from_secs(6) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
     Ok(())
 }

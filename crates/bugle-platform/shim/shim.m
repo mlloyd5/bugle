@@ -1063,7 +1063,8 @@ int32_t bugle_pin_close_all(void) {
 
 // ---------------------------------------------------------------------------
 // Toast: a small non-activating panel in the corner of the main screen that
-// shows a thumbnail and two lines of text, then fades out. Clicking it opens
+// shows a thumbnail, a title and a subtitle of up to four lines, then fades
+// out. Clicking it opens
 // the file. Used by the menu-bar app as its "capture done" notification;
 // unbundled binaries cannot post user notifications.
 // ---------------------------------------------------------------------------
@@ -1122,7 +1123,9 @@ void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const c
         CGFloat pad = 10, thumb = img ? 56 : 0, width = 320;
         CGFloat tx = img ? pad + thumb + pad : pad, textW = width - tx - pad;
         // The subtitle wraps (a message saying what to do must be read in
-        // full) up to four lines, the last truncated; the toast grows to fit.
+        // full) up to four lines, the last truncated at its tail; the toast
+        // grows to fit. (A wrapping label cannot truncate its last line in
+        // the middle: with that mode AppKit clips it without an ellipsis.)
         NSTextField *s = [NSTextField wrappingLabelWithString:subtitle ? [NSString stringWithUTF8String:subtitle] : @""];
         s.font = [NSFont systemFontOfSize:11];
         s.textColor = [NSColor colorWithWhite:1 alpha:0.75];

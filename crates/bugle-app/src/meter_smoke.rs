@@ -442,7 +442,7 @@ fn leftovers_of(path: &Path) -> Vec<String> {
 }
 
 /// How long the menu was open when it closed before the probe read it.
-fn closed_early(json: &str) -> Option<f64> {
+pub(crate) fn closed_early(json: &str) -> Option<f64> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let open = v["closed_at"].as_f64()? - v["opened_at"].as_f64()?;
     (v["opened"] == serde_json::Value::Bool(true) && v["sample"].is_null()).then_some(open)
