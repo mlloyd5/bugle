@@ -513,6 +513,10 @@ its start and stop: the status item shows its `● m:ss` (no level meter) and th
 showing within about two seconds when the recording stops by itself (its `max_seconds`, the GIF
 length or memory cap, the system recorder exiting) though nobody has called `record_stop` yet, and
 when the recording process crashes or is killed.
+While Bugle is still saving a recording that stopped at its `max_seconds`, the status item shows
+*Saving…* and the disabled Stop entry reads *Saving the previous recording…*; a Record picked then
+starts once the save is done, and until then the entry reads *Saving the previous recording; the new
+one starts once it is saved* and the Record entries are disabled.
 Other actions
 report through a small toast in the top-right corner (thumbnail and file name;
 click to open).
