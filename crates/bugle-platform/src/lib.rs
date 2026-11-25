@@ -49,6 +49,7 @@ pub use video_editor::{
 };
 #[cfg(target_os = "macos")]
 pub use video_editor::{video_editor_track_frame, video_editor_waveform};
+pub mod staging;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bugle_core::audio_level::{AudioLevels, TrackLevel};
@@ -600,6 +601,7 @@ pub fn toast_show(png: Option<&[u8]>, title: &str, subtitle: &str, open_path: Op
 pub fn export_audio_m4a(input: &Path, output: &Path) -> Result<()> {
     let i = path_cstr(input)?;
     let o = path_cstr(output)?;
+    staging::sweep_beside(output);
     match unsafe { ffi::bugle_export_audio_m4a(i.as_ptr(), o.as_ptr()) } {
         0 => Ok(()),
         -2 => bail!("{} has no audio track", input.display()),
@@ -611,6 +613,7 @@ pub fn export_audio_m4a(input: &Path, output: &Path) -> Result<()> {
 pub fn export_mp4(input: &Path, output: &Path) -> Result<()> {
     let i = path_cstr(input)?;
     let o = path_cstr(output)?;
+    staging::sweep_beside(output);
     if unsafe { ffi::bugle_export_mp4(i.as_ptr(), o.as_ptr()) } != 0 {
         bail!("{}", last_error());
     }
@@ -621,6 +624,7 @@ pub fn export_mp4(input: &Path, output: &Path) -> Result<()> {
 pub fn export_mov(input: &Path, output: &Path) -> Result<()> {
     let i = path_cstr(input)?;
     let o = path_cstr(output)?;
+    staging::sweep_beside(output);
     if unsafe { ffi::bugle_export_mov(i.as_ptr(), o.as_ptr()) } != 0 {
         bail!("{}", last_error());
     }
@@ -703,6 +707,7 @@ fn run_audio_pass(input: &Path, output: &Path, levels: &AudioMixConfig, separate
     levels.validate().map_err(BugleError::Invalid)?;
     let i = path_cstr(input)?;
     let o = path_cstr(output)?;
+    staging::sweep_beside(output);
     let mut state = MixState { levels: *levels, separate, processor: None };
     let ctx = &mut state as *mut MixState as *mut libc::c_void;
     match unsafe { ffi::bugle_mix_audio_tracks(i.as_ptr(), o.as_ptr(), separate as i32, mix_block, ctx) } {
@@ -1026,6 +1031,7 @@ pub fn export_video_ranges(
     let (r, n) = flat_ranges(ranges)?;
     let fps = fps.map(|f| f.min(240) as i32).unwrap_or(0);
     let timeout = timeout.filter(|t| t.is_finite() && *t > 0.0).unwrap_or(0.0);
+    staging::sweep_beside(output);
     if unsafe { ffi::bugle_export_video(i.as_ptr(), o.as_ptr(), r.as_ptr(), n, preset.code(), mp4 as i32, fps, timeout) } != 0 {
         bail!("{}", last_error());
     }
@@ -1095,6 +1101,7 @@ impl VideoFrameWriter {
             return Err(BugleError::Invalid(format!("frame size {width}x{height} is too large")).into());
         };
         let fps = i32::try_from(fps).unwrap_or(i32::MAX);
+        staging::sweep_beside(path);
         let handle = unsafe { ffi::bugle_writer_open(p.as_ptr(), w, h, fps, mp4 as i32, hevc as i32) };
         if handle.is_null() {
             bail!("{}", last_error());
@@ -1201,6 +1208,7 @@ pub fn mux_audio_ranges(video: &Path, audio_source: &Path, ranges: &[(f64, f64)]
     let (v, a, o) = (path_cstr(video)?, path_cstr(audio_source)?, path_cstr(output)?);
     let (r, n) = flat_ranges(ranges)?;
     let timeout = timeout.filter(|t| t.is_finite() && *t > 0.0).unwrap_or(0.0);
+    staging::sweep_beside(output);
     match unsafe { ffi::bugle_mux_audio(v.as_ptr(), a.as_ptr(), r.as_ptr(), n, o.as_ptr(), mp4 as i32, timeout) } {
         0 => Ok(true),
         1 => Ok(false),
@@ -2116,6 +2124,23 @@ mod tests {
         let mut want: Vec<_> = want.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         want.sort();
         assert_eq!(names, want);
+    }
+
+    #[test]
+    fn a_live_writer_keeps_its_staging_folder_from_the_sweeper() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("live.mp4");
+        let mut w = VideoFrameWriter::create(&out, 64, 48, 10, true).unwrap();
+        w.append(&solid(64, 48, [0, 255, 0])).unwrap();
+        let staged: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(staged.len(), 1);
+        assert!(staging::is_staging_name(staged[0].file_name().unwrap()), "{}", staged[0].display());
+        // No age floor: only the shim's lock keeps it.
+        assert_eq!(staging::sweep_with(dir.path(), std::time::Duration::ZERO, std::time::Duration::ZERO), 0);
+        assert!(staged[0].is_dir());
+        w.finish().unwrap();
+        assert_eq!(video_size(&out).unwrap(), (64, 48));
+        assert!(!staged[0].exists());
     }
 
     #[test]

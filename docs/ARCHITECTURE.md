@@ -88,6 +88,22 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `prompt_text`, `prompt_active`, `prompt_answer` | A non-modal `NSPanel` with a text field and OK/Cancel (`shim/prompt.m`): returns at once and reports the answer through a callback, one prompt at a time (a second open brings the first to the front); the panel maps ⌘A/C/V/X/Z itself (no Edit menu) and hands the focus on like the editors (`bugle_editor_window_closed`) when it closes |
 | `notify::{start, state, refresh, post}` | `UNUserNotificationCenter` (`shim/notify.m`, UserNotifications): delegate (banner while active, click opens the file), `requestAuthorizationWithOptions` or `getNotificationSettings`, `addNotificationRequest` with an optional `UNNotificationAttachment` (a PNG copy it consumes); nothing is called outside an app bundle |
 
+Staged writes: every shim writer (the exports, remuxes, audio mix/level,
+`mux_audio`, `VideoFrameWriter`) writes into a new hidden
+`.bugle-export.XXXXXX` folder (`mkdtemp`) next to its output and renames the
+finished file out of it; a failed or cancelled write removes the folder. While
+the folder exists the shim holds an exclusive `flock` on a close-on-exec
+descriptor of it, which the kernel drops when the process exits. A process
+killed mid-write leaves the folder behind, and `staging::sweep` removes it:
+only names matching the pattern exactly, directly in the swept folder, real
+directories (never a symlink, opened `O_NOFOLLOW`), whose lock it can take and
+which, with everything directly in them, were untouched for 15 minutes (24
+hours on a volume without flock support, where liveness cannot be checked).
+Every staged write first sweeps its output's folder (at most once per folder
+every 10 minutes per process), and `bugle-app`, `bugle serve` and `bugle mcp`
+sweep the save folder on a background thread at start. Sweeping never fails a
+caller.
+
 Window shadows: ScreenCaptureKit clips single-window screenshots to the window
 bounds, so the shadow path uses `CGWindowListCreateImage` (deprecated but
 functional on macOS 26).
