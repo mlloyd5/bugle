@@ -1204,11 +1204,22 @@ static NSMutableDictionary<NSString *, NSNumber *> *staging_locks(void) {
 
 /// Take the lock on new staging folder `dir` (at file system path `fsp`).
 /// Best effort: a volume without flock support, or a failed open, leaves the
-/// folder unlocked, and the sweeper then goes by a long idle time instead.
+/// folder unlocked, and the sweeper then goes by its idle time alone. The
+/// sweeper never tries the lock of a folder this new; should something else
+/// hold it for a moment, the lock is tried again for up to ~300 ms.
 static void staging_lock(NSURL *dir, const char *fsp) {
     int fd = open(fsp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) return;
-    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    int rc = -1, err = 0;
+    for (int i = 0; i < 10; i++) {
+        rc = flock(fd, LOCK_EX | LOCK_NB);
+        err = errno;
+        if (rc == 0 || err != EWOULDBLOCK) break;
+        usleep(30000);
+    }
+    if (rc != 0) {
+        // Expected on a volume without locks; anything else is worth a line.
+        if (err != ENOTSUP && err != EOPNOTSUPP) NSLog(@"bugle: could not lock the temp folder %s: %s", fsp, strerror(err));
         close(fd);
         return;
     }

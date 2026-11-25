@@ -2136,7 +2136,7 @@ mod tests {
         assert_eq!(staged.len(), 1);
         assert!(staging::is_staging_name(staged[0].file_name().unwrap()), "{}", staged[0].display());
         // No age floor: only the shim's lock keeps it.
-        assert_eq!(staging::sweep_with(dir.path(), std::time::Duration::ZERO, std::time::Duration::ZERO), 0);
+        assert_eq!(staging::sweep_with(dir.path(), &staging::Floors::ZERO), 0);
         assert!(staged[0].is_dir());
         w.finish().unwrap();
         assert_eq!(video_size(&out).unwrap(), (64, 48));
