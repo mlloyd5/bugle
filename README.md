@@ -283,7 +283,26 @@ runs `--smoke-test` with the same throwaway config as `verify --smoke-test`,
 plus `BUGLE_SMOKE_KEEP`, `BUGLE_SMOKE_CLIPBOARD=1` and `BUGLE_SMOKE_SAVE`
 (nothing leaves the VM, so the clipboard and export steps run too). The output
 streams to your terminal and to `share/smoke.log`; the guest's run directory
-(captures, history, kept temp files) comes back as `share/artifacts`. The VM is
+(captures, history, kept temp files) comes back as `share/artifacts`.
+
+The smoke test checks the menu-bar UI by reading its state; in the VM it also
+saves screenshots of it for a person to look at (`BUGLE_SMOKE_SCREENSHOTS`,
+which the guest script sets), in `share/artifacts/screenshots`, listed at the
+end of the run: the status item while another Bugle process records, the open
+menu with that process's disabled entry, the toast *Stop Recording* shows then,
+the recording timer and level meter in the status item a second or two apart,
+the open menu with the meter, and the idle menu after the stop. Each is the
+whole guest display, `-bar` (the right part of the menu bar, the same strip in
+every shot, so the timer's width can be compared) and, while a menu or toast is
+up, `-crop` around it. The status item's position is printed with each shot.
+They are taken in the app with ScreenCaptureKit while the menu stays open; the
+toast, which keeps itself out of screen captures, is let in while shots are on.
+They add about three seconds to a run. A shot that fails is a warning, not a
+failed run. The guest's display is 1024×768 at 1×, and its appearance is light:
+switching a running guest to dark mode needs System Events (an Automation
+grant the guest agent lacks) or a new login, so dark mode is not shown.
+
+The VM is
 stopped and deleted afterwards, also on failure and on Ctrl-C (SIGINT,
 SIGTERM, SIGHUP or SIGQUIT in any phase: the build, boot or test is stopped, a
 clone in progress is allowed to finish (about a second) and then deleted, the

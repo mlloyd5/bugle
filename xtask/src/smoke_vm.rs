@@ -21,7 +21,9 @@
 //!   shares (the bundle read-only, a run directory read-write), runs the
 //!   smoke test through the Tart guest agent (`tart exec`) with the
 //!   throwaway config from [`crate::smoke_config`], streams its output,
-//!   copies the guest's run directory back and deletes the VM.
+//!   copies the guest's run directory back (with the app's screenshots of
+//!   its menu-bar UI, listed at the end: [`report_screenshots`]) and deletes
+//!   the VM.
 //! * SIGINT, SIGTERM, SIGHUP and SIGQUIT in any phase stop the child
 //!   processes, stop and delete the clone and exit with 128 + the signal
 //!   ([`crate::interrupt`]); every Tart wait, the teardown's included, has a
@@ -51,6 +53,9 @@ pub const GOLDEN_IMAGE: &str = "bugle-smoke-base";
 const RUN_PREFIX: &str = "bugle-smoke-run-";
 /// Where Tart's default (automount) tag puts `--dir` shares in a macOS guest.
 const GUEST_SHARES: &str = "/Volumes/My Shared Files";
+/// The folder of the guest run directory the app saves its screenshots in
+/// (`BUGLE_SMOKE_SCREENSHOTS`); it comes back with the rest of it.
+const SCREENSHOTS: &str = "screenshots";
 /// The guest copy of the bundle and the run directory live here, at a fixed
 /// path so the path-based TCC grants written by `--prepare` match it.
 const GUEST_DIR: &str = "/Users/admin/bugle-smoke";
@@ -267,6 +272,7 @@ impl VmSmoke {
 
         let log = std::fs::read_to_string(share.join("smoke.log")).unwrap_or_default();
         let artifacts = share.join("artifacts");
+        report_screenshots(&artifacts.join(SCREENSHOTS), &log);
         if !status.success() {
             bail!("smoke test failed in the VM ({status}); log and artefacts in {}", share.display());
         }
@@ -286,6 +292,38 @@ impl VmSmoke {
     }
 }
 
+/// Lists the screenshots the app took in the guest (copied back to `dir`)
+/// for a person to look at, and says which shots failed. Never an error:
+/// the pictures are for review, the smoke test's checks are elsewhere.
+fn report_screenshots(dir: &Path, log: &str) {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    names.retain(|n| n.ends_with(".png"));
+    names.sort();
+    let failed = failed_screenshots(log);
+    if names.is_empty() {
+        errln!("warning: the smoke test saved no screenshots of the menu-bar UI (expected in {})", dir.display());
+    } else {
+        outln!("screenshots of the menu-bar UI ({}) in {}:", names.len(), dir.display());
+        for n in &names {
+            outln!("  {n}");
+        }
+    }
+    for f in failed {
+        errln!("warning: {f}");
+    }
+}
+
+/// The smoke log's lines about screenshots that failed or may miss what
+/// they were for.
+fn failed_screenshots(log: &str) -> Vec<&str> {
+    log.lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("smoke test: screenshot") && (l.contains("FAILED") || l.contains("may be missing") || l.contains("no menu")))
+        .collect()
+}
+
 /// The run directory of the VM called `name` (the same name).
 fn run_dir(ws: &Workspace, name: &str) -> PathBuf {
     ws.target_dir.join("xtask").join("smoke-vm").join(name)
@@ -301,7 +339,8 @@ fn missing_grant(log: &str) -> Option<&str> {
 /// the read-only share to `Bugle.app` in [`GUEST_DIR`] (the path the TCC
 /// grants name), run the smoke test
 /// with the throwaway config, tee its output to the run share and copy the
-/// guest run directory (captures, history, kept temp files) back.
+/// guest run directory (captures, history, kept temp files, the screenshots
+/// of the menu-bar UI in [`SCREENSHOTS`]) back.
 ///
 /// The guest's clipboard is its own (`--no-clipboard`), so the ⌘V step runs,
 /// and saving is on, since nothing it writes leaves the VM.
@@ -319,7 +358,8 @@ rm -rf {dir} && mkdir -p {captures} {tmp} || exit 90
 ditto {shared_app} {app} || exit 91
 cp {shared_config} {config} || exit 92
 cd {run} || exit 93
-env -u BUGLE_CONFIG TMPDIR={tmp} BUGLE_SMOKE_KEEP=1 BUGLE_SMOKE_CLIPBOARD=1 BUGLE_SMOKE_SAVE=1 \
+env -u BUGLE_CONFIG TMPDIR={tmp} BUGLE_SMOKE_SCREENSHOTS={screenshots} \
+  BUGLE_SMOKE_KEEP=1 BUGLE_SMOKE_CLIPBOARD=1 BUGLE_SMOKE_SAVE=1 \
   {exe} --smoke-test --config {config} 2>&1 | tee {log}
 status=${{PIPESTATUS[0]}}
 ditto {run} {artifacts} || echo "copying the artefacts back failed" >&2
@@ -328,6 +368,7 @@ exit "$status"
         dir = q(GUEST_DIR),
         captures = q(&format!("{run}/captures")),
         tmp = q(&format!("{run}/tmp")),
+        screenshots = q(&format!("{run}/{SCREENSHOTS}")),
         shared_app = q(&format!("{GUEST_SHARES}/app/{shared_name}")),
         app = q(&app),
         shared_config = q(&format!("{shared_run}/config.toml")),
@@ -1479,6 +1520,18 @@ mod tests {
             assert!(ok, "bash -n rejected:\n{script}");
         }
         assert!(guest_run_script("Bugle.app").contains("BUGLE_SMOKE_SAVE=1 \\\n  '/Users/admin"));
+        assert!(guest_run_script("Bugle.app").contains("BUGLE_SMOKE_SCREENSHOTS='/Users/admin/bugle-smoke/run/screenshots' "));
+    }
+
+    #[test]
+    fn failed_screenshots_are_found() {
+        let log = "smoke test: screenshot 01-a: 2048×1536 px at 2× (status item at x 900, 60×24 pt; 1 window(s) of this app shown)\n\
+                   smoke test: screenshot 02-b FAILED (no display); not a smoke-test failure\n\
+                   smoke test: screenshot c: the menu closed before the capture finished, so it may be missing from the picture\n\
+                   smoke test: level meter: ok\n";
+        let f = failed_screenshots(log);
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert!(f[0].contains("02-b") && f[1].contains("c:"), "{f:?}");
     }
 
     #[test]

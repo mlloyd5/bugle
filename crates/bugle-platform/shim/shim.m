@@ -1100,6 +1100,15 @@ static void toast_dismiss(void) {
     }];
 }
 
+// Toasts stay out of screen captures (NSWindowSharingNone) unless this is
+// set: `bugle-app --smoke-test` sets it while it takes screenshots of the UI
+// for review.
+static _Atomic int32_t g_toast_capturable = 0;
+
+void bugle_toast_set_capturable(int32_t on) {
+    g_toast_capturable = on ? 1 : 0;
+}
+
 void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const char *subtitle, const char *open_path,
                       double seconds) {
     @autoreleasepool {
@@ -1110,7 +1119,20 @@ void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const c
             g_toast_timer = nil;
         }
         NSImage *img = (png && len) ? [[NSImage alloc] initWithData:[NSData dataWithBytes:png length:len]] : nil;
-        CGFloat pad = 10, thumb = img ? 56 : 0, width = 320, height = 76;
+        CGFloat pad = 10, thumb = img ? 56 : 0, width = 320;
+        CGFloat tx = img ? pad + thumb + pad : pad, textW = width - tx - pad;
+        // The subtitle wraps (a message saying what to do must be read in
+        // full) up to four lines, the last truncated; the toast grows to fit.
+        NSTextField *s = [NSTextField wrappingLabelWithString:subtitle ? [NSString stringWithUTF8String:subtitle] : @""];
+        s.font = [NSFont systemFontOfSize:11];
+        s.textColor = [NSColor colorWithWhite:1 alpha:0.75];
+        s.maximumNumberOfLines = 4;
+        s.cell.truncatesLastVisibleLine = YES;
+        s.preferredMaxLayoutWidth = textW;
+        CGFloat subH = ceil([s sizeThatFits:NSMakeSize(textW, CGFLOAT_MAX)].height);
+        CGFloat titleH = 18, gap = 4, block = titleH + gap + subH;
+        CGFloat height = MAX(76, block + 2 * 14);
+        CGFloat y0 = floor((height - block) / 2);
         NSRect vf = [NSScreen mainScreen].visibleFrame;
         NSRect frame = NSMakeRect(NSMaxX(vf) - width - 16, NSMaxY(vf) - height - 16, width, height);
         NSPanel *panel = [[NSPanel alloc] initWithContentRect:frame
@@ -1124,7 +1146,11 @@ void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const c
         panel.backgroundColor = [NSColor clearColor];
         panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
         panel.hidesOnDeactivate = NO;
-        panel.sharingType = NSWindowSharingNone; // keep it out of screen captures where honoured
+        // Kept out of screen captures where honoured.
+        panel.sharingType = g_toast_capturable ? NSWindowSharingReadOnly : NSWindowSharingNone;
+        // Always the dark HUD: the text is white, and in the light
+        // appearance the HUD material is pale enough to lose it.
+        panel.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
 
         BugleToastView *root = [[BugleToastView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
         root.material = NSVisualEffectMaterialHUDWindow;
@@ -1135,7 +1161,6 @@ void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const c
         root.layer.masksToBounds = YES;
         root.openPath = open_path ? [NSString stringWithUTF8String:open_path] : nil;
 
-        CGFloat tx = pad;
         if (img) {
             NSImageView *iv = [[NSImageView alloc] initWithFrame:NSMakeRect(pad, (height - thumb) / 2, thumb, thumb)];
             iv.image = img;
@@ -1144,19 +1169,14 @@ void bugle_toast_show(const uint8_t *png, size_t len, const char *title, const c
             iv.layer.cornerRadius = 6;
             iv.layer.masksToBounds = YES;
             [root addSubview:iv];
-            tx = pad + thumb + pad;
         }
         NSTextField *t = [NSTextField labelWithString:title ? [NSString stringWithUTF8String:title] : @""];
         t.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
         t.textColor = [NSColor whiteColor];
         t.lineBreakMode = NSLineBreakByTruncatingTail;
-        t.frame = NSMakeRect(tx, height / 2 + 2, width - tx - pad, 18);
+        t.frame = NSMakeRect(tx, y0 + subH + gap, textW, titleH);
         [root addSubview:t];
-        NSTextField *s = [NSTextField labelWithString:subtitle ? [NSString stringWithUTF8String:subtitle] : @""];
-        s.font = [NSFont systemFontOfSize:11];
-        s.textColor = [NSColor colorWithWhite:1 alpha:0.75];
-        s.lineBreakMode = NSLineBreakByTruncatingMiddle;
-        s.frame = NSMakeRect(tx, height / 2 - 18, width - tx - pad, 16);
+        s.frame = NSMakeRect(tx, y0, textW, subH);
         [root addSubview:s];
         panel.contentView = root;
         panel.alphaValue = 1.0;

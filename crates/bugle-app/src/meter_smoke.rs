@@ -20,7 +20,7 @@
 //! twice and cannot account for the redraws in between.
 
 use crate::level_meter::{self, Update};
-use crate::{AppEvent, Proxy};
+use crate::{smoke_shots, AppEvent, Proxy};
 use bugle_core::audio_level::{meter_glyph, TrackLevel, FLOOR_DB, METER_GLYPHS, METER_RANGE_DB};
 use bugle_core::{CaptureTarget, MediaKind, RecordRequest, RecordingFormat, RecordingState, Rect};
 use bugle_engine::Engine;
@@ -109,6 +109,14 @@ pub fn open_probe(tray: &TrayIcon, menu: &Menu, req: ProbeRequest) {
     if !started {
         let _ = req.reply.send(Err("a probe is already running".into()));
     }
+}
+
+/// Open the status menu through the main thread and read it once
+/// ([`open_probe`]); the report comes back on the receiver.
+pub fn ask_probe(proxy: &Proxy) -> Receiver<Result<String, String>> {
+    let (reply, rx) = mpsc::channel();
+    proxy.send(AppEvent::MeterProbe(ProbeRequest { reply }));
+    rx
 }
 
 fn say(msg: impl AsRef<str>) {
@@ -241,15 +249,18 @@ fn run(engine: &Engine, proxy: &Proxy, out: &Path) -> Result<(), Vec<String>> {
     }
     let shown_after = t0.elapsed();
     let mut probe: Option<Receiver<Result<String, String>>> = None;
-    let ask = || {
-        let (reply, rx) = mpsc::channel();
-        proxy.send(AppEvent::MeterProbe(ProbeRequest { reply }));
-        rx
-    };
+    let mut shots = Vec::new();
+    let ask = || ask_probe(proxy);
     if level_meter::updates().is_empty() {
         failures.push(format!("the app did not show the recording's meter within {:.0} s", SHOW_TIMEOUT.as_secs_f64()));
     } else {
         say(format!("the app showed the recording after {:.2}s", shown_after.as_secs_f64()));
+        if smoke_shots::enabled() {
+            // Let the menu bar draw the title it was just given.
+            std::thread::sleep(Duration::from_millis(300));
+            smoke_shots::shoot("recording-timer-first");
+        }
+        shots.extend(smoke_shots::shoot_open_menu_soon("recording-menu-level-meter"));
         probe = Some(ask());
     }
     let mut menu_asked = Instant::now();
@@ -277,6 +288,11 @@ fn run(engine: &Engine, proxy: &Proxy, out: &Path) -> Result<(), Vec<String>> {
         }
         poll(&mut polled, &mut inactive);
         std::thread::sleep(Duration::from_millis(100));
+    }
+    if probe.is_some() {
+        // The timer a second or more later, menu closed: its width should
+        // not have changed.
+        smoke_shots::shoot("recording-timer-later");
     }
     let sound_ok = sounds.len() > attempts && sounds.into_iter().all(|s| s.and_then(|mut c| c.wait().ok()).is_some_and(|st| st.success()));
     if !sound_ok {
@@ -330,11 +346,15 @@ fn run(engine: &Engine, proxy: &Proxy, out: &Path) -> Result<(), Vec<String>> {
     // The idle status item has its own font back: read it once more (the
     // app redraws the recording UI before it opens the menu).
     if probe.is_some() {
+        shots.extend(smoke_shots::shoot_open_menu_soon("idle-menu-after-stop"));
         match ask().recv_timeout(Duration::from_secs(6)) {
             Ok(Ok(json)) => check_restored(&json, &mut failures),
             Ok(Err(e)) => failures.push(format!("status menu probe after the stop: {e}")),
             Err(_) => failures.push("no report from the status menu probe after the stop".into()),
         }
+    }
+    for s in shots {
+        let _ = s.join();
     }
     match stopped {
         Ok(media) => {

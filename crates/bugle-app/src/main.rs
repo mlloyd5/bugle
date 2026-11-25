@@ -21,6 +21,7 @@ mod quick_panel;
 mod recent_probe;
 mod recording_view;
 mod smoke_input;
+mod smoke_shots;
 mod video_editor;
 mod video_editor_window;
 
@@ -1029,6 +1030,9 @@ fn main() -> Result<()> {
         .with_tooltip("Bugle")
         .build()
         .context("creating status item")?;
+    if cli.smoke_test {
+        smoke_shots::set_status_item(&tray);
+    }
     {
         let p = proxy.clone();
         MenuEvent::set_event_handler(Some(move |e: MenuEvent| p.send(AppEvent::Menu(e.id))));
@@ -1145,6 +1149,7 @@ fn main() -> Result<()> {
 /// would, then quit. The main loop cancels the overlay after a few seconds.
 fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
     let t0 = Instant::now();
+    smoke_shots::init();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(800));
         proxy.send(AppEvent::Ui(UiRequest::Pin {
@@ -1179,7 +1184,7 @@ fn smoke_test(engine: Arc<Engine>, proxy: Proxy) -> Instant {
         if !smoke_input::smoke(&proxy) {
             smoke_fail("input", "one or more checks failed, see the lines above");
         }
-        smoke_other_recording(&engine);
+        smoke_other_recording(&engine, &proxy);
         // Last: it records.
         if let Err(e) = meter_smoke::smoke(&engine, &proxy) {
             smoke_fail("level meter", e);
@@ -1259,10 +1264,13 @@ fn smoke_pin(engine: &Engine, proxy: &Proxy) {
 /// the menu bar. A stand-in process (`sleep`) gets a recording-state file as
 /// an engine recording in it would write; within 3 s the app must find it
 /// and show another process's recording (the oldest one: with a configured
-/// `history_path` a real one may be older), then, once the process is
-/// killed without removing its file, drop it within 3 s, with the stale file
+/// `history_path` a real one may be older). While it shows, the open status
+/// menu must name the process on a disabled Stop entry, and *Stop
+/// Recording* (as its hotkey would) must show a toast saying where to stop
+/// it ([`smoke_other_recording_ui`]). Once the process is killed without
+/// removing its file, the app must drop it within 3 s, with the stale file
 /// removed (and the folder, if the step created it).
-fn smoke_other_recording(engine: &Engine) {
+fn smoke_other_recording(engine: &Engine, proxy: &Proxy) {
     use bugle_engine::record::marker;
     let wait_for = |pid: u32, found: bool| -> Option<Duration> {
         let t = Instant::now();
@@ -1293,6 +1301,7 @@ fn smoke_other_recording(engine: &Engine) {
         };
         let published = marker::publish(&dir, &rec);
         let shown = published.is_ok().then(|| wait_for(pid, true)).flatten();
+        let ui = shown.map(|_| smoke_other_recording_ui(proxy, OTHER_SHOWN.load(std::sync::atomic::Ordering::SeqCst)));
         let _ = child.kill();
         let _ = child.wait();
         let cleared = wait_for(pid, false);
@@ -1310,11 +1319,66 @@ fn smoke_other_recording(engine: &Engine) {
         if shown.is_none() || cleared.is_none() || left {
             anyhow::bail!("the menu did not follow the other process's recording");
         }
-        Ok(())
+        ui.unwrap_or(Ok(()))
     };
     if let Err(e) = run() {
         smoke_fail("other process recording", format!("{e:#}"));
     }
+}
+
+/// [`smoke_other_recording`] while the recording of process `pid` shows:
+/// open the status menu and read its Stop entry (label and enabled state),
+/// then choose *Stop Recording* and check that a toast appears. With
+/// screenshots on ([`smoke_shots`]), a picture of each.
+fn smoke_other_recording_ui(proxy: &Proxy, pid: u32) -> Result<()> {
+    if smoke_shots::enabled() {
+        // The title was set just now; let the menu bar draw it.
+        std::thread::sleep(Duration::from_millis(400));
+        smoke_shots::shoot("other-recording-timer");
+    }
+    let shot = smoke_shots::shoot_open_menu_soon("other-recording-menu");
+    let report = meter_smoke::ask_probe(proxy).recv_timeout(Duration::from_secs(6));
+    if let Some(s) = shot {
+        let _ = s.join();
+    }
+    let json = match report {
+        Ok(Ok(json)) => json,
+        Ok(Err(e)) => anyhow::bail!("status menu probe: {e}"),
+        Err(_) => anyhow::bail!("no report from the status menu probe"),
+    };
+    let v: serde_json::Value = serde_json::from_str(&json).context("status menu probe report")?;
+    let s = &v["sample"];
+    let want = recording_view::other_process_label(pid);
+    let items = s["items"].as_array().cloned().unwrap_or_default();
+    let at = items.iter().position(|i| i.as_str() == Some(want.as_str()));
+    let enabled = at.and_then(|i| s["enabled"][i].as_bool());
+    eprintln!(
+        "smoke test: other process recording: status item title {:?}, menu entry {want:?} at {at:?} (want some), enabled {enabled:?} (want Some(false))",
+        s["title"].as_str().unwrap_or("")
+    );
+    if at.is_none() || enabled != Some(false) {
+        anyhow::bail!("the open menu does not show {want:?} as a disabled entry");
+    }
+
+    let before = smoke_shots::toasts();
+    proxy.send(AppEvent::Menu(MenuId("stop_recording".into())));
+    let t = Instant::now();
+    let mut appeared = None;
+    while t.elapsed() < Duration::from_secs(2) {
+        if smoke_shots::toasts() > before {
+            appeared = Some(t.elapsed());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Past the toast's fade-in.
+    std::thread::sleep(Duration::from_millis(500));
+    smoke_shots::shoot("other-recording-stop-toast");
+    eprintln!("smoke test: other process recording: Stop Recording showed a toast after {appeared:?} (want some)");
+    if appeared.is_none() {
+        anyhow::bail!("Stop Recording while another process records showed no toast");
+    }
+    Ok(())
 }
 
 /// `--smoke-test` step: open the *Audio Levels* prompt from its menu item,

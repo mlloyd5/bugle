@@ -31,7 +31,9 @@ pub use prompt::{prompt_active, prompt_answer, prompt_text};
 #[cfg(target_os = "macos")]
 mod status_menu;
 #[cfg(target_os = "macos")]
-pub use status_menu::{attributed_width, menu_title_mono_tail, status_item_mono_digits, status_menu_probe, status_title_width};
+pub use status_menu::{
+    attributed_width, menu_title_mono_tail, status_item_frame, status_item_mono_digits, status_menu_probe, status_title_width,
+};
 #[cfg(target_os = "macos")]
 mod editor;
 #[cfg(target_os = "macos")]
@@ -589,6 +591,13 @@ pub fn toast_show(png: Option<&[u8]>, title: &str, subtitle: &str, open_path: Op
             seconds,
         )
     }
+}
+
+/// Whether toasts shown from now on appear in screen captures. They do not
+/// by default (`NSWindowSharingNone`); `bugle-app --smoke-test` lets them
+/// while it takes screenshots of its UI for review. Any thread.
+pub fn toast_set_capturable(on: bool) {
+    unsafe { ffi::bugle_toast_set_capturable(on as i32) }
 }
 
 // ---------------------------------------------------------------------------
