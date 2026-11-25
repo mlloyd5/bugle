@@ -43,7 +43,8 @@ static BOOL g_probe_running = NO;
 //  probe's own timer firings while open, "sample": {"t": s after opening,
 //  "mode": run-loop mode, "title": status item title, "digits_monospaced":
 //  whether the status item's font draws every digit at one advance, "items":
-//  [menu item titles], "width": menu width in points} or null}.
+//  [menu item titles], "enabled": [whether each item is enabled], "width":
+//  menu width in points} or null}.
 // The sample is taken `sample_at` seconds after the menu opens; it closes
 // after `seconds`. Returns 0 without calling `cb` when a probe is running,
 // an argument is missing, or not on the main thread. Main thread only.
@@ -68,13 +69,18 @@ int32_t bugle_status_menu_probe(void *status_item, void *menu, double seconds, d
         NSTimer *sampler = [NSTimer timerWithTimeInterval:sample_at repeats:NO block:^(NSTimer *t) {
             firings++;
             NSMutableArray *titles = [NSMutableArray array];
-            for (NSMenuItem *mi in m.itemArray) [titles addObject:mi.title ?: @""];
+            NSMutableArray *enabled = [NSMutableArray array];
+            for (NSMenuItem *mi in m.itemArray) {
+                [titles addObject:mi.title ?: @""];
+                [enabled addObject:@(mi.enabled)];
+            }
             sample = @{
                 @"t" : @(opened ? CFAbsoluteTimeGetCurrent() - openedAt : -1),
                 @"mode" : [NSRunLoop currentRunLoop].currentMode ?: @"",
                 @"title" : item.button.title ?: @"",
                 @"digits_monospaced" : @(font_digits_monospaced(item.button.font)),
                 @"items" : titles,
+                @"enabled" : enabled,
                 @"width" : @(m.size.width),
             };
         }];
@@ -176,3 +182,43 @@ double bugle_status_title_width(const char *text, int32_t mono) {
         return [@(text) ?: @"" sizeWithAttributes:@{NSFontAttributeName : font}].width;
     }
 }
+
+// The status item's frame on screen in global points, top-left origin (the
+// window server's), into `out` (x, y, w, h); for `bugle-app --smoke-test`'s
+// screenshots. Any thread: off the main thread it asks the main queue and
+// waits at most a second. While a menu tracks, the main thread does not
+// serve the main queue, so that wait runs out (and the block runs once the
+// menu closes); callers do not ask then. Returns 0 for a null or windowless
+// item or on that timeout.
+int32_t bugle_status_item_frame(void *status_item, double *out) {
+    if (!status_item || !out) return 0;
+    NSStatusItem *item = (__bridge NSStatusItem *)status_item;
+    __block NSRect r = NSZeroRect;
+    __block BOOL ok = NO;
+    __block double primaryHeight = 0;
+    void (^read)(void) = ^{
+        NSWindow *w = item.button.window;
+        if (!w) return;
+        r = w.frame;
+        primaryHeight = NSScreen.screens.firstObject.frame.size.height;
+        ok = YES;
+    };
+    if ([NSThread isMainThread]) {
+        read();
+    } else {
+        dispatch_semaphore_t done = dispatch_semaphore_create(0);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            read();
+            dispatch_semaphore_signal(done);
+        });
+        // The block keeps the __block storage alive if it runs late.
+        if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) != 0) return 0;
+    }
+    if (!ok) return 0;
+    out[0] = r.origin.x;
+    out[1] = primaryHeight - NSMaxY(r);
+    out[2] = r.size.width;
+    out[3] = r.size.height;
+    return 1;
+}
+

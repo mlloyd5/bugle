@@ -88,6 +88,33 @@ A C ABI over an Objective-C shim (`shim/shim.m`, compiled by `build.rs` with the
 | `prompt_text`, `prompt_active`, `prompt_answer` | A non-modal `NSPanel` with a text field and OK/Cancel (`shim/prompt.m`): returns at once and reports the answer through a callback, one prompt at a time (a second open brings the first to the front); the panel maps ⌘A/C/V/X/Z itself (no Edit menu) and hands the focus on like the editors (`bugle_editor_window_closed`) when it closes |
 | `notify::{start, state, refresh, post}` | `UNUserNotificationCenter` (`shim/notify.m`, UserNotifications): delegate (banner while active, click opens the file), `requestAuthorizationWithOptions` or `getNotificationSettings`, `addNotificationRequest` with an optional `UNNotificationAttachment` (a PNG copy it consumes); nothing is called outside an app bundle |
 
+Staged writes: every shim writer (the exports, remuxes, audio mix/level,
+`mux_audio`, `VideoFrameWriter`) writes into a new hidden
+`.bugle-export.XXXXXX` folder (`mkdtemp`) next to its output and renames the
+finished file out of it; a failed or cancelled write removes the folder. While
+the folder exists the shim holds an exclusive `flock` on a close-on-exec
+descriptor of it (tried again for up to ~300 ms if busy), which the kernel
+drops when the process exits. A process killed mid-write leaves the folder
+behind, and `staging::sweep` removes it: only names matching the pattern
+exactly, directly in the swept folder, real directories (never a symlink,
+opened `O_NOFOLLOW`) at least a minute old by their own modification time
+(younger ones are not even probed, so a sweep cannot take the lock of a
+folder whose writer has not locked it yet), whose lock it can take, that the
+path still names (device and inode of the locked descriptor, checked before
+the contents are read and again just before removal), and which, with
+everything directly in them, were untouched for the idle floor. The floor is
+15 minutes on a local volume where the lock was taken. A flock only reaches
+processes on the same Mac, so on a volume that is not local (`MNT_LOCAL`
+unset: a file share another Mac may write to) or that has no flock support,
+liveness cannot be checked and the floor is 24 hours; an export there that
+stays idle that long could be removed by another Mac's sweep. A lock call
+that fails any other way (`ENOLCK`, ...) keeps the folder. A writer that does
+not lock (an older build) is protected by the idle floor alone. Every staged
+write first sweeps its output's folder (at most once per folder every 10
+minutes per process), and `bugle-app`, `bugle serve` and `bugle mcp` sweep
+the save folder on a background thread at start. Sweeping never fails a
+caller.
+
 Window shadows: ScreenCaptureKit clips single-window screenshots to the window
 bounds, so the shadow path uses `CGWindowListCreateImage` (deprecated but
 functional on macOS 26).
