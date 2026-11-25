@@ -984,6 +984,9 @@ fn main() -> Result<()> {
     let mut engine = Engine::new(config, false)?;
     engine.ui_host = Some(Arc::new(AppUiHost { proxy: proxy.clone() }));
     let engine = Arc::new(engine);
+    // Clear what killed exports left in the save folder (exports elsewhere
+    // sweep their own folder as they start).
+    bugle_platform::staging::sweep_in_background(vec![engine.config.save_dir()]);
     notifications::init(engine.config.general.system_notifications, cli.smoke_test);
 
     if !bugle_platform::screen_access_preflight() {

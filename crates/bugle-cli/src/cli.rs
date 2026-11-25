@@ -580,6 +580,11 @@ pub async fn run(cli: Cli) -> Result<()> {
     // main_thread_ui = true; servers spawn helpers instead.
     let main_thread = !matches!(cli.cmd, Cmd::Serve { .. } | Cmd::Mcp);
     let engine = Arc::new(Engine::new(config, main_thread)?);
+    if !main_thread {
+        // A long-lived server: clear what killed exports left in the save
+        // folder (exports elsewhere sweep their own folder as they start).
+        bugle_platform::staging::sweep_in_background(vec![engine.config.save_dir()]);
+    }
 
     match cli.cmd {
         Cmd::Capture(a) => {
